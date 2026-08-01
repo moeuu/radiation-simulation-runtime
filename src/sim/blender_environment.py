@@ -176,7 +176,7 @@ def attach_known_obstacle_transport_model(
     include_room_boundaries: bool = False,
     room_boundary_thickness_m: float = 0.1,
 ) -> ObstacleGrid:
-    """Return an obstacle grid whose PF transport uses known obstacle components."""
+    """Return an obstacle grid whose shared transport uses known obstacle components."""
     (
         boxes_m,
         mu_by_isotope,

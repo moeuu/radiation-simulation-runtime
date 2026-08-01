@@ -326,7 +326,7 @@ class RobotController:
             translation_xyz=(0.0, 0.0, detector_local_z_m),
             orientation_wxyz=(1.0, 0.0, 0.0, 0.0),
         )
-        # PF octant indices describe the incoming source-to-detector direction.
+        # shared octant indices describe the incoming source-to-detector direction.
         # The physical shell occupies the opposite detector-to-source side.
         fe_normal = -np.asarray(
             self._shield_normals[fe_index],

@@ -590,7 +590,7 @@ def validate_transport_metadata(
         atol=1.0e-15,
     ):
         raise RuntimeError(
-            "Native Geant4 surface-emission epsilon differs from the PF model."
+            "Native Geant4 surface-emission epsilon differs from the shared model."
         )
     for key, expected_hash in (
         (

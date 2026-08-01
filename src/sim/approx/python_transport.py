@@ -684,7 +684,7 @@ class PythonTransportSpectrumModel:
         material_name: str,
         path_length_cm: float,
     ) -> TransportSegment:
-        """Build a shield segment using the PF TVL coefficients for this isotope."""
+        """Build a shield segment using the shared TVL coefficients for this isotope."""
         mu_fe, mu_pb = resolve_mu_values(
             self.mu_by_isotope,
             isotope,

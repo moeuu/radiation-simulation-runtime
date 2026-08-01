@@ -1,4 +1,4 @@
-"""Author PF particle and estimate markers into an Isaac Sim stage."""
+"""Author estimator particle and estimate markers into an Isaac Sim stage."""
 
 from __future__ import annotations
 
@@ -20,8 +20,8 @@ ISOTOPE_COLORS: dict[str, tuple[float, float, float]] = {
 
 
 @dataclass(frozen=True)
-class PFSceneVisualizationConfig:
-    """Collect visual-only PF marker settings for Isaac Sim."""
+class EstimatorSceneVisualizationConfig:
+    """Collect visual-only estimator marker settings for Isaac Sim."""
 
     enabled: bool = True
     max_particles_per_isotope: int = 800
@@ -32,57 +32,57 @@ class PFSceneVisualizationConfig:
     min_weight_fraction: float = 0.0
 
     @classmethod
-    def from_mapping(cls, data: dict[str, Any] | None) -> "PFSceneVisualizationConfig":
+    def from_mapping(cls, data: dict[str, Any] | None) -> "EstimatorSceneVisualizationConfig":
         """Build a config from an application config mapping."""
         payload = {} if data is None else dict(data)
         return cls(
-            enabled=bool(payload.get("show_pf_particles", payload.get("pf_visualization_enabled", True))),
+            enabled=bool(payload.get("estimator_visualization_enabled", True)),
             max_particles_per_isotope=max(
                 0,
-                int(payload.get("pf_visual_max_particles_per_isotope", 800)),
+                int(payload.get("estimator_visual_max_samples_per_isotope", 800)),
             ),
             particle_radius_m=max(
                 1.0e-4,
-                float(payload.get("pf_visual_particle_radius_m", 0.025)),
+                float(payload.get("estimator_visual_sample_radius_m", 0.025)),
             ),
             estimate_radius_m=max(
                 1.0e-4,
-                float(payload.get("pf_visual_estimate_radius_m", 0.13)),
+                float(payload.get("estimator_visual_estimate_radius_m", 0.13)),
             ),
             estimate_cross_size_m=max(
                 1.0e-4,
-                float(payload.get("pf_visual_estimate_cross_size_m", 0.35)),
+                float(payload.get("estimator_visual_estimate_cross_size_m", 0.35)),
             ),
             estimate_cross_width_m=max(
                 1.0e-4,
-                float(payload.get("pf_visual_estimate_cross_width_m", 0.035)),
+                float(payload.get("estimator_visual_estimate_cross_width_m", 0.035)),
             ),
             min_weight_fraction=max(
                 0.0,
-                float(payload.get("pf_visual_min_weight_fraction", 0.0)),
+                float(payload.get("estimator_visual_min_weight_fraction", 0.0)),
             ),
         )
 
 
-class PFSceneVisualizer:
-    """Render PF particles and estimates as visual-only Isaac Sim prims."""
+class EstimatorSceneVisualizer:
+    """Render estimator particles and estimates as visual-only Isaac Sim prims."""
 
     def __init__(
         self,
         stage_backend: StageBackend,
         *,
-        config: PFSceneVisualizationConfig | None = None,
+        config: EstimatorSceneVisualizationConfig | None = None,
         root_path: str = "/World/SimBridge/PFVisualization",
     ) -> None:
         """Store the backend and marker roots."""
         self.stage_backend = stage_backend
-        self.config = config or PFSceneVisualizationConfig()
+        self.config = config or EstimatorSceneVisualizationConfig()
         self.root_path = str(root_path)
         self.particles_root = f"{self.root_path}/Particles"
         self.estimates_root = f"{self.root_path}/Estimates"
 
     def update_from_payload(self, payload: dict[str, Any]) -> None:
-        """Replace PF marker prims from a serialized PFFrame-like payload."""
+        """Replace estimator markers from a serialized estimator frame payload."""
         if not self.config.enabled:
             return
         self.stage_backend.remove_prim(self.root_path)
@@ -134,7 +134,7 @@ class PFSceneVisualizer:
         positions: NDArray[np.float64],
         weights: NDArray[np.float64],
     ) -> None:
-        """Author small PF particle spheres for one isotope."""
+        """Author small estimator particle spheres for one isotope."""
         isotope_token = _sanitize_token(isotope)
         root = f"{self.particles_root}/{isotope_token}"
         self.stage_backend.ensure_xform(root)

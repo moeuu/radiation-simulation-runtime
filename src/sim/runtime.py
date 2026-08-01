@@ -115,7 +115,7 @@ def _config_string(
 
 
 class SimulationRuntime(ABC):
-    """Define the runtime interface used by the real-time PF loop."""
+    """Define the runtime interface used by the live acquisition loop."""
 
     @abstractmethod
     def reset(self, payload: dict[str, Any] | None = None) -> None:
@@ -248,9 +248,9 @@ class IsaacSimTCPClientRuntime(TCPSidecarClientRuntime):
         """Send observation metadata to Isaac Sim for stage visualization."""
         self._round_trip("visualize", {"observation": observation.to_dict()})
 
-    def visualize_pf_state(self, payload: dict[str, Any]) -> None:
-        """Send PF particle and estimate markers to Isaac Sim for visualization."""
-        self._round_trip("visualize_pf", payload)
+    def visualize_estimator_state(self, payload: dict[str, Any]) -> None:
+        """Send estimator particle and estimate markers to Isaac Sim for visualization."""
+        self._round_trip("visualize_estimator", payload)
 
 
 class Geant4TCPClientRuntime(TCPSidecarClientRuntime):
@@ -403,7 +403,7 @@ class Geant4TCPClientRuntime(TCPSidecarClientRuntime):
         self._validate_fidelity_handshake(response)
 
     def step(self, command: SimulationCommand) -> SimulationObservation:
-        """Execute one step and validate native fidelity before PF ingestion."""
+        """Execute one step and validate native fidelity before estimator ingestion."""
         from sim.geant4_app.app import validate_transport_metadata
 
         payload = self._round_trip("step", command.to_dict())
@@ -549,7 +549,7 @@ class Geant4TCPClientRuntime(TCPSidecarClientRuntime):
             abs_tol=1.0e-15,
         ):
             raise RuntimeError(
-                "Geant4 sidecar source epsilon differs from the PF contract."
+                "Geant4 sidecar source epsilon differs from the shared contract."
             )
         source_contract_hash = fidelity.get(
             "surface_source_contract_sha256"
@@ -790,9 +790,9 @@ class Geant4WithIsaacSimRuntime(SimulationRuntime):
             visualizer(observation)
         return observation
 
-    def visualize_pf_state(self, payload: dict[str, Any]) -> None:
-        """Forward PF particle visualization to the Isaac Sim companion runtime."""
-        visualizer = getattr(self.isaacsim_runtime, "visualize_pf_state", None)
+    def visualize_estimator_state(self, payload: dict[str, Any]) -> None:
+        """Forward estimator particle visualization to the Isaac Sim companion runtime."""
+        visualizer = getattr(self.isaacsim_runtime, "visualize_estimator_state", None)
         if visualizer is not None:
             visualizer(payload)
 

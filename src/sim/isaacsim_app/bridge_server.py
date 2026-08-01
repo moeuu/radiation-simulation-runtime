@@ -73,8 +73,8 @@ class _BridgeRequestHandler(socketserver.BaseRequestHandler):
             observation = SimulationObservation.from_dict(payload["observation"])
             server.app.visualize_observation(observation)
             return {"status": "visualized"}
-        if msg_type == "visualize_pf":
-            server.app.visualize_pf_state(dict(payload))
+        if msg_type == "visualize_estimator":
+            server.app.visualize_estimator_state(dict(payload))
             return {"status": "visualized_pf"}
         if msg_type == "shutdown":
             server.stop_requested = True

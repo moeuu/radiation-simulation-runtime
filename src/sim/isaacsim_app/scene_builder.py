@@ -21,7 +21,7 @@ from measurement.obstacle_assets import (
     obstacle_instances_from_dicts,
 )
 
-from sim.isaacsim_app.pf_visualizer import ISOTOPE_COLORS
+from sim.isaacsim_app.estimator_visualizer import ISOTOPE_COLORS
 from sim.isaacsim_app.stage_backend import StageBackend
 from sim.shield_geometry import (
     SHIELD_CONTACT_RADIUS_M,
