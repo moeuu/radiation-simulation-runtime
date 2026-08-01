@@ -1,0 +1,4 @@
+{
+  "extends": "variance_reduction_external_no_isaac_32threads.json",
+  "thread_count": 1
+}

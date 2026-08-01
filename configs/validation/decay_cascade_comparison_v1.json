@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "isotopes": [
+    "Co-60",
+    "Eu-152",
+    "Eu-154"
+  ],
+  "distances_m": [
+    1.5,
+    2.5,
+    4.0
+  ],
+  "target_expected_gamma_intersections": 1000,
+  "maximum_parent_decays_per_case": 25000000,
+  "independent_line_histories_per_case": 200000,
+  "energy_max_keV": 3400.0,
+  "comparison_bin_width_keV": 20.0,
+  "minimum_rdm_detected_pulses": 300,
+  "maximum_common_band_tv": 0.03,
+  "maximum_coincidence_excess_fraction": 0.01,
+  "bootstrap_samples": 2048,
+  "seed": 2026080101,
+  "total_geant4_threads": 30,
+  "case_workers": 3,
+  "timeout_s": 3600.0,
+  "physics_profile": "balanced",
+  "minimum_sum_line_probability": 0.01
+}

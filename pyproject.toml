@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rotating-shield-simulation-runtime"
+version = "0.1.0"
+description = "Shared high-fidelity simulation and observation runtime for rotating-shield estimators"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.3.5",
+    "scipy>=1.16.3",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=9.0.1"]
+
+[project.scripts]
+rotating-shield-sim = "runtime.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
