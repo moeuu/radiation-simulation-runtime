@@ -22,6 +22,15 @@ from spectrum.library import default_library
 
 
 DEFAULT_TRANSPORT_ISOTOPES = ("Cs-137", "Co-60", "Eu-154")
+MIN_NOMINAL_OBSTACLE_TRANSMISSION = 0.20
+_CLOSED_HOLLOW_TEMPLATES = frozenset(
+    {
+        "steel_cabinet_hollow",
+        "empty_steel_drum_hollow",
+        "precast_concrete_barrier_hollow",
+        "aluminum_equipment_frame_hollow",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -562,6 +571,101 @@ def known_obstacle_traversability_rects(
     return tuple(instance.footprint_xy for instance in instances)
 
 
+def nominal_obstacle_minimum_transmission(
+    instance: KnownObstacleInstance,
+    *,
+    isotopes: Sequence[str] = DEFAULT_TRANSPORT_ISOTOPES,
+) -> float:
+    """Return the worst nominal gamma transmission through one obstacle.
+
+    The contract covers a normal traversal of every individual member. Closed
+    hollow templates additionally cover the three principal centerlines through
+    both opposing walls. It intentionally does not clip rare grazing paths
+    along a member because doing so would change the physical transport law.
+    """
+    traversal_depths = [
+        ((component, min(component.size_xyz)),)
+        for component in instance.components
+    ]
+    if instance.template in _CLOSED_HOLLOW_TEMPLATES:
+        boxes = np.asarray(
+            [component.box_m for component in instance.components],
+            dtype=float,
+        )
+        lower = np.min(boxes[:, :3], axis=0)
+        upper = np.max(boxes[:, 3:], axis=0)
+        center = 0.5 * (lower + upper)
+        for axis in range(3):
+            other_axes = tuple(index for index in range(3) if index != axis)
+            depths: list[tuple[ObstacleComponent, float]] = []
+            for component, box in zip(
+                instance.components,
+                boxes,
+                strict=True,
+            ):
+                if all(
+                    box[index] - 1.0e-12
+                    <= center[index]
+                    <= box[index + 3] + 1.0e-12
+                    for index in other_axes
+                ):
+                    depths.append(
+                        (component, float(box[axis + 3] - box[axis]))
+                    )
+            if depths:
+                traversal_depths.append(tuple(depths))
+
+    library = default_library()
+    minimum_transmission = 1.0
+    for isotope in isotopes:
+        nuclide = _lookup_nuclide(library, str(isotope))
+        if nuclide is None:
+            raise ValueError(
+                f"Nominal obstacle attenuation requires isotope {isotope!r}."
+            )
+        for line in nuclide.lines:
+            if max(float(line.intensity), 0.0) <= 0.0:
+                continue
+            for depths in traversal_depths:
+                optical_depth = sum(
+                    material_mu_cm_inv_at_energy(
+                        component.material,
+                        float(line.energy_keV),
+                        isotope=str(isotope),
+                    )
+                    * 100.0
+                    * float(depth_m)
+                    for component, depth_m in depths
+                )
+                minimum_transmission = min(
+                    minimum_transmission,
+                    float(math.exp(-optical_depth)),
+                )
+    return float(minimum_transmission)
+
+
+def validate_nominal_obstacle_transmission(
+    instance: KnownObstacleInstance,
+    *,
+    isotopes: Sequence[str] = DEFAULT_TRANSPORT_ISOTOPES,
+    minimum_transmission: float = MIN_NOMINAL_OBSTACLE_TRANSMISSION,
+) -> float:
+    """Validate and return the physical nominal transmission of one obstacle."""
+    required = float(minimum_transmission)
+    if not math.isfinite(required) or not 0.0 < required <= 1.0:
+        raise ValueError("minimum_transmission must be finite in (0, 1].")
+    actual = nominal_obstacle_minimum_transmission(
+        instance,
+        isotopes=isotopes,
+    )
+    if actual + 1.0e-12 < required:
+        raise ValueError(
+            f"Obstacle {instance.name!r} template {instance.template!r} has "
+            f"nominal transmission {actual:.6f}, below {required:.6f}."
+        )
+    return actual
+
+
 def material_mu_cm_inv(material: str, isotope: str) -> float:
     """Return an effective linear attenuation coefficient for a material."""
     normalized = normalize_material_name(str(material))
@@ -676,15 +780,18 @@ def generate_manchester_obstacle_instances(
             max_height_m=max_height,
             rng=rng,
         )
-        instances.append(
-            KnownObstacleInstance(
-                name=f"KnownObstacle_{index:04d}",
-                template=template_name,
-                footprint_xy=bounds,
-                footprint_cells=(cell,),
-                components=tuple(components),
-            )
+        instance = KnownObstacleInstance(
+            name=f"KnownObstacle_{index:04d}",
+            template=template_name,
+            footprint_xy=bounds,
+            footprint_cells=(cell,),
+            components=tuple(components),
         )
+        validate_nominal_obstacle_transmission(
+            instance,
+            isotopes=DEFAULT_TRANSPORT_ISOTOPES,
+        )
+        instances.append(instance)
     return tuple(instances)
 
 
@@ -859,7 +966,7 @@ def _steel_cabinet_components(
             center_xy=center,
             size_xy=size,
             height_m=height,
-            thickness_m=0.035,
+            thickness_m=0.010,
             material="steel",
         ),
         "steel_cabinet_hollow",
@@ -878,7 +985,7 @@ def _pipe_rack_components(
     cx, cy = center
     sx, sy = size
     height = min(max_height_m, float(rng.uniform(1.2, 1.8)))
-    beam = 0.055
+    beam = 0.020
     xs = (cx - 0.42 * sx, cx + 0.42 * sx)
     ys = (cy - 0.42 * sy, cy + 0.42 * sy)
     span_x = max(xs[1] - xs[0] - beam, 1.0e-3)
@@ -942,35 +1049,21 @@ def _water_drum_pair_components(
     max_height_m: float,
     rng: np.random.Generator,
 ) -> tuple[list[ObstacleComponent], str]:
-    """Return two partially filled drum-like components."""
+    """Return one empty thin-wall steel drum obstacle."""
     center, size = _footprint_center_size(bounds_xy, fill_fraction=0.86, rng=rng)
     cx, cy = center
     sx, sy = size
-    drum_w = min(0.38 * sx, 0.44 * sy)
+    drum_w = min(0.72 * sx, 0.72 * sy)
     height = min(max_height_m, float(rng.uniform(0.75, 1.15)))
-    offset = 0.23 * sx
-    components = []
-    for idx, x in enumerate((cx - offset, cx + offset)):
-        components.extend(
-            _shell_components(
-                name_prefix=f"{name_prefix}_drum_{idx}",
-                center_xy=(x, cy),
-                size_xy=(drum_w, drum_w),
-                height_m=height,
-                thickness_m=0.025,
-                material="steel",
-            )
-        )
-        components.append(
-            _component(
-                f"{name_prefix}_drum_{idx}_water_fill",
-                center_xy=(x, cy),
-                z_center=0.38 * height,
-                size_xyz=(0.72 * drum_w, 0.72 * drum_w, 0.55 * height),
-                material="water",
-            )
-        )
-    return components, "partially_filled_steel_drums"
+    components = _shell_components(
+        name_prefix=f"{name_prefix}_drum",
+        center_xy=(cx, cy),
+        size_xy=(drum_w, drum_w),
+        height_m=height,
+        thickness_m=0.010,
+        material="steel",
+    )
+    return components, "empty_steel_drum_hollow"
 
 
 def _concrete_jersey_barrier_components(
@@ -980,26 +1073,18 @@ def _concrete_jersey_barrier_components(
     max_height_m: float,
     rng: np.random.Generator,
 ) -> tuple[list[ObstacleComponent], str]:
-    """Return a compact concrete barrier that does not fill the whole cell."""
+    """Return a hollow thin-wall precast concrete movement barrier."""
     center, size = _footprint_center_size(bounds_xy, fill_fraction=0.92, rng=rng)
     height = min(max_height_m, float(rng.uniform(0.75, 1.15)))
-    components = [
-        _component(
-            f"{name_prefix}_concrete_base",
-            center_xy=center,
-            z_center=0.22 * height,
-            size_xyz=(size[0], 0.46 * size[1], 0.44 * height),
-            material="concrete",
-        ),
-        _component(
-            f"{name_prefix}_concrete_cap",
-            center_xy=center,
-            z_center=0.67 * height,
-            size_xyz=(0.72 * size[0], 0.30 * size[1], 0.46 * height),
-            material="concrete",
-        ),
-    ]
-    return components, "concrete_barrier_partial"
+    components = _shell_components(
+        name_prefix=name_prefix,
+        center_xy=center,
+        size_xy=size,
+        height_m=height,
+        thickness_m=0.035,
+        material="concrete",
+    )
+    return components, "precast_concrete_barrier_hollow"
 
 
 def _aluminum_equipment_frame_components(
@@ -1009,7 +1094,7 @@ def _aluminum_equipment_frame_components(
     max_height_m: float,
     rng: np.random.Generator,
 ) -> tuple[list[ObstacleComponent], str]:
-    """Return a hollow aluminum instrument frame with a small steel insert."""
+    """Return an empty hollow aluminum instrument-frame obstacle."""
     center, size = _footprint_center_size(bounds_xy, fill_fraction=0.84, rng=rng)
     height = min(max_height_m, float(rng.uniform(1.0, 1.5)))
     components = _shell_components(
@@ -1017,16 +1102,7 @@ def _aluminum_equipment_frame_components(
         center_xy=center,
         size_xy=size,
         height_m=height,
-        thickness_m=0.03,
+        thickness_m=0.025,
         material="aluminum",
-    )
-    components.append(
-        _component(
-            f"{name_prefix}_steel_inner_box",
-            center_xy=center,
-            z_center=0.42 * height,
-            size_xyz=(0.35 * size[0], 0.35 * size[1], 0.35 * height),
-            material="steel",
-        )
     )
     return components, "aluminum_equipment_frame_hollow"

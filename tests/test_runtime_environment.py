@@ -52,7 +52,9 @@ def test_random_runtime_environment_can_attach_transport_model(tmp_path: Path) -
     assert environment.known_obstacle_instances is not None
     assert environment.grid.transport_boxes_m
     assert environment.grid.collision_boxes_m
-    assert environment.asset_summary() is not None
+    summary = environment.asset_summary()
+    assert summary is not None
+    assert "nominal_min_transmission=" in summary
 
 
 def test_shared_transport_attachment_matches_runtime_builder(tmp_path: Path) -> None:

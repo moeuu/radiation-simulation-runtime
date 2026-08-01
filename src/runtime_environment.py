@@ -10,6 +10,7 @@ from measurement.obstacle_assets import (
     DEFAULT_TRANSPORT_ISOTOPES,
     KnownObstacleInstance,
     generate_manchester_obstacle_instances,
+    nominal_obstacle_minimum_transmission,
 )
 from measurement.obstacles import ObstacleGrid, build_obstacle_grid
 from sim.blender_environment import attach_known_obstacle_transport_model
@@ -40,11 +41,19 @@ class RuntimeObstacleEnvironment:
         """Return a human-readable summary of generated obstacle assets."""
         if self.grid is None or self.known_obstacle_instances is None:
             return None
+        minimum_transmission = min(
+            (
+                nominal_obstacle_minimum_transmission(instance)
+                for instance in self.known_obstacle_instances
+            ),
+            default=1.0,
+        )
         return (
             "Known Manchester-style obstacle assets: "
             f"instances={len(self.known_obstacle_instances)}, "
             f"transport_components={len(self.grid.transport_boxes_m)}, "
-            f"templates={self.template_counts()}"
+            f"templates={self.template_counts()}, "
+            f"nominal_min_transmission={minimum_transmission:.3f}"
         )
 
 

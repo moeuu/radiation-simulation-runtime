@@ -7,6 +7,7 @@ import pytest
 
 from measurement.continuous_kernels import ContinuousKernel
 from measurement.obstacle_assets import (
+    MIN_NOMINAL_OBSTACLE_TRANSMISSION,
     KnownObstacleInstance,
     ObstacleComponent,
     _aluminum_equipment_frame_components,
@@ -20,6 +21,7 @@ from measurement.obstacle_assets import (
     known_obstacle_transport_model,
     known_obstacle_traversability_rects,
     material_mu_cm_inv,
+    nominal_obstacle_minimum_transmission,
     obstacle_instances_from_dicts,
     obstacle_instances_to_dicts,
     room_boundary_transport_components,
@@ -60,6 +62,44 @@ def test_manchester_assets_provide_hollow_transport_components() -> None:
     assert len(rects) == len(grid.blocked_cells)
     assert set(mu_by_isotope) >= {"Cs-137", "Co-60", "Eu-154"}
     assert len(mu_by_isotope["Cs-137"]) == len(boxes_m)
+
+
+def test_generated_obstacles_are_void_dominant_and_attenuation_bounded() -> None:
+    """Random assets should be hollow clutter with bounded nominal attenuation."""
+    grid = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(4, 4),
+        blocked_cells=tuple((index % 4, index // 4) for index in range(16)),
+    )
+
+    for seed in range(12):
+        instances = generate_manchester_obstacle_instances(
+            grid,
+            room_size_xyz=(4.0, 4.0, 3.0),
+            obstacle_height_m=2.0,
+            rng_seed=seed,
+        )
+        for instance in instances:
+            boxes = np.asarray(
+                [component.box_m for component in instance.components],
+                dtype=float,
+            )
+            lower = np.min(boxes[:, :3], axis=0)
+            upper = np.max(boxes[:, 3:], axis=0)
+            envelope_volume = float(np.prod(upper - lower))
+            material_volume = sum(
+                float(np.prod(component.size_xyz))
+                for component in instance.components
+            )
+            assert material_volume / envelope_volume < 0.35
+            assert all(
+                component.material != "water"
+                for component in instance.components
+            )
+            assert nominal_obstacle_minimum_transmission(instance) >= (
+                MIN_NOMINAL_OBSTACLE_TRANSMISSION - 1.0e-12
+            )
 
 
 def _valid_obstacle_instance_payload() -> dict[str, object]:
