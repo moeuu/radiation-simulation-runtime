@@ -5,17 +5,17 @@ Use these top-level configs for current simulations:
 Standard top-level configs use `primary_sampling_fraction=1.0`. The Python
 Geant4 application rejects fractional primary-history sampling unless the
 nonstandard accelerated mode is selected explicitly, and it checks native
-response provenance before returning any observation to the PF.
+response provenance before returning any observation to an estimator.
 
 - `variance_reduction_external_no_isaac_32threads.json`: standard no-GUI
-  Geant4/PF full simulation config. This is the default for `main.py`,
+  standard no-GUI Geant4 acquisition config for the shared runtime,
   `--cui`, and `--full-simulation`. It requires one authenticated
   profile-selected geometry-conditioned joint full-spectrum model with a
   globally fitted, nonnegative additive noncollided transport component. The
   standard RA-L profile uses a training-only, view-conditioned count and mark
   discrepancy; the rejected deterministic low-rank mean correction is not in
   the runtime path.
-- `variance_reduction_external_gui_32threads.json`: standard Geant4/PF full
+- `variance_reduction_external_gui_32threads.json`: standard Geant4 acquisition
   simulation config plus an Isaac Sim sidecar for visualization. It inherits
   the no-GUI config; the intended runtime difference is Isaac Sim startup only.
 - `high_fidelity_external_no_isaac.json`: full-transport verification config.

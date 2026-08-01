@@ -72,7 +72,7 @@ class EstimatorSceneVisualizer:
         stage_backend: StageBackend,
         *,
         config: EstimatorSceneVisualizationConfig | None = None,
-        root_path: str = "/World/SimBridge/PFVisualization",
+        root_path: str = "/World/SimBridge/EstimatorVisualization",
     ) -> None:
         """Store the backend and marker roots."""
         self.stage_backend = stage_backend
@@ -89,8 +89,8 @@ class EstimatorSceneVisualizer:
         self.stage_backend.ensure_xform(self.root_path)
         self.stage_backend.ensure_xform(self.particles_root)
         self.stage_backend.ensure_xform(self.estimates_root)
-        particles = _coerce_point_mapping(payload.get("particle_positions", {}))
-        weights = _coerce_raw_mapping(payload.get("particle_weights", {}))
+        particles = _coerce_point_mapping(payload.get("sample_positions", {}))
+        weights = _coerce_raw_mapping(payload.get("sample_weights", {}))
         estimates = _coerce_point_mapping(payload.get("estimated_sources", {}))
         strengths = _coerce_raw_mapping(payload.get("estimated_strengths", {}))
         for isotope, positions in sorted(particles.items()):

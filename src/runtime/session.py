@@ -33,13 +33,22 @@ from spectrum.transport_spectral import geometry_conditioned_model_from_runtime_
 
 _ESTIMATOR_ONLY_PREFIXES = (
     "adaptive_mission_",
+    "baseline_",
     "dss_",
     "evaluation_",
+    "history_",
     "joint_",
+    "measurement_pose_",
+    "measurement_route_",
     "mission_stop_",
+    "orientation_",
+    "path_",
     "pf_",
+    "pose_selection_",
     "posterior_",
-    "structural_rj_",
+    "structural_",
+    "surface_diagnostic_",
+    "surface_observability_",
 )
 _ESTIMATOR_ONLY_KEYS = frozenset(
     {
@@ -47,9 +56,7 @@ _ESTIMATOR_ONLY_KEYS = frozenset(
         "gpu_device",
         "gpu_dtype",
         "history_estimate_interval",
-        "orientation_k",
-        "path_planner",
-        "pose_selection_workers",
+        "python_worker_count",
         "pure_pf_schema_version",
         "use_gpu",
         "variable_cardinality",
