@@ -13,12 +13,14 @@ from measurement.source_boundary import (
 )
 from sim.runtime import (
     Geant4TCPClientRuntime,
+    TCPSidecarClientRuntime,
     _config_bool,
     _config_integer,
     _config_number,
     _config_string,
     load_runtime_config,
 )
+from sim.protocol import decode_message, encode_message
 from spectrum.response_matrix import (
     NATIVE_GEANT4_BACKGROUND_MODEL_ID,
     NATIVE_GEANT4_BIN_COUNT,
@@ -78,6 +80,67 @@ def _client(
         65530,
         expected_detector_response_sampling=True,
         expected_thread_count=expected_thread_count,
+    )
+
+
+def test_tcp_runtime_normalizes_geometry_tuples_before_encoding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The public runtime boundary must encode internal tuples as JSON arrays."""
+    sent: list[bytes] = []
+    response = encode_message("ok", {"accepted": True})
+
+    class FakeConnection:
+        """Capture one request and return one deterministic sidecar response."""
+
+        def __init__(self) -> None:
+            """Initialize the one-response receive cursor."""
+            self.response_pending = True
+
+        def __enter__(self) -> "FakeConnection":
+            """Return this fake socket from its context manager."""
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            """Close the fake socket without suppressing errors."""
+            del args
+
+        def sendall(self, payload: bytes) -> None:
+            """Capture the complete encoded request."""
+            sent.append(payload)
+
+        def shutdown(self, how: int) -> None:
+            """Accept the client write-shutdown notification."""
+            del how
+
+        def recv(self, size: int) -> bytes:
+            """Return the response once and EOF thereafter."""
+            del size
+            if not self.response_pending:
+                return b""
+            self.response_pending = False
+            return response
+
+    fake = FakeConnection()
+    monkeypatch.setattr(
+        "sim.runtime.socket.create_connection",
+        lambda *args, **kwargs: fake,
+    )
+    client = TCPSidecarClientRuntime("127.0.0.1", 5556)
+
+    result = client._round_trip(
+        "reset",
+        {"obstacle_cells": [(1, 2)], "transport_boxes_m": [(0.0,) * 6]},
+    )
+
+    assert result == {"accepted": True}
+    assert len(sent) == 1
+    assert decode_message(sent[0].strip()) == (
+        "reset",
+        {
+            "obstacle_cells": [[1, 2]],
+            "transport_boxes_m": [[0.0] * 6],
+        },
     )
 
 

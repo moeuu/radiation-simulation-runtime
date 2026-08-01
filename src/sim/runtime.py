@@ -22,6 +22,7 @@ from sim.protocol import (
     SimulationObservation,
     decode_message,
     encode_message,
+    normalize_json_payload,
 )
 from sim.approx.python_transport import PythonTransportSpectrumModel
 
@@ -198,10 +199,11 @@ class TCPSidecarClientRuntime(SimulationRuntime):
 
     def _round_trip(self, message_type: str, payload: dict[str, Any]) -> dict[str, Any]:
         """Send a single request and return the response payload."""
+        wire_payload = normalize_json_payload(payload)
         with socket.create_connection(
             (self.host, self.port), timeout=self.timeout_s
         ) as conn:
-            conn.sendall(encode_message(message_type, payload))
+            conn.sendall(encode_message(message_type, wire_payload))
             conn.shutdown(socket.SHUT_WR)
             chunks: list[bytes] = []
             while True:
