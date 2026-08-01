@@ -1,0 +1,4 @@
+SCENE scene_hash=force_collision_thin_leaf surface_source_contract_sha256=proof usd_path=- room_x=8 room_y=8 room_z=8
+DETECTOR crystal_radius_m=0.038 crystal_length_m=0.076 housing_thickness_m=0.0015 crystal_shape=sphere crystal_material=cebr3 housing_material=aluminum
+SOURCE isotope=Cs-137 x=0 y=0 z=0 intensity_cps_1m=1000 anchor_x=0 anchor_y=0 anchor_z=0
+VOLUME path=/Proof/ThinLeadLeaf shape=box tx=1.5 ty=0 tz=0 qw=1 qx=0 qy=0 qz=0 material_name=lead density_g_cm3=-1 preset_name=lead transport_group=proof transport_mode=geant4 sx=0.01 sy=2 sz=2 radius_m=-

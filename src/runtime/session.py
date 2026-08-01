@@ -166,7 +166,7 @@ def estimator_neutral_runtime_config(
     resolved["sim_backend"] = str(backend)
     resolved["candidate_isotopes"] = sorted(str(value) for value in isotopes)
     resolved["obstacle_attenuation_enabled"] = bool(
-        runtime_config.get("pf_obstacle_attenuation", True)
+        runtime_config.get("obstacle_attenuation_enabled", True)
     )
     return resolved
 

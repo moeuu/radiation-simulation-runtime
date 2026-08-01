@@ -484,6 +484,21 @@ class MeasurementLogRecord:
     spectrum_counts: NDArray[np.int64]
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
+    @property
+    def spectrum_variance(self) -> None:
+        """Return no derived variance because schema v2 stores raw counts only."""
+        return None
+
+    @property
+    def counts_by_isotope(self) -> None:
+        """Return no projected isotope counts at the raw observation boundary."""
+        return None
+
+    @property
+    def count_covariance_by_isotope(self) -> None:
+        """Return no projected covariance at the raw observation boundary."""
+        return None
+
     def __post_init__(self) -> None:
         """Validate record identifiers, pose, time, and observation shapes."""
         for name in ("step_id", "action_id", "station_id"):
@@ -646,6 +661,13 @@ class MeasurementLog:
     path: Path | None = None
 
     @property
+    def context(self) -> "RunContext":
+        """Return a read-only estimator-neutral view of run metadata."""
+        from runtime.records import RunContext
+
+        return RunContext.from_measurement_log(self)
+
+    @property
     def run_id(self) -> str:
         """Return the manifest run identifier."""
         value = self.run_manifest["run_id"]
@@ -681,6 +703,11 @@ class MeasurementLog:
                 "An in-memory MeasurementLog prefix has no independent directory digest."
             )
         return measurement_log_sha256(self.path)
+
+    @property
+    def content_sha256(self) -> str:
+        """Return the canonical log digest under its legacy consumer name."""
+        return self.log_sha256
 
     def prefix(self, record_count: int) -> "MeasurementLog":
         """Return an in-memory causal prefix without inspecting a future record."""

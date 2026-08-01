@@ -55,6 +55,5 @@
   "thread_count": 32,
   "timeout_s": 600.0,
   "usd_path": "../isaacsim/demo_room.usda",
-  "use_mock_stage": true,
-  "variable_cardinality": true
+  "use_mock_stage": true
 }

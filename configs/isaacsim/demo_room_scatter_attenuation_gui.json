@@ -135,6 +135,5 @@
     }
   ],
   "timeout_s": 90.0,
-  "usd_path": "demo_room_scatter_attenuation.usda",
-  "variable_cardinality": true
+  "usd_path": "demo_room_scatter_attenuation.usda"
 }

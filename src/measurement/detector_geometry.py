@@ -10,7 +10,9 @@ from typing import Any
 
 DEFAULT_CRYSTAL_RADIUS_M = 0.038
 DEFAULT_HOUSING_THICKNESS_M = 0.0015
-DEFAULT_PF_DETECTOR_APERTURE_SAMPLES = 121
+DEFAULT_DETECTOR_APERTURE_SAMPLES = 121
+# Compatibility for estimator code that has not yet renamed its local constant.
+DEFAULT_PF_DETECTOR_APERTURE_SAMPLES = DEFAULT_DETECTOR_APERTURE_SAMPLES
 
 
 @dataclass(frozen=True)
@@ -63,7 +65,7 @@ def normalize_detector_aperture_sampling(value: object | None) -> str:
     elif isinstance(value, str):
         text = value
     else:
-        raise TypeError("pf_detector_aperture_sampling must be a string.")
+        raise TypeError("detector_aperture_sampling must be a string.")
     if text not in {"solid_angle_cone", "disk"}:
         raise ValueError(f"Unsupported detector aperture sampling mode: {value!r}")
     return text
@@ -122,7 +124,7 @@ def detector_outer_radius_m(
 def detector_observation_geometry_from_runtime_config(
     runtime_config: Mapping[str, Any] | None,
     *,
-    default_aperture_samples: int = DEFAULT_PF_DETECTOR_APERTURE_SAMPLES,
+    default_aperture_samples: int = DEFAULT_DETECTOR_APERTURE_SAMPLES,
 ) -> DetectorObservationGeometry:
     """
     Resolve detector geometry shared by PF likelihoods and DSS-PP scoring.
@@ -141,23 +143,23 @@ def detector_observation_geometry_from_runtime_config(
     if not isinstance(detector_model, Mapping):
         raise TypeError("detector_model must be a mapping.")
     count_radius = detector_active_radius_m(detector_model)
-    if "pf_detector_count_radius_m" in payload:
+    if "detector_count_radius_m" in payload:
         count_radius = _nonnegative_finite_real(
-            payload["pf_detector_count_radius_m"],
-            field_name="pf_detector_count_radius_m",
+            payload["detector_count_radius_m"],
+            field_name="detector_count_radius_m",
         )
     aperture_radius = detector_outer_radius_m(detector_model)
-    if "pf_detector_aperture_radius_m" in payload:
+    if "detector_aperture_radius_m" in payload:
         aperture_radius = _nonnegative_finite_real(
-            payload["pf_detector_aperture_radius_m"],
-            field_name="pf_detector_aperture_radius_m",
+            payload["detector_aperture_radius_m"],
+            field_name="detector_aperture_radius_m",
         )
     samples = _positive_integer(
-        payload.get("pf_detector_aperture_samples", default_aperture_samples),
-        field_name="pf_detector_aperture_samples",
+        payload.get("detector_aperture_samples", default_aperture_samples),
+        field_name="detector_aperture_samples",
     )
     sampling = normalize_detector_aperture_sampling(
-        payload.get("pf_detector_aperture_sampling", "solid_angle_cone")
+        payload.get("detector_aperture_sampling", "solid_angle_cone")
     )
     return DetectorObservationGeometry(
         count_radius_m=count_radius,

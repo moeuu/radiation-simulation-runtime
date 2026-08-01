@@ -1,0 +1,4 @@
+STEP step_id=0 dwell_time_s=1 seed=1729
+POSE kind=detector x=3 y=0 z=0 qw=1 qx=0 qy=0 qz=0
+POSE kind=fe x=3 y=0 z=0 qw=1 qx=0 qy=0 qz=0
+POSE kind=pb x=3 y=0 z=0 qw=1 qx=0 qy=0 qz=0

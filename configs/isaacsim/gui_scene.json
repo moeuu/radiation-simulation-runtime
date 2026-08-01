@@ -323,6 +323,5 @@
     }
   ],
   "timeout_s": 90.0,
-  "usd_path": "../../data/manchester_nuclear_assets/usd/drum_store.usda",
-  "variable_cardinality": true
+  "usd_path": "../../data/manchester_nuclear_assets/usd/drum_store.usda"
 }

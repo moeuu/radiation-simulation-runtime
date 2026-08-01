@@ -67,6 +67,5 @@
   "thread_count": 8,
   "timeout_s": 300.0,
   "usd_path": "../../data/manchester_nuclear_assets/usd/drum_store.usda",
-  "use_mock_stage": false,
-  "variable_cardinality": true
+  "use_mock_stage": false
 }

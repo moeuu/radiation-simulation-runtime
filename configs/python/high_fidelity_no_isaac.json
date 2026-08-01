@@ -32,6 +32,5 @@
       "path_prefix": "/World/Environment"
     }
   ],
-  "transport_backend": "python",
-  "variable_cardinality": true
+  "transport_backend": "python"
 }

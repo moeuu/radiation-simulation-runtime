@@ -25,6 +25,8 @@
     "housing_material": "aluminum",
     "housing_thickness_m": 0.0015
   },
+  "detector_aperture_samples": 121,
+  "detector_aperture_sampling": "solid_angle_cone",
   "detector_pose_consistency_tolerance_m": 0.0001,
   "detector_scoring_mode": "incident_gamma_energy",
   "detector_transport_height_m": 0.5,
@@ -39,6 +41,7 @@
   "headless_visualizer_defer": true,
   "host": "127.0.0.1",
   "isotope_experiment_profile": "ral_eu154",
+  "line_resolved_shield_attenuation": true,
   "min_rotations_per_pose": 8,
   "obstacle_attenuation_enabled": true,
   "obstacle_height_m": 2.0,
@@ -57,6 +60,8 @@
   "shield_transmission_target": 0.2,
   "simulation_runtime_schema_version": 1,
   "source_bias_cone_half_angle_deg": 0.0,
+  "source_extent_radius_m": 0.0,
+  "source_extent_samples": 1,
   "source_rate_model": "detector_cps_1m",
   "spectrum_plot_save_every": 8,
   "stage_material_rules": [
@@ -73,6 +78,5 @@
   "thread_count": 32,
   "timeout_s": 86400.0,
   "usd_path": "../isaacsim/demo_room.usda",
-  "use_mock_stage": true,
-  "variable_cardinality": true
+  "use_mock_stage": true
 }

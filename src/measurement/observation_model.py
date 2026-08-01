@@ -1,4 +1,4 @@
-"""Shared runtime observation-model construction for PF and DSS-PP."""
+"""Shared runtime observation-model construction for every estimator."""
 
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ from spectrum.transport_spectral import (
 
 @dataclass(frozen=True)
 class RuntimeObservationModel:
-    """Collect the shared PF/DSS-PP observation-kernel parameters."""
+    """Collect the shared physical observation-kernel parameters."""
 
     detector_geometry: DetectorObservationGeometry
     shield_params: ShieldParams
@@ -47,18 +47,18 @@ class RuntimeObservationModel:
 
 
 def _buildup_runtime_config(runtime_config: Mapping[str, Any]) -> Mapping[str, Any]:
-    """Return the nested PF buildup configuration payload."""
-    if "pf_buildup" not in runtime_config:
+    """Return the nested physical buildup configuration payload."""
+    if "buildup" not in runtime_config:
         return {}
-    payload = runtime_config["pf_buildup"]
+    payload = runtime_config["buildup"]
     if not isinstance(payload, Mapping):
-        raise TypeError("pf_buildup must be a mapping.")
+        raise TypeError("buildup must be a mapping.")
     unknown = sorted(
         set(str(key) for key in payload)
         - {"fe_coeff", "pb_coeff", "obstacle_coeff"}
     )
     if unknown:
-        raise ValueError(f"pf_buildup contains unknown keys: {unknown}.")
+        raise ValueError(f"buildup contains unknown keys: {unknown}.")
     return payload
 
 
@@ -104,33 +104,28 @@ def _explicit_obstacle_mu_by_isotope(
     isotopes: Sequence[str],
 ) -> dict[str, float] | None:
     """Return an explicitly configured isotope obstacle-mu override."""
-    if "obstacle_mu_by_isotope" in payload:
-        raise ValueError(
-            "obstacle_mu_by_isotope was removed; use the canonical "
-            "pf_obstacle_mu_by_isotope field."
-        )
-    if "pf_obstacle_mu_by_isotope" not in payload:
+    if "obstacle_mu_by_isotope" not in payload:
         return None
-    raw = payload["pf_obstacle_mu_by_isotope"]
+    raw = payload["obstacle_mu_by_isotope"]
     if not isinstance(raw, Mapping):
         raise TypeError(
-            "pf_obstacle_mu_by_isotope must map isotope names to attenuation "
+            "obstacle_mu_by_isotope must map isotope names to attenuation "
             "coefficients."
         )
     parsed = {
         _nonempty_string(
             isotope,
-            field_name="pf_obstacle_mu_by_isotope key",
+            field_name="obstacle_mu_by_isotope key",
         ): _nonnegative_finite_float(
             value,
-            field_name=f"pf_obstacle_mu_by_isotope[{isotope!s}]",
+            field_name=f"obstacle_mu_by_isotope[{isotope!s}]",
         )
         for isotope, value in raw.items()
     }
     expected = {str(isotope) for isotope in isotopes}
     if not expected or set(parsed) != expected or any(not key for key in parsed):
         raise ValueError(
-            "pf_obstacle_mu_by_isotope keys must exactly equal the configured "
+            "obstacle_mu_by_isotope keys must exactly equal the configured "
             "isotope set."
         )
     return parsed
@@ -150,10 +145,10 @@ def _obstacle_mu_by_isotope_from_runtime_config(
         return explicit
     material = _nonempty_string(
         payload.get(
-            "pf_obstacle_material",
-            payload.get("obstacle_material", "concrete"),
+            "obstacle_material",
+            "concrete",
         ),
-        field_name="pf_obstacle_material",
+        field_name="obstacle_material",
     )
     return {
         str(isotope): _nonnegative_finite_float(
@@ -192,7 +187,7 @@ def build_runtime_observation_model(
     detector_geometry = detector_observation_geometry_from_runtime_config(payload)
     if detector_geometry.aperture_sampling != "solid_angle_cone":
         raise ValueError(
-            "Production PF/DSS must use the native Geant4 "
+            "Production estimators must use the native Geant4 "
             "solid_angle_cone detector-aperture geometry."
         )
     detector_outer_radius_cm_value = detector_outer_radius_cm(detector_model)
@@ -204,15 +199,15 @@ def build_runtime_observation_model(
     buildup = _buildup_runtime_config(payload)
     buildup_fe = _nonnegative_finite_float(
         buildup.get("fe_coeff", 0.0),
-        field_name="pf_buildup.fe_coeff",
+        field_name="buildup.fe_coeff",
     )
     buildup_pb = _nonnegative_finite_float(
         buildup.get("pb_coeff", 0.0),
-        field_name="pf_buildup.pb_coeff",
+        field_name="buildup.pb_coeff",
     )
     buildup_obstacle = _nonnegative_finite_float(
         buildup.get("obstacle_coeff", 0.0),
-        field_name="pf_buildup.obstacle_coeff",
+        field_name="buildup.obstacle_coeff",
     )
     shield_params = ShieldParams(
         thickness_fe_cm=float(shield_thickness.thickness_fe_cm),
@@ -242,8 +237,8 @@ def build_runtime_observation_model(
             "source_rate_model='detector_cps_1m'."
         )
     if _strict_boolean(
-        payload.get("pf_line_resolved_shield_attenuation", True),
-        field_name="pf_line_resolved_shield_attenuation",
+        payload.get("line_resolved_shield_attenuation", True),
+        field_name="line_resolved_shield_attenuation",
     ):
         line_mu_by_isotope = line_resolved_shield_mu_by_isotope(
             isotopes=isotope_order,
@@ -265,24 +260,13 @@ def build_runtime_observation_model(
         payload.get("obstacle_height_m", 2.0),
         field_name="obstacle_height_m",
     )
-    removed_extent_keys = sorted(
-        key
-        for key in ("pf_source_extent_radius_m", "pf_source_extent_samples")
-        if key in payload
-    )
-    if removed_extent_keys:
-        raise ValueError(
-            "Legacy PF source-extent keys were removed; use "
-            "pf_obstacle_source_extent_radius_m and "
-            f"pf_obstacle_source_extent_samples: {removed_extent_keys}."
-        )
     source_extent_radius_m = _nonnegative_finite_float(
-        payload.get("pf_obstacle_source_extent_radius_m", 0.0),
-        field_name="pf_obstacle_source_extent_radius_m",
+        payload.get("source_extent_radius_m", 0.0),
+        field_name="source_extent_radius_m",
     )
     source_extent_samples = _positive_integer(
-        payload.get("pf_obstacle_source_extent_samples", 1),
-        field_name="pf_obstacle_source_extent_samples",
+        payload.get("source_extent_samples", 1),
+        field_name="source_extent_samples",
     )
     if (source_extent_radius_m == 0.0) != (source_extent_samples == 1):
         raise ValueError(
