@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from runtime.session import estimator_neutral_runtime_config
 from sim.runtime import load_runtime_config
 
 
@@ -42,3 +43,20 @@ def test_standard_runtime_preserves_full_transport_fidelity() -> None:
     assert payload.get("theory_tvl_attenuation", False) is False
     assert payload["secondary_transport_mode"] == "full_transport"
     assert payload["sample_detector_response"] is True
+
+
+def test_standard_profile_resolves_once_for_estimator_neutral_log() -> None:
+    """Profile registry selection must produce one immutable logged model."""
+    payload = load_runtime_config(STANDARD_CONFIG)
+
+    resolved = estimator_neutral_runtime_config(
+        payload,
+        backend="geant4",
+        isotopes=("Co-60", "Cs-137", "Eu-154"),
+        run_root=ROOT,
+    )
+
+    assert resolved["simulation_runtime_schema_version"] == 1
+    assert resolved["candidate_isotopes"] == ["Co-60", "Cs-137", "Eu-154"]
+    assert "full_spectrum_generative_model" in resolved
+    assert "full_spectrum_generative_model_path" not in resolved

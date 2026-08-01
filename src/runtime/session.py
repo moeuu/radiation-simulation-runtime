@@ -144,12 +144,12 @@ def estimator_neutral_runtime_config(
     run_root: Path,
 ) -> dict[str, Any]:
     """Return logged physical configuration without estimator-owned settings."""
-    profile_resolved = resolve_profile_model_runtime_config(
+    model = geometry_conditioned_model_from_runtime_config(
         runtime_config,
         run_root=run_root,
     )
-    model = geometry_conditioned_model_from_runtime_config(
-        profile_resolved,
+    profile_resolved = resolve_profile_model_runtime_config(
+        runtime_config,
         run_root=run_root,
     )
     resolved = {
