@@ -7,6 +7,7 @@ name = "rotating-shield-simulation-runtime"
 version = "0.1.0"
 description = "Shared high-fidelity simulation and observation runtime for rotating-shield estimators"
 readme = "README.md"
+license = {file = "LICENSE"}
 requires-python = ">=3.12"
 dependencies = [
     "matplotlib>=3.10.7",
@@ -28,4 +29,3 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-

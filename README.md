@@ -32,3 +32,7 @@ uv run rotating-shield-sim run-plan PLAN.json
 `run-plan` reads source truth only from the private plan, durably records each raw
 observation before returning it to a controller, and never writes source truth into
 MeasurementLog v2.
+
+## License
+
+Released under the [MIT License](LICENSE).
