@@ -34,6 +34,7 @@
   "random_seed_base": 9027,
   "random_source_intensity_max_cps_1m": 2000000.0,
   "random_source_intensity_min_cps_1m": 300000.0,
+  "random_source_same_isotope_min_distance_m": 3.0,
   "random_source_surface_sampling_measure": "continuous_area_uniform",
   "renderer": "RayTracedLighting",
   "sample_detector_response": false,

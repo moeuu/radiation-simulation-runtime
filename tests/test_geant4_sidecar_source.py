@@ -18,6 +18,25 @@ def test_geant4_sidecar_uses_inverted_placement_rotation_for_placed_volumes() ->
     assert "physical->SetRotation(rotation.release());" in source
 
 
+def test_geant4_sidecar_enforces_positive_xyz_octant_pose_contract() -> None:
+    """Native placement must reject a pair index/quaternion disagreement."""
+    source = Path("native/geant4_sidecar/geant4_sidecar.cpp").read_text(
+        encoding="utf-8"
+    )
+
+    for token in (
+        "spherical_octant_positive_xyz_incoming_index_v1",
+        "PhysicalShieldNormalFromOrientationIndex",
+        "ValidateShieldPoseContract(request);",
+        "ShieldNormalFromPose(request.fe_pose)",
+        "ShieldNormalFromPose(request.pb_pose)",
+        'result.metadata["shield_pose_contract_id"]',
+        'result.metadata["shield_pose_contract_sha256"]',
+        "0.0 * deg,\n            90.0 * deg,\n            0.0 * deg,\n            90.0 * deg",
+    ):
+        assert token in source
+
+
 def test_geant4_world_bounds_include_every_daughter_with_positive_margin() -> None:
     """The native world must enclose authored geometry rather than only room sizes."""
     source = Path("native/geant4_sidecar/geant4_sidecar.cpp").read_text(

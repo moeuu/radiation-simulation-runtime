@@ -1,0 +1,211 @@
+{
+  "acceptance_contract_sha256": "0d55c31536052b27dc79e189239df10c52fcee033dbaf572dfc24192ea35d650",
+  "additive_noncollided_transport_response": {
+    "angular_quadrature_order": 16,
+    "contract_hash_sha256": "14aba5b5f46e4a800943a8384f63ba6d3f6f391e6dd29d966f1aae025a9bef11",
+    "detector_radius_m": 0.038,
+    "fe_scatter_distance_m": 0.05697425010840046,
+    "feature_basis_semantics": "detector_cone_path_quadrature_single_compton_v1",
+    "feature_order": [
+      "fe_single_compton_probability",
+      "pb_single_compton_probability",
+      "obstacle_single_compton_probability",
+      "air_single_compton_probability",
+      "fe_pb_interaction_probability",
+      "shield_obstacle_interaction_probability",
+      "material_air_interaction_probability"
+    ],
+    "fit_family": "none_physics_only",
+    "higher_order_mean": "excluded_positive_nuisance_owned_by_likelihood",
+    "material_path_quadrature_order": 2,
+    "mean_model": "beer_lambert_uncollided_plus_detector_cone_single_compton",
+    "model": "physics_only_detector_cone_transport_response_v1",
+    "obstacle_material_contract_id": "known_composite_materials_xcom_v1",
+    "obstacle_material_contract_sha256": "a89258ca5b5d31973852c0b1b7ea16b278131b1637abdcdae9298d3d2ff1798d",
+    "pb_scatter_distance_m": 0.08213717026449714,
+    "schema_version": 1,
+    "transport_physics_table_contract_id": "klein_nishina_xcom_single_scatter_quadrature_v1",
+    "transport_physics_table_contract_sha256": "ad6afe5b05a91059db3e38192c1e9d3b9aad6bc86513c6dc0cfd04ab3406d814"
+  },
+  "background_model": "native_geant4_background_shape_v1_bin_centres",
+  "background_rate_cps": 12.0,
+  "background_semantics": "independent_pre_dead_time_pulse_rate_added_once",
+  "bin_width_keV": 2.0,
+  "contract_hash_sha256": "3d333686631d6b1ed96b7c80f3e93e9696df0458995c913130ba6af994a1a80e",
+  "dead_time_application_count": 1,
+  "dead_time_model": "nonparalyzable_mean_then_component_gamma_poisson_total",
+  "dead_time_tau_s": 5.813e-09,
+  "detector_response_contract_sha256": "0ab48601e0965c2c9ea973505523558bf4dd5d394129397c3d4079c143787ae5",
+  "detector_response_sampling": "physical_component_gamma_poisson_and_dirichlet_marking",
+  "direct_partition": "minimum_of_total_and_uncollided",
+  "discrepancy_training": null,
+  "discrepancy_training_manifest_sha256": null,
+  "discrepancy_training_ready": false,
+  "energy_bin_count": 851,
+  "energy_max_keV": 1700.0,
+  "energy_min_keV": 0.0,
+  "line_identity": [
+    {
+      "branching_weight": 0.5,
+      "energy_keV": 1173.0,
+      "isotope": "Co-60",
+      "mu_fe_cm_inv": 0.436679542,
+      "mu_pb_cm_inv": 0.7091591472,
+      "raw_bin_energy_keV": 1172.0,
+      "raw_bin_index": 586,
+      "transport_line_index": 0
+    },
+    {
+      "branching_weight": 0.5,
+      "energy_keV": 1332.0,
+      "isotope": "Co-60",
+      "mu_fe_cm_inv": 0.4089900488,
+      "mu_pb_cm_inv": 0.6420127392,
+      "raw_bin_energy_keV": 1332.0,
+      "raw_bin_index": 666,
+      "transport_line_index": 1
+    },
+    {
+      "branching_weight": 0.037695095390010036,
+      "energy_keV": 563.246,
+      "isotope": "Cs-134",
+      "mu_fe_cm_inv": 0.62684183258,
+      "mu_pb_cm_inv": 1.56777727176,
+      "raw_bin_energy_keV": 562.0,
+      "raw_bin_index": 281,
+      "transport_line_index": 0
+    },
+    {
+      "branching_weight": 0.06944356580600267,
+      "energy_keV": 569.331,
+      "isotope": "Cs-134",
+      "mu_fe_cm_inv": 0.62344171713,
+      "mu_pb_cm_inv": 1.5425218443599997,
+      "raw_bin_energy_keV": 568.0,
+      "raw_bin_index": 284,
+      "transport_line_index": 1
+    },
+    {
+      "branching_weight": 0.4411618512259266,
+      "energy_keV": 604.721,
+      "isotope": "Cs-134",
+      "mu_fe_cm_inv": 0.6044377979325,
+      "mu_pb_cm_inv": 1.4055687267299999,
+      "raw_bin_energy_keV": 604.0,
+      "raw_bin_index": 302,
+      "transport_line_index": 2
+    },
+    {
+      "branching_weight": 0.38621431347208796,
+      "energy_keV": 795.864,
+      "isotope": "Cs-134",
+      "mu_fe_cm_inv": 0.52884695358,
+      "mu_pb_cm_inv": 1.01432385432,
+      "raw_bin_energy_keV": 794.0,
+      "raw_bin_index": 397,
+      "transport_line_index": 3
+    },
+    {
+      "branching_weight": 0.0392856820092001,
+      "energy_keV": 801.953,
+      "isotope": "Cs-134",
+      "mu_fe_cm_inv": 0.5266702721279999,
+      "mu_pb_cm_inv": 1.003900203432,
+      "raw_bin_energy_keV": 800.0,
+      "raw_bin_index": 400,
+      "transport_line_index": 4
+    },
+    {
+      "branching_weight": 0.004487081002431067,
+      "energy_keV": 1038.56,
+      "isotope": "Cs-134",
+      "mu_fe_cm_inv": 0.46397704624,
+      "mu_pb_cm_inv": 0.7839230595840001,
+      "raw_bin_energy_keV": 1038.0,
+      "raw_bin_index": 519,
+      "transport_line_index": 5
+    },
+    {
+      "branching_weight": 0.008093013167526728,
+      "energy_keV": 1167.968,
+      "isotope": "Cs-134",
+      "mu_fe_cm_inv": 0.437701269472,
+      "mu_pb_cm_inv": 0.7119575108352,
+      "raw_bin_energy_keV": 1166.0,
+      "raw_bin_index": 583,
+      "transport_line_index": 6
+    },
+    {
+      "branching_weight": 0.013619397926814943,
+      "energy_keV": 1365.185,
+      "isotope": "Cs-134",
+      "mu_fe_cm_inv": 0.404111468854,
+      "mu_pb_cm_inv": 0.632168262936,
+      "raw_bin_energy_keV": 1364.0,
+      "raw_bin_index": 682,
+      "transport_line_index": 7
+    },
+    {
+      "branching_weight": 1.0,
+      "energy_keV": 662.0,
+      "isotope": "Cs-137",
+      "mu_fe_cm_inv": 0.5817858149999999,
+      "mu_pb_cm_inv": 1.28832606,
+      "raw_bin_energy_keV": 662.0,
+      "raw_bin_index": 331,
+      "transport_line_index": 0
+    }
+  ],
+  "mark_concentration_source": null,
+  "mark_model": "physical_component_fraction_dirichlet_multinomial",
+  "maximum_scatter_order": 5,
+  "model": "geometry_conditioned_full_spectrum",
+  "obstacle_material_contract_id": "known_composite_materials_xcom_v1",
+  "obstacle_material_contract_sha256": "a89258ca5b5d31973852c0b1b7ea16b278131b1637abdcdae9298d3d2ff1798d",
+  "physical_component_discrepancy": {
+    "count_scatter_concentration": 4.0,
+    "count_scatter_relative_standard_uncertainty": 0.5,
+    "count_scope": "view_independent",
+    "count_uncollided_concentration": 2500.0,
+    "count_uncollided_relative_standard_uncertainty": 0.02,
+    "fraction_contract": "minimum_total_uncollided_and_total_minus_uncollided",
+    "higher_order_scatter_nuisance": "positive_mean_one_gamma_component",
+    "mark_scatter_concentration": 23.999999999999996,
+    "mark_scatter_probability_standard_uncertainty": 0.2,
+    "mark_uncollided_concentration": 9999.0,
+    "mark_uncollided_probability_standard_uncertainty": 0.01,
+    "model": "uncollided_scatter_component_latents_v1",
+    "obstacle_material_contract_sha256": "a89258ca5b5d31973852c0b1b7ea16b278131b1637abdcdae9298d3d2ff1798d",
+    "provenance": "physics_only_uncertainty_budget_v1",
+    "schema_version": 2,
+    "transport_physics_table_contract_sha256": "ad6afe5b05a91059db3e38192c1e9d3b9aad6bc86513c6dc0cfd04ab3406d814"
+  },
+  "production_ready": false,
+  "rate_scale_mixture": {
+    "nodes": [
+      1.0
+    ],
+    "scope": "station_shared_source_only",
+    "weighted_mean": 1.0,
+    "weights": [
+      1.0
+    ]
+  },
+  "runtime_ready": true,
+  "scatter_partition": "total_minus_direct",
+  "scatter_shape": "klein_nishina_optical_depth_orders",
+  "schema_version": 3,
+  "shield_pose_contract_id": "spherical_octant_positive_xyz_incoming_index_v1",
+  "shield_pose_contract_sha256": "0732f12d1f2aa83607560643484652da6ba942d02a0fdfdf4b0fda4e6d3116fd",
+  "source_rate_semantics": "pre_dead_time_detector_pulse_rate_at_1m",
+  "transport_feature_order": [
+    "tau_fe",
+    "tau_pb",
+    "tau_obstacle",
+    "distance_m"
+  ],
+  "transport_physics_table_contract_id": "klein_nishina_xcom_single_scatter_quadrature_v1",
+  "transport_physics_table_contract_sha256": "ad6afe5b05a91059db3e38192c1e9d3b9aad6bc86513c6dc0cfd04ab3406d814",
+  "validation": null,
+  "validation_manifest_sha256": null
+}

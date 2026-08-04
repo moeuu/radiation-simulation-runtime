@@ -11,6 +11,7 @@ from measurement.source_surfaces import (
     _build_source_surface_atlas,
     generate_surface_sources,
     is_allowed_source_surface_position,
+    same_isotope_min_distance_m,
     source_surface_kind_counts,
     source_surface_kind,
     source_surface_kinds,
@@ -119,7 +120,6 @@ def test_generate_surface_sources_rejects_synthetic_obstacle_surfaces() -> None:
         "random_source_max_ceiling_sources",
         "random_source_visibility_filter",
         "random_source_response_observability_filter",
-        "random_source_same_isotope_min_distance_m",
     ),
 )
 def test_area_uniform_source_config_rejects_truth_selection(
@@ -142,6 +142,59 @@ def test_area_uniform_source_config_has_one_valid_measure() -> None:
             validate_area_uniform_source_config(
                 {"random_source_surface_sampling_measure": invalid}
             )
+
+
+@pytest.mark.parametrize("value", (True, "3.0", -1.0, np.inf))
+def test_same_isotope_distance_config_rejects_invalid_values(
+    value: object,
+) -> None:
+    """The truth hard-core distance must be an exact finite metric value."""
+    with pytest.raises((TypeError, ValueError), match="min_distance"):
+        validate_area_uniform_source_config(
+            {"random_source_same_isotope_min_distance_m": value}
+        )
+
+
+def test_same_isotope_distance_config_accepts_predeclared_distance() -> None:
+    """A finite hard-core distance should remain explicit in the config."""
+    config = {"random_source_same_isotope_min_distance_m": 3.0}
+
+    assert validate_area_uniform_source_config(config) == "continuous_area_uniform"
+    assert same_isotope_min_distance_m(config) == pytest.approx(3.0)
+
+
+def test_generate_surface_sources_enforces_same_isotope_separation() -> None:
+    """Every same-isotope source pair should satisfy the 3-D hard core."""
+    env = EnvironmentConfig(size_x=10.0, size_y=20.0, size_z=10.0)
+    isotope_sequence = (
+        "Cs-137",
+        "Cs-137",
+        "Cs-137",
+        "Cs-137",
+        "Co-60",
+        "Co-60",
+        "Co-60",
+        "Eu-154",
+        "Eu-154",
+    )
+    sources = generate_surface_sources(
+        env=env,
+        obstacle_grid=None,
+        isotopes=isotope_sequence,
+        intensity_cps_1m=30000.0,
+        rng=np.random.default_rng(2026080401),
+        same_isotope_min_distance_m=3.0,
+    )
+    positions = np.asarray([source.position for source in sources], dtype=float)
+    isotopes = np.asarray([source.isotope for source in sources], dtype=str)
+    left, right = np.triu_indices(len(sources), k=1)
+    same = isotopes[left] == isotopes[right]
+    distances = np.linalg.norm(
+        positions[left[same]] - positions[right[same]],
+        axis=1,
+    )
+
+    assert np.all(distances >= 3.0)
 
 
 @pytest.mark.parametrize(

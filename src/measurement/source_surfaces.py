@@ -53,12 +53,14 @@ REMOVED_SOURCE_SELECTION_CONFIG_KEYS = frozenset(
         "random_source_response_max_pairwise_corr",
         "random_source_response_max_set_attempts",
         "random_source_response_observability_filter",
-        "random_source_same_isotope_min_distance_m",
         "random_source_visibility_batch_size",
         "random_source_visibility_filter",
         "random_source_visibility_max_attempts_per_source",
     }
 )
+
+DEFAULT_SOURCE_CONFIGURATION_BATCH_SIZE = 128
+DEFAULT_SOURCE_CONFIGURATION_MAX_ATTEMPTS = 8192
 
 
 def _nonnegative_finite_tolerance(value: object) -> float:
@@ -72,7 +74,7 @@ def _nonnegative_finite_tolerance(value: object) -> float:
 
 
 def validate_area_uniform_source_config(config: Mapping[str, object]) -> str:
-    """Validate the non-configurable continuous truth-position contract."""
+    """Validate the continuous truth-position and hard-core contract."""
     removed = sorted(REMOVED_SOURCE_SELECTION_CONFIG_KEYS.intersection(config))
     if removed:
         raise ValueError(
@@ -94,7 +96,31 @@ def validate_area_uniform_source_config(config: Mapping[str, object]) -> str:
             "random_source_surface_sampling_measure must be "
             "'continuous_area_uniform'."
         )
+    same_isotope_min_distance_m(config)
     return sampling_measure
+
+
+def same_isotope_min_distance_m(config: Mapping[str, object]) -> float:
+    """Return the configured same-isotope Euclidean hard-core distance."""
+    raw_distance = config.get(
+        "random_source_same_isotope_min_distance_m",
+        0.0,
+    )
+    if isinstance(raw_distance, (bool, np.bool_)) or not isinstance(
+        raw_distance,
+        Real,
+    ):
+        raise TypeError(
+            "random_source_same_isotope_min_distance_m must be a real "
+            "number."
+        )
+    distance = float(raw_distance)
+    if not np.isfinite(distance) or distance < 0.0:
+        raise ValueError(
+            "random_source_same_isotope_min_distance_m must be finite and "
+            "nonnegative."
+        )
+    return distance
 
 
 def transport_interior_mask(
@@ -513,6 +539,131 @@ def _build_source_surface_atlas(
     return charts
 
 
+def _same_isotope_pair_indices(
+    source_isotopes: Sequence[str],
+) -> tuple[NDArray[np.int64], NDArray[np.int64]]:
+    """Return vectorized source-slot pairs that share one isotope label."""
+    isotope_array = np.asarray(tuple(source_isotopes), dtype=str)
+    source_count = int(isotope_array.size)
+    lower, upper = np.triu_indices(source_count, k=1)
+    same = isotope_array[lower] == isotope_array[upper]
+    return (
+        np.asarray(lower[same], dtype=np.int64),
+        np.asarray(upper[same], dtype=np.int64),
+    )
+
+
+def _sample_separated_surface_coordinates(
+    charts: SurfaceChartGeometry,
+    *,
+    source_isotopes: Sequence[str],
+    minimum_distance_m: float,
+    rng: np.random.Generator,
+    eligible_materials_by_isotope: Mapping[str, Sequence[str]] | None,
+    transport_component_materials: Sequence[str] | None,
+    room_surface_material: str,
+    configuration_batch_size: int = DEFAULT_SOURCE_CONFIGURATION_BATCH_SIZE,
+    maximum_attempts: int = DEFAULT_SOURCE_CONFIGURATION_MAX_ATTEMPTS,
+) -> tuple[
+    NDArray[np.float64],
+    NDArray[np.int64],
+    NDArray[np.float64],
+]:
+    """Sample one area-uniform layout conditioned on isotope separation.
+
+    Complete source configurations are proposed from the unconditioned
+    physical surface-area measure. Accepting the first configuration that
+    satisfies every same-isotope Euclidean distance constraint produces the
+    joint area-uniform distribution conditioned on the hard-core event without
+    introducing source-order bias.
+    """
+    isotope_names = tuple(source_isotopes)
+    source_count = len(isotope_names)
+    left_indices, right_indices = _same_isotope_pair_indices(isotope_names)
+    if minimum_distance_m <= 0.0 or left_indices.size == 0:
+        if eligible_materials_by_isotope is None:
+            return sample_continuous_surface_coordinates(
+                charts,
+                source_count,
+                rng,
+            )
+        return _sample_material_conditioned_surface_coordinates(
+            charts,
+            source_isotopes=isotope_names,
+            eligible_materials_by_isotope=eligible_materials_by_isotope,
+            transport_component_materials=transport_component_materials,
+            room_surface_material=room_surface_material,
+            rng=rng,
+        )
+    if configuration_batch_size <= 0 or maximum_attempts <= 0:
+        raise ValueError(
+            "Source configuration batch size and maximum attempts must be "
+            "positive."
+        )
+    attempted = 0
+    minimum_distance_sq = float(minimum_distance_m) ** 2
+    while attempted < maximum_attempts:
+        batch_size = min(
+            int(configuration_batch_size),
+            int(maximum_attempts - attempted),
+        )
+        repeated_isotopes = isotope_names * batch_size
+        if eligible_materials_by_isotope is None:
+            flat_positions, flat_chart_indices, flat_surface_uv = (
+                sample_continuous_surface_coordinates(
+                    charts,
+                    batch_size * source_count,
+                    rng,
+                )
+            )
+        else:
+            flat_positions, flat_chart_indices, flat_surface_uv = (
+                _sample_material_conditioned_surface_coordinates(
+                    charts,
+                    source_isotopes=repeated_isotopes,
+                    eligible_materials_by_isotope=eligible_materials_by_isotope,
+                    transport_component_materials=transport_component_materials,
+                    room_surface_material=room_surface_material,
+                    rng=rng,
+                )
+            )
+        positions = np.asarray(flat_positions, dtype=float).reshape(
+            batch_size,
+            source_count,
+            3,
+        )
+        pair_deltas = (
+            positions[:, left_indices, :]
+            - positions[:, right_indices, :]
+        )
+        pair_distance_sq = np.einsum(
+            "bpd,bpd->bp",
+            pair_deltas,
+            pair_deltas,
+        )
+        valid = np.all(pair_distance_sq >= minimum_distance_sq, axis=1)
+        if np.any(valid):
+            selected = int(np.flatnonzero(valid)[0])
+            start = selected * source_count
+            stop = start + source_count
+            return (
+                np.ascontiguousarray(flat_positions[start:stop], dtype=float),
+                np.ascontiguousarray(
+                    flat_chart_indices[start:stop],
+                    dtype=np.int64,
+                ),
+                np.ascontiguousarray(flat_surface_uv[start:stop], dtype=float),
+            )
+        attempted += batch_size
+    raise RuntimeError(
+        "Unable to sample a complete source configuration satisfying "
+        f"same-isotope Euclidean separation >= {minimum_distance_m:.6g} m "
+        f"after {maximum_attempts} area-uniform proposals. The configured "
+        "surface support and source cardinalities are incompatible with this "
+        "hard-core contract; the runtime will not weaken it automatically."
+    )
+
+
 def generate_surface_sources(
     *,
     env: EnvironmentConfig,
@@ -523,18 +674,20 @@ def generate_surface_sources(
     count: int | None = None,
     obstacle_height_m: float = 2.0,
     chart_max_edge_m: float = 1.0,
+    same_isotope_min_distance_m: float = 0.0,
     eligible_materials_by_isotope: Mapping[str, Sequence[str]] | None = None,
     transport_component_materials: Sequence[str] | None = None,
     room_surface_material: str = "concrete",
 ) -> list[PointSource]:
-    """Generate independent points uniformly over eligible physical area.
+    """Generate points from physical area with optional isotope hard cores.
 
-    Source locations are independent continuous draws from the normalized
-    physical surface-area measure. When an evaluated activation-product
-    material contract is supplied, normalization is over that isotope's
-    physically eligible material surfaces. No detector visibility, height,
-    ceiling quota, isotope separation, PF state, or response-conditioning
-    criterion can alter the truth-position distribution.
+    Unconditioned source locations are continuous draws from normalized
+    physical surface area. A positive same-isotope minimum distance conditions
+    the complete joint layout on a predeclared Euclidean hard-core event. When
+    an evaluated activation-product material contract is supplied,
+    normalization is over that isotope's physically eligible material
+    surfaces. Detector visibility, height, PF state, and response observability
+    never enter truth generation.
     """
     if isinstance(isotopes, (str, bytes)) or not isinstance(
         isotopes,
@@ -570,23 +723,28 @@ def generate_surface_sources(
         isotope_names[index % len(isotope_names)]
         for index in range(source_count)
     )
-    if eligible_materials_by_isotope is None:
-        positions, chart_indices, surface_uv = sample_continuous_surface_coordinates(
+    minimum_distance = same_isotope_min_distance_m
+    if isinstance(minimum_distance, (bool, np.bool_)) or not isinstance(
+        minimum_distance,
+        Real,
+    ):
+        raise TypeError("same_isotope_min_distance_m must be a real number.")
+    minimum_distance = float(minimum_distance)
+    if not np.isfinite(minimum_distance) or minimum_distance < 0.0:
+        raise ValueError(
+            "same_isotope_min_distance_m must be finite and nonnegative."
+        )
+    positions, chart_indices, surface_uv = (
+        _sample_separated_surface_coordinates(
             surface_atlas,
-            source_count,
-            rng,
+            source_isotopes=source_isotopes,
+            minimum_distance_m=minimum_distance,
+            rng=rng,
+            eligible_materials_by_isotope=eligible_materials_by_isotope,
+            transport_component_materials=transport_component_materials,
+            room_surface_material=room_surface_material,
         )
-    else:
-        positions, chart_indices, surface_uv = (
-            _sample_material_conditioned_surface_coordinates(
-                surface_atlas,
-                source_isotopes=source_isotopes,
-                eligible_materials_by_isotope=eligible_materials_by_isotope,
-                transport_component_materials=transport_component_materials,
-                room_surface_material=room_surface_material,
-                rng=rng,
-            )
-        )
+    )
     if positions.shape != (source_count, 3):
         raise RuntimeError(
             "Continuous source sampler returned an invalid position array."

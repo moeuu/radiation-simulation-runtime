@@ -1,0 +1,4 @@
+STEP step_id=1 dwell_time_s=10 seed=19001 shield_pose_contract_id=spherical_octant_positive_xyz_incoming_index_v1 shield_pose_contract_sha256=0732f12d1f2aa83607560643484652da6ba942d02a0fdfdf4b0fda4e6d3116fd fe_orientation_index=7 pb_orientation_index=7
+POSE kind=detector x=2 y=2 z=2 qw=1 qx=0 qy=0 qz=0
+POSE kind=fe x=2 y=-3 z=2 qw=1 qx=0 qy=0 qz=0
+POSE kind=pb x=2 y=2 z=-3 qw=1 qx=0 qy=0 qz=0

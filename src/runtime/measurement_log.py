@@ -12,7 +12,7 @@ from pathlib import Path
 import re
 import shutil
 from types import MappingProxyType
-from typing import Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 import zipfile
 
 import numpy as np
@@ -32,6 +32,9 @@ from runtime.forward_model_manifest import (
     build_forward_model_manifest as _build_forward_model_manifest,
     validate_forward_model_manifest as _validate_forward_model_manifest,
 )
+
+if TYPE_CHECKING:
+    from runtime.records import RunContext
 
 MEASUREMENT_LOG_SCHEMA_VERSION = 2
 FULL_SPECTRUM_MODEL_SCHEMA_VERSION = 3
@@ -355,7 +358,72 @@ def _validate_environment_payload(payload: Mapping[str, Any]) -> None:
         if obstacle_grid is not None:
             if not isinstance(obstacle_grid, dict):
                 raise ValueError("obstacle_grid must be an object or null.")
-            ObstacleGrid.from_dict(dict(obstacle_grid))
+            parsed_grid = ObstacleGrid.from_dict(dict(obstacle_grid))
+            raw_instances = payload.get("obstacle_instances")
+            if raw_instances is not None:
+                from measurement.obstacle_assets import (
+                    obstacle_instances_from_dicts,
+                    validate_component_transport_contract,
+                )
+
+                instances = obstacle_instances_from_dicts(raw_instances)
+                validate_component_transport_contract(
+                    parsed_grid,
+                    instances,
+                    room_size_xyz=(
+                        float(payload["size_x"]),
+                        float(payload["size_y"]),
+                        float(payload["size_z"]),
+                    ),
+                )
+                raw_family = payload.get("geometry_family")
+                if raw_family is not None:
+                    from measurement.geometry_family import (
+                        geometry_family_descriptor,
+                        validate_geometry_family_descriptor,
+                    )
+
+                    if not isinstance(raw_family, Mapping):
+                        raise ValueError("geometry_family must be an object.")
+                    validate_geometry_family_descriptor(
+                        raw_family,
+                        require_in_domain=False,
+                    )
+                    expected_family = geometry_family_descriptor(
+                        parsed_grid,
+                        instances,
+                        room_size_xyz=(
+                            float(payload["size_x"]),
+                            float(payload["size_y"]),
+                            float(payload["size_z"]),
+                        ),
+                        passage_width_m=float(
+                            raw_family["passage_width_m"]
+                        ),
+                        target_blocked_fraction=float(
+                            raw_family["target_blocked_fraction"]
+                        ),
+                        obstacle_height_limit_m=(
+                            float(
+                                raw_family[
+                                    "obstacle_height_limit_fraction"
+                                ]
+                            )
+                            * float(payload["size_z"])
+                        ),
+                    )
+                    if dict(raw_family) != dict(expected_family):
+                        raise ValueError(
+                            "geometry_family does not match obstacle components."
+                        )
+            elif payload.get("geometry_family") is not None:
+                raise ValueError(
+                    "geometry_family requires obstacle_instances."
+                )
+        elif payload.get("obstacle_instances") not in (None, []):
+            raise ValueError(
+                "obstacle_instances require a non-null obstacle_grid."
+            )
     except (TypeError, ValueError) as exc:
         raise MeasurementLogValidationError(
             f"environment is incompatible with replay geometry: {exc}"

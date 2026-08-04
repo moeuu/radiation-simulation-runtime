@@ -29,9 +29,14 @@ from measurement.observation_model import (
     build_runtime_observation_model,
     continuous_kernel_from_observation_model,
 )
+from measurement.geometry_family import (
+    geometry_family_descriptor,
+    randomized_training_geometry_parameters,
+)
 from measurement.source_boundary import (
     surface_source_runtime_contract_sha256,
 )
+from measurement.shielding import SHIELD_POSE_CONTRACT_SHA256
 from sim.geant4_app.app import (
     Geant4AppConfig,
     Geant4Application,
@@ -43,7 +48,9 @@ from spectrum.additive_scatter import (
     ADDITIVE_SCATTER_FEATURE_ORDER,
     ADDITIVE_SCATTER_INCIDENT_LABEL_SEMANTICS,
     AdditiveNoncollidedTransportResponse,
+    LEGACY_SCATTER_BASIS_SEMANTICS,
     fit_additive_noncollided_transport_response,
+    scatter_basis_from_stored_geometry_numpy,
 )
 from spectrum.full_spectrum_acceptance_runner import (
     ACCEPTANCE_DWELL_TIME_S,
@@ -53,6 +60,7 @@ from spectrum.full_spectrum_acceptance_runner import (
 )
 from spectrum.geant4_acceptance_backend import (
     ACCEPTANCE_DETECTOR_POSE_XYZ,
+    ACCEPTANCE_ROOM_SIZE_XYZ,
     _FULL_SPECTRUM_RUNTIME_KEYS,
     _build_environment,
     _command_for_pair,
@@ -71,6 +79,10 @@ from spectrum.response_matrix import (
     NATIVE_GEANT4_BIN_COUNT,
     NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256,
 )
+from spectrum.physics_contracts import (
+    OBSTACLE_MATERIAL_CONTRACT_SHA256,
+    TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256,
+)
 from spectrum.transport_spectral import (
     DESIGNATED_TRAINING_SCENE_SEEDS,
     FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256,
@@ -80,7 +92,7 @@ from spectrum.transport_spectral import (
 
 
 MEAN_CALIBRATION_DESIGN_SCHEMA_VERSION = 1
-MEAN_CALIBRATION_PAIR_SCHEMA_VERSION = 1
+MEAN_CALIBRATION_PAIR_SCHEMA_VERSION = 2
 MEAN_CALIBRATION_SCENE_SCHEMA_VERSION = 1
 MEAN_CALIBRATION_COMPLETION_SCHEMA_VERSION = 1
 MEAN_CALIBRATION_MODEL_ID = "fixed_quota_transport_mean_training_v1"
@@ -281,6 +293,13 @@ def build_predeclared_mean_calibration_design(
         "detector_response_mode": "rao_blackwell_analytic_operator",
         "detector_response_contract_sha256": (
             NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
+        ),
+        "shield_pose_contract_sha256": SHIELD_POSE_CONTRACT_SHA256,
+        "obstacle_material_contract_sha256": (
+            OBSTACLE_MATERIAL_CONTRACT_SHA256
+        ),
+        "transport_physics_table_contract_sha256": (
+            TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256
         ),
         "background_cps": 0.0,
         "dead_time_tau_s": 0.0,
@@ -521,6 +540,13 @@ def write_mean_calibration_pair_artifact(
         "detector_response_contract_sha256": (
             NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
         ),
+        "shield_pose_contract_sha256": SHIELD_POSE_CONTRACT_SHA256,
+        "obstacle_material_contract_sha256": (
+            OBSTACLE_MATERIAL_CONTRACT_SHA256
+        ),
+        "transport_physics_table_contract_sha256": (
+            TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256
+        ),
         "detector_response_application": (
             "analytic_conditional_expectation_no_categorical_sampling"
         ),
@@ -551,6 +577,12 @@ def load_mean_calibration_pair_artifact(
         != "fixed_quota_transport_mean_pair_v1"
         or payload.get("detector_response_contract_sha256")
         != NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
+        or payload.get("shield_pose_contract_sha256")
+        != SHIELD_POSE_CONTRACT_SHA256
+        or payload.get("obstacle_material_contract_sha256")
+        != OBSTACLE_MATERIAL_CONTRACT_SHA256
+        or payload.get("transport_physics_table_contract_sha256")
+        != TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256
         or payload.get("detector_response_application")
         != "analytic_conditional_expectation_no_categorical_sampling"
         or payload.get("sampling_covariance_scope")
@@ -740,20 +772,45 @@ class ExternalGeant4MeanCalibrationBackend:
                 self.runtime_config.get("room_boundary_thickness_m", 0.1)
             ),
         )
+        family_parameters = randomized_training_geometry_parameters(
+            scene_seed,
+            room_size_xyz=(
+                environment.size_x,
+                environment.size_y,
+                environment.size_z,
+            ),
+        )
         sources = _generate_sources(
             environment=environment,
             grid=grid,
             scene_seed=scene_seed,
             scenario_id=scenario_id,
-            obstacle_height_m=float(self.app_config.obstacle_height_m),
+            obstacle_height_m=float(
+                family_parameters["obstacle_height_m"]
+            ),
         )
         if not sources:
+            family_descriptor = geometry_family_descriptor(
+                grid,
+                instances,
+                room_size_xyz=ACCEPTANCE_ROOM_SIZE_XYZ,
+                passage_width_m=float(
+                    family_parameters["passage_width_m"]
+                ),
+                target_blocked_fraction=float(
+                    family_parameters["blocked_fraction"]
+                ),
+                obstacle_height_limit_m=float(
+                    family_parameters["obstacle_height_m"]
+                ),
+            )
             return tuple(
                 self._write_exact_zero_pair(
                     layout=layout,
                     scene_seed=scene_seed,
                     scenario_id=scenario_id,
                     shield_pair_id=int(pair_id),
+                    geometry_family=family_descriptor,
                 )
                 for pair_id in selected_pair_ids
             )
@@ -861,6 +918,20 @@ class ExternalGeant4MeanCalibrationBackend:
                     scene_hash=str(exported.scene_hash),
                     source_hash=source_hash,
                     source_payloads=source_payloads,
+                    geometry_family=geometry_family_descriptor(
+                        grid,
+                        instances,
+                        room_size_xyz=ACCEPTANCE_ROOM_SIZE_XYZ,
+                        passage_width_m=float(
+                            family_parameters["passage_width_m"]
+                        ),
+                        target_blocked_fraction=float(
+                            family_parameters["blocked_fraction"]
+                        ),
+                        obstacle_height_limit_m=float(
+                            family_parameters["obstacle_height_m"]
+                        ),
+                    ),
                 )
                 paths.append(
                     write_mean_calibration_pair_artifact(
@@ -891,6 +962,7 @@ class ExternalGeant4MeanCalibrationBackend:
         scene_hash: str,
         source_hash: str,
         source_payloads: Sequence[Mapping[str, object]],
+        geometry_family: Mapping[str, object],
     ) -> dict[str, object]:
         """Return immutable acquisition identity for one pair."""
         return {
@@ -906,6 +978,7 @@ class ExternalGeant4MeanCalibrationBackend:
             "scene_hash": str(scene_hash),
             "surface_source_contract_sha256": str(source_hash),
             "sources": [dict(value) for value in source_payloads],
+            "geometry_family": dict(geometry_family),
             "holdout_artifacts_consumed": False,
         }
 
@@ -916,6 +989,7 @@ class ExternalGeant4MeanCalibrationBackend:
         scene_seed: int,
         scenario_id: str,
         shield_pair_id: int,
+        geometry_family: Mapping[str, object],
     ) -> Path:
         """Write the exact source-free, zero-background calibration identity."""
         directory = layout.pair_directory(
@@ -965,6 +1039,7 @@ class ExternalGeant4MeanCalibrationBackend:
                 "scene_hash": None,
                 "surface_source_contract_sha256": None,
                 "sources": [],
+                "geometry_family": dict(geometry_family),
                 "holdout_artifacts_consumed": False,
                 "exact_zero_reason": (
                     "no_sources_background_zero_dead_time_zero"
@@ -978,6 +1053,13 @@ class ExternalGeant4MeanCalibrationBackend:
             },
             "detector_response_contract_sha256": (
                 NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
+            ),
+            "shield_pose_contract_sha256": SHIELD_POSE_CONTRACT_SHA256,
+            "obstacle_material_contract_sha256": (
+                OBSTACLE_MATERIAL_CONTRACT_SHA256
+            ),
+            "transport_physics_table_contract_sha256": (
+                TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256
             ),
             "detector_response_application": (
                 "analytic_conditional_expectation_no_categorical_sampling"
@@ -1121,6 +1203,7 @@ class MeanCalibrationTrainingRow:
     feature_basis: tuple[float, ...]
     scatter_fraction: float
     sample_weight: float
+    direct_log_ratio: float | None = None
 
 
 def fit_additive_scatter_training_rows(
@@ -1130,6 +1213,7 @@ def fit_additive_scatter_training_rows(
     training_scene_seeds: Sequence[int] = DESIGNATED_TRAINING_SCENE_SEEDS,
     scenario_ids: Sequence[str] = VALIDATION_SCENARIO_IDS,
     shield_pair_ids: Sequence[int] = ACCEPTANCE_PAIR_IDS,
+    feature_basis_semantics: str = LEGACY_SCATTER_BASIS_SEMANTICS,
 ) -> AdditiveNoncollidedTransportResponse:
     """Fit the existing physical additive model from training-only rows."""
     declared_seeds = _strict_unique_integer_sequence(
@@ -1169,8 +1253,37 @@ def fit_additive_scatter_training_rows(
         dtype=np.float64,
     )
     scene_ids = [row.scene_id for row in rows]
+    direct_targets = [row.direct_log_ratio for row in rows]
+    if any(value is None for value in direct_targets) and not all(
+        value is None for value in direct_targets
+    ):
+        raise ValueError(
+            "Direct transport labels must be present for every row or none."
+        )
+    artifact_contracts = {
+        str(seed): canonical_json_sha256(
+            {
+                "scene_manifest_sha256": scene_manifest_sha256_by_seed[
+                    str(seed)
+                ],
+                "shield_pose_contract_sha256": (
+                    SHIELD_POSE_CONTRACT_SHA256
+                ),
+                "detector_response_contract_sha256": (
+                    NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
+                ),
+                "obstacle_material_contract_sha256": (
+                    OBSTACLE_MATERIAL_CONTRACT_SHA256
+                ),
+                "transport_physics_table_contract_sha256": (
+                    TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256
+                ),
+            }
+        )
+        for seed in declared_seeds
+    }
     training_manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "acceptance_contract_sha256": (
             FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256
         ),
@@ -1183,6 +1296,17 @@ def fit_additive_scatter_training_rows(
         "artifact_sha256_by_scene": dict(
             scene_manifest_sha256_by_seed
         ),
+        "artifact_contract_sha256_by_scene": artifact_contracts,
+        "shield_pose_contract_sha256": SHIELD_POSE_CONTRACT_SHA256,
+        "detector_response_contract_sha256": (
+            NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
+        ),
+        "obstacle_material_contract_sha256": (
+            OBSTACLE_MATERIAL_CONTRACT_SHA256
+        ),
+        "transport_physics_table_contract_sha256": (
+            TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256
+        ),
         "label_space": ADDITIVE_SCATTER_INCIDENT_LABEL_SEMANTICS,
         "selection_objective": (
             "leave_one_training_scene_out_weighted_log1p_mse"
@@ -1194,6 +1318,12 @@ def fit_additive_scatter_training_rows(
         weights,
         scene_ids,
         training_manifest=training_manifest,
+        direct_log_ratio_n=(
+            None
+            if all(value is None for value in direct_targets)
+            else np.asarray(direct_targets, dtype=np.float64)
+        ),
+        feature_basis_semantics=feature_basis_semantics,
     )
 
 
@@ -1201,6 +1331,7 @@ def _training_rows_from_pair(
     payload: Mapping[str, object],
     *,
     model: GeometryConditionedSpectralModel,
+    feature_basis_semantics: str = LEGACY_SCATTER_BASIS_SEMANTICS,
 ) -> tuple[MeanCalibrationTrainingRow, ...]:
     """Extract source-line additive-scatter rows from one pair artifact."""
     provenance = payload.get("provenance")
@@ -1221,14 +1352,23 @@ def _training_rows_from_pair(
         geometry.get("unattenuated_source_line_rate_sl"),
         dtype=np.float64,
     )
-    basis = np.asarray(
+    uncollided = np.asarray(
+        geometry.get("uncollided_source_line_rate_sl"),
+        dtype=np.float64,
+    )
+    stored_basis = np.asarray(
         geometry.get("additive_scatter_basis_slf"),
+        dtype=np.float64,
+    )
+    features = np.asarray(
+        geometry.get("transport_features_slf"),
         dtype=np.float64,
     )
     line_rows = model.line_identity
     if (
         unattenuated.shape != (len(sources), len(line_rows))
-        or basis.shape
+        or uncollided.shape != (len(sources), len(line_rows))
+        or stored_basis.shape
         != (
             len(sources),
             len(line_rows),
@@ -1236,10 +1376,21 @@ def _training_rows_from_pair(
         )
         or np.any(~np.isfinite(unattenuated))
         or np.any(unattenuated < 0.0)
-        or np.any(~np.isfinite(basis))
-        or np.any(basis < 0.0)
+        or np.any(~np.isfinite(uncollided))
+        or np.any(uncollided < 0.0)
+        or features.shape == ()
+        or features.shape
+        != (len(sources), len(line_rows), 4)
+        or np.any(~np.isfinite(stored_basis))
+        or np.any(stored_basis < 0.0)
     ):
         raise ValueError("Mean-calibration geometry arrays are invalid.")
+    basis = scatter_basis_from_stored_geometry_numpy(
+        stored_basis=stored_basis,
+        transport_features=features,
+        line_identity=line_rows,
+        target_semantics=feature_basis_semantics,
+    )
     scene_id = str(provenance.get("scene_seed"))
     result: list[MeanCalibrationTrainingRow] = []
     for source_index, source in enumerate(sources):
@@ -1261,9 +1412,11 @@ def _training_rows_from_pair(
                 )
             interacted = class_moments.get("interacted_primary")
             secondary = class_moments.get("secondary")
-            if not isinstance(interacted, Mapping) or not isinstance(
-                secondary,
-                Mapping,
+            uncollided_moments = class_moments.get("uncollided_primary")
+            if (
+                not isinstance(interacted, Mapping)
+                or not isinstance(secondary, Mapping)
+                or not isinstance(uncollided_moments, Mapping)
             ):
                 raise TypeError("Entry-class moments are invalid.")
             scatter_count = float(interacted["mean_count"]) + float(
@@ -1275,6 +1428,12 @@ def _training_rows_from_pair(
             )
             if denominator <= 0.0:
                 continue
+            analytic_uncollided = float(
+                uncollided[source_index, line_index]
+            ) * float(provenance["dwell_time_s"])
+            native_uncollided = float(uncollided_moments["mean_count"])
+            if analytic_uncollided <= 0.0 or native_uncollided <= 0.0:
+                continue
             result.append(
                 MeanCalibrationTrainingRow(
                     scene_id=scene_id,
@@ -1284,6 +1443,9 @@ def _training_rows_from_pair(
                     ),
                     scatter_fraction=max(scatter_count, 0.0) / denominator,
                     sample_weight=denominator,
+                    direct_log_ratio=float(
+                        np.log(native_uncollided / analytic_uncollided)
+                    ),
                 )
             )
     return tuple(result)
@@ -1294,6 +1456,7 @@ def fit_additive_scatter_from_complete_mean_calibration(
     layout: MeanCalibrationLayout,
     design: Mapping[str, object],
     model: GeometryConditionedSpectralModel,
+    feature_basis_semantics: str = LEGACY_SCATTER_BASIS_SEMANTICS,
 ) -> AdditiveNoncollidedTransportResponse:
     """Fit and freeze additive scatter after authenticating the full design."""
     resolved = validate_predeclared_mean_calibration_design(design)
@@ -1322,7 +1485,13 @@ def fit_additive_scatter_from_complete_mean_calibration(
                     / "manifest.json"
                 )
                 payload, _ = load_mean_calibration_pair_artifact(manifest)
-                rows.extend(_training_rows_from_pair(payload, model=model))
+                rows.extend(
+                    _training_rows_from_pair(
+                        payload,
+                        model=model,
+                        feature_basis_semantics=feature_basis_semantics,
+                    )
+                )
     response = fit_additive_scatter_training_rows(
         rows,
         scene_manifest_sha256_by_seed=expected_completion[
@@ -1331,6 +1500,7 @@ def fit_additive_scatter_from_complete_mean_calibration(
         training_scene_seeds=scene_seeds,
         scenario_ids=scenario_ids,
         shield_pair_ids=pair_ids,
+        feature_basis_semantics=feature_basis_semantics,
     )
     _write_immutable_bytes(
         layout.additive_model_path,

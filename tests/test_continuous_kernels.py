@@ -3,8 +3,11 @@
 import numpy as np
 import pytest
 
+import measurement.continuous_kernels as continuous_kernels
 from measurement.continuous_kernels import (
     ContinuousKernel,
+    _obstacle_single_scatter_probability_numpy,
+    _obstacle_single_scatter_probability_torch,
     finite_sphere_geometric_term,
     geometric_term,
     segment_rotated_octant_shell_path_length_cm_torch,
@@ -16,6 +19,191 @@ from measurement.shielding import (
     DEFAULT_PB_SHIELD_INNER_RADIUS_CM,
 )
 from measurement.continuous_kernels import expected_counts_single_isotope
+from spectrum.additive_scatter import PhysicsOnlyNoncollidedTransportResponse
+from spectrum.air_attenuation import dry_air_total_linear_attenuation_numpy
+
+
+def test_obstacle_material_path_scatter_matches_torch() -> None:
+    """Actual box-segment quadrature must agree on NumPy and Torch paths."""
+    torch = pytest.importorskip("torch")
+    source = np.asarray([[0.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+    target = np.asarray([[4.0, 0.0, 0.0], [4.0, 1.0, 0.0]])
+    boxes = np.asarray(
+        [
+            [1.0, -0.5, -0.5, 2.0, 1.5, 0.5],
+            [2.5, -0.5, -0.5, 3.0, 1.5, 0.5],
+        ],
+        dtype=np.float64,
+    )
+    energy = np.asarray([662.0, 1332.0], dtype=np.float64)
+    compton_mu = np.asarray(
+        [[0.08, 0.05], [0.06, 0.04]],
+        dtype=np.float64,
+    )
+    survival = np.asarray(
+        [[0.42, 0.55], [0.47, 0.61]],
+        dtype=np.float64,
+    )
+
+    numpy_value = _obstacle_single_scatter_probability_numpy(
+        source_pos=source,
+        target_pos=target,
+        obstacle_boxes_m=boxes,
+        compton_mu_cm_inv_lb=compton_mu,
+        energy_keV_l=energy,
+        detector_radius_m=0.04,
+        total_survival=survival,
+        tol=1.0e-12,
+    )
+    torch_value = _obstacle_single_scatter_probability_torch(
+        source_pos=torch.as_tensor(source, dtype=torch.float64),
+        target_pos=torch.as_tensor(target, dtype=torch.float64),
+        obstacle_boxes_m=torch.as_tensor(boxes, dtype=torch.float64),
+        compton_mu_cm_inv_lb=torch.as_tensor(
+            compton_mu,
+            dtype=torch.float64,
+        ),
+        energy_keV_l=torch.as_tensor(energy, dtype=torch.float64),
+        detector_radius_m=0.04,
+        total_survival=torch.as_tensor(survival, dtype=torch.float64),
+        tol=1.0e-12,
+    )
+
+    np.testing.assert_allclose(
+        torch_value.detach().cpu().numpy(),
+        numpy_value,
+        rtol=2.0e-13,
+        atol=2.0e-15,
+    )
+    assert np.all(numpy_value > 0.0)
+
+
+def test_obstacle_scatter_torch_compacts_intersecting_boxes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The batched runtime must quadrature only intersected box intervals."""
+    torch = pytest.importorskip("torch")
+    source = np.asarray(
+        [[0.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        dtype=np.float64,
+    )
+    target = np.asarray(
+        [[4.0, 0.0, 0.0], [4.0, 1.0, 0.0]],
+        dtype=np.float64,
+    )
+    boxes = np.asarray(
+        [
+            [0.5, -0.5, -0.5, 1.0, 1.5, 0.5],
+            [1.5, -0.2, -0.5, 2.0, 0.2, 0.5],
+            [2.5, 0.8, -0.5, 3.0, 1.2, 0.5],
+            [1.0, 2.0, -0.5, 2.0, 3.0, 0.5],
+        ],
+        dtype=np.float64,
+    )
+    energy = np.asarray([662.0, 1332.0], dtype=np.float64)
+    compton_mu = np.asarray(
+        [
+            [0.08, 0.07, 0.06, 0.05],
+            [0.06, 0.05, 0.04, 0.03],
+        ],
+        dtype=np.float64,
+    )
+    survival = np.asarray(
+        [[0.42, 0.55], [0.47, 0.61]],
+        dtype=np.float64,
+    )
+    numpy_value = _obstacle_single_scatter_probability_numpy(
+        source_pos=source,
+        target_pos=target,
+        obstacle_boxes_m=boxes,
+        compton_mu_cm_inv_lb=compton_mu,
+        energy_keV_l=energy,
+        detector_radius_m=0.04,
+        total_survival=survival,
+        tol=1.0e-12,
+    )
+
+    original = continuous_kernels.klein_nishina_forward_cone_fraction_torch
+    scatter_distance_sizes: list[int] = []
+
+    def _recording_cone(*args: object, **kwargs: object) -> "torch.Tensor":
+        """Record the compact quadrature batch before calling the oracle."""
+        scatter_distance = kwargs["scatter_distance_m"]
+        assert isinstance(scatter_distance, torch.Tensor)
+        scatter_distance_sizes.append(int(scatter_distance.numel()))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        continuous_kernels,
+        "klein_nishina_forward_cone_fraction_torch",
+        _recording_cone,
+    )
+    torch_value = _obstacle_single_scatter_probability_torch(
+        source_pos=torch.as_tensor(source, dtype=torch.float64),
+        target_pos=torch.as_tensor(target, dtype=torch.float64),
+        obstacle_boxes_m=torch.as_tensor(boxes, dtype=torch.float64),
+        compton_mu_cm_inv_lb=torch.as_tensor(
+            compton_mu,
+            dtype=torch.float64,
+        ),
+        energy_keV_l=torch.as_tensor(energy, dtype=torch.float64),
+        detector_radius_m=0.04,
+        total_survival=torch.as_tensor(survival, dtype=torch.float64),
+        tol=1.0e-12,
+    )
+
+    # Four valid ray-box intervals each use the same two Gauss nodes.
+    assert scatter_distance_sizes == [8]
+    np.testing.assert_allclose(
+        torch_value.detach().cpu().numpy(),
+        numpy_value,
+        rtol=2.0e-13,
+        atol=2.0e-15,
+    )
+
+
+def test_obstacle_scatter_ignores_nonintersecting_parallel_boxes() -> None:
+    """Missed parallel boxes must contribute zero without NaN quadrature."""
+    torch = pytest.importorskip("torch")
+    source = np.asarray([[0.0, 0.0, 0.0]], dtype=np.float64)
+    target = np.asarray([[4.0, 0.0, 0.0]], dtype=np.float64)
+    boxes = np.asarray(
+        [[1.0, 2.0, -0.5, 2.0, 3.0, 0.5]],
+        dtype=np.float64,
+    )
+    energy = np.asarray([662.0], dtype=np.float64)
+    compton_mu = np.asarray([[0.08]], dtype=np.float64)
+    survival = np.asarray([[0.75]], dtype=np.float64)
+
+    numpy_value = _obstacle_single_scatter_probability_numpy(
+        source_pos=source,
+        target_pos=target,
+        obstacle_boxes_m=boxes,
+        compton_mu_cm_inv_lb=compton_mu,
+        energy_keV_l=energy,
+        detector_radius_m=0.04,
+        total_survival=survival,
+        tol=1.0e-12,
+    )
+    torch_value = _obstacle_single_scatter_probability_torch(
+        source_pos=torch.as_tensor(source, dtype=torch.float64),
+        target_pos=torch.as_tensor(target, dtype=torch.float64),
+        obstacle_boxes_m=torch.as_tensor(boxes, dtype=torch.float64),
+        compton_mu_cm_inv_lb=torch.as_tensor(
+            compton_mu,
+            dtype=torch.float64,
+        ),
+        energy_keV_l=torch.as_tensor(energy, dtype=torch.float64),
+        detector_radius_m=0.04,
+        total_survival=torch.as_tensor(survival, dtype=torch.float64),
+        tol=1.0e-12,
+    )
+
+    np.testing.assert_array_equal(numpy_value, np.zeros((1, 1)))
+    np.testing.assert_array_equal(
+        torch_value.detach().cpu().numpy(),
+        numpy_value,
+    )
 
 
 @pytest.mark.parametrize(
@@ -321,6 +509,54 @@ def _line_resolved_inputs() -> tuple[
         np.asarray([0, 3], dtype=np.int64),
         np.asarray([7, 2], dtype=np.int64),
     )
+
+
+def test_physics_only_direct_kernel_applies_xcom_air() -> None:
+    """The production direct kernel must apply authenticated air attenuation."""
+    response = PhysicsOnlyNoncollidedTransportResponse(
+        detector_radius_m=0.025,
+        fe_scatter_distance_m=0.14,
+        pb_scatter_distance_m=0.10,
+    )
+    common = {
+        "mu_by_isotope": {"Cs-137": {"fe": 0.0, "pb": 0.0}},
+        "shield_params": ShieldParams(
+            mu_fe=0.0,
+            mu_pb=0.0,
+            thickness_fe_cm=0.0,
+            thickness_pb_cm=0.0,
+        ),
+        "line_mu_by_isotope": {
+            "Cs-137": (
+                {
+                    "weight": 1.0,
+                    "energy_keV": 662.0,
+                    "fe": 0.0,
+                    "pb": 0.0,
+                },
+            )
+        },
+        "additive_scatter_response": response,
+        "detector_radius_m": 0.025,
+        "gpu_device": "cpu",
+        "gpu_dtype": "float64",
+    }
+    detector = np.asarray([[0.0, 0.0, 0.0]], dtype=np.float64)
+    source = np.asarray([[18.0, 0.0, 0.0]], dtype=np.float64)
+    fe = np.asarray([0], dtype=np.int64)
+    pb = np.asarray([0], dtype=np.int64)
+    line = np.asarray([0], dtype=np.int64)
+    cpu = ContinuousKernel(**common, use_gpu=False)
+    cpu_components = cpu.line_transport_components_selected_pairs_for_detectors(
+        "Cs-137", detector, source, fe, pb, line
+    )
+    expected_ratio = np.exp(
+        -18.0 * 100.0 * dry_air_total_linear_attenuation_numpy(662.0)
+    )
+    assert (
+        cpu_components.uncollided_kernel[0, 0, 0]
+        / cpu_components.unattenuated_kernel[0, 0, 0]
+    ) == pytest.approx(float(expected_ratio), rel=2.0e-13)
 
 
 def test_matched_row_kernel_apis_match_cpu_and_torch_batches() -> None:
@@ -757,6 +993,126 @@ def test_line_transport_pair_program_torch_matches_selected_pair_oracle() -> Non
             rtol=2.0e-10,
             atol=2.0e-12,
         )
+
+
+def test_pair_program_device_components_match_host_components() -> None:
+    """Device-resident output must preserve every exact component value."""
+    torch = pytest.importorskip("torch")
+    kernel = _line_resolved_full_physics_kernel(use_gpu=True)
+    detectors, sources, _, _ = _line_resolved_inputs()
+    indices = np.asarray([0, 2], dtype=np.int64)
+    fe_program = np.asarray([[0, 2, 7], [1, 5, 3]], dtype=np.int64)
+    pb_program = np.asarray([[7, 4, 0], [6, 2, 3]], dtype=np.int64)
+
+    host = kernel.line_transport_components_pair_program_for_detectors(
+        "TestIso",
+        detectors,
+        sources,
+        fe_program,
+        pb_program,
+        indices,
+        chunk_size=5,
+    )
+    device = kernel.line_transport_components_pair_program_for_detectors(
+        "TestIso",
+        detectors,
+        sources,
+        fe_program,
+        pb_program,
+        indices,
+        chunk_size=5,
+        device_resident=True,
+    )
+
+    for field_name in (
+        "total_kernel",
+        "unattenuated_kernel",
+        "uncollided_kernel",
+        "tau_fe",
+        "tau_pb",
+        "tau_obstacle",
+        "tau_obstacle_compton",
+        "distance_m",
+    ):
+        device_value = getattr(device, field_name)
+        assert isinstance(device_value, torch.Tensor)
+        np.testing.assert_array_equal(
+            device_value.detach().cpu().numpy(),
+            getattr(host, field_name),
+        )
+
+
+def test_pair_program_evaluates_only_selected_shield_orientations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Compact pair programs must not trace unused exact shield geometries."""
+    pytest.importorskip("torch")
+    kernel = _line_resolved_full_physics_kernel(use_gpu=True)
+    detectors = np.asarray(
+        [[0.0, 0.0, 1.0], [1.8, 1.7, 1.2]],
+        dtype=np.float64,
+    )
+    sources = np.asarray(
+        [[1.0, 1.0, 1.0], [-0.8, 0.4, 0.7]],
+        dtype=np.float64,
+    )
+    fe_program = np.asarray([[0, 0, 0], [0, 0, 0]], dtype=np.int64)
+    pb_program = np.asarray([[1, 2, 1], [1, 2, 1]], dtype=np.int64)
+    original = (
+        continuous_kernels
+        .segment_rotated_octant_shell_path_length_cm_torch
+    )
+    call_count = 0
+
+    def _counted_segment(*args: object, **kwargs: object) -> object:
+        """Count and delegate one exact shield-segment evaluation."""
+        nonlocal call_count
+        call_count += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        continuous_kernels,
+        "segment_rotated_octant_shell_path_length_cm_torch",
+        _counted_segment,
+    )
+    kernel._kernel_values_all_pairs_for_detector_source_torch_chunk(
+        "TestIso",
+        detectors,
+        sources,
+        positive_line_indices=np.asarray([0, 2], dtype=np.int64),
+        return_line_transport_components=True,
+        fe_indices_by_row=fe_program,
+        pb_indices_by_row=pb_program,
+    )
+
+    assert call_count == 3
+
+
+def test_torch_physics_constants_are_cached_by_exact_contents() -> None:
+    """Repeated constants reuse device storage while changed values do not."""
+    torch = pytest.importorskip("torch")
+    kernel = _line_resolved_full_physics_kernel(use_gpu=True)
+    first = kernel._constant_tensor_torch(
+        "test",
+        np.asarray([1.0, 2.0], dtype=np.float64),
+        device=torch.device("cpu"),
+        dtype=torch.float64,
+    )
+    second = kernel._constant_tensor_torch(
+        "test",
+        np.asarray([1.0, 2.0], dtype=np.float64),
+        device=torch.device("cpu"),
+        dtype=torch.float64,
+    )
+    changed = kernel._constant_tensor_torch(
+        "test",
+        np.asarray([1.0, 3.0], dtype=np.float64),
+        device=torch.device("cpu"),
+        dtype=torch.float64,
+    )
+
+    assert first.data_ptr() == second.data_ptr()
+    assert first.data_ptr() != changed.data_ptr()
 
 
 @pytest.mark.parametrize(

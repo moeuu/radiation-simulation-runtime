@@ -10,10 +10,13 @@ from typing import Mapping, Sequence
 
 import numpy as np
 
+from spectrum.additive_scatter import scatter_basis_from_stored_geometry_numpy
 from spectrum.mean_calibration_runner import (
     load_mean_calibration_pair_artifact,
 )
 from spectrum.transport_spectral import (
+    DESIGNATED_TRAINING_SCENE_SEEDS,
+    VALIDATION_SCENARIO_IDS,
     GeometryConditionedSpectralModel,
     LowRankSpectralMeanCorrection,
     low_rank_spectral_mean_descriptor_numpy,
@@ -25,33 +28,33 @@ _DEFAULT_TRAINING_ROOT = (
     _ROOT
     / "results"
     / "mean_calibration"
-    / "standard_native_exact_analog65536_20260729"
+    / "randomized_geometry_family_v4"
 )
 _DEFAULT_BASE_MODEL = (
     _ROOT
     / "configs"
     / "geant4"
     / "models"
-    / "geometry_conditioned_full_spectrum_exact_v1.json"
+    / "geometry_conditioned_full_spectrum_randomized_mean_v3.json"
 )
 _DEFAULT_OUTPUT = (
     _ROOT
     / "configs"
     / "geant4"
     / "models"
-    / "low_rank_spectral_mean_correction_v1.json"
+    / "low_rank_spectral_mean_correction_randomized_v4.json"
 )
 _DEFAULT_SELECTION = (
     _ROOT
     / "results"
-    / "full_spectrum_short_diagnostic"
-    / "low_rank_mean_selection.json"
+    / "randomized_component_training_v2"
+    / "low_rank_mean_selection_v4.json"
 )
-_TRAINING_SCENE_SEEDS = (2026072701, 2026072702)
-_TRAINING_SCENARIOS = (
-    "dominant_plus_absent_isotope",
-    "multi_isotope_superposition",
-    "continuous_surface_perturbation_ranking",
+_TRAINING_SCENE_SEEDS = DESIGNATED_TRAINING_SCENE_SEEDS
+_TRAINING_SCENARIOS = tuple(
+    scenario
+    for scenario in VALIDATION_SCENARIO_IDS
+    if scenario != "background_only"
 )
 _RANK_GRID = (1, 2, 4, 6, 8)
 _RIDGE_GRID = (1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1, 1.0, 10.0, 100.0)
@@ -196,15 +199,25 @@ def _training_row(
         geometry["transport_features_slf"],
         dtype=np.float64,
     )
-    scatter_basis = np.asarray(
+    stored_scatter_basis = np.asarray(
         geometry["additive_scatter_basis_slf"],
         dtype=np.float64,
     )
     additive = model.additive_scatter_response
     if additive is None:
         raise RuntimeError("Base model lacks its authenticated scatter response.")
+    scatter_basis = scatter_basis_from_stored_geometry_numpy(
+        stored_basis=stored_scatter_basis,
+        transport_features=features,
+        line_identity=model.line_identity,
+        target_semantics=additive.feature_basis_semantics,
+    )
     total = additive.total_kernel_numpy(
         unattenuated,
+        uncollided,
+        scatter_basis,
+    )
+    uncollided = additive.corrected_uncollided_kernel_numpy(
         uncollided,
         scatter_basis,
     )
@@ -371,11 +384,18 @@ def build_correction(
         )
         for seed in _TRAINING_SCENE_SEEDS
     }
+    additive = base_model.additive_scatter_response
+    if additive is None:
+        raise RuntimeError("Base model lacks its authenticated scatter response.")
     training_manifest: dict[str, object] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "training_policy": (
-            "fixed_quota_loso_training_only_low_rank_log_mean_v1"
+            "randomized_geometry_family_loso_low_rank_log_mean_v3"
         ),
+        "base_additive_response_contract_sha256": (
+            additive.contract_hash_sha256
+        ),
+        "feature_basis_semantics": additive.feature_basis_semantics,
         "training_scene_seeds": list(_TRAINING_SCENE_SEEDS),
         "scenario_ids": list(_TRAINING_SCENARIOS),
         "pair_ids_by_scene": pair_ids_by_scene,

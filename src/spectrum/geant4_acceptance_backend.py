@@ -28,6 +28,10 @@ from measurement.observation_model import (
     build_runtime_observation_model,
     continuous_kernel_from_observation_model,
 )
+from measurement.geometry_family import (
+    geometry_family_descriptor,
+    randomized_training_geometry_parameters,
+)
 from measurement.obstacle_assets import obstacle_instances_to_dicts
 from measurement.obstacles import ObstacleGrid, build_obstacle_grid
 from measurement.source_boundary import (
@@ -37,6 +41,7 @@ from measurement.source_boundary import (
     surface_source_runtime_contract_sha256,
 )
 from measurement.source_surfaces import generate_surface_sources
+from measurement.shielding import SHIELD_POSE_CONTRACT_SHA256
 from measurement.surface_charts import build_surface_chart_geometry
 from runtime.randomness import named_random_generator
 from measurement.surface_atlas import ContinuousSurfaceAtlas
@@ -59,6 +64,7 @@ from spectrum.additive_scatter import (
 from spectrum.full_spectrum_acceptance_runner import (
     ACCEPTANCE_DWELL_TIME_S,
     ACCEPTANCE_ISOTOPES,
+    ACCEPTANCE_PAIR_SCHEMA_VERSION,
     ACCEPTANCE_PAIR_IDS,
     ACCEPTANCE_SCENARIO_SOURCE_SPEC,
     AcceptanceScenarioSession,
@@ -71,7 +77,14 @@ from spectrum.native_metadata import (
     native_source_line_token,
     sanitize_native_metadata_token,
 )
-from spectrum.response_matrix import NATIVE_GEANT4_BIN_COUNT
+from spectrum.physics_contracts import (
+    OBSTACLE_MATERIAL_CONTRACT_SHA256,
+    TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256,
+)
+from spectrum.response_matrix import (
+    NATIVE_GEANT4_BIN_COUNT,
+    NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256,
+)
 from spectrum.transport_spectral import (
     FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256,
     TRANSPORT_FEATURE_ORDER,
@@ -485,6 +498,11 @@ def _build_environment(
     room_boundary_thickness_m: float,
 ) -> tuple[EnvironmentConfig, ObstacleGrid, tuple[object, ...]]:
     """Build the deterministic random Manchester environment for one seed."""
+    del obstacle_height_m
+    family_parameters = randomized_training_geometry_parameters(
+        scene_seed,
+        room_size_xyz=ACCEPTANCE_ROOM_SIZE_XYZ,
+    )
     environment = EnvironmentConfig(
         size_x=ACCEPTANCE_ROOM_SIZE_XYZ[0],
         size_y=ACCEPTANCE_ROOM_SIZE_XYZ[1],
@@ -497,15 +515,15 @@ def _build_environment(
         size_x=environment.size_x,
         size_y=environment.size_y,
         cell_size=1.0,
-        blocked_fraction=ACCEPTANCE_OBSTACLE_BLOCKED_FRACTION,
+        blocked_fraction=float(family_parameters["blocked_fraction"]),
         rng_seed=scene_seed,
         keep_free_points=(ACCEPTANCE_DETECTOR_POSE_XYZ[:2],),
-        passage_width_m=ACCEPTANCE_PASSAGE_WIDTH_M,
+        passage_width_m=float(family_parameters["passage_width_m"]),
     )
     grid, instances = attach_random_manchester_transport_geometry(
         grid,
         room_size_xyz=ACCEPTANCE_ROOM_SIZE_XYZ,
-        obstacle_height_m=obstacle_height_m,
+        obstacle_height_m=float(family_parameters["obstacle_height_m"]),
         rng_seed=scene_seed,
         include_room_boundaries=author_room_boundaries,
         room_boundary_thickness_m=room_boundary_thickness_m,
@@ -818,6 +836,8 @@ def _request_for_command(
         fe_shield_quat_wxyz=fe_pose.orientation_wxyz,
         pb_shield_pose_xyz=pb_pose.translation_xyz,
         pb_shield_quat_wxyz=pb_pose.orientation_wxyz,
+        fe_orientation_index=int(command.fe_orientation_index),
+        pb_orientation_index=int(command.pb_orientation_index),
     )
 
 
@@ -1037,6 +1057,7 @@ class _NativeScenarioSession(AcceptanceScenarioSession):
         geometry: _GeometryBatch,
         perturbed_geometry: _GeometryBatch | None,
         boundary_gate: Mapping[str, object],
+        geometry_family: Mapping[str, object],
     ) -> None:
         """Store immutable acquisition state for one scenario."""
         self.app = app
@@ -1049,6 +1070,9 @@ class _NativeScenarioSession(AcceptanceScenarioSession):
         self.perturbed_geometry = perturbed_geometry
         self.boundary_gate = json.loads(
             json.dumps(dict(boundary_gate), allow_nan=False)
+        )
+        self.geometry_family = json.loads(
+            json.dumps(dict(geometry_family), allow_nan=False)
         )
         exported = getattr(app.engine, "scene", None)
         if exported is None:
@@ -1157,7 +1181,7 @@ class _NativeScenarioSession(AcceptanceScenarioSession):
                 }
             )
         return {
-            "schema_version": 1,
+            "schema_version": ACCEPTANCE_PAIR_SCHEMA_VERSION,
             "acceptance_contract_sha256": (
                 FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256
             ),
@@ -1177,8 +1201,19 @@ class _NativeScenarioSession(AcceptanceScenarioSession):
             ),
             "observed_spectrum_counts": observed.tolist(),
             "geometry": geometry,
+            "geometry_family": dict(self.geometry_family),
             "validation_labels": labels,
             "native_fidelity": fidelity,
+            "detector_response_contract_sha256": (
+                NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
+            ),
+            "shield_pose_contract_sha256": SHIELD_POSE_CONTRACT_SHA256,
+            "obstacle_material_contract_sha256": (
+                OBSTACLE_MATERIAL_CONTRACT_SHA256
+            ),
+            "transport_physics_table_contract_sha256": (
+                TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256
+            ),
         }
 
     def close(self) -> None:
@@ -1355,6 +1390,10 @@ class ExternalGeant4AcceptanceBackend(AcceptanceTransportBackend):
         cached = self._boundary_gate_by_seed.get(scene_seed)
         if cached is not None:
             return cached
+        family_parameters = randomized_training_geometry_parameters(
+            scene_seed,
+            room_size_xyz=ACCEPTANCE_ROOM_SIZE_XYZ,
+        )
         probe = generate_surface_sources(
             env=environment,
             obstacle_grid=grid,
@@ -1365,7 +1404,9 @@ class ExternalGeant4AcceptanceBackend(AcceptanceTransportBackend):
                 _BOUNDARY_RNG_DOMAIN,
             ),
             count=1,
-            obstacle_height_m=float(self.app_config.obstacle_height_m),
+            obstacle_height_m=float(
+                family_parameters["obstacle_height_m"]
+            ),
             chart_max_edge_m=ACCEPTANCE_SURFACE_CHART_MAX_EDGE_M,
         )
         app = self._app_for_scene(
@@ -1401,12 +1442,18 @@ class ExternalGeant4AcceptanceBackend(AcceptanceTransportBackend):
                 self._room_boundary_thickness_m()
             ),
         )
+        family_parameters = randomized_training_geometry_parameters(
+            scene_seed,
+            room_size_xyz=ACCEPTANCE_ROOM_SIZE_XYZ,
+        )
         sources = _generate_sources(
             environment=environment,
             grid=grid,
             scene_seed=scene_seed,
             scenario_id=scenario_id,
-            obstacle_height_m=float(self.app_config.obstacle_height_m),
+            obstacle_height_m=float(
+                family_parameters["obstacle_height_m"]
+            ),
         )
         model = GeometryConditionedSpectralModel.standard_native(
             ACCEPTANCE_ISOTOPES,
@@ -1431,7 +1478,9 @@ class ExternalGeant4AcceptanceBackend(AcceptanceTransportBackend):
                 environment=environment,
                 grid=grid,
                 sources=sources,
-                obstacle_height_m=float(self.app_config.obstacle_height_m),
+                obstacle_height_m=float(
+                    family_parameters["obstacle_height_m"]
+                ),
             )
             perturbed_geometry = _geometry_batch(
                 kernel=kernel,
@@ -1461,6 +1510,20 @@ class ExternalGeant4AcceptanceBackend(AcceptanceTransportBackend):
                 geometry=geometry,
                 perturbed_geometry=perturbed_geometry,
                 boundary_gate=gate,
+                geometry_family=geometry_family_descriptor(
+                    grid,
+                    instances,
+                    room_size_xyz=ACCEPTANCE_ROOM_SIZE_XYZ,
+                    passage_width_m=float(
+                        family_parameters["passage_width_m"]
+                    ),
+                    target_blocked_fraction=float(
+                        family_parameters["blocked_fraction"]
+                    ),
+                    obstacle_height_limit_m=float(
+                        family_parameters["obstacle_height_m"]
+                    ),
+                ),
             )
         )
 

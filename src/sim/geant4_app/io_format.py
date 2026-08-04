@@ -262,12 +262,21 @@ def write_scene_file(scene: ExportedGeant4Scene, path: str | Path) -> None:
 def write_request_file(request: Geant4StepRequest, path: str | Path) -> None:
     """Write one Geant4 step request into a line-oriented text format."""
     output_path = Path(path)
+    fe_orientation_index, pb_orientation_index = (
+        request.resolved_orientation_indices()
+    )
     lines = [
         _format_line(
             "STEP",
             step_id=request.step_id,
             dwell_time_s=request.dwell_time_s,
             seed=request.seed,
+            shield_pose_contract_id=request.shield_pose_contract_id,
+            shield_pose_contract_sha256=(
+                request.shield_pose_contract_sha256
+            ),
+            fe_orientation_index=fe_orientation_index,
+            pb_orientation_index=pb_orientation_index,
         ),
         _format_line(
             "POSE",

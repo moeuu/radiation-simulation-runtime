@@ -6,11 +6,25 @@ from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from hashlib import sha256
 from pathlib import Path
-from measurement.shielding import line_resolved_shield_mu_by_isotope
+from measurement.shielding import (
+    SHIELD_POSE_CONTRACT_ID,
+    SHIELD_POSE_CONTRACT_SHA256,
+    line_resolved_shield_mu_by_isotope,
+    shield_pose_contract_payload,
+)
 from runtime.provenance import sha256_json
+from spectrum.physics_contracts import (
+    OBSTACLE_MATERIAL_CONTRACT_ID,
+    OBSTACLE_MATERIAL_CONTRACT_SHA256,
+    TRANSPORT_PHYSICS_TABLE_CONTRACT_ID,
+    TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256,
+)
+from spectrum.response_matrix import (
+    NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256,
+)
 
 
-FORWARD_MODEL_MANIFEST_SCHEMA_VERSION = 2
+FORWARD_MODEL_MANIFEST_SCHEMA_VERSION = 4
 SOURCE_RATE_MODEL = "detector_cps_1m"
 SOURCE_RATE_SEMANTICS = {
     "quantity": "expected_pre_dead_time_detector_pulse_rate",
@@ -58,6 +72,13 @@ _NATIVE_FIELDS = {
     "units",
     "response_semantics",
     "line_mu_by_isotope",
+    "shield_pose_contract_id",
+    "shield_pose_contract_sha256",
+    "detector_response_contract_sha256",
+    "obstacle_material_contract_id",
+    "obstacle_material_contract_sha256",
+    "transport_physics_table_contract_id",
+    "transport_physics_table_contract_sha256",
 }
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
@@ -263,12 +284,40 @@ def _runtime_file_asset_identities(
     for field_path, component, path_value in _runtime_file_asset_references(
         runtime_config
     ):
-        grouped[component][field_path] = _file_asset_identity(
-            path_value,
-            field_name=f"runtime_config.{field_path}",
-            run_root=run_root,
-            repository_root=repository_root,
-        )
+        if (
+            field_path == "full_spectrum_model_registry_path"
+            and isinstance(
+                runtime_config.get("full_spectrum_generative_model"),
+                Mapping,
+            )
+            and runtime_config.get(
+                "full_spectrum_model_registry_file_sha256"
+            )
+            is not None
+        ):
+            relative = _safe_relative_asset_path(
+                path_value,
+                field_name=f"runtime_config.{field_path}",
+            )
+            grouped[component][field_path] = {
+                "path": relative.as_posix(),
+                "sha256": _sha256(
+                    runtime_config[
+                        "full_spectrum_model_registry_file_sha256"
+                    ],
+                    name=(
+                        "runtime_config."
+                        "full_spectrum_model_registry_file_sha256"
+                    ),
+                ),
+            }
+        else:
+            grouped[component][field_path] = _file_asset_identity(
+                path_value,
+                field_name=f"runtime_config.{field_path}",
+                run_root=run_root,
+                repository_root=repository_root,
+            )
     return grouped
 
 
@@ -291,7 +340,11 @@ def forward_model_component_payloads(
         # The shield hash is the full production line table and the spectrum
         # hash is exactly its energy/weight projection. Runtime-specific
         # settings remain bound by the resolved-config artifact hash.
-        "shield": line_table,
+        "shield": {
+            "line_mu_by_isotope": line_table,
+            "pose_contract": shield_pose_contract_payload(),
+            "pose_contract_sha256": SHIELD_POSE_CONTRACT_SHA256,
+        },
         "environment": environment_payload,
         "obstacle": {
             "environment": _selected(
@@ -424,6 +477,21 @@ def build_forward_model_manifest(
         "units": deepcopy(CANONICAL_UNITS),
         "response_semantics": deepcopy(RESPONSE_SEMANTICS),
         "line_mu_by_isotope": line_table,
+        "shield_pose_contract_id": SHIELD_POSE_CONTRACT_ID,
+        "shield_pose_contract_sha256": SHIELD_POSE_CONTRACT_SHA256,
+        "detector_response_contract_sha256": (
+            NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
+        ),
+        "obstacle_material_contract_id": OBSTACLE_MATERIAL_CONTRACT_ID,
+        "obstacle_material_contract_sha256": (
+            OBSTACLE_MATERIAL_CONTRACT_SHA256
+        ),
+        "transport_physics_table_contract_id": (
+            TRANSPORT_PHYSICS_TABLE_CONTRACT_ID
+        ),
+        "transport_physics_table_contract_sha256": (
+            TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256
+        ),
         "model_identifiers": {
             name: {
                 "id": identifiers[name],
@@ -508,6 +576,37 @@ def _validate_common(
         raise ValueError("forward-model units are incompatible.")
     if payload.get("response_semantics") != RESPONSE_SEMANTICS:
         raise ValueError("forward-model response_semantics are incompatible.")
+    if payload.get("shield_pose_contract_id") != SHIELD_POSE_CONTRACT_ID:
+        raise ValueError("forward-model shield-pose contract ID is incompatible.")
+    if (
+        payload.get("shield_pose_contract_sha256")
+        != SHIELD_POSE_CONTRACT_SHA256
+    ):
+        raise ValueError("forward-model shield-pose contract hash is incompatible.")
+    if (
+        payload.get("detector_response_contract_sha256")
+        != NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
+    ):
+        raise ValueError(
+            "forward-model detector-response contract hash is incompatible."
+        )
+    physics_contracts = {
+        "obstacle_material_contract_id": OBSTACLE_MATERIAL_CONTRACT_ID,
+        "obstacle_material_contract_sha256": (
+            OBSTACLE_MATERIAL_CONTRACT_SHA256
+        ),
+        "transport_physics_table_contract_id": (
+            TRANSPORT_PHYSICS_TABLE_CONTRACT_ID
+        ),
+        "transport_physics_table_contract_sha256": (
+            TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256
+        ),
+    }
+    for field_name, expected_value in physics_contracts.items():
+        if payload.get(field_name) != expected_value:
+            raise ValueError(
+                f"forward-model {field_name} is incompatible."
+            )
 
 
 def validate_forward_model_manifest(

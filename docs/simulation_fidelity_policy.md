@@ -61,7 +61,8 @@ definition, statistics, and observation path.
   when an obstacle layout or generated environment is active.
 - PF shielding likelihoods must use the same spherical-octant shell geometry
   and Pb/Fe dimensions exported to Geant4, not a lower-fidelity fixed-slab
-  shortcut.
+  shortcut. Pose indices, rotations, and pair IDs must satisfy
+  [the shared shield-pose contract](shield_pose_contract.md).
 - Do not implement calibration, response correction, PF observation logic, or
   quality-gate changes that are selected to pass a specific validation run,
   random seed, environment, source layout, shield-pair set, or tail case.

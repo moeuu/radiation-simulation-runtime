@@ -20,15 +20,16 @@ from measurement.shielding import (
     DEFAULT_FE_SHIELD_INNER_RADIUS_CM,
     DEFAULT_PB_SHIELD_INNER_RADIUS_CM,
     DEFAULT_SHIELD_CONTACT_RADIUS_CM,
+    LOCAL_POSITIVE_OCTANT_CENTER,
     spherical_shell_path_length_cm,
 )
 from sim.isaacsim_app.geometry import quaternion_wxyz_to_matrix
 
 SHIELD_SHAPE_SPHERICAL_OCTANT = "spherical_octant_shell"
 LOCAL_POSITIVE_OCTANT_CENTER_XYZ: tuple[float, float, float] = (
-    1.0 / np.sqrt(3.0),
-    1.0 / np.sqrt(3.0),
-    1.0 / np.sqrt(3.0),
+    float(LOCAL_POSITIVE_OCTANT_CENTER[0]),
+    float(LOCAL_POSITIVE_OCTANT_CENTER[1]),
+    float(LOCAL_POSITIVE_OCTANT_CENTER[2]),
 )
 
 FE_SHIELD_INNER_RADIUS_M = DEFAULT_FE_SHIELD_INNER_RADIUS_CM / 100.0

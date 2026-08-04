@@ -16,6 +16,7 @@ from typing import Any
 
 import numpy as np
 
+from sim.isaacsim_app.geometry import quaternion_wxyz_to_matrix
 from sim.isaacsim_app.materials import normalize_composition_by_mass, normalize_material_name
 
 
@@ -494,22 +495,32 @@ class FakeStageBackend(StageBackend):
         prim.scale_xyz = tuple(float(v) for v in scale)
 
     def get_world_pose(self, path: str) -> PrimPose:
-        """Return the stored prim pose with parent translations accumulated."""
+        """Return the stored prim pose with all parent transforms composed."""
         prim = self.prims.get(path)
         if prim is None:
             raise KeyError(f"Prim not found: {path}")
         translation = np.asarray(prim.pose.translation_xyz, dtype=float)
+        rotation = quaternion_wxyz_to_matrix(
+            prim.pose.orientation_wxyz
+        )
         parent_path = path.rsplit("/", 1)[0]
         while parent_path and parent_path != path:
             parent = self.prims.get(parent_path)
             if parent is not None:
-                translation += np.asarray(parent.pose.translation_xyz, dtype=float)
+                parent_rotation = quaternion_wxyz_to_matrix(
+                    parent.pose.orientation_wxyz
+                )
+                translation = (
+                    parent_rotation @ translation
+                    + np.asarray(parent.pose.translation_xyz, dtype=float)
+                )
+                rotation = parent_rotation @ rotation
             if "/" not in parent_path.strip("/"):
                 break
             parent_path = parent_path.rsplit("/", 1)[0]
         return PrimPose(
             translation_xyz=(float(translation[0]), float(translation[1]), float(translation[2])),
-            orientation_wxyz=prim.pose.orientation_wxyz,
+            orientation_wxyz=_rotation_matrix_to_quaternion_wxyz(rotation),
         )
 
     def list_solid_prims(self, path_prefixes: tuple[str, ...] | None = None) -> list[StageSolidPrim]:

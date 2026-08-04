@@ -332,6 +332,35 @@ def test_pair_artifact_saves_rao_blackwell_moments_and_covariance(
         load_mean_calibration_pair_artifact(manifest)
 
 
+def test_pair_artifact_rejects_laundered_shield_contract(
+    tmp_path: Path,
+) -> None:
+    """A model input cannot gain a new shield contract by editing one JSON."""
+    calibration = parse_mean_calibration_metadata(_metadata(), bin_count=3)
+    response = np.eye(3, dtype=np.float64)
+    raw_covariance = calibration.raw_covariance()
+    manifest = write_mean_calibration_pair_artifact(
+        directory=tmp_path / "pair",
+        provenance={
+            "scene_seed": DESIGNATED_TRAINING_SCENE_SEEDS[0],
+            "scenario_id": "single_line_source_resolved",
+            "shield_pair_id": 0,
+            "dwell_time_s": 30.0,
+            "sources": [],
+        },
+        calibration=calibration,
+        native_spectrum=calibration.raw_mean(),
+        native_spectrum_variance=np.diag(raw_covariance),
+        response_operator_br=response,
+        geometry={},
+    )
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["shield_pose_contract_sha256"] = "0" * 64
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="manifest is invalid"):
+        load_mean_calibration_pair_artifact(manifest)
+
+
 def test_additive_fit_accepts_only_complete_training_scene_identity() -> None:
     """Physical fitting must bind all designated training-scene manifests."""
     rows: list[MeanCalibrationTrainingRow] = []

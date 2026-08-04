@@ -19,7 +19,11 @@ from runtime.measurement_log import (
     MeasurementLogRecord,
     MeasurementLogStreamWriter,
 )
-from runtime.provenance import canonical_json_bytes, repository_commit
+from runtime.provenance import (
+    canonical_json_bytes,
+    repository_commit,
+    repository_source_snapshot_sha256,
+)
 from sim.isaacsim_app.scene_builder import build_scene_description
 from sim.protocol import SimulationCommand, SimulationObservation
 from sim.runtime import (
@@ -52,12 +56,17 @@ _ESTIMATOR_ONLY_PREFIXES = (
 )
 _ESTIMATOR_ONLY_KEYS = frozenset(
     {
+        "cui_truth_display_mode",
         "estimator_profile",
         "gpu_device",
         "gpu_dtype",
         "history_estimate_interval",
+        "max_temper_steps",
+        "min_delta_beta",
+        "num_particles",
         "python_worker_count",
         "pure_pf_schema_version",
+        "target_ess_ratio",
         "use_gpu",
         "variable_cardinality",
     }
@@ -136,6 +145,18 @@ class AcquisitionAction:
         )
 
 
+def estimator_neutral_physical_runtime_config(
+    runtime_config: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return physical runtime fields without estimator-owned settings."""
+    return {
+        str(key): value
+        for key, value in runtime_config.items()
+        if str(key) not in _ESTIMATOR_ONLY_KEYS
+        and not str(key).startswith(_ESTIMATOR_ONLY_PREFIXES)
+    }
+
+
 def estimator_neutral_runtime_config(
     runtime_config: Mapping[str, Any],
     *,
@@ -144,22 +165,22 @@ def estimator_neutral_runtime_config(
     run_root: Path,
 ) -> dict[str, Any]:
     """Return logged physical configuration without estimator-owned settings."""
+    physical_config = estimator_neutral_physical_runtime_config(runtime_config)
     model = geometry_conditioned_model_from_runtime_config(
-        runtime_config,
+        physical_config,
         run_root=run_root,
     )
     profile_resolved = resolve_profile_model_runtime_config(
-        runtime_config,
+        physical_config,
         run_root=run_root,
     )
-    resolved = {
-        str(key): value
-        for key, value in profile_resolved.items()
-        if str(key) not in _ESTIMATOR_ONLY_KEYS
-        and not str(key).startswith(_ESTIMATOR_ONLY_PREFIXES)
-    }
+    resolved = estimator_neutral_physical_runtime_config(profile_resolved)
     resolved.pop("full_spectrum_generative_model_path", None)
     resolved.pop("full_spectrum_generative_model_file_sha256", None)
+    resolved.pop("full_spectrum_model_registry_path", None)
+    resolved.pop("full_spectrum_model_registry_file_sha256", None)
+    resolved.pop("isotope_experiment_profile", None)
+    resolved.pop("full_spectrum_profile_calibration_status", None)
     resolved["full_spectrum_generative_model"] = model.manifest_payload()
     resolved["full_spectrum_contract_hash_sha256"] = model.contract_hash_sha256
     resolved["simulation_runtime_schema_version"] = 1
@@ -311,6 +332,11 @@ def run_acquisition_plan(plan_path: str | Path) -> MeasurementLog:
     commit = repository_commit(Path(__file__).resolve().parents[2])
     if len(commit) != 40:
         raise RuntimeError("Acquisition runtime must execute from a Git commit.")
+    source_snapshot = repository_source_snapshot_sha256(
+        Path(__file__).resolve().parents[2]
+    )
+    run_metadata = dict(plan["metadata"])
+    run_metadata["repository_source_snapshot_sha256"] = source_snapshot
     resolved_hash = sha256(canonical_json_bytes(logged_config)).hexdigest()
     forward = build_forward_model_manifest(
         runtime_config=logged_config,
@@ -329,7 +355,7 @@ def run_acquisition_plan(plan_path: str | Path) -> MeasurementLog:
         environment=environment,
         forward_model_manifest=forward,
         isotopes=isotopes,
-        metadata=plan["metadata"],
+        metadata=run_metadata,
         obstacle_layout_path=plan["obstacle_layout_path"],
         source_layout_path=None,
     )
@@ -367,6 +393,7 @@ def run_acquisition_plan(plan_path: str | Path) -> MeasurementLog:
 __all__ = [
     "AcquisitionAction",
     "ObservationSession",
+    "estimator_neutral_physical_runtime_config",
     "estimator_neutral_runtime_config",
     "run_acquisition_plan",
 ]

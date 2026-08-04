@@ -326,6 +326,132 @@ def known_obstacle_transport_model(
     )
 
 
+def validate_component_transport_contract(
+    grid: ObstacleGrid,
+    instances: Sequence[KnownObstacleInstance],
+    *,
+    room_size_xyz: tuple[float, float, float] | None = None,
+) -> None:
+    """Require collision and transport geometry to preserve authored components.
+
+    A blocked footprint is navigation geometry, not a solid attenuation body.
+    This invariant prevents hollow assets from being serialized or transported
+    as their enclosing box.  Optional room-boundary transport components may
+    follow the authored obstacle components and are intentionally not collision
+    obstacles.
+    """
+    authored_components = tuple(
+        component
+        for instance in instances
+        for component in instance.components
+    )
+    component_boxes = tuple(
+        component.box_m for component in authored_components
+    )
+    if not component_boxes:
+        raise ValueError(
+            "Known obstacle instances require at least one physical component."
+        )
+    if grid.collision_boxes_m != component_boxes:
+        raise ValueError(
+            "Obstacle collision geometry must equal the authored component "
+            "boxes; footprint envelopes are not physical boxes."
+        )
+    if grid.transport_boxes_m[: len(component_boxes)] != component_boxes:
+        raise ValueError(
+            "Obstacle transport geometry must begin with the exact authored "
+            "component boxes; hollow envelopes are forbidden."
+        )
+    if len(grid.transport_boxes_m) < len(component_boxes):
+        raise ValueError(
+            "Obstacle transport geometry omitted authored material components."
+        )
+    trailing_count = len(grid.transport_boxes_m) - len(component_boxes)
+    physical_components = authored_components
+    if trailing_count:
+        if room_size_xyz is None or trailing_count != 6:
+            raise ValueError(
+                "Transport boxes outside authored obstacles must be the six "
+                "explicit room-boundary components."
+            )
+        floor = grid.transport_boxes_m[len(component_boxes)]
+        boundary_thickness = float(floor[5] - floor[2])
+        room_components = room_boundary_transport_components(
+            room_size_xyz,
+            thickness_m=boundary_thickness,
+            material="concrete",
+        )
+        if tuple(
+            component.box_m for component in room_components
+        ) != grid.transport_boxes_m[len(component_boxes) :]:
+            raise ValueError(
+                "Room-boundary transport boxes differ from their authored "
+                "floor, wall, and ceiling components."
+            )
+        physical_components = (*authored_components, *room_components)
+    transport_count = len(grid.transport_boxes_m)
+    isotope_order = tuple(grid.transport_mu_by_isotope)
+    if not isotope_order:
+        raise ValueError(
+            "Component transport requires isotope attenuation coefficients."
+        )
+    _, expected_mu = transport_model_from_components(
+        physical_components,
+        isotopes=isotope_order,
+    )
+    for isotope, values in grid.transport_mu_by_isotope.items():
+        if len(values) != transport_count:
+            raise ValueError(
+                f"Transport attenuation length mismatch for {isotope}."
+            )
+        if not np.allclose(
+            np.asarray(values, dtype=np.float64),
+            np.asarray(expected_mu[isotope], dtype=np.float64),
+            rtol=1.0e-12,
+            atol=1.0e-15,
+        ):
+            raise ValueError(
+                f"Transport attenuation coefficients disagree with authored "
+                f"component materials for {isotope}."
+            )
+    expected_line = line_transport_model_from_components(
+        physical_components,
+        isotopes=isotope_order,
+    )
+    expected_compton = line_compton_transport_model_from_components(
+        physical_components,
+        isotopes=isotope_order,
+    )
+    for table_name, table in (
+        ("line", grid.transport_line_mu_by_isotope),
+        ("Compton", grid.transport_line_compton_mu_by_isotope),
+    ):
+        expected_table = (
+            expected_line if table_name == "line" else expected_compton
+        )
+        if set(table) != set(expected_table):
+            raise ValueError(
+                f"Transport {table_name} isotope keys disagree with authored "
+                "component materials."
+            )
+        for isotope, rows in table.items():
+            if any(len(row) != transport_count for row in rows):
+                raise ValueError(
+                    f"Transport {table_name} attenuation length mismatch "
+                    f"for {isotope}."
+                )
+            if not np.allclose(
+                np.asarray(rows, dtype=np.float64),
+                np.asarray(expected_table[isotope], dtype=np.float64),
+                rtol=1.0e-12,
+                atol=1.0e-15,
+            ):
+                raise ValueError(
+                    f"Transport {table_name} coefficients disagree with "
+                    f"authored component materials for {isotope}."
+                )
+
+
 def known_obstacle_line_transport_model(
     instances: Iterable[KnownObstacleInstance],
     *,

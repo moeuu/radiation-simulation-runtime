@@ -9,6 +9,7 @@ from typing import Mapping, Sequence
 
 import numpy as np
 
+from spectrum.additive_scatter import scatter_basis_from_stored_geometry_numpy
 from spectrum.full_spectrum_acceptance_runner import (
     ACCEPTANCE_ISOTOPES,
     canonical_json_bytes,
@@ -172,9 +173,15 @@ def _group_arrays(
         [record.features_vslf for record in records],
         axis=0,
     )
-    scatter_basis = np.concatenate(
+    stored_scatter_basis = np.concatenate(
         [record.scatter_basis_vslf for record in records],
         axis=0,
+    )
+    scatter_basis = scatter_basis_from_stored_geometry_numpy(
+        stored_basis=stored_scatter_basis,
+        transport_features=features,
+        line_identity=model.line_identity,
+        target_semantics=additive.feature_basis_semantics,
     )
     total = additive.total_kernel_numpy(
         unattenuated,
@@ -205,13 +212,19 @@ def _predicted_training_source_mean(
         geometry["transport_features_slf"],
         dtype=np.float64,
     )
-    scatter_basis = np.asarray(
+    stored_scatter_basis = np.asarray(
         geometry["additive_scatter_basis_slf"],
         dtype=np.float64,
     )
     additive = model.additive_scatter_response
     if additive is None:
         raise RuntimeError("Mean-training model lacks additive scatter response.")
+    scatter_basis = scatter_basis_from_stored_geometry_numpy(
+        stored_basis=stored_scatter_basis,
+        transport_features=features,
+        line_identity=model.line_identity,
+        target_semantics=additive.feature_basis_semantics,
+    )
     total = additive.total_kernel_numpy(
         unattenuated,
         uncollided,

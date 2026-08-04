@@ -13,12 +13,14 @@ import pytest
 
 from runtime.measurement_log import (
     MEASUREMENT_LOG_SCHEMA_VERSION,
-    MeasurementLog,
     MeasurementLogValidationError,
     _validate_full_spectrum_contract_alignment,
+    _validate_environment_payload,
     _validate_record_sequence,
     load_measurement_log,
 )
+from measurement.obstacle_assets import KnownObstacleInstance, ObstacleComponent
+from measurement.obstacles import ObstacleGrid
 from tests.runtime_test_support import make_measurement_log, records
 
 
@@ -299,6 +301,47 @@ def test_loader_rejects_environment_numeric_coercion(
         load_measurement_log(root)
 
 
+def test_environment_rejects_hollow_asset_serialized_as_solid_box() -> None:
+    """MeasurementLog must bind PF replay to authored shell components."""
+    component = ObstacleComponent(
+        name="cabinet_left_wall",
+        center_xyz=(1.05, 1.5, 1.0),
+        size_xyz=(0.1, 1.0, 2.0),
+        material="steel",
+    )
+    instance = KnownObstacleInstance(
+        name="cabinet_0",
+        template="steel_cabinet_hollow",
+        footprint_xy=(1.0, 2.0, 1.0, 2.0),
+        footprint_cells=((1, 1),),
+        components=(component,),
+    )
+    solid_envelope = (1.0, 1.0, 0.0, 2.0, 2.0, 2.0)
+    invalid_grid = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(3, 3),
+        blocked_cells=((1, 1),),
+        collision_boxes_m=(solid_envelope,),
+        transport_boxes_m=(solid_envelope,),
+    )
+    payload = {
+        "environment_model_id": "hollow-contract-test.v1",
+        "size_x": 3.0,
+        "size_y": 3.0,
+        "size_z": 2.5,
+        "detector_position": [0.5, 0.5, 0.5],
+        "obstacle_grid": invalid_grid.to_dict(),
+        "obstacle_instances": [instance.to_dict()],
+    }
+
+    with pytest.raises(
+        MeasurementLogValidationError,
+        match="authored component boxes",
+    ):
+        _validate_environment_payload(payload)
+
+
 def test_loader_rejects_non_string_manifest_isotope(tmp_path: Path) -> None:
     """An isotope identifier cannot be made valid through stringification."""
     root = make_measurement_log(tmp_path / "measurement-log")
@@ -466,4 +509,3 @@ def test_full_spectrum_alignment_rejects_duplicate_manifest_isotopes(
             runtime_config=loaded.runtime_config,
             records=loaded.records,
         )
-

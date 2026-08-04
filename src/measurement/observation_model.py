@@ -24,7 +24,10 @@ from measurement.shielding import (
 )
 from sim.shield_geometry import nested_shield_inner_radii_cm
 from sim.shield_geometry import resolve_shield_thickness_config
-from spectrum.additive_scatter import AdditiveNoncollidedTransportResponse
+from spectrum.additive_scatter import (
+    AdditiveNoncollidedTransportResponse,
+    PhysicsOnlyNoncollidedTransportResponse,
+)
 from spectrum.transport_spectral import (
     geometry_conditioned_model_from_runtime_config,
 )
@@ -38,7 +41,11 @@ class RuntimeObservationModel:
     shield_params: ShieldParams
     mu_by_isotope: dict[str, object]
     line_mu_by_isotope: dict[str, tuple[dict[str, float], ...]] | None
-    additive_scatter_response: AdditiveNoncollidedTransportResponse | None
+    additive_scatter_response: (
+        AdditiveNoncollidedTransportResponse
+        | PhysicsOnlyNoncollidedTransportResponse
+        | None
+    )
     obstacle_mu_by_isotope: dict[str, float] | None
     obstacle_height_m: float
     obstacle_buildup_coeff: float
@@ -244,12 +251,15 @@ def build_runtime_observation_model(
             isotopes=isotope_order,
             normalize_line_intensities=True,
         )
+    full_spectrum_selector_keys = {
+        "full_spectrum_generative_model",
+        "full_spectrum_generative_model_path",
+        "full_spectrum_model_registry_path",
+        "isotope_experiment_profile",
+    }
     full_spectrum_model = (
         geometry_conditioned_model_from_runtime_config(payload)
-        if (
-            "full_spectrum_generative_model" in payload
-            or "full_spectrum_generative_model_path" in payload
-        )
+        if full_spectrum_selector_keys.intersection(payload)
         else None
     )
     obstacle_mu_by_isotope = _obstacle_mu_by_isotope_from_runtime_config(

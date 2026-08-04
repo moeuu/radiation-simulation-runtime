@@ -113,6 +113,10 @@ constexpr double kDefaultFeShieldInnerRadiusM = kDefaultShieldContactRadiusM;
 constexpr double kDefaultPbShieldInnerRadiusM =
     kDefaultFeShieldInnerRadiusM + kDefaultFeShieldThicknessM;
 constexpr double kWorldDaughterMarginM = 0.5;
+constexpr const char* kShieldPoseContractId =
+    "spherical_octant_positive_xyz_incoming_index_v1";
+constexpr const char* kShieldPoseContractSha256 =
+    "0732f12d1f2aa83607560643484652da6ba942d02a0fdfdf4b0fda4e6d3116fd";
 
 struct MaterialSpec {
     std::string name;
@@ -351,6 +355,10 @@ struct RequestSpec {
     PoseSpec detector_pose;
     PoseSpec fe_pose;
     PoseSpec pb_pose;
+    std::string shield_pose_contract_id;
+    std::string shield_pose_contract_sha256;
+    int fe_orientation_index = -1;
+    int pb_orientation_index = -1;
 };
 
 struct SimulationResult {
@@ -1262,6 +1270,55 @@ std::array<double, 3> ShieldNormalFromPose(const PoseSpec& pose) {
         return {local, local, local};
     }
     return {normal[0] / mag, normal[1] / mag, normal[2] / mag};
+}
+
+std::array<double, 3> PhysicalShieldNormalFromOrientationIndex(
+    const int orientation_index
+) {
+    if (orientation_index < 0 || orientation_index >= 8) {
+        throw std::runtime_error("Shield orientation index must be in [0, 7].");
+    }
+    const double inv_sqrt3 = 1.0 / std::sqrt(3.0);
+    const int incoming_x = orientation_index < 4 ? 1 : -1;
+    const int incoming_y = (orientation_index % 4) < 2 ? 1 : -1;
+    const int incoming_z = (orientation_index % 2) == 0 ? 1 : -1;
+    return {
+        -static_cast<double>(incoming_x) * inv_sqrt3,
+        -static_cast<double>(incoming_y) * inv_sqrt3,
+        -static_cast<double>(incoming_z) * inv_sqrt3,
+    };
+}
+
+void ValidateShieldPoseContract(const RequestSpec& request) {
+    if (request.shield_pose_contract_id != kShieldPoseContractId) {
+        throw std::runtime_error(
+            "Request shield_pose_contract_id is missing or incompatible."
+        );
+    }
+    if (request.shield_pose_contract_sha256 != kShieldPoseContractSha256) {
+        throw std::runtime_error(
+            "Request shield_pose_contract_sha256 is missing or incompatible."
+        );
+    }
+    const std::array<std::pair<std::string, std::pair<int, PoseSpec>>, 2> entries = {{
+        {"Fe", {request.fe_orientation_index, request.fe_pose}},
+        {"Pb", {request.pb_orientation_index, request.pb_pose}},
+    }};
+    for (const auto& entry : entries) {
+        const auto expected = PhysicalShieldNormalFromOrientationIndex(
+            entry.second.first
+        );
+        const auto actual = ShieldNormalFromPose(entry.second.second);
+        for (std::size_t axis = 0; axis < 3; ++axis) {
+            if (std::abs(expected[axis] - actual[axis]) > 1.0e-8) {
+                throw std::runtime_error(
+                    entry.first
+                    + " shield quaternion violates the shared local "
+                    "(+X,+Y,+Z) octant-pose contract."
+                );
+            }
+        }
+    }
 }
 
 std::array<std::array<double, 3>, 3> ShieldAxesFromPose(const PoseSpec& pose) {
@@ -5092,6 +5149,24 @@ RequestSpec ReadRequestFile(const std::string& request_path) {
             request.step_id = static_cast<int>(ParseLong(fields, "step_id", 0));
             request.dwell_time_s = ParseDouble(fields, "dwell_time_s", 1.0);
             request.seed = ParseLong(fields, "seed", 123);
+            request.shield_pose_contract_id = ParseString(
+                fields,
+                "shield_pose_contract_id"
+            );
+            request.shield_pose_contract_sha256 = ParseString(
+                fields,
+                "shield_pose_contract_sha256"
+            );
+            request.fe_orientation_index = static_cast<int>(ParseLong(
+                fields,
+                "fe_orientation_index",
+                -1
+            ));
+            request.pb_orientation_index = static_cast<int>(ParseLong(
+                fields,
+                "pb_orientation_index",
+                -1
+            ));
         } else if (tokens[0] == "POSE") {
             PoseSpec pose;
             pose.x = ParseDouble(fields, "x");
@@ -5111,6 +5186,7 @@ RequestSpec ReadRequestFile(const std::string& request_path) {
             }
         }
     }
+    ValidateShieldPoseContract(request);
     return request;
 }
 
@@ -7130,6 +7206,15 @@ public:
         );
         const auto fe_shield_normal = ShieldNormalFromPose(request.fe_pose);
         const auto pb_shield_normal = ShieldNormalFromPose(request.pb_pose);
+        result.metadata["shield_pose_contract_id"] = kShieldPoseContractId;
+        result.metadata["shield_pose_contract_sha256"] =
+            kShieldPoseContractSha256;
+        result.metadata["fe_orientation_index"] = std::to_string(
+            request.fe_orientation_index
+        );
+        result.metadata["pb_orientation_index"] = std::to_string(
+            request.pb_orientation_index
+        );
         result.metadata["fe_shield_normal_x"] = std::to_string(fe_shield_normal[0]);
         result.metadata["fe_shield_normal_y"] = std::to_string(fe_shield_normal[1]);
         result.metadata["fe_shield_normal_z"] = std::to_string(fe_shield_normal[2]);

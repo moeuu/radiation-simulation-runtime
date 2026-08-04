@@ -9,12 +9,18 @@ from measurement.shielding import (
     DEFAULT_SHIELD_TRANSMISSION_TARGET,
     HVL_TVL_TABLE_MM,
     OCTANT_NORMALS,
+    LOCAL_POSITIVE_OCTANT_CENTER,
     OctantShield,
+    SHIELD_POSE_CONTRACT_ID,
+    SHIELD_POSE_CONTRACT_SHA256,
     generate_octant_orientations,
     generate_octant_rotation_matrices,
     generate_fe_pb_orientation_pairs,
     line_resolved_shield_mu_by_isotope,
     octant_index_from_normal,
+    octant_index_from_rotation,
+    physical_shield_normal_from_orientation_index,
+    shield_pose_contract_payload,
     cartesian_to_spherical,
     iron_shield,
     mu_by_isotope_from_hvl_mm,
@@ -78,19 +84,34 @@ def test_generate_octant_orientations_and_index() -> None:
 
 
 def test_generate_rotation_matrices_and_pairs() -> None:
-    """Rotation matrices should be orthonormal with third column aligned to the octant normal; pair count = 8x8."""
+    """Rotations must place material opposite each incoming octant normal."""
     mats = generate_octant_rotation_matrices()
     assert mats.shape == (8, 3, 3)
-    for n, m in zip(generate_octant_orientations(), mats):
-        # third column = normalized normal
-        n_unit = n / np.linalg.norm(n)
-        assert np.allclose(m[:, 2], n_unit)
-        # columns should be orthonormal
+    for index, m in enumerate(mats):
+        expected_physical = physical_shield_normal_from_orientation_index(index)
+        assert np.allclose(m @ LOCAL_POSITIVE_OCTANT_CENTER, expected_physical)
         assert np.allclose(m.T @ m, np.eye(3), atol=1e-6)
+        assert np.linalg.det(m) == pytest.approx(1.0)
+        assert octant_index_from_rotation(m) == index
     pairs = generate_fe_pb_orientation_pairs()
     assert len(pairs) == 64
-    assert pairs[0]["id"] == 0
-    assert pairs[-1]["id"] == 63
+    for pair_id, pair in enumerate(pairs):
+        assert pair["id"] == pair_id
+        assert pair["fe_index"] == pair_id // 8
+        assert pair["pb_index"] == pair_id % 8
+        assert octant_index_from_rotation(pair["RFe"]) == pair_id // 8
+        assert octant_index_from_rotation(pair["RPb"]) == pair_id % 8
+
+
+def test_shield_pose_contract_digest_is_stable() -> None:
+    """The cross-language shield contract must change only by versioned edit."""
+    assert SHIELD_POSE_CONTRACT_ID == (
+        "spherical_octant_positive_xyz_incoming_index_v1"
+    )
+    assert SHIELD_POSE_CONTRACT_SHA256 == (
+        "0732f12d1f2aa83607560643484652da6ba942d02a0fdfdf4b0fda4e6d3116fd"
+    )
+    assert shield_pose_contract_payload()["pair_ids"] == list(range(64))
 
 
 def test_tvl_table_mu_and_attenuation_factors() -> None:

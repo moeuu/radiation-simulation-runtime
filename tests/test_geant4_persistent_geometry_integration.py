@@ -11,6 +11,11 @@ import sys
 
 import pytest
 
+from measurement.shielding import (
+    SHIELD_POSE_CONTRACT_ID,
+    SHIELD_POSE_CONTRACT_SHA256,
+)
+
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 SCENE_PATH = (
@@ -66,7 +71,13 @@ def _write_request(
     path.write_text(
         "\n".join(
             (
-                f"STEP step_id={step_id} dwell_time_s=1 seed={seed}",
+                (
+                    f"STEP step_id={step_id} dwell_time_s=1 seed={seed} "
+                    f"shield_pose_contract_id={SHIELD_POSE_CONTRACT_ID} "
+                    "shield_pose_contract_sha256="
+                    f"{SHIELD_POSE_CONTRACT_SHA256} "
+                    "fe_orientation_index=7 pb_orientation_index=7"
+                ),
                 (
                     "POSE kind=detector "
                     f"x={detector_x_m} y=0 z=0 "

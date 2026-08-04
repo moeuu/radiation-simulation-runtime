@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import json
 from typing import Sequence, Tuple
 
 import numpy as np
@@ -36,6 +38,48 @@ LOCAL_POSITIVE_OCTANT_CENTER: NDArray[np.float64] = np.array(
     dtype=float,
 )
 LOCAL_POSITIVE_OCTANT_CENTER /= np.linalg.norm(LOCAL_POSITIVE_OCTANT_CENTER)
+
+# Immutable cross-language contract for command indices and physical placement.
+# An orientation index names the incoming photon direction (source -> detector).
+# The material shell must occupy the opposite detector -> source octant.
+SHIELD_POSE_CONTRACT_ID = "spherical_octant_positive_xyz_incoming_index_v1"
+SHIELD_POSE_CONTRACT_SCHEMA_VERSION = 1
+
+
+def shield_pose_contract_payload() -> dict[str, object]:
+    """Return the canonical Python/Geant4 octant-pose contract payload."""
+    return {
+        "schema_version": SHIELD_POSE_CONTRACT_SCHEMA_VERSION,
+        "contract_id": SHIELD_POSE_CONTRACT_ID,
+        "rotation_semantics": "active_local_to_world",
+        "local_occupied_octant": {
+            "x": "nonnegative",
+            "y": "nonnegative",
+            "z": "nonnegative",
+        },
+        "local_material_center_xyz": [
+            float(value) for value in LOCAL_POSITIVE_OCTANT_CENTER
+        ],
+        "orientation_index_semantics": "incoming_source_to_detector_octant",
+        "physical_material_center_semantics": (
+            "negative_orientation_index_normal_detector_to_source"
+        ),
+        "orientation_normals_xyz": OCTANT_NORMALS.tolist(),
+        "pair_id_semantics": "8_times_fe_orientation_index_plus_pb_orientation_index",
+        "pair_ids": list(range(64)),
+        "geant4_sphere_phi_deg": [0.0, 90.0],
+        "geant4_sphere_theta_deg": [0.0, 90.0],
+    }
+
+
+SHIELD_POSE_CONTRACT_SHA256 = hashlib.sha256(
+    json.dumps(
+        shield_pose_contract_payload(),
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+).hexdigest()
 
 OCTANT_THETA_PHI_RANGES: list[tuple[tuple[float, float], tuple[float, float]]] = [
     ((0.0, np.pi / 2.0), (0.0, np.pi / 2.0)),
@@ -549,42 +593,76 @@ def generate_octant_orientations() -> NDArray[np.float64]:
     return OCTANT_NORMALS.copy()
 
 
-def rotation_matrix_from_normal(normal: NDArray[np.float64]) -> NDArray[np.float64]:
-    """
-    Generate a simple rotation matrix for an octant defined by a normal.
+def physical_shield_normal_from_orientation_index(
+    orientation_index: int,
+) -> NDArray[np.float64]:
+    """Return the material-centre normal for one incoming octant index."""
+    if isinstance(orientation_index, bool) or not isinstance(
+        orientation_index,
+        (int, np.integer),
+    ):
+        raise TypeError("orientation_index must be an integer.")
+    index = int(orientation_index)
+    if not 0 <= index < len(OCTANT_NORMALS):
+        raise ValueError("orientation_index must be in [0, 7].")
+    return -np.asarray(OCTANT_NORMALS[index], dtype=float).copy()
 
-    The third column is aligned with the (normalized) octant normal. The first two
-    columns are any orthonormal basis spanning the plane perpendicular to the normal.
+
+def rotation_matrix_from_normal(normal: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Return an active rotation placing material at a physical normal.
+
+    A spherical-octant solid occupies local ``(+X,+Y,+Z)``.  Its centre
+    direction is therefore ``(1, 1, 1) / sqrt(3)``, not the local Z axis.
+    The returned active rotation maps that local centre direction onto the
+    requested physical normal, matching the Geant4 placement contract.
     """
     n = np.asarray(normal, dtype=float)
     n_norm = np.linalg.norm(n)
     if n_norm == 0:
         raise ValueError("normal must be non-zero")
     n_unit = n / n_norm
-    # choose a helper vector that is not collinear
-    helper = np.array([1.0, 0.0, 0.0]) if abs(n_unit[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
-    x_axis = np.cross(helper, n_unit)
-    x_axis /= (np.linalg.norm(x_axis) + 1e-12)
-    y_axis = np.cross(n_unit, x_axis)
-    y_axis /= (np.linalg.norm(y_axis) + 1e-12)
-    R = np.stack([x_axis, y_axis, n_unit], axis=1)
-    return R
+    local = np.ones(3, dtype=float) / np.sqrt(3.0)
+    cosine = float(np.clip(np.dot(local, n_unit), -1.0, 1.0))
+    if cosine > 1.0 - 1.0e-12:
+        return np.eye(3, dtype=float)
+    if cosine < -1.0 + 1.0e-12:
+        helper = np.array([0.0, 0.0, 1.0], dtype=float)
+        if abs(float(np.dot(local, helper))) > 0.9:
+            helper = np.array([0.0, 1.0, 0.0], dtype=float)
+        axis = np.cross(local, helper)
+        axis /= np.linalg.norm(axis)
+        return 2.0 * np.outer(axis, axis) - np.eye(3, dtype=float)
+    cross = np.cross(local, n_unit)
+    skew = np.array(
+        (
+            (0.0, -cross[2], cross[1]),
+            (cross[2], 0.0, -cross[0]),
+            (-cross[1], cross[0], 0.0),
+        ),
+        dtype=float,
+    )
+    return np.eye(3, dtype=float) + skew + (skew @ skew) / (1.0 + cosine)
 
 
 def octant_index_from_rotation(R: NDArray[np.float64]) -> int:
-    """
-    Map a rotation matrix (diagonal sign matrix) back to its octant index.
-
-    Uses the third column as the normal, consistent with expected_counts_single_isotope.
-    """
-    n = R[:, 2] if R.shape == (3, 3) else np.asarray(R, dtype=float)
-    return octant_index_from_normal(n)
+    """Map an active material placement rotation to its incoming index."""
+    matrix = np.asarray(R, dtype=float)
+    physical_normal = (
+        matrix @ (np.ones(3, dtype=float) / np.sqrt(3.0))
+        if matrix.shape == (3, 3)
+        else matrix
+    )
+    return octant_index_from_normal(-physical_normal)
 
 
 def generate_octant_rotation_matrices() -> NDArray[np.float64]:
-    """Return 8 diagonal rotation matrices corresponding to the octant normals."""
-    normals = generate_octant_orientations()
-    mats = [rotation_matrix_from_normal(n) for n in normals]
+    """Return physical placements for all eight incoming orientation indices."""
+    mats = [
+        rotation_matrix_from_normal(
+            physical_shield_normal_from_orientation_index(index)
+        )
+        for index in range(len(OCTANT_NORMALS))
+    ]
     return np.stack(mats, axis=0)
 
 
@@ -595,7 +673,7 @@ def generate_fe_pb_orientation_pairs() -> list[dict]:
     Returns a list of dictionaries with keys:
         - id: integer orientation ID
         - fe_index, pb_index: octant indices for Fe/Pb
-        - RFe, RPb: 3x3 rotation matrices (diagonal sign matrices)
+        - RFe, RPb: 3x3 active physical material-placement rotations
     """
     fe_normals = generate_octant_orientations()
     pb_normals = generate_octant_orientations()

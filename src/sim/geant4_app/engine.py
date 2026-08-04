@@ -13,6 +13,12 @@ from typing import Any
 
 import numpy as np
 
+from measurement.shielding import (
+    SHIELD_POSE_CONTRACT_ID,
+    SHIELD_POSE_CONTRACT_SHA256,
+    octant_index_from_normal,
+    physical_shield_normal_from_orientation_index,
+)
 from measurement.source_boundary import (
     activity_surface_source_runtime_contract_sha256,
     surface_source_runtime_contract_sha256,
@@ -27,6 +33,7 @@ from sim.radiation_visualization import (
     RadiationVisualizationConfig,
     build_visualization_metadata_from_scene,
 )
+from sim.shield_geometry import shield_normal_from_quaternion_wxyz
 from spectrum.library import default_library, nuclide_catalog_sha256
 
 
@@ -171,6 +178,46 @@ def validate_native_scene_identity(
         )
 
 
+def validate_native_shield_pose_identity(
+    metadata: dict[str, Any],
+    request: Geant4StepRequest,
+) -> None:
+    """Prove native shield placement matches the shared octant contract."""
+    fe_index, pb_index = request.resolved_orientation_indices()
+    if metadata.get("shield_pose_contract_id") != SHIELD_POSE_CONTRACT_ID:
+        raise RuntimeError("Native Geant4 shield-pose contract is incompatible.")
+    if (
+        metadata.get("shield_pose_contract_sha256")
+        != SHIELD_POSE_CONTRACT_SHA256
+    ):
+        raise RuntimeError("Native Geant4 shield-pose hash is incompatible.")
+    for kind, index in (("fe", fe_index), ("pb", pb_index)):
+        try:
+            native_index = int(metadata[f"{kind}_orientation_index"])
+            native_normal = np.asarray(
+                [
+                    float(metadata[f"{kind}_shield_normal_{axis}"])
+                    for axis in ("x", "y", "z")
+                ],
+                dtype=float,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"Native Geant4 omitted valid {kind} shield-pose identity."
+            ) from exc
+        expected = physical_shield_normal_from_orientation_index(index)
+        if native_index != index or not np.allclose(
+            native_normal,
+            expected,
+            rtol=0.0,
+            atol=2.0e-6,
+        ):
+            raise RuntimeError(
+                f"Native Geant4 {kind} shield placement disagrees with "
+                "the requested octant orientation."
+            )
+
+
 @dataclass(frozen=True)
 class Geant4StepRequest:
     """Describe a single Geant4 step request."""
@@ -184,9 +231,49 @@ class Geant4StepRequest:
     fe_shield_quat_wxyz: tuple[float, float, float, float]
     pb_shield_pose_xyz: tuple[float, float, float]
     pb_shield_quat_wxyz: tuple[float, float, float, float]
+    shield_pose_contract_id: str = SHIELD_POSE_CONTRACT_ID
+    shield_pose_contract_sha256: str = SHIELD_POSE_CONTRACT_SHA256
+    fe_orientation_index: int | None = None
+    pb_orientation_index: int | None = None
+
+    def resolved_orientation_indices(self) -> tuple[int, int]:
+        """Return indices proven consistent with both physical quaternions."""
+        if self.shield_pose_contract_id != SHIELD_POSE_CONTRACT_ID:
+            raise ValueError("Geant4 request shield-pose contract is incompatible.")
+        if self.shield_pose_contract_sha256 != SHIELD_POSE_CONTRACT_SHA256:
+            raise ValueError("Geant4 request shield-pose hash is incompatible.")
+        resolved: list[int] = []
+        for kind, quaternion, declared_index in (
+            ("fe", self.fe_shield_quat_wxyz, self.fe_orientation_index),
+            ("pb", self.pb_shield_quat_wxyz, self.pb_orientation_index),
+        ):
+            physical_normal = np.asarray(
+                shield_normal_from_quaternion_wxyz(quaternion),
+                dtype=float,
+            )
+            inferred_index = octant_index_from_normal(-physical_normal)
+            index = (
+                inferred_index
+                if declared_index is None
+                else int(declared_index)
+            )
+            expected = physical_shield_normal_from_orientation_index(index)
+            if not np.allclose(
+                physical_normal,
+                expected,
+                rtol=0.0,
+                atol=1.0e-8,
+            ):
+                raise ValueError(
+                    f"{kind} shield quaternion does not place local (+X,+Y,+Z) "
+                    f"material at orientation index {index}."
+                )
+            resolved.append(index)
+        return int(resolved[0]), int(resolved[1])
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable request payload."""
+        fe_index, pb_index = self.resolved_orientation_indices()
         return {
             "step_id": int(self.step_id),
             "dwell_time_s": float(self.dwell_time_s),
@@ -197,6 +284,10 @@ class Geant4StepRequest:
             "fe_shield_quat_wxyz": list(self.fe_shield_quat_wxyz),
             "pb_shield_pose_xyz": list(self.pb_shield_pose_xyz),
             "pb_shield_quat_wxyz": list(self.pb_shield_quat_wxyz),
+            "shield_pose_contract_id": self.shield_pose_contract_id,
+            "shield_pose_contract_sha256": self.shield_pose_contract_sha256,
+            "fe_orientation_index": fe_index,
+            "pb_orientation_index": pb_index,
         }
 
 
@@ -287,6 +378,7 @@ class ExternalCommandGeant4Engine(Geant4Engine):
         else:
             spectrum, metadata = self._simulate_one_shot(request)
         validate_native_scene_identity(metadata, self.scene)
+        validate_native_shield_pose_identity(metadata, request)
         metadata["cache_hit"] = bool(self._last_cache_hit)
         metadata["seed"] = int(request.seed)
         metadata.update(

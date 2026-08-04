@@ -9,7 +9,12 @@ import time
 import numpy as np
 
 from measurement.continuous_kernels import validate_orientation_pair_indices
-from measurement.shielding import generate_octant_orientations
+from measurement.shielding import (
+    LOCAL_POSITIVE_OCTANT_CENTER,
+    generate_octant_orientations,
+    physical_shield_normal_from_orientation_index,
+)
+from sim.isaacsim_app.geometry import quaternion_wxyz_to_matrix
 from sim.isaacsim_app.scene_builder import StagePrimPaths
 from sim.isaacsim_app.stage_backend import (
     PrimPose,
@@ -270,11 +275,17 @@ class RobotController:
             )
             if self.animation_time_scale > 0.0 and len(detector_samples) > 1:
                 time.sleep(self.animation_dt_s * self.animation_time_scale)
-        self.stage_backend.set_local_pose(
-            self.prim_paths.robot_root,
-            orientation_wxyz=yaw_to_quaternion_wxyz(float(command.target_base_yaw_rad)),
+        self._apply_pose_and_shields(
+            base_pose_xyz=(
+                float(target_detector_pose[0]),
+                float(target_detector_pose[1]),
+                self.ground_z_m,
+            ),
+            detector_world_z_m=float(target_detector_pose[2]),
+            base_yaw_rad=float(command.target_base_yaw_rad),
+            fe_orientation_index=int(command.fe_orientation_index),
+            pb_orientation_index=int(command.pb_orientation_index),
         )
-        self.stage_backend.step()
         self.state.apply_command(command, ground_z_m=self.ground_z_m)
 
     def _apply_pose_and_shields(
@@ -328,15 +339,18 @@ class RobotController:
         )
         # shared octant indices describe the incoming source-to-detector direction.
         # The physical shell occupies the opposite detector-to-source side.
-        fe_normal = -np.asarray(
-            self._shield_normals[fe_index],
-            dtype=float,
+        root_rotation = quaternion_wxyz_to_matrix(
+            yaw_to_quaternion_wxyz(base_yaw_rad)
         )
-        pb_normal = -np.asarray(
-            self._shield_normals[pb_index],
-            dtype=float,
+        fe_normal = root_rotation.T @ (
+            physical_shield_normal_from_orientation_index(fe_index)
         )
-        local_octant_center = _normalize_vector((1.0, 1.0, 1.0))
+        pb_normal = root_rotation.T @ (
+            physical_shield_normal_from_orientation_index(pb_index)
+        )
+        local_octant_center = tuple(
+            float(value) for value in LOCAL_POSITIVE_OCTANT_CENTER
+        )
         self.stage_backend.set_local_pose(
             self.prim_paths.fe_shield_path,
             translation_xyz=fe_translation,

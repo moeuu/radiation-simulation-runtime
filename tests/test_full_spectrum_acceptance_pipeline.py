@@ -15,6 +15,13 @@ from measurement.source_boundary import (
     surface_emission_policy_sha256,
     surface_source_runtime_contract_sha256,
 )
+from measurement.geometry_family import (
+    GEOMETRY_FAMILY_APPLICABILITY_SHA256,
+    GEOMETRY_FAMILY_ID,
+    GEOMETRY_FAMILY_SCHEMA_VERSION,
+    GEOMETRY_GENERATOR_ALGORITHM_ID,
+)
+from measurement.shielding import SHIELD_POSE_CONTRACT_SHA256
 import scripts.run_full_spectrum_all64_acceptance as acceptance_cli
 from spectrum.additive_scatter import (
     ADDITIVE_SCATTER_FEATURE_ORDER,
@@ -33,11 +40,64 @@ from spectrum.full_spectrum_acceptance_runner import (
     validate_scene_corpus,
 )
 from spectrum.native_metadata import native_source_line_token
-from spectrum.response_matrix import NATIVE_GEANT4_BIN_COUNT
+from spectrum.physics_contracts import (
+    OBSTACLE_MATERIAL_CONTRACT_SHA256,
+    TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256,
+)
+from spectrum.response_matrix import (
+    NATIVE_GEANT4_BIN_COUNT,
+    NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256,
+)
 from spectrum.transport_spectral import (
     ACCEPTANCE_METRIC_CONTRACT,
     GeometryConditionedSpectralModel,
 )
+
+
+class _ComponentMarkDiagnosticModel:
+    """Minimal model proving acceptance uses component mark concentration."""
+
+    physical_component_discrepancy = object()
+    mark_concentration_source = None
+
+    def __init__(self) -> None:
+        """Initialize the component-concentration call counter."""
+        self.component_calls = 0
+
+    def predict_mean_numpy(
+        self,
+        total: np.ndarray,
+        uncollided: np.ndarray,
+        features: np.ndarray,
+        live: np.ndarray,
+    ) -> np.ndarray:
+        """Return one fixed two-bin source spectrum per shield pair."""
+        del uncollided, features, live
+        return np.broadcast_to(
+            np.asarray([90.0, 10.0], dtype=np.float64),
+            (total.shape[0], 2),
+        ).copy()
+
+    def pre_dead_time_components_numpy(
+        self,
+        total: np.ndarray,
+        uncollided: np.ndarray,
+        features: np.ndarray,
+        live: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return source and zero-background component means."""
+        source = self.predict_mean_numpy(total, uncollided, features, live)
+        return source, np.zeros_like(source)
+
+    def _base_mark_concentration_numpy(
+        self,
+        total: np.ndarray,
+        uncollided: np.ndarray,
+    ) -> np.ndarray:
+        """Return the physical-component concentration used by likelihood."""
+        del uncollided
+        self.component_calls += 1
+        return np.full(total.shape[0], 300.0, dtype=np.float64)
 
 
 def _source(
@@ -212,7 +272,7 @@ class _FakeSession:
                     )
                 }
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "acceptance_contract_sha256": (
                 self.model.manifest_payload()[
                     "acceptance_contract_sha256"
@@ -251,6 +311,39 @@ class _FakeSession:
                 ),
             },
             "native_fidelity": dict(NATIVE_ACCEPTANCE_FIDELITY),
+            "geometry_family": {
+                "schema_version": GEOMETRY_FAMILY_SCHEMA_VERSION,
+                "geometry_family_id": GEOMETRY_FAMILY_ID,
+                "generator_algorithm_id": GEOMETRY_GENERATOR_ALGORITHM_ID,
+                "transport_representation": (
+                    "explicit_material_component_boxes"
+                ),
+                "room_size_xyz_m": [10.0, 20.0, 10.0],
+                "cell_size_m": 1.0,
+                "target_blocked_fraction": 0.4,
+                "realized_blocked_fraction": 0.3,
+                "passage_width_m": 2.0,
+                "obstacle_height_limit_fraction": 0.5,
+                "realized_max_component_height_fraction": 0.1,
+                "instance_count": 1,
+                "transport_component_count": 1,
+                "template_names": ["fake_hollow_obstacle"],
+                "component_materials": ["concrete"],
+                "component_geometry_sha256": "9" * 64,
+                "applicability_contract_sha256": (
+                    GEOMETRY_FAMILY_APPLICABILITY_SHA256
+                ),
+            },
+            "detector_response_contract_sha256": (
+                NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
+            ),
+            "shield_pose_contract_sha256": SHIELD_POSE_CONTRACT_SHA256,
+            "obstacle_material_contract_sha256": (
+                OBSTACLE_MATERIAL_CONTRACT_SHA256
+            ),
+            "transport_physics_table_contract_sha256": (
+                TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256
+            ),
         }
 
 
@@ -298,6 +391,38 @@ def _passing_metrics(
         metric: 0.0 if comparison == "le" else 1.0
         for metric, (comparison, _) in ACCEPTANCE_METRIC_CONTRACT.items()
     }
+
+
+def test_mark_diagnostic_uses_physical_component_concentration() -> None:
+    """Acceptance PIT must evaluate the same component latent as runtime."""
+    pair_count = len(evaluator.ACCEPTANCE_PAIR_IDS)
+    observed = np.broadcast_to(
+        np.asarray([90.0, 10.0], dtype=np.float64),
+        (pair_count, 2),
+    ).copy()
+    total = np.ones((pair_count, 1, 1), dtype=np.float64)
+    data = evaluator._ScenarioData(
+        scenario_id="single_line_source_resolved",
+        observed_vb=observed,
+        total_vsl=total,
+        uncollided_vsl=total.copy(),
+        features_vslf=np.zeros((pair_count, 1, 1, 4), dtype=np.float64),
+        source_isotopes=("Cs-137",),
+        perturbed_total_vsl=None,
+        perturbed_uncollided_vsl=None,
+        perturbed_features_vslf=None,
+    )
+    model = _ComponentMarkDiagnosticModel()
+
+    result = evaluator._mark_diagnostics(
+        data,
+        model=model,  # type: ignore[arg-type]
+        scene_seed=2026072799,
+    )
+
+    assert model.component_calls == 1
+    assert result.upper_tail_probability_v.shape == (pair_count,)
+    assert np.all(result.upper_tail_probability_v > 0.01)
 
 
 def test_fake_backend_full_pipeline_is_resumable_and_holdout_cannot_refit(

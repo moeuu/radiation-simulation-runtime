@@ -29,6 +29,7 @@ from numpy.typing import NDArray
 from scipy import special, stats
 
 from measurement.source_boundary import surface_emission_policy_sha256
+from spectrum.additive_scatter import scatter_basis_from_stored_geometry_numpy
 from spectrum.full_spectrum_acceptance import (
     build_independent_validation_manifest,
 )
@@ -197,14 +198,43 @@ def _scenario_data(
         [record.features_vslf for record in ordered],
         axis=0,
     )
-    scatter_basis = np.concatenate(
+    stored_scatter_basis = np.concatenate(
         [record.scatter_basis_vslf for record in ordered],
         axis=0,
+    )
+    scatter_basis = scatter_basis_from_stored_geometry_numpy(
+        stored_basis=stored_scatter_basis,
+        transport_features=features,
+        line_identity=model.line_identity,
+        target_semantics=(
+            model.additive_scatter_response.feature_basis_semantics
+        ),
+        detector_radius_m=getattr(
+            model.additive_scatter_response,
+            "detector_radius_m",
+            None,
+        ),
+        fe_scatter_distance_m=getattr(
+            model.additive_scatter_response,
+            "fe_scatter_distance_m",
+            None,
+        ),
+        pb_scatter_distance_m=getattr(
+            model.additive_scatter_response,
+            "pb_scatter_distance_m",
+            None,
+        ),
     )
     total = model.additive_scatter_response.total_kernel_numpy(
         unattenuated,
         uncollided,
         scatter_basis,
+    )
+    uncollided = (
+        model.additive_scatter_response.corrected_uncollided_kernel_numpy(
+            uncollided,
+            scatter_basis,
+        )
     )
     observed = np.stack(
         [record.observed_spectrum_counts for record in ordered],
@@ -224,13 +254,43 @@ def _scenario_data(
             [record.perturbed_features_vslf for record in ordered],
             axis=0,
         )
-        perturbed_basis = np.concatenate(
+        stored_perturbed_basis = np.concatenate(
             [record.perturbed_scatter_basis_vslf for record in ordered],
             axis=0,
+        )
+        perturbed_basis = scatter_basis_from_stored_geometry_numpy(
+            stored_basis=stored_perturbed_basis,
+            transport_features=perturbed_features,
+            line_identity=model.line_identity,
+            target_semantics=(
+                model.additive_scatter_response.feature_basis_semantics
+            ),
+            detector_radius_m=getattr(
+                model.additive_scatter_response,
+                "detector_radius_m",
+                None,
+            ),
+            fe_scatter_distance_m=getattr(
+                model.additive_scatter_response,
+                "fe_scatter_distance_m",
+                None,
+            ),
+            pb_scatter_distance_m=getattr(
+                model.additive_scatter_response,
+                "pb_scatter_distance_m",
+                None,
+            ),
         )
         perturbed_total = (
             model.additive_scatter_response.total_kernel_numpy(
                 perturbed_unattenuated,
+                perturbed_uncollided,
+                perturbed_basis,
+            )
+        )
+        perturbed_uncollided = (
+            model.additive_scatter_response
+            .corrected_uncollided_kernel_numpy(
                 perturbed_uncollided,
                 perturbed_basis,
             )
@@ -361,20 +421,35 @@ def _mark_diagnostics(
         np.square(data.observed_vb - expected) / np.maximum(expected, 1.0),
         axis=1,
     )
-    source_pre_total = (
-        np.sum(data.total_vsl, axis=(-2, -1)) * live
+    source_mean, background_mean = model.pre_dead_time_components_numpy(
+        data.total_vsl,
+        data.uncollided_vsl,
+        data.features_vslf,
+        live,
     )
+    source_pre_total = np.sum(source_mean, axis=-1)
+    background_pre_total = np.sum(background_mean, axis=-1)
     source_fraction = np.divide(
         source_pre_total,
-        source_pre_total + float(model.background_rate_cps) * live,
+        source_pre_total + background_pre_total,
         out=np.zeros_like(source_pre_total),
         where=(
-            source_pre_total + float(model.background_rate_cps) * live
+            source_pre_total + background_pre_total
         )
         > 0.0,
     )
+    component_discrepancy = model.physical_component_discrepancy
     concentration_source = model.mark_concentration_source
-    if concentration_source is None:
+    if component_discrepancy is not None:
+        base_concentration = model._base_mark_concentration_numpy(
+            data.total_vsl,
+            data.uncollided_vsl,
+        )
+        concentration = base_concentration / np.maximum(
+            np.square(source_fraction),
+            1.0e-12,
+        )
+    elif concentration_source is None:
         concentration = np.full_like(source_fraction, np.inf)
     else:
         concentration = float(concentration_source) / np.maximum(
@@ -397,7 +472,10 @@ def _mark_diagnostics(
             (batch,) + probabilities.shape,
         ).copy()
         active = source_fraction > 0.0
-        if np.any(active) and concentration_source is not None:
+        if np.any(active) and (
+            concentration_source is not None
+            or component_discrepancy is not None
+        ):
             alpha = (
                 probabilities[active]
                 * concentration[active, np.newaxis]

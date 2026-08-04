@@ -20,12 +20,29 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy import special, stats
 
+from measurement.geometry_family import (
+    GEOMETRY_FAMILY_APPLICABILITY_SHA256,
+    validate_geometry_family_descriptor,
+)
 from measurement.source_boundary import surface_emission_policy_sha256
-from measurement.shielding import line_resolved_shield_mu_by_isotope
+from measurement.shielding import (
+    SHIELD_POSE_CONTRACT_ID,
+    SHIELD_POSE_CONTRACT_SHA256,
+    line_resolved_shield_mu_by_isotope,
+)
 from runtime.forward_model_manifest import resolve_file_backed_model_asset
 from spectrum.additive_scatter import (
     ADDITIVE_SCATTER_INCIDENT_LABEL_SEMANTICS,
+    LEGACY_PHYSICS_ONLY_TRANSPORT_RESPONSE_ID,
+    PHYSICS_ONLY_TRANSPORT_RESPONSE_ID,
     AdditiveNoncollidedTransportResponse,
+    PhysicsOnlyNoncollidedTransportResponse,
+)
+from spectrum.physics_contracts import (
+    OBSTACLE_MATERIAL_CONTRACT_ID,
+    OBSTACLE_MATERIAL_CONTRACT_SHA256,
+    TRANSPORT_PHYSICS_TABLE_CONTRACT_ID,
+    TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256,
 )
 from spectrum.library import default_library
 from spectrum.response_matrix import (
@@ -871,12 +888,18 @@ def view_independent_gamma_poisson_count_log_increments_numpy(
     observed_counts_qv: NDArray[np.float64],
     expected_counts_njv: NDArray[np.float64],
     *,
-    concentration: float,
+    concentration: float | NDArray[np.float64],
 ) -> NDArray[np.float64]:
     """Return per-view Gamma-Poisson count log probabilities."""
     observed = np.asarray(observed_counts_qv, dtype=np.float64)
     expected = np.asarray(expected_counts_njv, dtype=np.float64)
-    shape = float(concentration)
+    raw_shape = np.asarray(concentration, dtype=np.float64)
+    try:
+        shape = np.broadcast_to(raw_shape, expected.shape)
+    except ValueError as exc:
+        raise ValueError(
+            "View-independent Gamma concentrations are not broadcastable."
+        ) from exc
     if (
         observed.ndim < 2
         or expected.ndim < 3
@@ -887,19 +910,20 @@ def view_independent_gamma_poisson_count_log_increments_numpy(
         or np.any(observed != np.floor(observed))
         or np.any(~np.isfinite(expected))
         or np.any(expected < 0.0)
-        or not np.isfinite(shape)
-        or shape <= 0.0
+        or np.any(~np.isfinite(shape))
+        or np.any(shape <= 0.0)
     ):
         raise ValueError("View-independent Gamma count inputs are invalid.")
     counts = observed[..., :, np.newaxis, np.newaxis, :]
     means = expected[..., np.newaxis, :, :, :]
+    shapes = shape[..., np.newaxis, :, :, :]
     return (
-        special.gammaln(shape + counts)
-        - special.gammaln(shape)
+        special.gammaln(shapes + counts)
+        - special.gammaln(shapes)
         - special.gammaln(counts + 1.0)
-        + shape * np.log(shape)
+        + shapes * np.log(shapes)
         + special.xlogy(counts, means)
-        - (shape + counts) * np.log(shape + means)
+        - (shapes + counts) * np.log(shapes + means)
     )
 
 
@@ -907,7 +931,7 @@ def view_independent_gamma_poisson_count_log_increments_torch(
     observed_counts_qv: object,
     expected_counts_njv: object,
     *,
-    concentration: float,
+    concentration: object,
 ) -> object:
     """Return Torch per-view Gamma-Poisson count log probabilities."""
     import torch
@@ -918,7 +942,18 @@ def view_independent_gamma_poisson_count_log_increments_torch(
         device=expected.device,
         dtype=expected.dtype,
     )
-    shape = float(concentration)
+    raw_shape = torch.as_tensor(
+        concentration,
+        device=expected.device,
+        dtype=expected.dtype,
+    )
+    try:
+        shape = torch.broadcast_to(raw_shape, expected.shape)
+    except RuntimeError as exc:
+        raise ValueError(
+            "Torch view-independent Gamma concentrations are not "
+            "broadcastable."
+        ) from exc
     if (
         observed.ndim < 2
         or expected.ndim < 3
@@ -929,17 +964,13 @@ def view_independent_gamma_poisson_count_log_increments_torch(
         or bool(torch.any(observed != torch.floor(observed)))
         or bool(torch.any(~torch.isfinite(expected)))
         or bool(torch.any(expected < 0.0))
-        or not np.isfinite(shape)
-        or shape <= 0.0
+        or bool(torch.any(~torch.isfinite(shape)))
+        or bool(torch.any(shape <= 0.0))
     ):
         raise ValueError("Torch view-independent Gamma count inputs are invalid.")
     counts = observed.unsqueeze(-2).unsqueeze(-2)
     means = expected.unsqueeze(-4)
-    shape_tensor = torch.as_tensor(
-        shape,
-        device=expected.device,
-        dtype=expected.dtype,
-    )
+    shape_tensor = shape.unsqueeze(-4)
     return (
         torch.lgamma(shape_tensor + counts)
         - torch.lgamma(shape_tensor)
@@ -1298,7 +1329,7 @@ class LowRankSpectralMeanCorrection:
     def training_ready(self) -> bool:
         """Return whether only the designated fixed-quota training was used."""
         manifest = self.training_manifest
-        expected_keys = {
+        legacy_keys = {
             "schema_version",
             "training_policy",
             "training_scene_seeds",
@@ -1314,14 +1345,55 @@ class LowRankSpectralMeanCorrection:
             "selection_completed",
             "holdout_artifacts_consumed",
         }
+        exact_basis_keys = legacy_keys | {
+            "base_additive_response_contract_sha256",
+            "feature_basis_semantics",
+        }
+        policy = manifest.get("training_policy")
+        training_seeds = tuple(manifest.get("training_scene_seeds", ()))
+        legacy_training = bool(
+            policy == "fixed_quota_loso_training_only_low_rank_log_mean_v1"
+            and training_seeds == (2026072701, 2026072702)
+        )
+        randomized_family_training = bool(
+            policy
+            == "randomized_geometry_family_loso_low_rank_log_mean_v2"
+            and training_seeds == DESIGNATED_TRAINING_SCENE_SEEDS
+            and tuple(manifest.get("scenario_ids", ()))
+            == tuple(
+                scenario
+                for scenario in VALIDATION_SCENARIO_IDS
+                if scenario != "background_only"
+            )
+        )
+        exact_basis_training = bool(
+            policy
+            == "randomized_geometry_family_loso_low_rank_log_mean_v3"
+            and manifest.get("schema_version") == 2
+            and set(manifest) == exact_basis_keys
+            and _is_sha256(
+                manifest.get("base_additive_response_contract_sha256")
+            )
+            and manifest.get("feature_basis_semantics")
+            == "exactly_one_compton_with_zero_other_los_interactions_v2"
+            and training_seeds == DESIGNATED_TRAINING_SCENE_SEEDS
+            and tuple(manifest.get("scenario_ids", ()))
+            == tuple(
+                scenario
+                for scenario in VALIDATION_SCENARIO_IDS
+                if scenario != "background_only"
+            )
+        )
         return bool(
             isinstance(manifest, Mapping)
-            and set(manifest) == expected_keys
-            and manifest.get("schema_version") == 1
-            and manifest.get("training_policy")
-            == "fixed_quota_loso_training_only_low_rank_log_mean_v1"
-            and tuple(manifest.get("training_scene_seeds", ()))
-            == (2026072701, 2026072702)
+            and set(manifest) in (legacy_keys, exact_basis_keys)
+            and (
+                (
+                    manifest.get("schema_version") == 1
+                    and (legacy_training or randomized_family_training)
+                )
+                or exact_basis_training
+            )
             and manifest.get("selection_objective")
             == "leave_one_scene_out_target_probability_weighted_log_mse"
             and manifest.get("selection_completed") is True
@@ -1583,6 +1655,181 @@ class LowRankSpectralMeanCorrection:
         return correction
 
 
+@dataclass(frozen=True)
+class PhysicalComponentDiscrepancy:
+    """Define state-dependent latent dispersion from physical transport parts.
+
+    The latent count-rate and conditional-mark distributions remain explicit
+    Gamma and Dirichlet laws.  Their concentrations are not global constants:
+    they are derived from the current uncollided/scattered source fractions.
+    This prevents a scatter-dominated calibration case from erasing the much
+    sharper isotope information carried by an uncollided photopeak.
+    """
+
+    count_uncollided_concentration: float
+    count_scatter_concentration: float
+    mark_uncollided_concentration: float
+    mark_scatter_concentration: float
+    count_scope: str = "view_independent"
+    provenance: str = "empirical_training"
+
+    def __post_init__(self) -> None:
+        """Validate the component-latent statistical contract."""
+        values = (
+            self.count_uncollided_concentration,
+            self.count_scatter_concentration,
+            self.mark_uncollided_concentration,
+            self.mark_scatter_concentration,
+        )
+        if any(not np.isfinite(value) or float(value) <= 0.0 for value in values):
+            raise ValueError(
+                "Physical-component discrepancy concentrations must be "
+                "finite and positive."
+            )
+        if self.count_scope != "view_independent":
+            raise ValueError(
+                "Physical-component count discrepancy currently requires "
+                "view_independent Gamma latents."
+            )
+        if self.provenance not in (
+            "empirical_training",
+            "physics_only_uncertainty_budget_v1",
+        ):
+            raise ValueError("Physical-component provenance is invalid.")
+
+    def to_payload(self) -> Mapping[str, object]:
+        """Return the authenticated JSON representation."""
+        payload: dict[str, object] = {
+            "schema_version": 1,
+            "model": "uncollided_scatter_component_latents_v1",
+            "count_scope": self.count_scope,
+            "count_uncollided_concentration": float(
+                self.count_uncollided_concentration
+            ),
+            "count_scatter_concentration": float(
+                self.count_scatter_concentration
+            ),
+            "mark_uncollided_concentration": float(
+                self.mark_uncollided_concentration
+            ),
+            "mark_scatter_concentration": float(
+                self.mark_scatter_concentration
+            ),
+            "fraction_contract": (
+                "minimum_total_uncollided_and_total_minus_uncollided"
+            ),
+        }
+        if self.provenance == "physics_only_uncertainty_budget_v1":
+            payload.update(
+                {
+                    "schema_version": 2,
+                    "provenance": self.provenance,
+                    "count_uncollided_relative_standard_uncertainty": 0.02,
+                    "count_scatter_relative_standard_uncertainty": 0.5,
+                    "mark_uncollided_probability_standard_uncertainty": 0.01,
+                    "mark_scatter_probability_standard_uncertainty": 0.2,
+                    "higher_order_scatter_nuisance": (
+                        "positive_mean_one_gamma_component"
+                    ),
+                    "obstacle_material_contract_sha256": (
+                        OBSTACLE_MATERIAL_CONTRACT_SHA256
+                    ),
+                    "transport_physics_table_contract_sha256": (
+                        TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256
+                    ),
+                }
+            )
+        return payload
+
+    @classmethod
+    def physics_only_budget(cls) -> "PhysicalComponentDiscrepancy":
+        """Return the predeclared non-empirical physical uncertainty budget."""
+        return cls(
+            count_uncollided_concentration=1.0 / (0.02**2),
+            count_scatter_concentration=1.0 / (0.5**2),
+            mark_uncollided_concentration=1.0 / (0.01**2) - 1.0,
+            mark_scatter_concentration=1.0 / (0.2**2) - 1.0,
+            provenance="physics_only_uncertainty_budget_v1",
+        )
+
+    @property
+    def physics_only(self) -> bool:
+        """Return whether uncertainty parameters were fixed without scenes."""
+        return self.provenance == "physics_only_uncertainty_budget_v1"
+
+    @classmethod
+    def from_payload(
+        cls,
+        payload: Mapping[str, object],
+    ) -> "PhysicalComponentDiscrepancy":
+        """Reconstruct one strict physical-component latent contract."""
+        expected_keys = {
+            "schema_version",
+            "model",
+            "count_scope",
+            "count_uncollided_concentration",
+            "count_scatter_concentration",
+            "mark_uncollided_concentration",
+            "mark_scatter_concentration",
+            "fraction_contract",
+        }
+        schema_version = payload.get("schema_version")
+        if schema_version == 2:
+            expected_keys.update(
+                {
+                    "provenance",
+                    "count_uncollided_relative_standard_uncertainty",
+                    "count_scatter_relative_standard_uncertainty",
+                    "mark_uncollided_probability_standard_uncertainty",
+                    "mark_scatter_probability_standard_uncertainty",
+                    "higher_order_scatter_nuisance",
+                    "obstacle_material_contract_sha256",
+                    "transport_physics_table_contract_sha256",
+                }
+            )
+        if (
+            not isinstance(payload, Mapping)
+            or set(payload) != expected_keys
+            or schema_version not in (1, 2)
+            or payload.get("model")
+            != "uncollided_scatter_component_latents_v1"
+            or payload.get("fraction_contract")
+            != "minimum_total_uncollided_and_total_minus_uncollided"
+        ):
+            raise ValueError(
+                "Physical-component discrepancy payload is invalid."
+            )
+        result = cls(
+            count_uncollided_concentration=_strict_json_number(
+                payload.get("count_uncollided_concentration"),
+                field_name="count_uncollided_concentration",
+            ),
+            count_scatter_concentration=_strict_json_number(
+                payload.get("count_scatter_concentration"),
+                field_name="count_scatter_concentration",
+            ),
+            mark_uncollided_concentration=_strict_json_number(
+                payload.get("mark_uncollided_concentration"),
+                field_name="mark_uncollided_concentration",
+            ),
+            mark_scatter_concentration=_strict_json_number(
+                payload.get("mark_scatter_concentration"),
+                field_name="mark_scatter_concentration",
+            ),
+            count_scope=str(payload.get("count_scope")),
+            provenance=(
+                "empirical_training"
+                if schema_version == 1
+                else str(payload.get("provenance"))
+            ),
+        )
+        if result.to_payload() != dict(payload):
+            raise ValueError(
+                "Physical-component discrepancy does not reconstruct exactly."
+            )
+        return result
+
+
 @dataclass
 class GeometryConditionedSpectralModel:
     """Represent the shared source-resolved PF/DSS spectrum distribution."""
@@ -1601,9 +1848,14 @@ class GeometryConditionedSpectralModel:
     count_discrepancy_scope: str | None = None
     mark_concentration_source: float | None = None
     mark_concentration_multi_isotope: float | None = None
+    physical_component_discrepancy: PhysicalComponentDiscrepancy | None = None
     discrepancy_training_manifest: Mapping[str, object] | None = None
     validation_manifest: Mapping[str, object] | None = None
-    additive_scatter_response: AdditiveNoncollidedTransportResponse | None = None
+    additive_scatter_response: (
+        AdditiveNoncollidedTransportResponse
+        | PhysicsOnlyNoncollidedTransportResponse
+        | None
+    ) = None
     low_rank_spectral_mean_correction: (
         LowRankSpectralMeanCorrection | None
     ) = None
@@ -1640,7 +1892,10 @@ class GeometryConditionedSpectralModel:
             self.additive_scatter_response is not None
             and not isinstance(
                 self.additive_scatter_response,
-                AdditiveNoncollidedTransportResponse,
+                (
+                    AdditiveNoncollidedTransportResponse,
+                    PhysicsOnlyNoncollidedTransportResponse,
+                ),
             )
         ):
             raise TypeError(
@@ -1656,6 +1911,15 @@ class GeometryConditionedSpectralModel:
         ):
             raise TypeError(
                 "low_rank_spectral_mean_correction must use its authenticated "
+                "schema."
+            )
+        component_discrepancy = self.physical_component_discrepancy
+        if component_discrepancy is not None and not isinstance(
+            component_discrepancy,
+            PhysicalComponentDiscrepancy,
+        ):
+            raise TypeError(
+                "physical_component_discrepancy must use its authenticated "
                 "schema."
             )
         self._discrepancy_training_manifest_sha256 = (
@@ -1790,6 +2054,40 @@ class GeometryConditionedSpectralModel:
             "view_independent",
         ):
             raise ValueError("Count discrepancy scope is invalid.")
+        if component_discrepancy is not None and (
+            count_concentration is not None
+            or self.count_discrepancy_scope is not None
+            or self.mark_concentration_source is not None
+            or self.mark_concentration_multi_isotope is not None
+            or not np.array_equal(nodes, np.asarray((1.0,), dtype=np.float64))
+            or not np.array_equal(weights, np.asarray((1.0,), dtype=np.float64))
+        ):
+            raise ValueError(
+                "Physical-component discrepancy cannot be combined with the "
+                "legacy global discrepancy or rate-scale mixture."
+            )
+        physics_response = isinstance(
+            self.additive_scatter_response,
+            PhysicsOnlyNoncollidedTransportResponse,
+        )
+        if physics_response and (
+            self.low_rank_spectral_mean_correction is not None
+            or self.discrepancy_training_manifest is not None
+            or component_discrepancy is None
+            or not component_discrepancy.physics_only
+        ):
+            raise ValueError(
+                "Physics-only transport requires its predeclared physical "
+                "uncertainty budget and forbids trained mean/discrepancy terms."
+            )
+        if (
+            not physics_response
+            and component_discrepancy is not None
+            and component_discrepancy.physics_only
+        ):
+            raise ValueError(
+                "Physics-only uncertainty cannot accompany a fitted response."
+            )
         self._rate_scale_nodes_j = np.ascontiguousarray(nodes)
         self._rate_scale_weights_j = np.ascontiguousarray(weights)
         isotope_names = tuple(
@@ -1893,10 +2191,15 @@ class GeometryConditionedSpectralModel:
         count_discrepancy_scope: str | None = None,
         mark_concentration_source: float | None = None,
         mark_concentration_multi_isotope: float | None = None,
+        physical_component_discrepancy: (
+            PhysicalComponentDiscrepancy | None
+        ) = None,
         discrepancy_training_manifest: Mapping[str, object] | None = None,
         validation_manifest: Mapping[str, object] | None = None,
         additive_scatter_response: (
-            AdditiveNoncollidedTransportResponse | None
+            AdditiveNoncollidedTransportResponse
+            | PhysicsOnlyNoncollidedTransportResponse
+            | None
         ) = None,
         low_rank_spectral_mean_correction: (
             LowRankSpectralMeanCorrection | None
@@ -1994,6 +2297,7 @@ class GeometryConditionedSpectralModel:
                 if mark_concentration_multi_isotope is None
                 else float(mark_concentration_multi_isotope)
             ),
+            physical_component_discrepancy=physical_component_discrepancy,
             discrepancy_training_manifest=discrepancy_training_manifest,
             validation_manifest=validation_manifest,
             additive_scatter_response=additive_scatter_response,
@@ -2101,6 +2405,30 @@ class GeometryConditionedSpectralModel:
                 field_name="count_discrepancy_concentration",
             )
         )
+        physical_component_payload = payload.get(
+            "physical_component_discrepancy"
+        )
+        physical_component_discrepancy = (
+            PhysicalComponentDiscrepancy.from_payload(
+                physical_component_payload
+            )
+            if isinstance(physical_component_payload, Mapping)
+            else None
+        )
+        response_model_id = additive_payload.get("model")
+        if response_model_id in (
+            LEGACY_PHYSICS_ONLY_TRANSPORT_RESPONSE_ID,
+            PHYSICS_ONLY_TRANSPORT_RESPONSE_ID,
+        ):
+            additive_response = (
+                PhysicsOnlyNoncollidedTransportResponse.from_payload(
+                    additive_payload
+                )
+            )
+        else:
+            additive_response = AdditiveNoncollidedTransportResponse.from_payload(
+                additive_payload
+            )
         model = cls.standard_native(
             isotope_order,
             dead_time_tau_s=dead_time_tau_s,
@@ -2115,6 +2443,9 @@ class GeometryConditionedSpectralModel:
             mark_concentration_multi_isotope=(
                 mark_concentration_multi_isotope
             ),
+            physical_component_discrepancy=(
+                physical_component_discrepancy
+            ),
             discrepancy_training_manifest=(
                 payload.get("discrepancy_training")
                 if isinstance(
@@ -2128,11 +2459,7 @@ class GeometryConditionedSpectralModel:
                 if isinstance(payload.get("validation"), Mapping)
                 else None
             ),
-            additive_scatter_response=(
-                AdditiveNoncollidedTransportResponse.from_payload(
-                    additive_payload
-                )
-            ),
+            additive_scatter_response=additive_response,
             low_rank_spectral_mean_correction=(
                 LowRankSpectralMeanCorrection.from_payload(
                     payload["low_rank_spectral_mean_correction"]
@@ -2209,6 +2536,15 @@ class GeometryConditionedSpectralModel:
                     "detector_response_contract_sha256": (
                         NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
                     ),
+                    "shield_pose_contract_sha256": (
+                        SHIELD_POSE_CONTRACT_SHA256
+                    ),
+                    "obstacle_material_contract_sha256": (
+                        OBSTACLE_MATERIAL_CONTRACT_SHA256
+                    ),
+                    "transport_physics_table_contract_sha256": (
+                        TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256
+                    ),
                     "dead_time_model": (
                         "nonparalyzable_renewal_total_conditional_multinomial"
                     ),
@@ -2219,6 +2555,9 @@ class GeometryConditionedSpectralModel:
                     "birth_proposal_background_regularization_counts": 1.0,
                     "rate_scale_mixture": "station_shared_finite_positive",
                     "mark_discrepancy": (
+                        "physical_component_fraction_dirichlet"
+                        if self.physical_component_discrepancy is not None
+                        else
                         "source_fraction_dirichlet_multinomial"
                         if self.mark_concentration_source is not None
                         else "exact_multinomial_diagnostic_only"
@@ -2267,6 +2606,13 @@ class GeometryConditionedSpectralModel:
                     "ascii"
                 )
             )
+        if self.physical_component_discrepancy is not None:
+            digest.update(b"\0physical_component_discrepancy\0")
+            digest.update(
+                _canonical_json_sha256(
+                    self.physical_component_discrepancy.to_payload()
+                ).encode("ascii")
+            )
         for array in (
             self._energy_axis_keV,
             self.response_operator_br,
@@ -2291,6 +2637,8 @@ class GeometryConditionedSpectralModel:
         manifest = self.discrepancy_training_manifest
         if not isinstance(manifest, Mapping):
             return False
+        if manifest.get("schema_version") in (3, 4, 5):
+            return self._physical_component_training_ready(manifest)
         if manifest.get("schema_version") == 2:
             return self._short_discrepancy_training_ready(manifest)
         expected_keys = {
@@ -2384,6 +2732,153 @@ class GeometryConditionedSpectralModel:
                 np.asarray(expected_weights, dtype=np.float64),
             )
         )
+
+    def _physical_component_training_ready(
+        self,
+        manifest: Mapping[str, object],
+    ) -> bool:
+        """Validate randomized-family training for component latents."""
+        legacy_keys = {
+            "schema_version",
+            "training_policy",
+            "acceptance_contract_sha256",
+            "geometry_family_applicability_sha256",
+            "training_scene_seeds",
+            "scenario_ids",
+            "artifact_sha256_by_scene_and_scenario",
+            "component_family",
+            "selected_concentrations",
+            "selection_objective",
+            "selection_completed",
+            "holdout_artifacts_consumed",
+        }
+        exact_basis_keys = legacy_keys | {
+            "base_additive_response_contract_sha256",
+            "low_rank_mean_correction_contract_sha256",
+            "feature_basis_semantics",
+        }
+        calibrated_exact_basis_keys = exact_basis_keys | {
+            "mark_tail_probability_threshold",
+            "mark_cross_fitted_coverage_threshold",
+            "selected_mark_cross_fitted_coverage",
+        }
+        component = self.physical_component_discrepancy
+        selected = manifest.get("selected_concentrations")
+        selection_contract = (
+            manifest.get("training_policy"),
+            manifest.get("selection_objective"),
+        )
+        if (
+            component is None
+            or set(manifest)
+            not in (
+                legacy_keys,
+                exact_basis_keys,
+                calibrated_exact_basis_keys,
+            )
+            or manifest.get("schema_version") not in (3, 4, 5)
+            or selection_contract
+            not in {
+                (
+                    "randomized_geometry_family_training_only_v1",
+                    "maximum_training_log_predictive_density_regularized",
+                ),
+                (
+                    "randomized_geometry_family_cross_fitted_component_v2",
+                    "leave_one_geometry_out_log_predictive_density_regularized",
+                ),
+                (
+                    "randomized_geometry_family_cross_fitted_component_v3",
+                    "leave_one_geometry_out_log_predictive_density_regularized",
+                ),
+                (
+                    "randomized_geometry_family_cross_fitted_component_v4",
+                    "leave_one_geometry_out_log_predictive_density_regularized_"
+                    "subject_to_predeclared_pairwise_mark_coverage",
+                ),
+            }
+            or manifest.get("acceptance_contract_sha256")
+            != FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256
+            or manifest.get("geometry_family_applicability_sha256")
+            != GEOMETRY_FAMILY_APPLICABILITY_SHA256
+            or tuple(manifest.get("training_scene_seeds", ()))
+            != DESIGNATED_TRAINING_SCENE_SEEDS
+            or tuple(manifest.get("scenario_ids", ()))
+            != VALIDATION_SCENARIO_IDS
+            or manifest.get("component_family")
+            != "uncollided_scatter_component_latents_v1"
+            or manifest.get("selection_completed") is not True
+            or manifest.get("holdout_artifacts_consumed") is not False
+            or not isinstance(
+                manifest.get("artifact_sha256_by_scene_and_scenario"),
+                Mapping,
+            )
+            or not isinstance(selected, Mapping)
+        ):
+            return False
+        if manifest.get("schema_version") in (4, 5):
+            additive = self.additive_scatter_response
+            correction = self.low_rank_spectral_mean_correction
+            if (
+                set(manifest)
+                != (
+                    exact_basis_keys
+                    if manifest.get("schema_version") == 4
+                    else calibrated_exact_basis_keys
+                )
+                or additive is None
+                or correction is None
+                or manifest.get("base_additive_response_contract_sha256")
+                != additive.contract_hash_sha256
+                or manifest.get("low_rank_mean_correction_contract_sha256")
+                != correction.contract_hash_sha256
+                or manifest.get("feature_basis_semantics")
+                != additive.feature_basis_semantics
+            ):
+                return False
+        if manifest.get("schema_version") == 5:
+            try:
+                mark_tail_threshold = float(
+                    manifest["mark_tail_probability_threshold"]
+                )
+                mark_coverage_threshold = float(
+                    manifest["mark_cross_fitted_coverage_threshold"]
+                )
+                selected_mark_coverage = float(
+                    manifest["selected_mark_cross_fitted_coverage"]
+                )
+            except (TypeError, ValueError):
+                return False
+            required_coverage = float(
+                ACCEPTANCE_METRIC_CONTRACT[
+                    "pairwise_mark_tail_ge_0p01_fraction"
+                ][1]
+            )
+            if (
+                mark_tail_threshold != 0.01
+                or mark_coverage_threshold != required_coverage
+                or not np.isfinite(selected_mark_coverage)
+                or selected_mark_coverage + 1.0e-12
+                < mark_coverage_threshold
+                or selected_mark_coverage > 1.0
+            ):
+                return False
+        expected_selected = {
+            "count_uncollided_concentration": float(
+                component.count_uncollided_concentration
+            ),
+            "count_scatter_concentration": float(
+                component.count_scatter_concentration
+            ),
+            "mark_uncollided_concentration": float(
+                component.mark_uncollided_concentration
+            ),
+            "mark_scatter_concentration": float(
+                component.mark_scatter_concentration
+            ),
+            "count_scope": component.count_scope,
+        }
+        return dict(selected) == expected_selected
 
     def _short_discrepancy_training_ready(
         self,
@@ -2647,22 +3142,50 @@ class GeometryConditionedSpectralModel:
             and self.count_discrepancy_concentration is None
             and self.count_discrepancy_scope is None
             and self.mark_concentration_multi_isotope is None
+            and self.physical_component_discrepancy is None
         )
 
     @property
     def runtime_ready(self) -> bool:
         """Return whether training-only contracts authorize runtime use."""
+        additive_response = self.additive_scatter_response
+        if isinstance(
+            additive_response,
+            PhysicsOnlyNoncollidedTransportResponse,
+        ):
+            return bool(
+                additive_response.training_ready
+                and self.low_rank_spectral_mean_correction is None
+                and self.discrepancy_training_manifest is None
+                and self.physical_component_discrepancy is not None
+                and self.physical_component_discrepancy.physics_only
+            )
         if not (
             self.exact_physical_statistics_ready
             or self.discrepancy_training_ready
         ):
             return False
-        additive_response = self.additive_scatter_response
         correction = self.low_rank_spectral_mean_correction
+        correction_bound = bool(
+            correction is None
+            or correction.training_manifest.get("schema_version") != 2
+            or (
+                additive_response is not None
+                and correction.training_manifest.get(
+                    "base_additive_response_contract_sha256"
+                )
+                == additive_response.contract_hash_sha256
+                and correction.training_manifest.get(
+                    "feature_basis_semantics"
+                )
+                == additive_response.feature_basis_semantics
+            )
+        )
         return bool(
             additive_response is not None
             and additive_response.training_ready
             and (correction is None or correction.training_ready)
+            and correction_bound
         )
 
     @property
@@ -2859,6 +3382,33 @@ class GeometryConditionedSpectralModel:
                 "Geometry-conditioned spectrum model has not passed its "
                 "training-only discrepancy and additive-scatter runtime gates."
             )
+
+    def require_environment_applicable(
+        self,
+        environment_payload: Mapping[str, object],
+    ) -> None:
+        """Reject empirical component latents outside their geometry family."""
+        if (
+            self.physical_component_discrepancy is None
+            or self.physical_component_discrepancy.physics_only
+        ):
+            return
+        descriptor = environment_payload.get("geometry_family")
+        if not isinstance(descriptor, Mapping):
+            raise RuntimeError(
+                "Physical-component discrepancy requires an authenticated "
+                "geometry_family descriptor in MeasurementLog v2."
+            )
+        try:
+            validate_geometry_family_descriptor(
+                descriptor,
+                require_in_domain=True,
+            )
+        except ValueError as exc:
+            raise RuntimeError(
+                "Measurement environment is outside the trained geometry "
+                "family; refusing empirical full-spectrum discrepancy."
+            ) from exc
 
     def _validated_numpy_inputs(
         self,
@@ -3381,8 +3931,36 @@ class GeometryConditionedSpectralModel:
     def _base_mark_concentration_numpy(
         self,
         total_line_contributions_xnvsl: NDArray[np.float64],
+        uncollided_line_contributions_xnvsl: NDArray[np.float64] | None = None,
     ) -> NDArray[np.float64]:
         """Return smooth source-mixture-conditioned mark concentrations."""
+        component = self.physical_component_discrepancy
+        if component is not None:
+            if uncollided_line_contributions_xnvsl is None:
+                raise ValueError(
+                    "Physical-component mark concentrations require "
+                    "uncollided line contributions."
+                )
+            direct_fraction, scatter_fraction = (
+                self._source_component_fractions_numpy(
+                    total_line_contributions_xnvsl,
+                    uncollided_line_contributions_xnvsl,
+                )
+            )
+            reciprocal = (
+                np.square(direct_fraction)
+                / (float(component.mark_uncollided_concentration) + 1.0)
+                + np.square(scatter_fraction)
+                / (float(component.mark_scatter_concentration) + 1.0)
+            )
+            return np.maximum(
+                np.divide(
+                    1.0,
+                    np.maximum(reciprocal, np.finfo(np.float64).tiny),
+                )
+                - 1.0,
+                np.finfo(np.float64).tiny,
+            )
         low = self.mark_concentration_source
         if low is None:
             raise RuntimeError("Mark concentration is not configured.")
@@ -3420,10 +3998,39 @@ class GeometryConditionedSpectralModel:
     def _base_mark_concentration_torch(
         self,
         total_line_contributions_xnvsl: object,
+        uncollided_line_contributions_xnvsl: object | None = None,
     ) -> object:
         """Return Torch source-mixture-conditioned mark concentrations."""
         import torch
 
+        component = self.physical_component_discrepancy
+        if component is not None:
+            if uncollided_line_contributions_xnvsl is None:
+                raise ValueError(
+                    "Physical-component Torch mark concentrations require "
+                    "uncollided line contributions."
+                )
+            direct_fraction, scatter_fraction = (
+                self._source_component_fractions_torch(
+                    total_line_contributions_xnvsl,
+                    uncollided_line_contributions_xnvsl,
+                )
+            )
+            reciprocal = (
+                torch.square(direct_fraction)
+                / (float(component.mark_uncollided_concentration) + 1.0)
+                + torch.square(scatter_fraction)
+                / (float(component.mark_scatter_concentration) + 1.0)
+            )
+            return torch.clamp(
+                1.0
+                / torch.clamp(
+                    reciprocal,
+                    min=torch.finfo(direct_fraction.dtype).tiny,
+                )
+                - 1.0,
+                min=torch.finfo(direct_fraction.dtype).tiny,
+            )
         low = self.mark_concentration_source
         if low is None:
             raise RuntimeError("Mark concentration is not configured.")
@@ -3461,6 +4068,129 @@ class GeometryConditionedSpectralModel:
             float(np.log(float(low)))
             + entropy
             * (float(np.log(float(high))) - float(np.log(float(low))))
+        )
+
+    @staticmethod
+    def _source_component_fractions_numpy(
+        total_line_contributions_xvsl: NDArray[np.float64],
+        uncollided_line_contributions_xvsl: NDArray[np.float64],
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Return uncollided and scatter fractions of source incident rate."""
+        total = np.asarray(total_line_contributions_xvsl, dtype=np.float64)
+        uncollided = np.minimum(
+            np.asarray(
+                uncollided_line_contributions_xvsl,
+                dtype=np.float64,
+            ),
+            total,
+        )
+        total_rate = np.sum(total, axis=(-2, -1))
+        direct_rate = np.sum(uncollided, axis=(-2, -1))
+        direct_fraction = np.divide(
+            direct_rate,
+            total_rate,
+            out=np.ones_like(total_rate),
+            where=total_rate > 0.0,
+        )
+        return direct_fraction, np.maximum(1.0 - direct_fraction, 0.0)
+
+    @staticmethod
+    def _source_component_fractions_torch(
+        total_line_contributions_xvsl: object,
+        uncollided_line_contributions_xvsl: object,
+    ) -> tuple[object, object]:
+        """Return Torch uncollided and scatter source-rate fractions."""
+        import torch
+
+        total = torch.as_tensor(total_line_contributions_xvsl)
+        uncollided = torch.minimum(
+            torch.as_tensor(
+                uncollided_line_contributions_xvsl,
+                device=total.device,
+                dtype=total.dtype,
+            ),
+            total,
+        )
+        total_rate = torch.sum(total, dim=(-2, -1))
+        direct_rate = torch.sum(uncollided, dim=(-2, -1))
+        direct_fraction = torch.where(
+            total_rate > 0.0,
+            direct_rate
+            / torch.clamp(total_rate, min=torch.finfo(total.dtype).tiny),
+            torch.ones_like(total_rate),
+        )
+        return direct_fraction, torch.clamp(1.0 - direct_fraction, min=0.0)
+
+    def _component_count_concentration_numpy(
+        self,
+        total_line_contributions_xvsl: NDArray[np.float64],
+        uncollided_line_contributions_xvsl: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Return a per-state/view Gamma concentration from physical parts."""
+        component = self.physical_component_discrepancy
+        if component is None:
+            raise RuntimeError("Physical-component discrepancy is not configured.")
+        total = np.asarray(total_line_contributions_xvsl, dtype=np.float64)
+        uncollided = np.minimum(
+            np.asarray(
+                uncollided_line_contributions_xvsl,
+                dtype=np.float64,
+            ),
+            total,
+        )
+        direct_rate = np.sum(uncollided, axis=(-2, -1))
+        total_rate = np.sum(total, axis=(-2, -1))
+        scatter_rate = np.maximum(total_rate - direct_rate, 0.0)
+        denominator = (
+            np.square(direct_rate)
+            / float(component.count_uncollided_concentration)
+            + np.square(scatter_rate)
+            / float(component.count_scatter_concentration)
+        )
+        return np.where(
+            total_rate > 0.0,
+            np.square(total_rate)
+            / np.maximum(denominator, np.finfo(np.float64).tiny),
+            1.0e15,
+        )
+
+    def _component_count_concentration_torch(
+        self,
+        total_line_contributions_xvsl: object,
+        uncollided_line_contributions_xvsl: object,
+    ) -> object:
+        """Return Torch per-state/view Gamma concentration from components."""
+        import torch
+
+        component = self.physical_component_discrepancy
+        if component is None:
+            raise RuntimeError("Physical-component discrepancy is not configured.")
+        total = torch.as_tensor(total_line_contributions_xvsl)
+        uncollided = torch.minimum(
+            torch.as_tensor(
+                uncollided_line_contributions_xvsl,
+                device=total.device,
+                dtype=total.dtype,
+            ),
+            total,
+        )
+        direct_rate = torch.sum(uncollided, dim=(-2, -1))
+        total_rate = torch.sum(total, dim=(-2, -1))
+        scatter_rate = torch.clamp(total_rate - direct_rate, min=0.0)
+        denominator = (
+            torch.square(direct_rate)
+            / float(component.count_uncollided_concentration)
+            + torch.square(scatter_rate)
+            / float(component.count_scatter_concentration)
+        )
+        return torch.where(
+            total_rate > 0.0,
+            torch.square(total_rate)
+            / torch.clamp(
+                denominator,
+                min=torch.finfo(total.dtype).tiny,
+            ),
+            torch.full_like(total_rate, 1.0e15),
         )
 
     def _cross_log_likelihood_numpy_unchunked(
@@ -3506,7 +4236,11 @@ class GeometryConditionedSpectralModel:
         observed_total = np.sum(observed, axis=-1)
         pre_total = np.sum(pre_mean, axis=-1)
         live = np.asarray(live_times_s_v, dtype=np.float64)
-        if self.count_discrepancy_concentration is None:
+        component_discrepancy = self.physical_component_discrepancy
+        if (
+            self.count_discrepancy_concentration is None
+            and component_discrepancy is None
+        ):
             count_log = nonparalyzable_count_log_probability_numpy(
                 observed_total[..., :, np.newaxis, np.newaxis, :],
                 pre_total[..., np.newaxis, :, :, :] / live,
@@ -3521,15 +4255,28 @@ class GeometryConditionedSpectralModel:
                 * float(self.dead_time_tau_s)
             )
             recorded_total_mean = pre_total / dead_time_scale
+            component_count_concentration = None
+            if component_discrepancy is not None:
+                component_count_concentration = (
+                    self._component_count_concentration_numpy(
+                        total_line_contributions_xnvsl,
+                        uncollided_line_contributions_xnvsl,
+                    )[..., np.newaxis, :]
+                )
             count_function = (
                 view_independent_gamma_poisson_count_log_increments_numpy
-                if self.count_discrepancy_scope == "view_independent"
+                if component_discrepancy is not None
+                or self.count_discrepancy_scope == "view_independent"
                 else station_shared_gamma_poisson_count_log_increments_numpy
             )
             count_log = count_function(
                 observed_total,
                 recorded_total_mean,
-                concentration=float(self.count_discrepancy_concentration),
+                concentration=(
+                    component_count_concentration
+                    if component_count_concentration is not None
+                    else float(self.count_discrepancy_concentration)
+                ),
             )
         probabilities = np.divide(
             pre_mean,
@@ -3567,7 +4314,10 @@ class GeometryConditionedSpectralModel:
             multinomial_log,
         )
         mark_log = multinomial_log
-        if self.mark_concentration_source is not None:
+        if (
+            self.mark_concentration_source is not None
+            or component_discrepancy is not None
+        ):
             source_total = np.sum(node_source, axis=-1)
             source_fraction = np.divide(
                 source_total,
@@ -3576,7 +4326,8 @@ class GeometryConditionedSpectralModel:
                 where=pre_total > 0.0,
             )
             base_concentration = self._base_mark_concentration_numpy(
-                total_line_contributions_xnvsl
+                total_line_contributions_xnvsl,
+                uncollided_line_contributions_xnvsl,
             )
             concentration = base_concentration[..., np.newaxis, :] / np.maximum(
                 np.square(source_fraction),
@@ -3751,7 +4502,11 @@ class GeometryConditionedSpectralModel:
             device=total.device,
             dtype=total.dtype,
         )
-        if self.count_discrepancy_concentration is None:
+        component_discrepancy = self.physical_component_discrepancy
+        if (
+            self.count_discrepancy_concentration is None
+            and component_discrepancy is None
+        ):
             count_log = nonparalyzable_count_log_probability_torch(
                 observed_total.unsqueeze(-2).unsqueeze(-2),
                 pre_total.unsqueeze(-4) / live,
@@ -3766,15 +4521,28 @@ class GeometryConditionedSpectralModel:
                 * float(self.dead_time_tau_s)
             )
             recorded_total_mean = pre_total / dead_time_scale
+            component_count_concentration = None
+            if component_discrepancy is not None:
+                component_count_concentration = (
+                    self._component_count_concentration_torch(
+                        total,
+                        uncollided_line_contributions_xnvsl,
+                    ).unsqueeze(-2)
+                )
             count_function = (
                 view_independent_gamma_poisson_count_log_increments_torch
-                if self.count_discrepancy_scope == "view_independent"
+                if component_discrepancy is not None
+                or self.count_discrepancy_scope == "view_independent"
                 else station_shared_gamma_poisson_count_log_increments_torch
             )
             count_log = count_function(
                 observed_total,
                 recorded_total_mean,
-                concentration=float(self.count_discrepancy_concentration),
+                concentration=(
+                    component_count_concentration
+                    if component_count_concentration is not None
+                    else float(self.count_discrepancy_concentration)
+                ),
             )
         tiny = torch.finfo(total.dtype).tiny
         probabilities = torch.where(
@@ -3806,14 +4574,20 @@ class GeometryConditionedSpectralModel:
             multinomial_log,
         )
         mark_log = multinomial_log
-        if self.mark_concentration_source is not None:
+        if (
+            self.mark_concentration_source is not None
+            or component_discrepancy is not None
+        ):
             source_total = torch.sum(node_source, dim=-1)
             source_fraction = torch.where(
                 pre_total > 0.0,
                 source_total / torch.clamp(pre_total, min=tiny),
                 torch.zeros_like(source_total),
             )
-            base_concentration = self._base_mark_concentration_torch(total)
+            base_concentration = self._base_mark_concentration_torch(
+                total,
+                uncollided_line_contributions_xnvsl,
+            )
             concentration = base_concentration.unsqueeze(-2) / torch.clamp(
                 torch.square(source_fraction),
                 min=1.0e-12,
@@ -4336,7 +5110,11 @@ class GeometryConditionedSpectralModel:
         pre_total = np.sum(pre_mean, axis=-1)
         observed_total = np.sum(observed, axis=-1)
         live = np.asarray(live_times_s_v, dtype=np.float64)
-        if self.count_discrepancy_concentration is None:
+        component_discrepancy = self.physical_component_discrepancy
+        if (
+            self.count_discrepancy_concentration is None
+            and component_discrepancy is None
+        ):
             count_log = nonparalyzable_count_log_probability_numpy(
                 observed_total[np.newaxis, np.newaxis, :],
                 pre_total / live[np.newaxis, np.newaxis, :],
@@ -4350,15 +5128,28 @@ class GeometryConditionedSpectralModel:
                 / live[np.newaxis, np.newaxis, :]
                 * float(self.dead_time_tau_s)
             )
+            component_count_concentration = None
+            if component_discrepancy is not None:
+                component_count_concentration = (
+                    self._component_count_concentration_numpy(
+                        total,
+                        uncollided_line_contributions_nvsl,
+                    )[:, np.newaxis, :]
+                )
             count_function = (
                 view_independent_gamma_poisson_count_log_increments_numpy
-                if self.count_discrepancy_scope == "view_independent"
+                if component_discrepancy is not None
+                or self.count_discrepancy_scope == "view_independent"
                 else station_shared_gamma_poisson_count_log_increments_numpy
             )
             count_log = count_function(
                 observed_total[np.newaxis, :],
                 pre_total / dead_time_scale,
-                concentration=float(self.count_discrepancy_concentration),
+                concentration=(
+                    component_count_concentration
+                    if component_count_concentration is not None
+                    else float(self.count_discrepancy_concentration)
+                ),
             )[0]
         node_log = np.sum(count_log, axis=-1)
         return special.logsumexp(
@@ -4606,7 +5397,11 @@ class GeometryConditionedSpectralModel:
         )
         pre_mean = background_mean[..., np.newaxis, :, :] + node_source
         pre_total = np.sum(pre_mean, axis=-1)
-        if self.count_discrepancy_concentration is None:
+        component_discrepancy = self.physical_component_discrepancy
+        if (
+            self.count_discrepancy_concentration is None
+            and component_discrepancy is None
+        ):
             rates = pre_total / live
             totals = sample_nonparalyzable_counts_numpy(
                 rates,
@@ -4623,18 +5418,37 @@ class GeometryConditionedSpectralModel:
                 * float(self.dead_time_tau_s)
             )
             recorded_total_mean = pre_total / dead_time_scale
-            count_concentration = float(
-                self.count_discrepancy_concentration
-            )
-            scale_shape = leading_shape + (int(sample_count),)
-            if self.count_discrepancy_scope == "view_independent":
-                scale_shape += (int(recorded_total_mean.shape[-1]),)
-            sampled_count_scale = rng.gamma(
-                shape=count_concentration,
-                scale=1.0 / count_concentration,
-                size=scale_shape,
-            )
-            if self.count_discrepancy_scope == "station_shared":
+            if component_discrepancy is not None:
+                base_count_concentration = (
+                    self._component_count_concentration_numpy(
+                        total_line_contributions_xvsl,
+                        uncollided_line_contributions_xvsl,
+                    )[..., np.newaxis, :]
+                )
+                count_concentration = np.broadcast_to(
+                    base_count_concentration,
+                    recorded_total_mean.shape,
+                )
+                sampled_count_scale = rng.gamma(
+                    shape=count_concentration,
+                    scale=1.0 / count_concentration,
+                )
+            else:
+                count_concentration = float(
+                    self.count_discrepancy_concentration
+                )
+                scale_shape = leading_shape + (int(sample_count),)
+                if self.count_discrepancy_scope == "view_independent":
+                    scale_shape += (int(recorded_total_mean.shape[-1]),)
+                sampled_count_scale = rng.gamma(
+                    shape=count_concentration,
+                    scale=1.0 / count_concentration,
+                    size=scale_shape,
+                )
+            if (
+                component_discrepancy is None
+                and self.count_discrepancy_scope == "station_shared"
+            ):
                 sampled_count_scale = sampled_count_scale[..., np.newaxis]
             totals = rng.poisson(
                 recorded_total_mean * sampled_count_scale
@@ -4654,7 +5468,10 @@ class GeometryConditionedSpectralModel:
                 fallback,
                 probabilities,
             )
-        if self.mark_concentration_source is not None:
+        if (
+            self.mark_concentration_source is not None
+            or component_discrepancy is not None
+        ):
             source_total = np.sum(node_source, axis=-1)
             source_fraction = np.divide(
                 source_total,
@@ -4663,7 +5480,8 @@ class GeometryConditionedSpectralModel:
                 where=pre_total > 0.0,
             )
             base_concentration = self._base_mark_concentration_numpy(
-                total_line_contributions_xvsl
+                total_line_contributions_xvsl,
+                uncollided_line_contributions_xvsl,
             )
             concentration = base_concentration[..., np.newaxis, :] / np.maximum(
                 np.square(source_fraction),
@@ -5135,16 +5953,28 @@ class GeometryConditionedSpectralModel:
             * float(self.dead_time_tau_s)
         )
         component_total_mean = pre_total / dead_time_scale
-        if self.count_discrepancy_concentration is None:
+        component_discrepancy = self.physical_component_discrepancy
+        if (
+            self.count_discrepancy_concentration is None
+            and component_discrepancy is None
+        ):
             component_total_variance = pre_total / np.power(
                 dead_time_scale,
                 3.0,
             )
         else:
+            count_concentration = (
+                self._component_count_concentration_numpy(
+                    total_line_contributions_nvsl,
+                    uncollided_line_contributions_nvsl,
+                )[:, np.newaxis, :]
+                if component_discrepancy is not None
+                else float(self.count_discrepancy_concentration)
+            )
             component_total_variance = (
                 component_total_mean
                 + np.square(component_total_mean)
-                / float(self.count_discrepancy_concentration)
+                / count_concentration
             )
         posterior_total_mean = np.einsum(
             "nj,njv->v",
@@ -5180,7 +6010,10 @@ class GeometryConditionedSpectralModel:
             optimize=True,
         )
         expected_marks = observed_total[:, np.newaxis] * posterior_probabilities
-        if self.mark_concentration_source is None:
+        if (
+            self.mark_concentration_source is None
+            and component_discrepancy is None
+        ):
             dispersion = np.ones_like(pre_total)
         else:
             node_source_total = np.sum(
@@ -5197,7 +6030,8 @@ class GeometryConditionedSpectralModel:
                 where=pre_total > 0.0,
             )
             base_concentration = self._base_mark_concentration_numpy(
-                total_line_contributions_nvsl
+                total_line_contributions_nvsl,
+                uncollided_line_contributions_nvsl,
             )
             concentration = base_concentration[:, np.newaxis, :] / np.maximum(
                 np.square(source_fraction),
@@ -5250,6 +6084,9 @@ class GeometryConditionedSpectralModel:
         """Return immutable physics and validation provenance."""
         bin_width = float(self._energy_axis_keV[1] - self._energy_axis_keV[0])
         mark_model = (
+            "physical_component_fraction_dirichlet_multinomial"
+            if self.physical_component_discrepancy is not None
+            else
             "source_fraction_dirichlet_multinomial"
             if self.mark_concentration_source is not None
             else "exact_multinomial_diagnostic_only"
@@ -5258,6 +6095,18 @@ class GeometryConditionedSpectralModel:
             "schema_version": 3,
             "model": "geometry_conditioned_full_spectrum",
             "contract_hash_sha256": self.contract_hash_sha256,
+            "shield_pose_contract_id": SHIELD_POSE_CONTRACT_ID,
+            "shield_pose_contract_sha256": SHIELD_POSE_CONTRACT_SHA256,
+            "obstacle_material_contract_id": OBSTACLE_MATERIAL_CONTRACT_ID,
+            "obstacle_material_contract_sha256": (
+                OBSTACLE_MATERIAL_CONTRACT_SHA256
+            ),
+            "transport_physics_table_contract_id": (
+                TRANSPORT_PHYSICS_TABLE_CONTRACT_ID
+            ),
+            "transport_physics_table_contract_sha256": (
+                TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256
+            ),
             "runtime_ready": self.runtime_ready,
             "production_ready": self.production_ready,
             "energy_bin_count": int(self._energy_axis_keV.size),
@@ -5279,6 +6128,9 @@ class GeometryConditionedSpectralModel:
             "scatter_shape": "klein_nishina_optical_depth_orders",
             "maximum_scatter_order": int(self.maximum_scatter_order),
             "detector_response_sampling": (
+                "physical_component_gamma_poisson_and_dirichlet_marking"
+                if self.physical_component_discrepancy is not None
+                else
                 "multinomial_marking_with_station_shared_gamma_poisson_"
                 "recorded_total"
                 if self.count_discrepancy_concentration is not None
@@ -5288,6 +6140,9 @@ class GeometryConditionedSpectralModel:
                 NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
             ),
             "dead_time_model": (
+                "nonparalyzable_mean_then_component_gamma_poisson_total"
+                if self.physical_component_discrepancy is not None
+                else
                 "nonparalyzable_mean_then_gamma_poisson_recorded_total"
                 if self.count_discrepancy_concentration is not None
                 else "nonparalyzable_event_time_renewal_total"
@@ -5348,6 +6203,10 @@ class GeometryConditionedSpectralModel:
         if self.mark_concentration_multi_isotope is not None:
             payload["mark_concentration_multi_isotope"] = float(
                 self.mark_concentration_multi_isotope
+            )
+        if self.physical_component_discrepancy is not None:
+            payload["physical_component_discrepancy"] = (
+                self.physical_component_discrepancy.to_payload()
             )
         if correction is not None:
             payload["low_rank_spectral_mean_correction"] = (

@@ -223,7 +223,7 @@ def resolve_profile_model_runtime_config(
         raise ValueError(
             f"Profile registry isotopes disagree for {profile.name!r}."
         )
-    model_path = _resolve_registry_asset_path(
+    _resolve_registry_asset_path(
         entry["model_path"],
         registry_path=registry_path,
     )

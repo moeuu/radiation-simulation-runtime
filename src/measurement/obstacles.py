@@ -780,17 +780,19 @@ def _expand_cells(
     return expanded
 
 
-def _coverage_line_indices(cell_count: int) -> list[int]:
+def _coverage_line_indices(
+    cell_count: int,
+    *,
+    maximum_gap_cells: int = EXPLORATION_BACKBONE_MAX_GAP_CELLS,
+) -> list[int]:
     """Return grid-line indices that keep coverage gaps bounded."""
     count = int(cell_count)
     if count <= 0:
         return []
     if count <= 2:
         return list(range(count))
-    indices = list(range(0, count, EXPLORATION_BACKBONE_MAX_GAP_CELLS))
-    midpoint = count // 2
-    if midpoint not in indices:
-        indices.append(midpoint)
+    gap = max(1, int(maximum_gap_cells))
+    indices = list(range(0, count, gap))
     if indices[-1] != count - 1:
         indices.append(count - 1)
     return sorted(set(indices))
@@ -817,13 +819,14 @@ def _exploration_backbone_cells(
     *,
     grid_shape: tuple[int, int],
     keep_free_cells: set[tuple[int, int]],
+    maximum_gap_cells: int = EXPLORATION_BACKBONE_MAX_GAP_CELLS,
 ) -> set[tuple[int, int]]:
     """Return a connected sparse grid backbone for whole-environment traversal."""
     nx, ny = grid_shape
     if nx <= 0 or ny <= 0:
         return set()
-    xs = _coverage_line_indices(nx)
-    ys = _coverage_line_indices(ny)
+    xs = _coverage_line_indices(nx, maximum_gap_cells=maximum_gap_cells)
+    ys = _coverage_line_indices(ny, maximum_gap_cells=maximum_gap_cells)
     backbone: set[tuple[int, int]] = set()
     for ix in xs:
         for iy in range(ny):
@@ -832,7 +835,9 @@ def _exploration_backbone_cells(
         for ix in range(nx):
             backbone.add((ix, iy))
     anchor = sorted(backbone)[0]
-    for cell in keep_free_cells:
+    required_cells = set(keep_free_cells)
+    required_cells.add((nx // 2, ny // 2))
+    for cell in required_cells:
         if 0 <= cell[0] < nx and 0 <= cell[1] < ny:
             nearest = min(
                 backbone,
@@ -911,10 +916,15 @@ def generate_obstacle_grid(
         1,
         int(np.ceil(max(float(passage_width_m), cell_size) / cell_size)),
     )
+    backbone_gap_cells = max(
+        EXPLORATION_BACKBONE_MAX_GAP_CELLS,
+        width_cells + 2,
+    )
     reserved_cells = _expand_cells(
         _exploration_backbone_cells(
             grid_shape=(nx, ny),
             keep_free_cells=keep_free_cells,
+            maximum_gap_cells=backbone_gap_cells,
         ),
         width_cells=width_cells,
         grid_shape=(nx, ny),

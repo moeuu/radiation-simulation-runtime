@@ -11,6 +11,10 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
+from measurement.shielding import (
+    SHIELD_POSE_CONTRACT_ID,
+    SHIELD_POSE_CONTRACT_SHA256,
+)
 from measurement.source_boundary import (
     SURFACE_EMISSION_EPSILON_M,
     surface_emission_policy_sha256,
@@ -1396,6 +1400,8 @@ def validate_mean_calibration_transport_metadata(
         "validation_entry_spectrum_grouping": (
             "source_token_initial_gamma_line_entry_class"
         ),
+        "shield_pose_contract_id": SHIELD_POSE_CONTRACT_ID,
+        "shield_pose_contract_sha256": SHIELD_POSE_CONTRACT_SHA256,
     }
     if expected_physics_profile is not None:
         exact_strings["physics_profile"] = expected_physics_profile
@@ -2926,6 +2932,8 @@ class Geant4Application:
             ),
             "surface_source_contract_sha256": source_contract_sha256,
             "scene_hash": scene_hash,
+            "shield_pose_contract_id": SHIELD_POSE_CONTRACT_ID,
+            "shield_pose_contract_sha256": SHIELD_POSE_CONTRACT_SHA256,
         }
         if budget_enabled:
             metadata["history_thinning_resolution"] = "per_observation_pending"
@@ -2958,6 +2966,8 @@ class Geant4Application:
                 fe_shield_quat_wxyz=fe_pose.orientation_wxyz,
                 pb_shield_pose_xyz=pb_pose.translation_xyz,
                 pb_shield_quat_wxyz=pb_pose.orientation_wxyz,
+                fe_orientation_index=int(command.fe_orientation_index),
+                pb_orientation_index=int(command.pb_orientation_index),
             )
         )
         metadata = dict(metadata)
@@ -3049,6 +3059,8 @@ class Geant4Application:
         metadata["accelerated_weighted_transport_enable"] = bool(
             self.config.accelerated_weighted_transport_enable
         )
+        metadata["shield_pose_contract_id"] = SHIELD_POSE_CONTRACT_ID
+        metadata["shield_pose_contract_sha256"] = SHIELD_POSE_CONTRACT_SHA256
         metadata.setdefault("cache_hit", self._last_cache_hit)
         metadata.setdefault("fe_orientation_index", int(command.fe_orientation_index))
         metadata.setdefault("pb_orientation_index", int(command.pb_orientation_index))

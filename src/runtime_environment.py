@@ -11,7 +11,9 @@ from measurement.obstacle_assets import (
     KnownObstacleInstance,
     generate_manchester_obstacle_instances,
     nominal_obstacle_minimum_transmission,
+    validate_component_transport_contract,
 )
+from measurement.geometry_family import geometry_family_descriptor
 from measurement.obstacles import ObstacleGrid, build_obstacle_grid
 from sim.blender_environment import attach_known_obstacle_transport_model
 
@@ -26,6 +28,7 @@ class RuntimeObstacleEnvironment:
     mode: EnvironmentMode
     layout_path: Path | None
     known_obstacle_instances: tuple[KnownObstacleInstance, ...] | None
+    geometry_family: dict[str, object] | None
     message: str | None
 
     def template_counts(self) -> dict[str, int]:
@@ -135,6 +138,11 @@ def attach_random_manchester_transport_geometry(
             for component in instance.components
         )
     )
+    validate_component_transport_contract(
+        grid_with_transport,
+        instances,
+        room_size_xyz=room_size_xyz,
+    )
     return grid_with_transport, instances
 
 
@@ -164,6 +172,7 @@ def build_runtime_obstacle_environment(
             mode=mode,
             layout_path=None,
             known_obstacle_instances=None,
+            geometry_family=None,
             message=None,
         )
     keep_free = None
@@ -182,6 +191,7 @@ def build_runtime_obstacle_environment(
         passage_width_m=active_passage_width_m,
     )
     known_obstacle_instances: tuple[KnownObstacleInstance, ...] | None = None
+    family_descriptor: dict[str, object] | None = None
     if attach_known_transport and mode == "random":
         grid, known_obstacle_instances = attach_random_manchester_transport_geometry(
             grid,
@@ -192,11 +202,22 @@ def build_runtime_obstacle_environment(
             include_room_boundaries=include_room_boundaries,
             room_boundary_thickness_m=room_boundary_thickness_m,
         )
+        family_descriptor = dict(
+            geometry_family_descriptor(
+                grid,
+                known_obstacle_instances,
+                room_size_xyz=room_size_xyz,
+                passage_width_m=active_passage_width_m,
+                target_blocked_fraction=float(blocked_fraction),
+                obstacle_height_limit_m=float(obstacle_height_m),
+            )
+        )
     return RuntimeObstacleEnvironment(
         grid=grid,
         mode=mode,
         layout_path=obstacle_path,
         known_obstacle_instances=known_obstacle_instances,
+        geometry_family=family_descriptor,
         message=_obstacle_mode_message(
             mode=mode,
             path=obstacle_path,

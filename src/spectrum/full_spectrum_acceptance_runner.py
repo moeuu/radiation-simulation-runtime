@@ -35,14 +35,20 @@ from measurement.source_boundary import (
     surface_emission_policy_sha256,
     surface_source_runtime_contract_sha256,
 )
+from measurement.shielding import SHIELD_POSE_CONTRACT_SHA256
 from spectrum.additive_scatter import (
     ADDITIVE_SCATTER_FEATURE_ORDER,
     ADDITIVE_SCATTER_INCIDENT_LABEL_SEMANTICS,
     ADDITIVE_SCATTER_TARGET_SEMANTICS,
     AdditiveNoncollidedTransportResponse,
     fit_additive_noncollided_transport_response,
+    scatter_basis_from_stored_geometry_numpy,
 )
 from spectrum.native_metadata import native_source_line_token
+from spectrum.physics_contracts import (
+    OBSTACLE_MATERIAL_CONTRACT_SHA256,
+    TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256,
+)
 from spectrum.response_matrix import (
     NATIVE_GEANT4_BIN_COUNT,
     NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256,
@@ -62,7 +68,7 @@ from spectrum.transport_spectral import (
 
 
 ACCEPTANCE_RUN_CONTRACT_SCHEMA_VERSION = 2
-ACCEPTANCE_PAIR_SCHEMA_VERSION = 1
+ACCEPTANCE_PAIR_SCHEMA_VERSION = 2
 ACCEPTANCE_SCENE_CORPUS_SCHEMA_VERSION = 1
 DISCREPANCY_SELECTION_ARTIFACT_SCHEMA_VERSION = 1
 ACCEPTANCE_DWELL_TIME_S = 30.0
@@ -134,10 +140,22 @@ _PAIR_KEYS = frozenset(
         "line_identity_contract_sha256",
         "observed_spectrum_counts",
         "geometry",
+        "geometry_family",
         "validation_labels",
         "native_fidelity",
+        "detector_response_contract_sha256",
+        "shield_pose_contract_sha256",
+        "obstacle_material_contract_sha256",
+        "transport_physics_table_contract_sha256",
     }
 )
+_LEGACY_PAIR_KEYS = _PAIR_KEYS - {
+    "geometry_family",
+    "detector_response_contract_sha256",
+    "shield_pose_contract_sha256",
+    "obstacle_material_contract_sha256",
+    "transport_physics_table_contract_sha256",
+}
 _GEOMETRY_KEYS = frozenset(
     {
         "unattenuated_source_line_rate_vsl",
@@ -531,6 +549,7 @@ class AcceptancePairRecord:
     perturbed_features_vslf: NDArray[np.float64]
     perturbed_scatter_basis_vslf: NDArray[np.float64]
     labels: Mapping[str, object]
+    geometry_family: Mapping[str, object] | None = None
 
 
 def load_acceptance_pair(
@@ -553,7 +572,15 @@ def load_acceptance_pair(
         raise ValueError(
             f"Pair artifact is not immutable canonical JSON: {artifact_path}."
         )
-    if not isinstance(payload, Mapping) or set(payload) != _PAIR_KEYS:
+    if not isinstance(payload, Mapping):
+        raise ValueError("Pair artifact has an incompatible exact schema.")
+    schema_version = payload.get("schema_version")
+    expected_keys = (
+        _PAIR_KEYS
+        if schema_version == ACCEPTANCE_PAIR_SCHEMA_VERSION
+        else _LEGACY_PAIR_KEYS
+    )
+    if set(payload) != expected_keys:
         raise ValueError("Pair artifact has an incompatible exact schema.")
     seed = payload["scene_seed"]
     pair_id = payload["shield_pair_id"]
@@ -577,7 +604,7 @@ def load_acceptance_pair(
         raise ValueError("Pair seed or shield-pair identity is invalid.")
     if (
         type(payload["schema_version"]) is not int
-        or payload["schema_version"] != ACCEPTANCE_PAIR_SCHEMA_VERSION
+        or payload["schema_version"] not in (1, ACCEPTANCE_PAIR_SCHEMA_VERSION)
         or payload["acceptance_contract_sha256"]
         != FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256
         or type(payload["split"]) is not str
@@ -607,6 +634,32 @@ def load_acceptance_pair(
     )
     validate_surface_boundary_gate(payload["surface_boundary_gate"])
     validate_native_fidelity(payload["native_fidelity"])
+    if payload["schema_version"] == ACCEPTANCE_PAIR_SCHEMA_VERSION:
+        from measurement.geometry_family import (
+            validate_geometry_family_descriptor,
+        )
+
+        validate_geometry_family_descriptor(
+            payload["geometry_family"],
+            require_in_domain=True,
+        )
+        expected_physics_contracts = {
+            "detector_response_contract_sha256": (
+                NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
+            ),
+            "shield_pose_contract_sha256": SHIELD_POSE_CONTRACT_SHA256,
+            "obstacle_material_contract_sha256": (
+                OBSTACLE_MATERIAL_CONTRACT_SHA256
+            ),
+            "transport_physics_table_contract_sha256": (
+                TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256
+            ),
+        }
+        for field_name, expected_value in expected_physics_contracts.items():
+            if payload.get(field_name) != expected_value:
+                raise ValueError(
+                    f"Pair physics contract {field_name!r} is incompatible."
+                )
     detector = _validate_vector_payload(
         payload["detector_pose_xyz"],
         shape=(3,),
@@ -848,6 +901,16 @@ def load_acceptance_pair(
         perturbed_features_vslf=perturbed_features,
         perturbed_scatter_basis_vslf=perturbed_scatter,
         labels=json.loads(json.dumps(dict(labels), allow_nan=False)),
+        geometry_family=(
+            None
+            if payload["schema_version"] == 1
+            else json.loads(
+                json.dumps(
+                    dict(payload["geometry_family"]),
+                    allow_nan=False,
+                )
+            )
+        ),
     )
 
 
@@ -1236,21 +1299,65 @@ def build_complete_training_manifest(
 ) -> dict[str, object]:
     """Rehash all designated training data before exposing it to fitting."""
     artifact_hashes: dict[str, str] = {}
+    artifact_contract_hashes: dict[str, str] = {}
     pair_ids: dict[str, list[int]] = {}
     for seed in DESIGNATED_TRAINING_SCENE_SEEDS:
         corpus_path = layout.scene_corpus_path(
             split="training",
             scene_seed=seed,
         )
-        validate_scene_corpus(
+        records = validate_scene_corpus(
             corpus_path,
             layout=layout,
             expected_line_identity_sha256=line_identity_sha256,
         )
+        for record in records:
+            pair_payload = _load_json_mapping(record.path)
+            if pair_payload.get("schema_version") != ACCEPTANCE_PAIR_SCHEMA_VERSION:
+                raise ValueError(
+                    "Training pair artifact predates the authenticated "
+                    "physics-contract schema."
+                )
+            expected_contracts = {
+                "detector_response_contract_sha256": (
+                    NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
+                ),
+                "shield_pose_contract_sha256": SHIELD_POSE_CONTRACT_SHA256,
+                "obstacle_material_contract_sha256": (
+                    OBSTACLE_MATERIAL_CONTRACT_SHA256
+                ),
+                "transport_physics_table_contract_sha256": (
+                    TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256
+                ),
+            }
+            if any(
+                pair_payload.get(key) != value
+                for key, value in expected_contracts.items()
+            ):
+                raise ValueError(
+                    "Training pair artifact physics contracts do not match."
+                )
         artifact_hashes[str(seed)] = file_sha256(corpus_path)
+        artifact_contract_hashes[str(seed)] = canonical_json_sha256(
+            {
+                "scene_corpus_sha256": artifact_hashes[str(seed)],
+                "detector_response_contract_sha256": (
+                    NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
+                ),
+                "shield_pose_contract_sha256": (
+                    SHIELD_POSE_CONTRACT_SHA256
+                ),
+                "obstacle_material_contract_sha256": (
+                    OBSTACLE_MATERIAL_CONTRACT_SHA256
+                ),
+                "transport_physics_table_contract_sha256": (
+                    TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256
+                ),
+            }
+        )
         pair_ids[str(seed)] = list(ACCEPTANCE_PAIR_IDS)
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "acceptance_contract_sha256": (
             FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256
         ),
@@ -1258,6 +1365,17 @@ def build_complete_training_manifest(
         "scenario_ids": list(VALIDATION_SCENARIO_IDS),
         "pair_ids_by_scene": pair_ids,
         "artifact_sha256_by_scene": artifact_hashes,
+        "artifact_contract_sha256_by_scene": artifact_contract_hashes,
+        "detector_response_contract_sha256": (
+            NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
+        ),
+        "shield_pose_contract_sha256": SHIELD_POSE_CONTRACT_SHA256,
+        "obstacle_material_contract_sha256": (
+            OBSTACLE_MATERIAL_CONTRACT_SHA256
+        ),
+        "transport_physics_table_contract_sha256": (
+            TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256
+        ),
         "line_identity_contract_sha256": line_identity_sha256,
         "pair_artifact_count": (
             len(DESIGNATED_TRAINING_SCENE_SEEDS)
@@ -1377,7 +1495,7 @@ def fit_training_additive_scatter(
         raise RuntimeError("Training corpus contains no additive-scatter samples.")
     completion = _load_json_mapping(layout.training_complete_path)
     training_manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "acceptance_contract_sha256": (
             FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256
         ),
@@ -1389,6 +1507,19 @@ def fit_training_additive_scatter(
         },
         "artifact_sha256_by_scene": dict(
             completion["artifact_sha256_by_scene"]
+        ),
+        "artifact_contract_sha256_by_scene": dict(
+            completion["artifact_contract_sha256_by_scene"]
+        ),
+        "detector_response_contract_sha256": (
+            NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
+        ),
+        "shield_pose_contract_sha256": SHIELD_POSE_CONTRACT_SHA256,
+        "obstacle_material_contract_sha256": (
+            OBSTACLE_MATERIAL_CONTRACT_SHA256
+        ),
+        "transport_physics_table_contract_sha256": (
+            TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256
         ),
         "label_space": ADDITIVE_SCATTER_INCIDENT_LABEL_SEMANTICS,
         "selection_objective": (
@@ -1414,6 +1545,7 @@ def _scenario_arrays(
     records: Sequence[AcceptancePairRecord],
     *,
     additive_response: AdditiveNoncollidedTransportResponse,
+    line_identity: Sequence[Mapping[str, object]],
 ) -> tuple[
     NDArray[np.float64],
     NDArray[np.float64],
@@ -1442,12 +1574,37 @@ def _scenario_arrays(
         [record.features_vslf for record in ordered],
         axis=0,
     )
-    scatter_basis = np.concatenate(
+    stored_scatter_basis = np.concatenate(
         [record.scatter_basis_vslf for record in ordered],
         axis=0,
     )
+    scatter_basis = scatter_basis_from_stored_geometry_numpy(
+        stored_basis=stored_scatter_basis,
+        transport_features=features,
+        line_identity=line_identity,
+        target_semantics=additive_response.feature_basis_semantics,
+        detector_radius_m=getattr(
+            additive_response,
+            "detector_radius_m",
+            None,
+        ),
+        fe_scatter_distance_m=getattr(
+            additive_response,
+            "fe_scatter_distance_m",
+            None,
+        ),
+        pb_scatter_distance_m=getattr(
+            additive_response,
+            "pb_scatter_distance_m",
+            None,
+        ),
+    )
     total = additive_response.total_kernel_numpy(
         unattenuated,
+        uncollided,
+        scatter_basis,
+    )
+    uncollided = additive_response.corrected_uncollided_kernel_numpy(
         uncollided,
         scatter_basis,
     )
@@ -1500,6 +1657,7 @@ def select_training_discrepancy(
                 observed, total, uncollided, features = _scenario_arrays(
                     grouped[key],
                     additive_response=additive_response,
+                    line_identity=base_model.line_identity,
                 )
                 value = candidate.log_likelihood_numpy(
                     observed,

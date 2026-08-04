@@ -22,6 +22,7 @@ from spectrum.transport_spectral import (
     FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256,
     GeometryConditionedSpectralModel,
     LowRankSpectralMeanCorrection,
+    PhysicalComponentDiscrepancy,
     MARK_CONCENTRATION_GRID,
     RATE_SCALE_HALF_WIDTH_GRID,
     VALIDATION_SCENARIO_IDS,
@@ -34,6 +35,14 @@ from spectrum.transport_spectral import (
     station_shared_gamma_poisson_count_log_increments_numpy,
     station_shared_gamma_poisson_count_log_increments_torch,
 )
+from measurement.shielding import (
+    SHIELD_POSE_CONTRACT_ID,
+    SHIELD_POSE_CONTRACT_SHA256,
+)
+from measurement.geometry_family import (
+    GEOMETRY_FAMILY_APPLICABILITY_SHA256,
+)
+from tests.runtime_test_support import approved_full_spectrum_model
 
 
 def test_continuous_rate_scale_quadrature_integrates_uniform_moments() -> None:
@@ -89,9 +98,6 @@ def test_shared_gamma_count_prefixes_match_closed_form_and_torch() -> None:
 
     assert float(np.sum(increments)) == pytest.approx(expected_log)
     assert np.allclose(increments, torch_increments, rtol=1.0e-12, atol=1.0e-12)
-from tests.runtime_test_support import approved_full_spectrum_model
-
-
 def _model(
     *,
     dead_time_tau_s: float = 5.813e-9,
@@ -118,6 +124,119 @@ def _runtime_ready_candidate() -> GeometryConditionedSpectralModel:
         discrepancy_training_manifest=approved.discrepancy_training_manifest,
         additive_scatter_response=approved.additive_scatter_response,
     )
+
+
+def _physical_component_candidate() -> GeometryConditionedSpectralModel:
+    """Return a synthetic randomized-family component-latent candidate."""
+    approved = approved_full_spectrum_model()
+    component = PhysicalComponentDiscrepancy(
+        count_uncollided_concentration=100_000.0,
+        count_scatter_concentration=300.0,
+        mark_uncollided_concentration=100_000.0,
+        mark_scatter_concentration=300.0,
+    )
+    manifest = {
+        "schema_version": 3,
+        "training_policy": "randomized_geometry_family_training_only_v1",
+        "acceptance_contract_sha256": (
+            FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256
+        ),
+        "geometry_family_applicability_sha256": (
+            GEOMETRY_FAMILY_APPLICABILITY_SHA256
+        ),
+        "training_scene_seeds": list(DESIGNATED_TRAINING_SCENE_SEEDS),
+        "scenario_ids": list(VALIDATION_SCENARIO_IDS),
+        "artifact_sha256_by_scene_and_scenario": {
+            str(seed): {
+                scenario: {"0": "0" * 64}
+                for scenario in VALIDATION_SCENARIO_IDS
+            }
+            for seed in DESIGNATED_TRAINING_SCENE_SEEDS
+        },
+        "component_family": "uncollided_scatter_component_latents_v1",
+        "selected_concentrations": {
+            **dict(component.to_payload()),
+        },
+        "selection_objective": (
+            "maximum_training_log_predictive_density_regularized"
+        ),
+        "selection_completed": True,
+        "holdout_artifacts_consumed": False,
+    }
+    manifest["selected_concentrations"] = {
+        key: value
+        for key, value in manifest["selected_concentrations"].items()
+        if key
+        in {
+            "count_uncollided_concentration",
+            "count_scatter_concentration",
+            "mark_uncollided_concentration",
+            "mark_scatter_concentration",
+            "count_scope",
+        }
+    }
+    return GeometryConditionedSpectralModel.standard_native(
+        ("Co-60", "Cs-137", "Eu-154"),
+        dead_time_tau_s=approved.dead_time_tau_s,
+        background_rate_cps=approved.background_rate_cps,
+        physical_component_discrepancy=component,
+        discrepancy_training_manifest=manifest,
+        additive_scatter_response=approved.additive_scatter_response,
+    )
+
+
+def test_physical_component_concentration_preserves_direct_information() -> None:
+    """Direct-dominated states must remain sharper than scatter states."""
+    model = _physical_component_candidate()
+    total = np.ones((2, 1, 1, len(model.line_identity)), dtype=np.float64)
+    uncollided = total.copy()
+    uncollided[1] *= 0.0
+
+    count = model._component_count_concentration_numpy(total, uncollided)
+    mark = model._base_mark_concentration_numpy(total, uncollided)
+
+    assert model.runtime_ready
+    assert model.discrepancy_training_ready
+    assert count[0, 0] == pytest.approx(100_000.0)
+    assert count[1, 0] == pytest.approx(300.0)
+    assert mark[0, 0] == pytest.approx(100_000.0)
+    assert mark[1, 0] == pytest.approx(300.0)
+
+
+def test_physical_component_concentrations_match_torch() -> None:
+    """CPU and Torch component concentration paths must be identical."""
+    torch = pytest.importorskip("torch")
+    model = _physical_component_candidate()
+    rng = np.random.default_rng(71)
+    total = rng.uniform(0.1, 4.0, size=(3, 2, 2, len(model.line_identity)))
+    uncollided = total * rng.uniform(0.0, 1.0, size=total.shape)
+
+    count_numpy = model._component_count_concentration_numpy(
+        total,
+        uncollided,
+    )
+    mark_numpy = model._base_mark_concentration_numpy(total, uncollided)
+    count_torch = (
+        model._component_count_concentration_torch(
+            torch.as_tensor(total, dtype=torch.float64),
+            torch.as_tensor(uncollided, dtype=torch.float64),
+        )
+        .detach()
+        .cpu()
+        .numpy()
+    )
+    mark_torch = (
+        model._base_mark_concentration_torch(
+            torch.as_tensor(total, dtype=torch.float64),
+            torch.as_tensor(uncollided, dtype=torch.float64),
+        )
+        .detach()
+        .cpu()
+        .numpy()
+    )
+
+    assert np.allclose(count_numpy, count_torch, rtol=1.0e-12, atol=1.0e-12)
+    assert np.allclose(mark_numpy, mark_torch, rtol=1.0e-12, atol=1.0e-12)
 
 
 def _training_ready_mean_correction(
@@ -1390,6 +1509,21 @@ def test_exact_physical_statistics_need_only_trained_additive_mean() -> None:
     assert reconstructed.runtime_ready is True
 
 
+def test_legacy_component_candidate_without_physics_contract_is_rejected() -> None:
+    """A learned asset cannot be laundered without source-artifact contracts."""
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "configs"
+        / "geant4"
+        / "models"
+        / "geometry_conditioned_full_spectrum_ral_eu154_component_v4.json"
+    )
+    with pytest.raises(ValueError, match="does not exactly reconstruct"):
+        GeometryConditionedSpectralModel.from_manifest_payload(
+            json.loads(path.read_text(encoding="utf-8"))
+        )
+
+
 def test_acceptance_contract_file_is_predeclared_and_hash_stable() -> None:
     """The versioned JSON must exactly match the in-code holdout contract."""
     path = (
@@ -1705,6 +1839,11 @@ def test_discrepancy_manifest_is_training_only_and_manifest_is_schema_three() ->
     assert manifest["source_rate_semantics"] == (
         "pre_dead_time_detector_pulse_rate_at_1m"
     )
+    assert manifest["shield_pose_contract_id"] == SHIELD_POSE_CONTRACT_ID
+    assert (
+        manifest["shield_pose_contract_sha256"]
+        == SHIELD_POSE_CONTRACT_SHA256
+    )
     assert manifest["discrepancy_training_ready"] is True
     assert manifest["rate_scale_mixture"]["weighted_mean"] == 1.0
 
@@ -1737,6 +1876,12 @@ def test_runtime_factory_reconstructs_and_authenticates_schema_three() -> None:
     corrupted = json.loads(json.dumps(runtime))
     corrupted["full_spectrum_contract_hash_sha256"] = "0" * 64
     with pytest.raises(ValueError, match="hash"):
+        geometry_conditioned_model_from_runtime_config(corrupted)
+    corrupted = json.loads(json.dumps(runtime))
+    corrupted["full_spectrum_generative_model"][
+        "shield_pose_contract_sha256"
+    ] = "0" * 64
+    with pytest.raises(ValueError, match="reconstruct"):
         geometry_conditioned_model_from_runtime_config(corrupted)
 
 
