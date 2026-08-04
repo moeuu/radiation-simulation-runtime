@@ -11,7 +11,7 @@ Rotating-shield-simulation-runtime
                                            |
                   +------------------------+------------------------+
                   |                        |                        |
-      Rotating-shield-particle-filter  3D_estimation  estimator orchestrator
+      Rotating-shield-particle-filter  radiation-surface-mle-estimator  estimator orchestrator
 ```
 
 For a fair same-observation comparison, run acquisition once and replay the exact
@@ -32,4 +32,3 @@ uv run rotating-shield-sim run-plan PLAN.json
 `run-plan` reads source truth only from the private plan, durably records each raw
 observation before returning it to a controller, and never writes source truth into
 MeasurementLog v2.
-
