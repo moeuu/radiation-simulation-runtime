@@ -21,6 +21,7 @@ from runtime.adaptive import (
     _validate_private_scene_profile,
     serve_adaptive_session,
 )
+from runtime.adaptive_client import AdaptiveRuntimeClient
 from runtime.measurement_log import MeasurementLogRecord
 from runtime.records import RunContext
 
@@ -573,3 +574,32 @@ def test_adaptive_protocol_uses_private_prefix_for_cui_overlay(
     assert private_events[0]["truth"]["true_sources"]["Cs-137"] == [
         [1.0, 1.0, 1.0]
     ]
+
+
+def test_adaptive_client_requests_truth_only_on_private_cui_protocol() -> None:
+    """The client must keep CUI truth outside estimator-validated events."""
+    response = {
+        "type": "cui_overlay",
+        "schema_version": 1,
+        "truth": {
+            "schema_version": 1,
+            "semantics": "evaluation_cui_overlay_only_not_estimator_input",
+            "true_sources": {"Cs-137": [[1.0, 1.0, 1.0]]},
+            "true_strengths": {"Cs-137": [300000.0]},
+        },
+    }
+    client = AdaptiveRuntimeClient.__new__(AdaptiveRuntimeClient)
+    client.input = StringIO()
+    client.output = StringIO(
+        ADAPTIVE_CUI_OVERLAY_PREFIX + json.dumps(response) + "\n"
+    )
+    client.output_hook = lambda message: None
+    client.process = SimpleNamespace(poll=lambda: None)
+
+    payload = client.request_cui_overlay(include_truth=True)
+
+    assert json.loads(client.input.getvalue()) == {
+        "type": "cui_overlay",
+        "include_truth": True,
+    }
+    assert payload == response

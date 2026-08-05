@@ -315,11 +315,12 @@ class AdaptiveRuntimeClient:
         """Request private CUI overlay data outside the estimator protocol."""
         if self.input is None:
             raise RuntimeError("Adaptive runtime input is closed.")
+        if not isinstance(include_truth, bool):
+            raise TypeError("include_truth must be a boolean.")
         payload = {
             "type": "cui_overlay",
-            "include_truth": bool(include_truth),
+            "include_truth": include_truth,
         }
-        validate_truth_free_estimator_input(payload, path="adaptive.cui_request")
         self.input.write(json.dumps(payload, allow_nan=False) + "\n")
         self.input.flush()
         assert self.output is not None
