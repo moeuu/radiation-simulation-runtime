@@ -27,11 +27,86 @@ uv sync --extra test
 uv run rotating-shield-sim validate-log PATH
 uv run rotating-shield-sim serve --config configs/geant4/variance_reduction_external_no_isaac_32threads.json
 uv run rotating-shield-sim run-plan PLAN.json
+uv run rotating-shield-sim run-adaptive-session PRIVATE_SCENARIO.json \
+  --private-scene-profile ral-mix9
+uv run rotating-shield-sim generate-ral-scenario PRIVATE_SCENARIO.json \
+  --measurement-log-output /private/logs/run-001 \
+  --run-id run-001 \
+  --runtime-config configs/geant4/variance_reduction_external_no_isaac_32threads.json \
+  --source-profile ral-mix9
+uv run rotating-shield-sim calibrate-discrepancy CALIBRATION_ROWS.npz \
+  discrepancy-calibration.json --calibration-id ral-independent-v1
 ```
 
 `run-plan` reads source truth only from the private plan, durably records each raw
 observation before returning it to a controller, and never writes source truth into
 MeasurementLog v2.
+
+`run-adaptive-session` is the closed-loop boundary. Its private scenario contains
+the realized sources, environment/obstacles, physical runtime configuration, and
+MeasurementLog destination, but no action array, station count, view count, route,
+or shield program. It publishes reachable truth-free candidates, accepts exactly one
+controller selection over JSON lines, durably stages that observation, and repeats
+until the controller requests finalization.
+The optional `ral-mix9` private-scene profile validates Cs-137 x4, Co-60 x3, and
+Eu-154 x2 entirely inside the runtime; the counts and realized source data are not
+included in estimator-visible events.
+
+`generate-ral-scenario` creates that private, action-free scenario. Omitting
+`--scene-seed` creates a fresh environment and source realization; an explicit seed
+is reserved for exact replay or paired estimator comparisons. The command does not
+choose station count, view count, shield programs, estimator settings, or a stopping
+rule. Those remain private to the estimator or experiment harness controlling the
+session. `--source-profile ral-cs4-co3-eu0` keeps Cs-137, Co-60, and Eu-154 in the
+truth-free inference contract while privately realizing exactly four Cs-137, three
+Co-60, and zero Eu-154 sources. This permits a genuine absent-isotope/ghost test
+without leaking Eu absence to an estimator.
+
+## Common adaptive workspace
+
+Adaptive candidate generation is estimator-neutral. The runtime draws a nested,
+scrambled Sobol sequence directly in collision-free `(x, y, z)` free volume; it is
+not a floor grid with a list of heights attached. The initial pose and requested
+same-XY height anchors are retained, and a controller may ask the runtime to refine
+the neighborhood of selected candidate indices. Local refinement is still generated,
+collision-checked, and timed by the runtime—the controller supplies only seeds.
+
+The free-volume check models the detector head, mast, and base separately. Motion
+costs separately account for horizontal travel, retract/extend vertical travel,
+settling time, shield angular actuation, and dwell. Candidate events therefore expose
+only reachable poses and common physical costs; PF and MLE remain responsible for
+their own ranking objectives. Increasing `candidate_count` preserves the earlier
+Sobol prefix, which makes candidate-density convergence tests reproducible.
+
+The runtime does **not** contain a PF candidate generator and an MLE candidate
+generator. It has one physical workspace and one acquisition protocol shared by all
+estimators. Likewise, it never contains estimator likelihoods, posterior state,
+regularization, stopping rules, or planner scores.
+
+This is an interface commonality, not a requirement that estimators use the same
+configuration or take the same actions. A PF-controlled and an MLE-controlled run
+normally create separate causal sessions and may use different station programs,
+budgets, and stopping times while relying on the same runtime implementation.
+
+## Shared discrepancy calibration contract
+
+`calibrate-discrepancy` fits a versioned, estimator-neutral spectral discrepancy
+artifact from independent calibration environments. Its strict NPZ input contains
+exactly:
+
+- `observed_counts` and corresponding physics-model `expected_counts` with shape
+  `N x B`;
+- `energy_bin_edges_keV` with shape `B + 1`;
+- `environment_ids` with at least two distinct independent realizations;
+- `shield_pair_ids` covering every Fe/Pb pair `0..63`.
+
+The published JSON contains background/scatter bases, low-dimensional all-pair shield
+leakage features, station-rate and low-rank residual families, gain/resolution drift
+derivatives, shrinkage strengths, and calibrated negative-binomial overdispersion.
+Incomplete pair coverage or non-independent environments fail closed. The artifact
+is common physical/calibration input: an estimator chooses whether and how to include
+these nuisance columns in its own likelihood. Runtime calibration never imports or
+calls PF or MLE code.
 
 ## License
 

@@ -70,7 +70,7 @@ def build_assets(repository_root: Path) -> None:
         )
         relative_path = (
             "configs/geant4/models/profiles/"
-            f"{profile_name}_physics_only_v2.json"
+            f"{profile_name}_physics_only_v4.json"
         )
         model_path = repository_root / relative_path
         model_bytes = _canonical_bytes(model.manifest_payload())

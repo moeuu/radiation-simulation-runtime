@@ -239,6 +239,58 @@ def test_physical_component_concentrations_match_torch() -> None:
     assert np.allclose(mark_numpy, mark_torch, rtol=1.0e-12, atol=1.0e-12)
 
 
+def test_physics_only_hierarchical_marks_round_trip_and_match_torch() -> None:
+    """Physics-only peak/continuum marks must match on CPU and GPU."""
+    torch = pytest.importorskip("torch")
+    payload = PhysicalComponentDiscrepancy.physics_only_budget().to_payload()
+    component = PhysicalComponentDiscrepancy.from_payload(payload)
+
+    assert payload["schema_version"] == 4
+    assert component.mark_latent_model == (
+        "photopeak_continuum_hierarchical"
+    )
+    model_path = (
+        Path(__file__).resolve().parents[1]
+        / "configs/geant4/models/profiles/ral_eu154_physics_only_v4.json"
+    )
+    model = GeometryConditionedSpectralModel.from_manifest_payload(
+        json.loads(model_path.read_text(encoding="utf-8"))
+    )
+    rng = np.random.default_rng(7391)
+    line_count = len(model.line_identity)
+    total = rng.uniform(0.1, 3.0, size=(3, 2, 2, line_count))
+    uncollided = total * rng.uniform(0.2, 1.0, size=total.shape)
+    features = rng.uniform(0.0, 1.0, size=total.shape + (4,))
+    live = np.asarray([2.0, 3.0], dtype=np.float64)
+    observed = model.sample_predictive_numpy(
+        total[:1],
+        uncollided[:1],
+        features[:1],
+        live,
+        sample_count=1,
+        rng=rng,
+    )[0, 0].astype(np.float64)
+    numpy_log = model.log_likelihood_numpy(
+        observed,
+        total,
+        uncollided,
+        features,
+        live,
+    )
+    torch_log = model.log_likelihood_torch(
+        torch.as_tensor(observed, dtype=torch.float64),
+        torch.as_tensor(total, dtype=torch.float64),
+        torch.as_tensor(uncollided, dtype=torch.float64),
+        torch.as_tensor(features, dtype=torch.float64),
+        torch.as_tensor(live, dtype=torch.float64),
+    ).detach().cpu().numpy()
+
+    np.testing.assert_allclose(numpy_log, torch_log, rtol=0.0, atol=2.0e-10)
+    assert model.manifest_payload()["mark_model"] == (
+        "photopeak_and_grouped_continuum_dirichlet_hierarchical"
+    )
+
+
 def _training_ready_mean_correction(
     model: GeometryConditionedSpectralModel,
 ) -> LowRankSpectralMeanCorrection:
@@ -838,6 +890,22 @@ def test_cross_likelihood_chunking_matches_unchunked_numpy_and_torch() -> None:
         sample_chunk_size=2,
         state_chunk_size=3,
     )
+    torch_total = torch.as_tensor(total, dtype=torch.float64)
+    prepared = model.prepare_cross_observation_torch(
+        torch.as_tensor(observations, dtype=torch.float64),
+        reference=torch_total,
+    )
+    prepared_torch = model.cross_log_likelihood_torch(
+        prepared.observed_asvb,
+        torch_total,
+        torch.as_tensor(uncollided, dtype=torch.float64),
+        torch.as_tensor(features, dtype=torch.float64),
+        torch.as_tensor(live_times, dtype=torch.float64),
+        action_chunk_size=1,
+        sample_chunk_size=2,
+        state_chunk_size=3,
+        prepared_observation=prepared,
+    )
     np.testing.assert_allclose(
         chunked_torch.detach().cpu().numpy(),
         oracle_torch.detach().cpu().numpy(),
@@ -850,6 +918,71 @@ def test_cross_likelihood_chunking_matches_unchunked_numpy_and_torch() -> None:
         rtol=1.0e-10,
         atol=1.0e-7,
     )
+    np.testing.assert_array_equal(
+        prepared_torch.detach().cpu().numpy(),
+        chunked_torch.detach().cpu().numpy(),
+    )
+
+
+def test_cuda_cross_likelihood_autotune_matches_explicit_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Empirical CUDA state tuning must preserve every exact score."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available.")
+    model = _model()
+    monkeypatch.setattr(
+        model,
+        "estimate_cross_likelihood_working_set_bytes",
+        lambda **_: 0,
+    )
+    state_count = 256 + 512 + 1024
+    line_count = len(model.line_identity)
+    total = torch.full(
+        (1, state_count, 1, 1, line_count),
+        0.25,
+        device="cuda",
+        dtype=torch.float64,
+    )
+    uncollided = 0.75 * total
+    features = torch.zeros(
+        tuple(total.shape) + (4,),
+        device="cuda",
+        dtype=torch.float64,
+    )
+    observed = torch.zeros(
+        (1, 1, 1, int(model.energy_axis_keV.size)),
+        device="cuda",
+        dtype=torch.float64,
+    )
+    live_times = torch.ones(1, device="cuda", dtype=torch.float64)
+    tuned = model.cross_log_likelihood_torch(
+        observed,
+        total,
+        uncollided,
+        features,
+        live_times,
+    )
+    diagnostics = dict(model.last_torch_cross_chunk_diagnostics)
+    explicit = model.cross_log_likelihood_torch(
+        observed,
+        total,
+        uncollided,
+        features,
+        live_times,
+        state_chunk_size=256,
+    )
+
+    np.testing.assert_array_equal(
+        tuned.detach().cpu().numpy(),
+        explicit.detach().cpu().numpy(),
+    )
+    assert diagnostics["mode"] == "empirical_cuda_autotune"
+    assert [
+        trial["state_chunk_size"] for trial in diagnostics["trials"]
+    ] == [256, 512, 1024]
+    assert diagnostics["selected_state_chunk_size"] in {256, 512, 1024}
 
 
 def test_cross_likelihood_working_set_estimate_tracks_chunk_sizes() -> None:
@@ -912,6 +1045,22 @@ def test_birth_proposal_score_is_finite_target_only_and_matches_torch() -> None:
         live_times,
         target_line_mask_l=mask,
     )
+    background = model.predict_mean_numpy(
+        np.zeros((1, 2, 1, line_count), dtype=np.float64),
+        np.zeros((1, 2, 1, line_count), dtype=np.float64),
+        np.zeros((1, 2, 1, line_count, 4), dtype=np.float64),
+        live_times,
+    )[0]
+    reference = background + 0.15 * observed
+    numpy_reference_scores = model.birth_proposal_log_scores_numpy(
+        observed,
+        total,
+        uncollided,
+        features,
+        live_times,
+        target_line_mask_l=mask,
+        reference_mean_vb=reference,
+    )
     torch_scores = (
         model.birth_proposal_log_scores_torch(
             torch.as_tensor(observed, dtype=torch.float64),
@@ -925,9 +1074,33 @@ def test_birth_proposal_score_is_finite_target_only_and_matches_torch() -> None:
         .cpu()
         .numpy()
     )
+    torch_reference_scores = (
+        model.birth_proposal_log_scores_torch(
+            torch.as_tensor(observed, dtype=torch.float64),
+            torch.as_tensor(total, dtype=torch.float64),
+            torch.as_tensor(uncollided, dtype=torch.float64),
+            torch.as_tensor(features, dtype=torch.float64),
+            torch.as_tensor(live_times, dtype=torch.float64),
+            target_line_mask_l=torch.as_tensor(mask),
+            reference_mean_vb=torch.as_tensor(
+                reference,
+                dtype=torch.float64,
+            ),
+        )
+        .detach()
+        .cpu()
+        .numpy()
+    )
     assert numpy_scores.shape == (candidate_count,)
     assert np.all(np.isfinite(numpy_scores))
     assert np.allclose(numpy_scores, torch_scores, rtol=1e-10, atol=1e-8)
+    assert np.allclose(
+        numpy_reference_scores,
+        torch_reference_scores,
+        rtol=1e-10,
+        atol=1e-8,
+    )
+    assert not np.allclose(numpy_reference_scores, numpy_scores)
     assert int(np.argmax(numpy_scores)) in (2, 3, 4)
 
 

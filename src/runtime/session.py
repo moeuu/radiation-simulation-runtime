@@ -243,6 +243,11 @@ class ObservationSession:
             if key in observation.metadata
         }
         metadata[FULL_SPECTRUM_CONTRACT_HASH_METADATA_KEY] = self.contract_hash
+        if action.command.travel_waypoints_xyz:
+            metadata["travel_waypoints_xyz"] = [
+                [float(value) for value in waypoint]
+                for waypoint in action.command.travel_waypoints_xyz
+            ]
         self.writer.append_before_update(
             MeasurementLogRecord(
                 step_id=expected_step,

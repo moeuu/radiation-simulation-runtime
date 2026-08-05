@@ -12,7 +12,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import hashlib
 import json
+import math
 from pathlib import Path
+import time
 from types import MappingProxyType
 from typing import Mapping, Sequence
 
@@ -73,7 +75,9 @@ BIRTH_PROPOSAL_WORKING_SET_BYTES = 512 * 1024 * 1024
 CROSS_LIKELIHOOD_ACTION_CHUNK_SIZE = 1
 CROSS_LIKELIHOOD_SAMPLE_CHUNK_SIZE = 64
 CROSS_LIKELIHOOD_STATE_CHUNK_SIZE = 256
+CROSS_LIKELIHOOD_STATE_AUTOTUNE_MAX_CHUNK_SIZE = 1024
 CROSS_LIKELIHOOD_BIN_CHUNK_SIZE = 128
+CONTINUUM_NUISANCE_BAND_WIDTH_KEV = 50.0
 RENEWAL_LOG_GAMMA_MAX_ITERATIONS = 2_048
 RENEWAL_GAMMA_INTERVAL_QUADRATURE_ORDER = 32
 (
@@ -95,6 +99,73 @@ MARK_CONCENTRATION_GRID = (
     10_000.0,
     100_000.0,
 )
+
+
+@dataclass(frozen=True)
+class PreparedTorchCrossObservation:
+    """Hold immutable CUDA observation terms reused across exact states."""
+
+    leading_shape: tuple[int, ...]
+    observed_asvb: object
+    observed_total_asv: object
+    multinomial_constant_asv: object
+    peak_observed_asvp: object
+    continuum_observed_asvc: object
+    peak_count_asv: object
+    continuum_count_asv: object
+    beta_binomial_constant_asv: object
+    peak_multinomial_constant_asv: object
+    continuum_group_observed_asvg: object
+    continuum_group_constant_asv: object
+    continuum_within_constant_asv: object
+
+    def restored(self, values: object) -> object:
+        """Restore the original leading action axes of a prepared tensor."""
+        trailing_shape = tuple(int(value) for value in values.shape[1:])
+        return values.reshape(self.leading_shape + trailing_shape)
+
+    def block(
+        self,
+        *,
+        action_start: int,
+        action_stop: int,
+        sample_start: int,
+        sample_stop: int,
+    ) -> "PreparedTorchCrossObservation":
+        """Return a view of one action/sample slab without recomputation."""
+
+        def _slice(values: object) -> object:
+            """Slice a prepared tensor on its action and sample axes."""
+            return values[
+                int(action_start) : int(action_stop),
+                int(sample_start) : int(sample_stop),
+            ]
+
+        return PreparedTorchCrossObservation(
+            leading_shape=(int(action_stop) - int(action_start),),
+            observed_asvb=_slice(self.observed_asvb),
+            observed_total_asv=_slice(self.observed_total_asv),
+            multinomial_constant_asv=_slice(self.multinomial_constant_asv),
+            peak_observed_asvp=_slice(self.peak_observed_asvp),
+            continuum_observed_asvc=_slice(self.continuum_observed_asvc),
+            peak_count_asv=_slice(self.peak_count_asv),
+            continuum_count_asv=_slice(self.continuum_count_asv),
+            beta_binomial_constant_asv=_slice(
+                self.beta_binomial_constant_asv
+            ),
+            peak_multinomial_constant_asv=_slice(
+                self.peak_multinomial_constant_asv
+            ),
+            continuum_group_observed_asvg=_slice(
+                self.continuum_group_observed_asvg
+            ),
+            continuum_group_constant_asv=_slice(
+                self.continuum_group_constant_asv
+            ),
+            continuum_within_constant_asv=_slice(
+                self.continuum_within_constant_asv
+            ),
+        )
 VALIDATION_SCENARIO_IDS = (
     "background_only",
     "single_line_source_resolved",
@@ -681,6 +752,7 @@ def nonparalyzable_count_log_probability_torch(
     live_times_s: object,
     *,
     dead_time_tau_s: float,
+    validate_inputs: bool = True,
 ) -> object:
     """Return the Torch equivalent renewal-count log probabilities."""
     import torch
@@ -706,19 +778,22 @@ def nonparalyzable_count_log_probability_torch(
         live_times,
     )
     tau = float(dead_time_tau_s)
-    invalid = (
-        torch.any(~torch.isfinite(counts))
-        or torch.any(counts < 0.0)
-        or torch.any(counts != torch.floor(counts))
-        or torch.any(~torch.isfinite(rates))
-        or torch.any(rates < 0.0)
-        or torch.any(~torch.isfinite(live_times))
-        or torch.any(live_times <= 0.0)
-        or not np.isfinite(tau)
-        or tau < 0.0
-    )
-    if bool(invalid):
+    if not np.isfinite(tau) or tau < 0.0:
         raise ValueError("Torch renewal-count inputs are invalid.")
+    if validate_inputs:
+        invalid = torch.stack(
+            (
+                torch.any(~torch.isfinite(counts)),
+                torch.any(counts < 0.0),
+                torch.any(counts != torch.floor(counts)),
+                torch.any(~torch.isfinite(rates)),
+                torch.any(rates < 0.0),
+                torch.any(~torch.isfinite(live_times)),
+                torch.any(live_times <= 0.0),
+            )
+        ).any()
+        if bool(invalid.item()):
+            raise ValueError("Torch renewal-count inputs are invalid.")
     mean = rates * live_times
     if tau == 0.0:
         safe_mean = torch.clamp(mean, min=torch.finfo(dtype).tiny)
@@ -763,10 +838,13 @@ def nonparalyzable_count_log_probability_torch(
             first_argument[fallback],
             second_argument[fallback],
         )
-        if bool(
-            torch.any(torch.isnan(recovered))
-            or torch.any(torch.isposinf(recovered))
-        ):
+        invalid_recovery = torch.stack(
+            (
+                torch.any(torch.isnan(recovered)),
+                torch.any(torch.isposinf(recovered)),
+            )
+        ).any()
+        if bool(invalid_recovery.item()):
             raise RuntimeError(
                 "Torch positive-term renewal likelihood recovery was invalid."
             )
@@ -832,6 +910,7 @@ def station_shared_gamma_poisson_count_log_increments_torch(
     expected_counts_njv: object,
     *,
     concentration: float,
+    validate_inputs: bool = True,
 ) -> object:
     """Return Torch increments of the shared-Gamma Poisson count law."""
     import torch
@@ -848,15 +927,22 @@ def station_shared_gamma_poisson_count_log_increments_torch(
         or expected.ndim < 3
         or tuple(observed.shape[:-2]) != tuple(expected.shape[:-3])
         or int(observed.shape[-1]) != int(expected.shape[-1])
-        or bool(torch.any(~torch.isfinite(observed)))
-        or bool(torch.any(observed < 0.0))
-        or bool(torch.any(observed != torch.floor(observed)))
-        or bool(torch.any(~torch.isfinite(expected)))
-        or bool(torch.any(expected < 0.0))
         or not np.isfinite(shape)
         or shape <= 0.0
     ):
         raise ValueError("Torch shared-Gamma count inputs are invalid.")
+    if validate_inputs:
+        invalid = torch.stack(
+            (
+                torch.any(~torch.isfinite(observed)),
+                torch.any(observed < 0.0),
+                torch.any(observed != torch.floor(observed)),
+                torch.any(~torch.isfinite(expected)),
+                torch.any(expected < 0.0),
+            )
+        ).any()
+        if bool(invalid.item()):
+            raise ValueError("Torch shared-Gamma count inputs are invalid.")
     counts = observed.unsqueeze(-2).unsqueeze(-2)
     means = expected.unsqueeze(-4)
     cumulative_counts = torch.cumsum(counts, dim=-1)
@@ -932,6 +1018,7 @@ def view_independent_gamma_poisson_count_log_increments_torch(
     expected_counts_njv: object,
     *,
     concentration: object,
+    validate_inputs: bool = True,
 ) -> object:
     """Return Torch per-view Gamma-Poisson count log probabilities."""
     import torch
@@ -959,15 +1046,24 @@ def view_independent_gamma_poisson_count_log_increments_torch(
         or expected.ndim < 3
         or tuple(observed.shape[:-2]) != tuple(expected.shape[:-3])
         or int(observed.shape[-1]) != int(expected.shape[-1])
-        or bool(torch.any(~torch.isfinite(observed)))
-        or bool(torch.any(observed < 0.0))
-        or bool(torch.any(observed != torch.floor(observed)))
-        or bool(torch.any(~torch.isfinite(expected)))
-        or bool(torch.any(expected < 0.0))
-        or bool(torch.any(~torch.isfinite(shape)))
-        or bool(torch.any(shape <= 0.0))
     ):
         raise ValueError("Torch view-independent Gamma count inputs are invalid.")
+    if validate_inputs:
+        invalid = torch.stack(
+            (
+                torch.any(~torch.isfinite(observed)),
+                torch.any(observed < 0.0),
+                torch.any(observed != torch.floor(observed)),
+                torch.any(~torch.isfinite(expected)),
+                torch.any(expected < 0.0),
+                torch.any(~torch.isfinite(shape)),
+                torch.any(shape <= 0.0),
+            )
+        ).any()
+        if bool(invalid.item()):
+            raise ValueError(
+                "Torch view-independent Gamma count inputs are invalid."
+            )
     counts = observed.unsqueeze(-2).unsqueeze(-2)
     means = expected.unsqueeze(-4)
     shape_tensor = shape.unsqueeze(-4)
@@ -1672,6 +1768,8 @@ class PhysicalComponentDiscrepancy:
     mark_scatter_concentration: float
     count_scope: str = "view_independent"
     provenance: str = "empirical_training"
+    mark_latent_model: str = "fraction_dirichlet_multinomial"
+    mark_continuum_group_concentration: float | None = None
 
     def __post_init__(self) -> None:
         """Validate the component-latent statistical contract."""
@@ -1696,6 +1794,28 @@ class PhysicalComponentDiscrepancy:
             "physics_only_uncertainty_budget_v1",
         ):
             raise ValueError("Physical-component provenance is invalid.")
+        if self.mark_latent_model not in (
+            "fraction_dirichlet_multinomial",
+            "station_shared_two_point_component_scale",
+            "photopeak_continuum_hierarchical",
+        ):
+            raise ValueError("Physical-component mark latent model is invalid.")
+        if self.mark_latent_model == "photopeak_continuum_hierarchical":
+            if (
+                self.mark_continuum_group_concentration is None
+                or not np.isfinite(
+                    self.mark_continuum_group_concentration
+                )
+                or float(self.mark_continuum_group_concentration) <= 0.0
+            ):
+                raise ValueError(
+                    "Hierarchical continuum groups require a positive "
+                    "physical concentration."
+                )
+        elif self.mark_continuum_group_concentration is not None:
+            raise ValueError(
+                "Continuum-group concentration requires hierarchical marks."
+            )
 
     def to_payload(self) -> Mapping[str, object]:
         """Return the authenticated JSON representation."""
@@ -1739,6 +1859,52 @@ class PhysicalComponentDiscrepancy:
                     ),
                 }
             )
+        if self.mark_latent_model == "station_shared_two_point_component_scale":
+            payload.update(
+                {
+                    "schema_version": 3,
+                    "mark_latent_model": self.mark_latent_model,
+                    "mark_latent_scope": "station_shared",
+                    "mark_latent_quadrature": (
+                        "symmetric_two_point_mean_one_per_component"
+                    ),
+                }
+            )
+        if self.mark_latent_model == "photopeak_continuum_hierarchical":
+            payload.update(
+                {
+                    "schema_version": 4,
+                    "mark_latent_model": self.mark_latent_model,
+                    "mark_latent_scope": "station_view_physical_partition",
+                    "mark_latent_quadrature": (
+                        "beta_binomial_peak_fraction_plus_sharp_dirichlet_"
+                        "multinomial_peaks_and_detector_resolution_grouped_"
+                        "continuum_hierarchy"
+                    ),
+                    "photopeak_partition_contract": (
+                        "detector_response_contiguous_three_sigma_support_v1"
+                    ),
+                    "continuum_partition_contract": (
+                        "fixed_50kev_detector_resolution_bands_v1"
+                    ),
+                    "mark_continuum_group_concentration": float(
+                        self.mark_continuum_group_concentration
+                    ),
+                    "mark_continuum_group_relative_standard_uncertainty": (
+                        float(
+                            np.sqrt(
+                                1.0
+                                / (
+                                    float(
+                                        self.mark_continuum_group_concentration
+                                    )
+                                    + 1.0
+                                )
+                            )
+                        )
+                    ),
+                }
+            )
         return payload
 
     @classmethod
@@ -1750,6 +1916,8 @@ class PhysicalComponentDiscrepancy:
             mark_uncollided_concentration=1.0 / (0.01**2) - 1.0,
             mark_scatter_concentration=1.0 / (0.2**2) - 1.0,
             provenance="physics_only_uncertainty_budget_v1",
+            mark_latent_model="photopeak_continuum_hierarchical",
+            mark_continuum_group_concentration=1.0 / (0.05**2) - 1.0,
         )
 
     @property
@@ -1774,7 +1942,7 @@ class PhysicalComponentDiscrepancy:
             "fraction_contract",
         }
         schema_version = payload.get("schema_version")
-        if schema_version == 2:
+        if schema_version in (2, 3, 4):
             expected_keys.update(
                 {
                     "provenance",
@@ -1787,10 +1955,27 @@ class PhysicalComponentDiscrepancy:
                     "transport_physics_table_contract_sha256",
                 }
             )
+        if schema_version in (3, 4):
+            expected_keys.update(
+                {
+                    "mark_latent_model",
+                    "mark_latent_scope",
+                    "mark_latent_quadrature",
+                }
+            )
+        if schema_version == 4:
+            expected_keys.update(
+                {
+                    "photopeak_partition_contract",
+                    "continuum_partition_contract",
+                    "mark_continuum_group_concentration",
+                    "mark_continuum_group_relative_standard_uncertainty",
+                }
+            )
         if (
             not isinstance(payload, Mapping)
             or set(payload) != expected_keys
-            or schema_version not in (1, 2)
+            or schema_version not in (1, 2, 3, 4)
             or payload.get("model")
             != "uncollided_scatter_component_latents_v1"
             or payload.get("fraction_contract")
@@ -1821,6 +2006,16 @@ class PhysicalComponentDiscrepancy:
                 "empirical_training"
                 if schema_version == 1
                 else str(payload.get("provenance"))
+            ),
+            mark_latent_model=(
+                "fraction_dirichlet_multinomial"
+                if schema_version in (1, 2)
+                else str(payload.get("mark_latent_model"))
+            ),
+            mark_continuum_group_concentration=(
+                None
+                if schema_version != 4
+                else float(payload["mark_continuum_group_concentration"])
             ),
         )
         if result.to_payload() != dict(payload):
@@ -1864,8 +2059,31 @@ class GeometryConditionedSpectralModel:
         init=False,
         repr=False,
     )
+    _torch_likelihood_cache: dict[tuple[str, str], tuple[object, ...]] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
+    _torch_cross_state_chunk_cache: dict[tuple[object, ...], int] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
+    last_torch_cross_chunk_diagnostics: dict[str, object] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
     _proposal_basis_cache: dict[bytes, NDArray[np.float64]] = field(
         default_factory=dict,
+        init=False,
+        repr=False,
+    )
+    _photopeak_mask_b: NDArray[np.bool_] = field(
+        init=False,
+        repr=False,
+    )
+    _continuum_group_mask_gb: NDArray[np.float64] = field(
         init=False,
         repr=False,
     )
@@ -2132,6 +2350,60 @@ class GeometryConditionedSpectralModel:
             scatter,
             optimize=True,
         )
+        photopeak_mask = np.zeros(bin_count, dtype=np.bool_)
+        three_sigma_relative_height = math.exp(-4.5)
+        for line_index, identity in enumerate(self._line_identity):
+            shape = self._marked_direct_line_shapes_lb[line_index]
+            peak = int(np.argmax(shape))
+            threshold = float(shape[peak]) * three_sigma_relative_height
+            lower = peak
+            upper = peak
+            while lower > 0 and float(shape[lower - 1]) >= threshold:
+                lower -= 1
+            while (
+                upper + 1 < bin_count
+                and float(shape[upper + 1]) >= threshold
+            ):
+                upper += 1
+            photopeak_mask[lower : upper + 1] = True
+        if not np.any(photopeak_mask) or np.all(photopeak_mask):
+            raise RuntimeError(
+                "Detector response did not define a valid peak/continuum "
+                "partition."
+            )
+        photopeak_mask.setflags(write=False)
+        self._photopeak_mask_b = photopeak_mask
+        raw_continuum_groups = np.floor(
+            (
+                self._energy_axis_keV
+                - float(self._energy_axis_keV[0])
+            )
+            / CONTINUUM_NUISANCE_BAND_WIDTH_KEV
+        ).astype(np.int64)
+        active_group_ids = np.unique(
+            raw_continuum_groups[~photopeak_mask]
+        )
+        continuum_group_mask = np.asarray(
+            [
+                (~photopeak_mask) & (raw_continuum_groups == group_id)
+                for group_id in active_group_ids
+            ],
+            dtype=np.float64,
+        )
+        if (
+            continuum_group_mask.ndim != 2
+            or continuum_group_mask.shape[1] != bin_count
+            or np.any(np.sum(continuum_group_mask, axis=0) > 1.0)
+            or not np.array_equal(
+                np.sum(continuum_group_mask, axis=0) > 0.0,
+                ~photopeak_mask,
+            )
+        ):
+            raise RuntimeError(
+                "Detector-resolution continuum grouping is invalid."
+            )
+        continuum_group_mask.setflags(write=False)
+        self._continuum_group_mask_gb = continuum_group_mask
         energies = np.asarray(
             [float(item["energy_keV"]) for item in self._line_identity],
             dtype=np.float64,
@@ -3524,6 +3796,7 @@ class GeometryConditionedSpectralModel:
         live_times_s_v: NDArray[np.float64],
         *,
         return_components: bool = False,
+        return_physical_components: bool = False,
     ) -> (
         NDArray[np.float64]
         | tuple[NDArray[np.float64], NDArray[np.float64]]
@@ -3549,22 +3822,26 @@ class GeometryConditionedSpectralModel:
             scatter[..., np.newaxis] * order_weights,
             axis=-3,
         )
-        marked_source = (
-            np.einsum(
-                "...vl,lb->...vb",
-                direct_by_line,
-                self._marked_direct_line_shapes_lb,
-                optimize=True,
-            )
-            + np.einsum(
-                "...vlo,lob->...vb",
-                scatter_by_line_order,
-                self._marked_scatter_order_shapes_lob,
-                optimize=True,
-            )
+        marked_direct = np.einsum(
+            "...vl,lb->...vb",
+            direct_by_line,
+            self._marked_direct_line_shapes_lb,
+            optimize=True,
         )
+        marked_scatter = np.einsum(
+            "...vlo,lob->...vb",
+            scatter_by_line_order,
+            self._marked_scatter_order_shapes_lob,
+            optimize=True,
+        )
+        marked_source = marked_direct + marked_scatter
         correction = self.low_rank_spectral_mean_correction
         if correction is not None:
+            if return_physical_components:
+                raise RuntimeError(
+                    "Physical mark-component latents cannot be combined with "
+                    "an undecomposed learned spectral correction."
+                )
             marked_source = correction.apply_numpy(
                 marked_source,
                 total_counts,
@@ -3594,6 +3871,12 @@ class GeometryConditionedSpectralModel:
             )
         if return_components:
             return np.maximum(marked_source, 0.0), background
+        if return_physical_components:
+            return (
+                np.maximum(marked_direct, 0.0),
+                np.maximum(marked_scatter, 0.0),
+                background,
+            )
         return np.maximum(mean, 0.0)
 
     def predict_mean_numpy(
@@ -3604,13 +3887,31 @@ class GeometryConditionedSpectralModel:
         live_times_s_v: NDArray[np.float64],
     ) -> NDArray[np.float64]:
         """Return asymptotic renewal means with exact conditional mark means."""
-        source_mean, background_mean = self._pre_dead_time_mean_numpy(
-            total_line_contributions_xvsl,
-            uncollided_line_contributions_xvsl,
-            transport_features_xvslf,
-            live_times_s_v,
-            return_components=True,
+        component_discrepancy = self.physical_component_discrepancy
+        component_scale_marks = bool(
+            component_discrepancy is not None
+            and component_discrepancy.mark_latent_model
+            == "station_shared_two_point_component_scale"
         )
+        if component_scale_marks:
+            direct_mean, scatter_mean, background_mean = (
+                self._pre_dead_time_mean_numpy(
+                    total_line_contributions_xvsl,
+                    uncollided_line_contributions_xvsl,
+                    transport_features_xvslf,
+                    live_times_s_v,
+                    return_physical_components=True,
+                )
+            )
+            source_mean = direct_mean + scatter_mean
+        else:
+            source_mean, background_mean = self._pre_dead_time_mean_numpy(
+                total_line_contributions_xvsl,
+                uncollided_line_contributions_xvsl,
+                transport_features_xvslf,
+                live_times_s_v,
+                return_components=True,
+            )
         live_times = np.asarray(live_times_s_v, dtype=np.float64)
         pre_mean = (
             background_mean[..., np.newaxis, :, :]
@@ -3698,6 +3999,156 @@ class GeometryConditionedSpectralModel:
         self._torch_cache[key] = cached
         return cached
 
+    def _torch_likelihood_constants(
+        self,
+        reference: object,
+    ) -> tuple[object, ...]:
+        """Return cached quadrature nodes, weights, and spectral masks."""
+        import torch
+
+        tensor = torch.as_tensor(reference)
+        key = (str(tensor.device), str(tensor.dtype))
+        cached = self._torch_likelihood_cache.get(key)
+        if cached is not None:
+            return cached
+        peak_mask = torch.as_tensor(
+            np.array(self._photopeak_mask_b, copy=True),
+            device=tensor.device,
+            dtype=torch.bool,
+        )
+        continuum_group_mask = torch.as_tensor(
+            np.array(
+                self._continuum_group_mask_gb[:, ~self._photopeak_mask_b],
+                dtype=np.float64,
+                copy=True,
+            ),
+            device=tensor.device,
+            dtype=tensor.dtype,
+        )
+        cached = (
+            torch.as_tensor(
+                np.array(self._rate_scale_nodes_j, dtype=np.float64, copy=True),
+                device=tensor.device,
+                dtype=tensor.dtype,
+            ),
+            torch.as_tensor(
+                np.array(
+                    self._rate_scale_weights_j,
+                    dtype=np.float64,
+                    copy=True,
+                ),
+                device=tensor.device,
+                dtype=tensor.dtype,
+            ),
+            peak_mask,
+            continuum_group_mask,
+        )
+        self._torch_likelihood_cache[key] = cached
+        return cached
+
+    def prepare_cross_observation_torch(
+        self,
+        observed_spectra_xqvb: object,
+        *,
+        reference: object,
+    ) -> PreparedTorchCrossObservation:
+        """Prepare exact observation-only likelihood terms on one device."""
+        import torch
+
+        tensor = torch.as_tensor(reference)
+        observed = torch.as_tensor(
+            observed_spectra_xqvb,
+            device=tensor.device,
+            dtype=tensor.dtype,
+        )
+        if observed.ndim < 3:
+            raise ValueError("Torch cross-spectrum observations need three axes.")
+        if int(observed.shape[-1]) != int(self._energy_axis_keV.size):
+            raise ValueError("Torch cross-spectrum energy bins are misaligned.")
+        invalid = torch.stack(
+            (
+                torch.any(~torch.isfinite(observed)),
+                torch.any(observed < 0.0),
+                torch.any(observed != torch.floor(observed)),
+            )
+        ).any()
+        if bool(invalid.item()):
+            raise ValueError("Torch cross-spectrum observations are invalid.")
+        leading_shape = tuple(int(value) for value in observed.shape[:-3])
+        action_count = int(np.prod(leading_shape, dtype=np.int64))
+        if not leading_shape:
+            action_count = 1
+        sample_count = int(observed.shape[-3])
+        view_count = int(observed.shape[-2])
+        bin_count = int(observed.shape[-1])
+        observed_flat = observed.reshape(
+            action_count,
+            sample_count,
+            view_count,
+            bin_count,
+        )
+        observed_total = torch.sum(observed_flat, dim=-1)
+        log_factorial_sum = torch.sum(
+            torch.lgamma(observed_flat + 1.0),
+            dim=-1,
+        )
+        multinomial_constant = (
+            torch.lgamma(observed_total + 1.0) - log_factorial_sum
+        )
+        _, _, peak_mask, continuum_group_mask = (
+            self._torch_likelihood_constants(observed_flat)
+        )
+        peak_observed = observed_flat[..., peak_mask]
+        continuum_observed = observed_flat[..., ~peak_mask]
+        peak_count = torch.sum(peak_observed, dim=-1)
+        continuum_count = observed_total - peak_count
+        continuum_group_observed = torch.einsum(
+            "...b,gb->...g",
+            continuum_observed,
+            continuum_group_mask,
+        )
+        beta_binomial_constant = (
+            torch.lgamma(observed_total + 1.0)
+            - torch.lgamma(peak_count + 1.0)
+            - torch.lgamma(continuum_count + 1.0)
+        )
+        peak_multinomial_constant = (
+            torch.lgamma(peak_count + 1.0)
+            - torch.sum(torch.lgamma(peak_observed + 1.0), dim=-1)
+        )
+        continuum_group_constant = (
+            torch.lgamma(continuum_count + 1.0)
+            - torch.sum(
+                torch.lgamma(continuum_group_observed + 1.0),
+                dim=-1,
+            )
+        )
+        continuum_within_constant = (
+            torch.sum(
+                torch.lgamma(continuum_group_observed + 1.0),
+                dim=-1,
+            )
+            - torch.sum(
+                torch.lgamma(continuum_observed + 1.0),
+                dim=-1,
+            )
+        )
+        return PreparedTorchCrossObservation(
+            leading_shape=leading_shape,
+            observed_asvb=observed_flat,
+            observed_total_asv=observed_total,
+            multinomial_constant_asv=multinomial_constant,
+            peak_observed_asvp=peak_observed,
+            continuum_observed_asvc=continuum_observed,
+            peak_count_asv=peak_count,
+            continuum_count_asv=continuum_count,
+            beta_binomial_constant_asv=beta_binomial_constant,
+            peak_multinomial_constant_asv=peak_multinomial_constant,
+            continuum_group_observed_asvg=continuum_group_observed,
+            continuum_group_constant_asv=continuum_group_constant,
+            continuum_within_constant_asv=continuum_within_constant,
+        )
+
     def _pre_dead_time_mean_torch(
         self,
         total_line_contributions_xvsl: object,
@@ -3706,6 +4157,7 @@ class GeometryConditionedSpectralModel:
         live_times_s_v: object,
         *,
         return_components: bool = False,
+        return_physical_components: bool = False,
     ) -> object:
         """Return the Torch pre-dead-time marked spectral mean."""
         import torch
@@ -3736,14 +4188,6 @@ class GeometryConditionedSpectralModel:
             or uncollided.shape != total.shape
             or features.shape != total.shape + (len(TRANSPORT_FEATURE_ORDER),)
             or tuple(live_times.shape) != (int(total.shape[-3]),)
-            or bool(torch.any(~torch.isfinite(total)))
-            or bool(torch.any(total < 0.0))
-            or bool(torch.any(~torch.isfinite(uncollided)))
-            or bool(torch.any(uncollided < 0.0))
-            or bool(torch.any(~torch.isfinite(features)))
-            or bool(torch.any(features < 0.0))
-            or bool(torch.any(~torch.isfinite(live_times)))
-            or bool(torch.any(live_times <= 0.0))
         ):
             raise ValueError("Torch spectrum transport inputs are invalid.")
         tolerance = (
@@ -3754,10 +4198,23 @@ class GeometryConditionedSpectralModel:
                 torch.maximum(torch.abs(total), torch.abs(uncollided)),
             )
         )
-        if bool(torch.any(uncollided > total + tolerance)):
+        invalid = torch.stack(
+            (
+                torch.any(~torch.isfinite(total)),
+                torch.any(total < 0.0),
+                torch.any(~torch.isfinite(uncollided)),
+                torch.any(uncollided < 0.0),
+                torch.any(~torch.isfinite(features)),
+                torch.any(features < 0.0),
+                torch.any(~torch.isfinite(live_times)),
+                torch.any(live_times <= 0.0),
+                torch.any(uncollided > total + tolerance),
+            )
+        ).any()
+        if bool(invalid.item()):
             raise ValueError(
-                "Uncollided line contributions cannot exceed total incident "
-                "line contributions."
+                "Torch spectrum transport values are invalid or uncollided "
+                "contributions exceed total incident contributions."
             )
         uncollided = torch.minimum(uncollided, total)
         (
@@ -3827,16 +4284,24 @@ class GeometryConditionedSpectralModel:
             scatter.unsqueeze(-1) * order_weights,
             dim=-3,
         )
-        marked_source = (
-            torch.einsum("...vl,lb->...vb", direct_by_line, direct_shapes)
-            + torch.einsum(
-                "...vlo,lob->...vb",
-                scatter_by_line_order,
-                scatter_shapes,
-            )
+        marked_direct = torch.einsum(
+            "...vl,lb->...vb",
+            direct_by_line,
+            direct_shapes,
         )
+        marked_scatter = torch.einsum(
+            "...vlo,lob->...vb",
+            scatter_by_line_order,
+            scatter_shapes,
+        )
+        marked_source = marked_direct + marked_scatter
         correction = self.low_rank_spectral_mean_correction
         if correction is not None:
+            if return_physical_components:
+                raise RuntimeError(
+                    "Physical mark-component latents cannot be combined with "
+                    "an undecomposed learned spectral correction."
+                )
             marked_source = correction.apply_torch(
                 marked_source,
                 total_counts,
@@ -3864,6 +4329,12 @@ class GeometryConditionedSpectralModel:
             raise RuntimeError("Torch spectral count conservation failed.")
         if return_components:
             return torch.clamp(marked_source, min=0.0), background
+        if return_physical_components:
+            return (
+                torch.clamp(marked_direct, min=0.0),
+                torch.clamp(marked_scatter, min=0.0),
+                background,
+            )
         return torch.clamp(marked_source + background, min=0.0)
 
     def predict_mean_torch(
@@ -3994,6 +4465,618 @@ class GeometryConditionedSpectralModel:
             np.log(float(low))
             + entropy * (np.log(float(high)) - np.log(float(low)))
         )
+
+    def _physical_mark_scale_nodes_numpy(
+        self,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Return fixed mean-one direct/scatter mark-scale quadrature nodes."""
+        component = self.physical_component_discrepancy
+        if (
+            component is None
+            or component.mark_latent_model
+            != "station_shared_two_point_component_scale"
+        ):
+            raise RuntimeError("Physical component-scale marks are inactive.")
+        direct_sigma = float(np.sqrt(
+            1.0 / (float(component.mark_uncollided_concentration) + 1.0)
+        ))
+        scatter_sigma = float(np.sqrt(
+            1.0 / (float(component.mark_scatter_concentration) + 1.0)
+        ))
+        if direct_sigma >= 1.0 or scatter_sigma >= 1.0:
+            raise ValueError(
+                "Two-point physical mark scales require relative uncertainty "
+                "strictly below one."
+            )
+        nodes = np.asarray(
+            [
+                (1.0 - direct_sigma, 1.0 - scatter_sigma),
+                (1.0 - direct_sigma, 1.0 + scatter_sigma),
+                (1.0 + direct_sigma, 1.0 - scatter_sigma),
+                (1.0 + direct_sigma, 1.0 + scatter_sigma),
+            ],
+            dtype=np.float64,
+        )
+        return nodes, np.full(4, 0.25, dtype=np.float64)
+
+    def _hierarchical_physical_mark_log_numpy(
+        self,
+        observed_xqvb: NDArray[np.float64],
+        probabilities_xnjvb: NDArray[np.float64],
+        peak_fraction_concentration_xnjv: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Return a peak-preserving physical conditional-mark likelihood.
+
+        Counts are first partitioned between detector-response photopeak
+        support and continuum with a beta-binomial physical discrepancy.
+        Relative photopeak counts retain isotope information under the sharp
+        detector/branching physical uncertainty budget.  Continuum shape uses
+        the broader scatter budget.  This is one hierarchical factorization
+        of the observed marks, not an auxiliary likelihood added to the same
+        data.
+        """
+        observed = np.asarray(observed_xqvb, dtype=np.float64)
+        probabilities = np.asarray(
+            probabilities_xnjvb,
+            dtype=np.float64,
+        )
+        concentration = np.asarray(
+            peak_fraction_concentration_xnjv,
+            dtype=np.float64,
+        )
+        if (
+            observed.ndim < 3
+            or probabilities.ndim != observed.ndim + 1
+            or probabilities.shape[:-4] != observed.shape[:-3]
+            or probabilities.shape[-2:] != observed.shape[-2:]
+            or concentration.shape != probabilities.shape[:-1]
+            or np.any(~np.isfinite(concentration))
+            or np.any(concentration <= 0.0)
+        ):
+            raise ValueError("Hierarchical NumPy mark inputs are invalid.")
+        peak = np.asarray(self._photopeak_mask_b, dtype=np.bool_)
+        continuum = ~peak
+        observed_expanded = observed[..., :, None, None, :, :]
+        probability_expanded = probabilities[..., None, :, :, :, :]
+        total = np.sum(observed_expanded, axis=-1)
+        peak_count = np.sum(observed_expanded[..., peak], axis=-1)
+        continuum_count = total - peak_count
+        peak_probability = np.sum(
+            probability_expanded[..., peak],
+            axis=-1,
+        )
+        concentration_expanded = np.expand_dims(concentration, axis=-4)
+        tiny = np.finfo(np.float64).tiny
+        interior_peak = (
+            (peak_probability > 0.0) & (peak_probability < 1.0)
+        )
+        alpha = np.maximum(
+            concentration_expanded * peak_probability,
+            tiny,
+        )
+        beta = np.maximum(
+            concentration_expanded * (1.0 - peak_probability),
+            tiny,
+        )
+        beta_binomial = (
+            special.gammaln(total + 1.0)
+            - special.gammaln(peak_count + 1.0)
+            - special.gammaln(continuum_count + 1.0)
+            + special.betaln(peak_count + alpha, continuum_count + beta)
+            - special.betaln(alpha, beta)
+        )
+        beta_binomial = np.where(
+            interior_peak,
+            beta_binomial,
+            np.where(
+                (peak_probability <= 0.0) & (peak_count == 0.0),
+                0.0,
+                np.where(
+                    (peak_probability >= 1.0) & (continuum_count == 0.0),
+                    0.0,
+                    -np.inf,
+                ),
+            ),
+        )
+
+        peak_probabilities = np.divide(
+            probability_expanded[..., peak],
+            peak_probability[..., None],
+            out=np.zeros_like(probability_expanded[..., peak]),
+            where=peak_probability[..., None] > 0.0,
+        )
+        peak_observed = observed_expanded[..., peak]
+        component = self.physical_component_discrepancy
+        if component is None:
+            raise RuntimeError(
+                "Hierarchical marks require physical component uncertainty."
+            )
+        peak_shape_concentration = float(
+            component.mark_uncollided_concentration
+        )
+        peak_alpha = peak_probabilities * peak_shape_concentration
+        peak_active = (peak_observed > 0.0) & (peak_alpha > 0.0)
+        safe_peak_alpha = np.where(peak_active, peak_alpha, 1.0)
+        safe_peak_observed = np.where(peak_active, peak_observed, 0.0)
+        peak_increment = np.where(
+            peak_active,
+            special.gammaln(safe_peak_alpha + safe_peak_observed)
+            - special.gammaln(safe_peak_alpha),
+            0.0,
+        )
+        peak_dirichlet = (
+            special.gammaln(peak_count + 1.0)
+            - np.sum(special.gammaln(peak_observed + 1.0), axis=-1)
+            + special.gammaln(peak_shape_concentration)
+            - special.gammaln(
+                peak_shape_concentration + peak_count
+            )
+            + np.sum(peak_increment, axis=-1)
+        )
+        peak_impossible = np.any(
+            (peak_observed > 0.0) & (peak_probabilities <= 0.0),
+            axis=-1,
+        )
+        peak_dirichlet = np.where(
+            peak_count == 0.0,
+            0.0,
+            np.where(peak_impossible, -np.inf, peak_dirichlet),
+        )
+
+        continuum_probabilities = np.divide(
+            probability_expanded[..., continuum],
+            (1.0 - peak_probability)[..., None],
+            out=np.zeros_like(probability_expanded[..., continuum]),
+            where=(1.0 - peak_probability)[..., None] > 0.0,
+        )
+        continuum_observed = observed_expanded[..., continuum]
+        continuum_concentration = float(
+            component.mark_continuum_group_concentration
+        )
+        continuum_group_mask = self._continuum_group_mask_gb[:, continuum]
+        continuum_group_probabilities = np.einsum(
+            "...b,gb->...g",
+            continuum_probabilities,
+            continuum_group_mask,
+            optimize=True,
+        )
+        continuum_group_observed = np.einsum(
+            "...b,gb->...g",
+            continuum_observed,
+            continuum_group_mask,
+            optimize=True,
+        )
+        group_alpha = (
+            continuum_group_probabilities * continuum_concentration
+        )
+        group_active = (
+            (continuum_group_observed > 0.0) & (group_alpha > 0.0)
+        )
+        safe_group_alpha = np.where(group_active, group_alpha, 1.0)
+        safe_group_observed = np.where(
+            group_active,
+            continuum_group_observed,
+            0.0,
+        )
+        group_increment = np.where(
+            group_active,
+            special.gammaln(safe_group_alpha + safe_group_observed)
+            - special.gammaln(safe_group_alpha),
+            0.0,
+        )
+        continuum_group_dirichlet = (
+            special.gammaln(continuum_count + 1.0)
+            - np.sum(
+                special.gammaln(continuum_group_observed + 1.0),
+                axis=-1,
+            )
+            + special.gammaln(continuum_concentration)
+            - special.gammaln(
+                continuum_concentration + continuum_count
+            )
+            + np.sum(group_increment, axis=-1)
+        )
+        group_impossible = np.any(
+            (continuum_group_observed > 0.0)
+            & (continuum_group_probabilities <= 0.0),
+            axis=-1,
+        )
+        continuum_group_dirichlet = np.where(
+            continuum_count == 0.0,
+            0.0,
+            np.where(
+                group_impossible,
+                -np.inf,
+                continuum_group_dirichlet,
+            ),
+        )
+        probability_by_bin_group = np.einsum(
+            "...g,gb->...b",
+            continuum_group_probabilities,
+            continuum_group_mask,
+            optimize=True,
+        )
+        continuum_within_probabilities = np.divide(
+            continuum_probabilities,
+            probability_by_bin_group,
+            out=np.zeros_like(continuum_probabilities),
+            where=probability_by_bin_group > 0.0,
+        )
+        within_concentration = peak_shape_concentration
+        within_alpha = (
+            continuum_within_probabilities * within_concentration
+        )
+        within_active = (
+            (continuum_observed > 0.0) & (within_alpha > 0.0)
+        )
+        safe_within_alpha = np.where(within_active, within_alpha, 1.0)
+        safe_within_observed = np.where(
+            within_active,
+            continuum_observed,
+            0.0,
+        )
+        within_increment = np.where(
+            within_active,
+            special.gammaln(safe_within_alpha + safe_within_observed)
+            - special.gammaln(safe_within_alpha),
+            0.0,
+        )
+        continuum_within_dirichlet = (
+            np.sum(
+                special.gammaln(continuum_group_observed + 1.0)
+                + special.gammaln(within_concentration)
+                - special.gammaln(
+                    continuum_group_observed + within_concentration
+                ),
+                axis=-1,
+            )
+            - np.sum(
+                special.gammaln(continuum_observed + 1.0),
+                axis=-1,
+            )
+            + np.sum(within_increment, axis=-1)
+        )
+        within_impossible = np.any(
+            (continuum_observed > 0.0)
+            & (continuum_within_probabilities <= 0.0),
+            axis=-1,
+        )
+        continuum_within_dirichlet = np.where(
+            continuum_count == 0.0,
+            0.0,
+            np.where(
+                within_impossible,
+                -np.inf,
+                continuum_within_dirichlet,
+            ),
+        )
+        result = (
+            beta_binomial
+            + peak_dirichlet
+            + continuum_group_dirichlet
+            + continuum_within_dirichlet
+        )
+        if np.any(np.isnan(result)) or np.any(np.isposinf(result)):
+            raise RuntimeError(
+                "Hierarchical NumPy mark likelihood is numerically invalid."
+            )
+        return np.asarray(result, dtype=np.float64)
+
+    def _hierarchical_physical_mark_log_torch(
+        self,
+        observed_xqvb: object,
+        probabilities_xnjvb: object,
+        peak_fraction_concentration_xnjv: object,
+        *,
+        prepared_observation: PreparedTorchCrossObservation | None = None,
+    ) -> object:
+        """Return the Torch-equivalent hierarchical mark likelihood."""
+        import torch
+
+        probabilities = torch.as_tensor(probabilities_xnjvb)
+        prepared = prepared_observation
+        if prepared is None:
+            prepared = self.prepare_cross_observation_torch(
+                observed_xqvb,
+                reference=probabilities,
+            )
+        observed = torch.as_tensor(
+            prepared.restored(prepared.observed_asvb),
+            device=probabilities.device,
+            dtype=probabilities.dtype,
+        )
+        concentration = torch.as_tensor(
+            peak_fraction_concentration_xnjv,
+            device=probabilities.device,
+            dtype=probabilities.dtype,
+        )
+        if (
+            observed.ndim < 3
+            or probabilities.ndim != observed.ndim + 1
+            or tuple(probabilities.shape[:-4]) != tuple(observed.shape[:-3])
+            or tuple(probabilities.shape[-2:]) != tuple(observed.shape[-2:])
+            or tuple(concentration.shape) != tuple(probabilities.shape[:-1])
+        ):
+            raise ValueError("Hierarchical Torch mark inputs are invalid.")
+        _, _, peak, continuum_group_mask = self._torch_likelihood_constants(
+            probabilities
+        )
+        continuum = ~peak
+        probability_expanded = probabilities.unsqueeze(-5)
+        peak_observed = prepared.restored(
+            prepared.peak_observed_asvp
+        ).unsqueeze(-3).unsqueeze(-3)
+        continuum_observed = (
+            prepared.restored(prepared.continuum_observed_asvc)
+            .unsqueeze(-3)
+            .unsqueeze(-3)
+        )
+        peak_count = prepared.restored(
+            prepared.peak_count_asv
+        ).unsqueeze(-2).unsqueeze(-2)
+        continuum_count = (
+            prepared.restored(prepared.continuum_count_asv)
+            .unsqueeze(-2)
+            .unsqueeze(-2)
+        )
+        peak_probability = torch.sum(
+            probability_expanded[..., peak],
+            dim=-1,
+        )
+        concentration_expanded = concentration.unsqueeze(-4)
+        tiny = torch.finfo(probabilities.dtype).tiny
+        alpha = torch.clamp(
+            concentration_expanded * peak_probability,
+            min=tiny,
+        )
+        beta = torch.clamp(
+            concentration_expanded * (1.0 - peak_probability),
+            min=tiny,
+        )
+
+        def _betaln(first: object, second: object) -> object:
+            """Return elementwise log-beta values in Torch."""
+            first_tensor = torch.as_tensor(first)
+            second_tensor = torch.as_tensor(second)
+            return (
+                torch.lgamma(first_tensor)
+                + torch.lgamma(second_tensor)
+                - torch.lgamma(first_tensor + second_tensor)
+            )
+
+        beta_binomial = (
+            prepared.restored(prepared.beta_binomial_constant_asv)
+            .unsqueeze(-2)
+            .unsqueeze(-2)
+            + _betaln(peak_count + alpha, continuum_count + beta)
+            - _betaln(alpha, beta)
+        )
+        interior = (peak_probability > 0.0) & (peak_probability < 1.0)
+        beta_binomial = torch.where(
+            interior,
+            beta_binomial,
+            torch.where(
+                (peak_probability <= 0.0) & (peak_count == 0.0),
+                torch.zeros_like(beta_binomial),
+                torch.where(
+                    (peak_probability >= 1.0)
+                    & (continuum_count == 0.0),
+                    torch.zeros_like(beta_binomial),
+                    torch.full_like(beta_binomial, float("-inf")),
+                ),
+            ),
+        )
+        peak_probabilities = torch.where(
+            peak_probability.unsqueeze(-1) > 0.0,
+            probability_expanded[..., peak]
+            / torch.clamp(peak_probability.unsqueeze(-1), min=tiny),
+            torch.zeros_like(probability_expanded[..., peak]),
+        )
+        component = self.physical_component_discrepancy
+        if component is None:
+            raise RuntimeError(
+                "Hierarchical marks require physical component uncertainty."
+            )
+        peak_shape_concentration = float(
+            component.mark_uncollided_concentration
+        )
+        peak_alpha = peak_probabilities * peak_shape_concentration
+        peak_active = (peak_observed > 0.0) & (peak_alpha > 0.0)
+        safe_peak_alpha = torch.where(
+            peak_active,
+            peak_alpha,
+            torch.ones_like(peak_alpha),
+        )
+        safe_peak_observed = torch.where(
+            peak_active,
+            peak_observed,
+            torch.zeros_like(peak_observed),
+        )
+        peak_increment = torch.where(
+            peak_active,
+            torch.lgamma(safe_peak_alpha + safe_peak_observed)
+            - torch.lgamma(safe_peak_alpha),
+            torch.zeros_like(peak_alpha),
+        )
+        peak_dirichlet = (
+            prepared.restored(prepared.peak_multinomial_constant_asv)
+            .unsqueeze(-2)
+            .unsqueeze(-2)
+            + math.lgamma(peak_shape_concentration)
+            - torch.lgamma(
+                peak_count + peak_shape_concentration
+            )
+            + torch.sum(peak_increment, dim=-1)
+        )
+        peak_impossible = torch.any(
+            (peak_observed > 0.0) & (peak_probabilities <= 0.0),
+            dim=-1,
+        )
+        peak_dirichlet = torch.where(
+            peak_count == 0.0,
+            torch.zeros_like(peak_dirichlet),
+            torch.where(
+                peak_impossible,
+                torch.full_like(peak_dirichlet, float("-inf")),
+                peak_dirichlet,
+            ),
+        )
+        continuum_probabilities = torch.where(
+            (1.0 - peak_probability).unsqueeze(-1) > 0.0,
+            probability_expanded[..., continuum]
+            / torch.clamp(
+                (1.0 - peak_probability).unsqueeze(-1),
+                min=tiny,
+            ),
+            torch.zeros_like(probability_expanded[..., continuum]),
+        )
+        continuum_concentration = float(
+            component.mark_continuum_group_concentration
+        )
+        continuum_group_probabilities = torch.einsum(
+            "...b,gb->...g",
+            continuum_probabilities,
+            continuum_group_mask,
+        )
+        continuum_group_observed = (
+            prepared.restored(prepared.continuum_group_observed_asvg)
+            .unsqueeze(-3)
+            .unsqueeze(-3)
+        )
+        group_alpha = (
+            continuum_group_probabilities * continuum_concentration
+        )
+        group_active = (
+            (continuum_group_observed > 0.0) & (group_alpha > 0.0)
+        )
+        safe_group_alpha = torch.where(
+            group_active,
+            group_alpha,
+            torch.ones_like(group_alpha),
+        )
+        safe_group_observed = torch.where(
+            group_active,
+            continuum_group_observed,
+            torch.zeros_like(continuum_group_observed),
+        )
+        group_increment = torch.where(
+            group_active,
+            torch.lgamma(safe_group_alpha + safe_group_observed)
+            - torch.lgamma(safe_group_alpha),
+            torch.zeros_like(group_alpha),
+        )
+        continuum_group_dirichlet = (
+            prepared.restored(prepared.continuum_group_constant_asv)
+            .unsqueeze(-2)
+            .unsqueeze(-2)
+            + math.lgamma(continuum_concentration)
+            - torch.lgamma(
+                continuum_count + continuum_concentration
+            )
+            + torch.sum(group_increment, dim=-1)
+        )
+        group_impossible = torch.any(
+            (continuum_group_observed > 0.0)
+            & (continuum_group_probabilities <= 0.0),
+            dim=-1,
+        )
+        continuum_group_dirichlet = torch.where(
+            continuum_count == 0.0,
+            torch.zeros_like(continuum_group_dirichlet),
+            torch.where(
+                group_impossible,
+                torch.full_like(
+                    continuum_group_dirichlet,
+                    float("-inf"),
+                ),
+                continuum_group_dirichlet,
+            ),
+        )
+        probability_by_bin_group = torch.einsum(
+            "...g,gb->...b",
+            continuum_group_probabilities,
+            continuum_group_mask,
+        )
+        continuum_within_probabilities = torch.where(
+            probability_by_bin_group > 0.0,
+            continuum_probabilities
+            / torch.clamp(probability_by_bin_group, min=tiny),
+            torch.zeros_like(continuum_probabilities),
+        )
+        within_concentration = peak_shape_concentration
+        within_alpha = (
+            continuum_within_probabilities * within_concentration
+        )
+        within_active = (
+            (continuum_observed > 0.0) & (within_alpha > 0.0)
+        )
+        safe_within_alpha = torch.where(
+            within_active,
+            within_alpha,
+            torch.ones_like(within_alpha),
+        )
+        safe_within_observed = torch.where(
+            within_active,
+            continuum_observed,
+            torch.zeros_like(continuum_observed),
+        )
+        within_increment = torch.where(
+            within_active,
+            torch.lgamma(
+                safe_within_alpha + safe_within_observed
+            )
+            - torch.lgamma(safe_within_alpha),
+            torch.zeros_like(within_alpha),
+        )
+        continuum_within_dirichlet = (
+            prepared.restored(prepared.continuum_within_constant_asv)
+            .unsqueeze(-2)
+            .unsqueeze(-2)
+            + torch.sum(
+                math.lgamma(within_concentration)
+                - torch.lgamma(
+                    continuum_group_observed + within_concentration
+                ),
+                dim=-1,
+            )
+            + torch.sum(within_increment, dim=-1)
+        )
+        within_impossible = torch.any(
+            (continuum_observed > 0.0)
+            & (continuum_within_probabilities <= 0.0),
+            dim=-1,
+        )
+        continuum_within_dirichlet = torch.where(
+            continuum_count == 0.0,
+            torch.zeros_like(continuum_within_dirichlet),
+            torch.where(
+                within_impossible,
+                torch.full_like(
+                    continuum_within_dirichlet,
+                    float("-inf"),
+                ),
+                continuum_within_dirichlet,
+            ),
+        )
+        result = (
+            beta_binomial
+            + peak_dirichlet
+            + continuum_group_dirichlet
+            + continuum_within_dirichlet
+        )
+        invalid = torch.stack(
+            (
+                torch.any(~torch.isfinite(concentration)),
+                torch.any(concentration <= 0.0),
+                torch.any(torch.isnan(result)),
+                torch.any(torch.isinf(result) & (result > 0.0)),
+            )
+        ).any()
+        if bool(invalid.item()):
+            raise RuntimeError(
+                "Hierarchical Torch mark likelihood is numerically invalid."
+            )
+        return result
 
     def _base_mark_concentration_torch(
         self,
@@ -4205,13 +5288,36 @@ class GeometryConditionedSpectralModel:
     ) -> NDArray[np.float64]:
         """Return vectorized sample-by-state renewal/multinomial likelihoods."""
         observed = np.asarray(observed_spectra_xqvb, dtype=np.float64)
-        source_mean, background_mean = self._pre_dead_time_mean_numpy(
-            total_line_contributions_xnvsl,
-            uncollided_line_contributions_xnvsl,
-            transport_features_xnvslf,
-            live_times_s_v,
-            return_components=True,
+        component_discrepancy = self.physical_component_discrepancy
+        component_scale_marks = bool(
+            component_discrepancy is not None
+            and component_discrepancy.mark_latent_model
+            == "station_shared_two_point_component_scale"
         )
+        hierarchical_marks = bool(
+            component_discrepancy is not None
+            and component_discrepancy.mark_latent_model
+            == "photopeak_continuum_hierarchical"
+        )
+        if component_scale_marks:
+            direct_mean, scatter_mean, background_mean = (
+                self._pre_dead_time_mean_numpy(
+                    total_line_contributions_xnvsl,
+                    uncollided_line_contributions_xnvsl,
+                    transport_features_xnvslf,
+                    live_times_s_v,
+                    return_physical_components=True,
+                )
+            )
+            source_mean = direct_mean + scatter_mean
+        else:
+            source_mean, background_mean = self._pre_dead_time_mean_numpy(
+                total_line_contributions_xnvsl,
+                uncollided_line_contributions_xnvsl,
+                transport_features_xnvslf,
+                live_times_s_v,
+                return_components=True,
+            )
         if (
             observed.ndim < 3
             or observed.shape[:-3] != source_mean.shape[:-3]
@@ -4236,7 +5342,6 @@ class GeometryConditionedSpectralModel:
         observed_total = np.sum(observed, axis=-1)
         pre_total = np.sum(pre_mean, axis=-1)
         live = np.asarray(live_times_s_v, dtype=np.float64)
-        component_discrepancy = self.physical_component_discrepancy
         if (
             self.count_discrepancy_concentration is None
             and component_discrepancy is None
@@ -4314,9 +5419,90 @@ class GeometryConditionedSpectralModel:
             multinomial_log,
         )
         mark_log = multinomial_log
+        component_mark_weights: NDArray[np.float64] | None = None
+        if component_scale_marks:
+            component_nodes, component_mark_weights = (
+                self._physical_mark_scale_nodes_numpy()
+            )
+            node_direct = (
+                direct_mean[..., :, np.newaxis, :, :]
+                * self._rate_scale_nodes_j.reshape(node_shape)
+            )
+            node_scatter = (
+                scatter_mean[..., :, np.newaxis, :, :]
+                * self._rate_scale_nodes_j.reshape(node_shape)
+            )
+            component_shape = (
+                (1,) * (node_direct.ndim - 2)
+                + (int(component_nodes.shape[0]), 1, 1)
+            )
+            marked_pre_mean = (
+                background_mean[..., :, np.newaxis, np.newaxis, :, :]
+                + node_direct[..., np.newaxis, :, :]
+                * component_nodes[:, 0].reshape(component_shape)
+                + node_scatter[..., np.newaxis, :, :]
+                * component_nodes[:, 1].reshape(component_shape)
+            )
+            marked_total = np.sum(marked_pre_mean, axis=-1)
+            marked_probabilities = np.divide(
+                marked_pre_mean,
+                marked_total[..., np.newaxis],
+                out=np.zeros_like(marked_pre_mean),
+                where=marked_total[..., np.newaxis] > 0.0,
+            )
+            marked_log_probabilities = np.log(
+                np.maximum(
+                    marked_probabilities,
+                    np.finfo(np.float64).tiny,
+                )
+            )
+            mark_log = (
+                special.gammaln(observed_total + 1.0)[
+                    ..., :, np.newaxis, np.newaxis, np.newaxis, :
+                ]
+                - np.sum(
+                    special.gammaln(observed + 1.0),
+                    axis=-1,
+                )[..., :, np.newaxis, np.newaxis, np.newaxis, :]
+                + np.einsum(
+                    "...qvb,...njkvb->...qnjkv",
+                    observed,
+                    marked_log_probabilities,
+                    optimize=True,
+                )
+            )
+            impossible_component_marks = np.einsum(
+                "...qvb,...njkvb->...qnjkv",
+                observed,
+                marked_probabilities <= 0.0,
+                optimize=True,
+            ) > 0.0
+            mark_log = np.where(
+                impossible_component_marks,
+                -np.inf,
+                mark_log,
+            )
+        if hierarchical_marks:
+            base_concentration = self._base_mark_concentration_numpy(
+                total_line_contributions_xnvsl,
+                uncollided_line_contributions_xnvsl,
+            )
+            node_concentration = np.broadcast_to(
+                base_concentration[..., :, np.newaxis, :],
+                probabilities.shape[:-1],
+            )
+            mark_log = self._hierarchical_physical_mark_log_numpy(
+                observed,
+                probabilities,
+                node_concentration,
+            )
         if (
-            self.mark_concentration_source is not None
-            or component_discrepancy is not None
+            not component_scale_marks
+            and not hierarchical_marks
+            and (
+                self.mark_concentration_source is not None
+                or component_discrepancy is not None
+            )
         ):
             source_total = np.sum(node_source, axis=-1)
             source_fraction = np.divide(
@@ -4407,13 +5593,49 @@ class GeometryConditionedSpectralModel:
                 dirichlet_log,
                 multinomial_log,
             )
-        zero_mark_total = (
-            observed_total[..., :, np.newaxis, np.newaxis, :] == 0.0
-        )
+        zero_mark_total = observed_total[..., :, np.newaxis, np.newaxis, :]
+        if component_scale_marks:
+            zero_mark_total = zero_mark_total[..., np.newaxis, :]
+        zero_mark_total = zero_mark_total == 0.0
         mark_log = np.where(zero_mark_total, 0.0, mark_log)
-        view_node_log = count_log + mark_log
+        view_node_log = (
+            count_log[..., np.newaxis, :] + mark_log
+            if component_scale_marks
+            else count_log + mark_log
+        )
         if return_view_prefixes:
             cumulative_node_log = np.cumsum(view_node_log, axis=-1)
+            if component_scale_marks:
+                if component_mark_weights is None:
+                    raise RuntimeError("Physical mark weights are unavailable.")
+                rate_weight_shape = (
+                    (1,) * (cumulative_node_log.ndim - 3)
+                    + (int(self._rate_scale_weights_j.size), 1, 1)
+                )
+                mark_weight_shape = (
+                    (1,) * (cumulative_node_log.ndim - 2)
+                    + (int(component_mark_weights.size), 1)
+                )
+                nonempty_prefixes = special.logsumexp(
+                    cumulative_node_log
+                    + np.log(self._rate_scale_weights_j).reshape(
+                        rate_weight_shape
+                    )
+                    + np.log(component_mark_weights).reshape(
+                        mark_weight_shape
+                    ),
+                    axis=(-3, -2),
+                )
+                return np.concatenate(
+                    (
+                        np.zeros(
+                            nonempty_prefixes.shape[:-1] + (1,),
+                            dtype=np.float64,
+                        ),
+                        nonempty_prefixes,
+                    ),
+                    axis=-1,
+                )
             weight_shape = (
                 (1,) * (cumulative_node_log.ndim - 2)
                 + (int(self._rate_scale_weights_j.size), 1)
@@ -4434,6 +5656,25 @@ class GeometryConditionedSpectralModel:
                 axis=-1,
             )
         node_log = np.sum(view_node_log, axis=-1)
+        if component_scale_marks:
+            if component_mark_weights is None:
+                raise RuntimeError("Physical mark weights are unavailable.")
+            rate_weight_shape = (
+                (1,) * (node_log.ndim - 2)
+                + (int(self._rate_scale_weights_j.size), 1)
+            )
+            mark_weight_shape = (
+                (1,) * (node_log.ndim - 1)
+                + (int(component_mark_weights.size),)
+            )
+            return special.logsumexp(
+                node_log
+                + np.log(self._rate_scale_weights_j).reshape(
+                    rate_weight_shape
+                )
+                + np.log(component_mark_weights).reshape(mark_weight_shape),
+                axis=(-2, -1),
+            )
         return special.logsumexp(
             node_log
             + np.log(self._rate_scale_weights_j).reshape(
@@ -4451,42 +5692,60 @@ class GeometryConditionedSpectralModel:
         live_times_s_v: object,
         *,
         return_view_prefixes: bool = False,
+        prepared_observation: PreparedTorchCrossObservation | None = None,
     ) -> object:
         """Return the Torch vectorized sample-by-state likelihood matrix."""
         import torch
 
         total = torch.as_tensor(total_line_contributions_xnvsl)
+        prepared = prepared_observation
+        if prepared is None:
+            prepared = self.prepare_cross_observation_torch(
+                observed_spectra_xqvb,
+                reference=total,
+            )
         observed = torch.as_tensor(
-            observed_spectra_xqvb,
+            prepared.restored(prepared.observed_asvb),
             device=total.device,
             dtype=total.dtype,
         )
-        source_mean, background_mean = self._pre_dead_time_mean_torch(
-            total,
-            uncollided_line_contributions_xnvsl,
-            transport_features_xnvslf,
-            live_times_s_v,
-            return_components=True,
+        component_discrepancy = self.physical_component_discrepancy
+        component_scale_marks = bool(
+            component_discrepancy is not None
+            and component_discrepancy.mark_latent_model
+            == "station_shared_two_point_component_scale"
         )
+        hierarchical_marks = bool(
+            component_discrepancy is not None
+            and component_discrepancy.mark_latent_model
+            == "photopeak_continuum_hierarchical"
+        )
+        if component_scale_marks:
+            direct_mean, scatter_mean, background_mean = (
+                self._pre_dead_time_mean_torch(
+                    total,
+                    uncollided_line_contributions_xnvsl,
+                    transport_features_xnvslf,
+                    live_times_s_v,
+                    return_physical_components=True,
+                )
+            )
+            source_mean = direct_mean + scatter_mean
+        else:
+            source_mean, background_mean = self._pre_dead_time_mean_torch(
+                total,
+                uncollided_line_contributions_xnvsl,
+                transport_features_xnvslf,
+                live_times_s_v,
+                return_components=True,
+            )
         if (
             observed.ndim < 3
             or tuple(observed.shape[:-3]) != tuple(source_mean.shape[:-3])
             or tuple(observed.shape[-2:]) != tuple(source_mean.shape[-2:])
-            or bool(torch.any(~torch.isfinite(observed)))
-            or bool(torch.any(observed < 0.0))
-            or bool(torch.any(observed != torch.floor(observed)))
         ):
             raise ValueError("Torch cross-spectrum observations are invalid.")
-        nodes = torch.as_tensor(
-            np.array(self._rate_scale_nodes_j, copy=True),
-            device=total.device,
-            dtype=torch.float64,
-        )
-        node_weights = torch.as_tensor(
-            np.array(self._rate_scale_weights_j, copy=True),
-            device=total.device,
-            dtype=torch.float64,
-        )
+        nodes, node_weights, _, _ = self._torch_likelihood_constants(total)
         node_shape = (
             (1,) * (source_mean.ndim - 3)
             + (1, int(nodes.numel()), 1, 1)
@@ -4495,14 +5754,13 @@ class GeometryConditionedSpectralModel:
             source_mean.unsqueeze(-3) * nodes.reshape(node_shape)
         )
         pre_mean = background_mean.unsqueeze(-3) + node_source
-        observed_total = torch.sum(observed, dim=-1)
+        observed_total = prepared.restored(prepared.observed_total_asv)
         pre_total = torch.sum(pre_mean, dim=-1)
         live = torch.as_tensor(
             live_times_s_v,
             device=total.device,
             dtype=total.dtype,
         )
-        component_discrepancy = self.physical_component_discrepancy
         if (
             self.count_discrepancy_concentration is None
             and component_discrepancy is None
@@ -4512,6 +5770,7 @@ class GeometryConditionedSpectralModel:
                 pre_total.unsqueeze(-4) / live,
                 live,
                 dead_time_tau_s=float(self.dead_time_tau_s),
+                validate_inputs=False,
             )
         else:
             dead_time_scale = (
@@ -4543,6 +5802,7 @@ class GeometryConditionedSpectralModel:
                     if component_count_concentration is not None
                     else float(self.count_discrepancy_concentration)
                 ),
+                validate_inputs=False,
             )
         tiny = torch.finfo(total.dtype).tiny
         probabilities = torch.where(
@@ -4552,11 +5812,9 @@ class GeometryConditionedSpectralModel:
         )
         log_probabilities = torch.log(torch.clamp(probabilities, min=tiny))
         multinomial_log = (
-            torch.lgamma(observed_total + 1.0).unsqueeze(-2).unsqueeze(-2)
-            - torch.sum(
-                torch.lgamma(observed + 1.0),
-                dim=-1,
-            ).unsqueeze(-2).unsqueeze(-2)
+            prepared.restored(prepared.multinomial_constant_asv)
+            .unsqueeze(-2)
+            .unsqueeze(-2)
             + torch.einsum(
                 "...qvb,...njvb->...qnjv",
                 observed,
@@ -4574,9 +5832,87 @@ class GeometryConditionedSpectralModel:
             multinomial_log,
         )
         mark_log = multinomial_log
+        component_mark_weights = None
+        if component_scale_marks:
+            component_nodes_numpy, component_weights_numpy = (
+                self._physical_mark_scale_nodes_numpy()
+            )
+            component_nodes = torch.as_tensor(
+                component_nodes_numpy,
+                device=total.device,
+                dtype=total.dtype,
+            )
+            component_mark_weights = torch.as_tensor(
+                component_weights_numpy,
+                device=total.device,
+                dtype=total.dtype,
+            )
+            node_direct = direct_mean.unsqueeze(-3) * nodes.reshape(node_shape)
+            node_scatter = scatter_mean.unsqueeze(-3) * nodes.reshape(node_shape)
+            component_shape = (
+                (1,) * (node_direct.ndim - 2)
+                + (int(component_nodes.shape[0]), 1, 1)
+            )
+            marked_pre_mean = (
+                background_mean.unsqueeze(-3).unsqueeze(-3)
+                + node_direct.unsqueeze(-3)
+                * component_nodes[:, 0].reshape(component_shape)
+                + node_scatter.unsqueeze(-3)
+                * component_nodes[:, 1].reshape(component_shape)
+            )
+            marked_total = torch.sum(marked_pre_mean, dim=-1)
+            marked_probabilities = torch.where(
+                marked_total.unsqueeze(-1) > 0.0,
+                marked_pre_mean
+                / torch.clamp(marked_total.unsqueeze(-1), min=tiny),
+                torch.zeros_like(marked_pre_mean),
+            )
+            marked_log_probabilities = torch.log(
+                torch.clamp(marked_probabilities, min=tiny)
+            )
+            mark_log = (
+                prepared.restored(prepared.multinomial_constant_asv)
+                .unsqueeze(-2)
+                .unsqueeze(-2)
+                .unsqueeze(-2)
+                + torch.einsum(
+                    "...qvb,...njkvb->...qnjkv",
+                    observed,
+                    marked_log_probabilities,
+                )
+            )
+            impossible_component_marks = torch.einsum(
+                "...qvb,...njkvb->...qnjkv",
+                observed,
+                (marked_probabilities <= 0.0).to(dtype=observed.dtype),
+            ) > 0.0
+            mark_log = torch.where(
+                impossible_component_marks,
+                -torch.inf,
+                mark_log,
+            )
+        if hierarchical_marks:
+            base_concentration = self._base_mark_concentration_torch(
+                total,
+                uncollided_line_contributions_xnvsl,
+            )
+            node_concentration = torch.broadcast_to(
+                base_concentration.unsqueeze(-2),
+                probabilities.shape[:-1],
+            )
+            mark_log = self._hierarchical_physical_mark_log_torch(
+                observed,
+                probabilities,
+                node_concentration,
+                prepared_observation=prepared,
+            )
         if (
-            self.mark_concentration_source is not None
-            or component_discrepancy is not None
+            not component_scale_marks
+            and not hierarchical_marks
+            and (
+                self.mark_concentration_source is not None
+                or component_discrepancy is not None
+            )
         ):
             source_total = torch.sum(node_source, dim=-1)
             source_fraction = torch.where(
@@ -4634,13 +5970,7 @@ class GeometryConditionedSpectralModel:
                     dim=-1,
                 )
             dirichlet_log = (
-                torch.lgamma(observed_total + 1.0)
-                .unsqueeze(-2)
-                .unsqueeze(-2)
-                - torch.sum(
-                    torch.lgamma(observed + 1.0),
-                    dim=-1,
-                )
+                prepared.restored(prepared.multinomial_constant_asv)
                 .unsqueeze(-2)
                 .unsqueeze(-2)
                 + torch.lgamma(concentration).unsqueeze(-4)
@@ -4660,17 +5990,52 @@ class GeometryConditionedSpectralModel:
                 dirichlet_log,
                 multinomial_log,
             )
-        zero_mark_total = (
-            observed_total.unsqueeze(-2).unsqueeze(-2) == 0.0
-        )
+        zero_mark_total = observed_total.unsqueeze(-2).unsqueeze(-2)
+        if component_scale_marks:
+            zero_mark_total = zero_mark_total.unsqueeze(-2)
+        zero_mark_total = zero_mark_total == 0.0
         mark_log = torch.where(
             zero_mark_total,
             torch.zeros_like(mark_log),
             mark_log,
         )
-        view_node_log = count_log + mark_log
+        view_node_log = (
+            count_log.unsqueeze(-2) + mark_log
+            if component_scale_marks
+            else count_log + mark_log
+        )
         if return_view_prefixes:
             cumulative_node_log = torch.cumsum(view_node_log, dim=-1)
+            if component_scale_marks:
+                if component_mark_weights is None:
+                    raise RuntimeError("Physical mark weights are unavailable.")
+                rate_weight_shape = (
+                    (1,) * (cumulative_node_log.ndim - 3)
+                    + (int(node_weights.numel()), 1, 1)
+                )
+                mark_weight_shape = (
+                    (1,) * (cumulative_node_log.ndim - 2)
+                    + (int(component_mark_weights.numel()), 1)
+                )
+                nonempty_prefixes = torch.logsumexp(
+                    cumulative_node_log
+                    + torch.log(node_weights).reshape(rate_weight_shape)
+                    + torch.log(component_mark_weights).reshape(
+                        mark_weight_shape
+                    ),
+                    dim=(-3, -2),
+                )
+                return torch.cat(
+                    (
+                        torch.zeros(
+                            nonempty_prefixes.shape[:-1] + (1,),
+                            device=total.device,
+                            dtype=total.dtype,
+                        ),
+                        nonempty_prefixes,
+                    ),
+                    dim=-1,
+                )
             weight_shape = (
                 (1,) * (cumulative_node_log.ndim - 2)
                 + (int(node_weights.numel()), 1)
@@ -4692,6 +6057,23 @@ class GeometryConditionedSpectralModel:
                 dim=-1,
             )
         node_log = torch.sum(view_node_log, dim=-1)
+        if component_scale_marks:
+            if component_mark_weights is None:
+                raise RuntimeError("Physical mark weights are unavailable.")
+            rate_weight_shape = (
+                (1,) * (node_log.ndim - 2)
+                + (int(node_weights.numel()), 1)
+            )
+            mark_weight_shape = (
+                (1,) * (node_log.ndim - 1)
+                + (int(component_mark_weights.numel()),)
+            )
+            return torch.logsumexp(
+                node_log
+                + torch.log(node_weights).reshape(rate_weight_shape)
+                + torch.log(component_mark_weights).reshape(mark_weight_shape),
+                dim=(-2, -1),
+            )
         weight_shape = (1,) * (node_log.ndim - 1) + (
             int(node_weights.numel()),
         )
@@ -4821,6 +6203,57 @@ class GeometryConditionedSpectralModel:
         )
         return int(total_elements * int(dtype_bytes))
 
+    @staticmethod
+    def _torch_cross_state_autotune_candidates(
+        *,
+        state_count: int,
+        memory_limited_maximum: int,
+    ) -> tuple[int, ...]:
+        """Return real-work CUDA state slabs used for one-time tuning."""
+        maximum = min(
+            int(state_count),
+            int(memory_limited_maximum),
+            CROSS_LIKELIHOOD_STATE_AUTOTUNE_MAX_CHUNK_SIZE,
+        )
+        candidates: list[int] = []
+        consumed = 0
+        candidate = CROSS_LIKELIHOOD_STATE_CHUNK_SIZE
+        while candidate <= maximum and consumed + candidate <= int(state_count):
+            candidates.append(candidate)
+            consumed += candidate
+            candidate *= 2
+        return tuple(candidates)
+
+    def _torch_cross_state_autotune_key(
+        self,
+        *,
+        total: object,
+        action_count: int,
+        sample_count: int,
+        action_chunk: int,
+        sample_chunk: int,
+    ) -> tuple[object, ...]:
+        """Return a reusable exact-likelihood CUDA workload key."""
+        tensor = total
+        component = self.physical_component_discrepancy
+        return (
+            str(tensor.device),
+            str(tensor.dtype),
+            int(action_count),
+            int(sample_count),
+            int(action_chunk),
+            int(sample_chunk),
+            (
+                1024
+                if int(tensor.shape[-4]) >= 1792
+                else 512 if int(tensor.shape[-4]) >= 768 else 256
+            ),
+            int(tensor.shape[-3]),
+            int(tensor.shape[-2]),
+            int(tensor.shape[-1]),
+            None if component is None else str(component.mark_latent_model),
+        )
+
     def cross_log_likelihood_numpy(
         self,
         observed_spectra_xqvb: NDArray[np.float64],
@@ -4937,13 +6370,20 @@ class GeometryConditionedSpectralModel:
         action_chunk_size: int | None = None,
         sample_chunk_size: int | None = None,
         state_chunk_size: int | None = None,
+        prepared_observation: PreparedTorchCrossObservation | None = None,
     ) -> object:
-        """Return Torch cross likelihoods with bounded deterministic workspace."""
+        """Return exact Torch likelihoods with cached CUDA chunk selection."""
         import torch
 
         total = torch.as_tensor(total_line_contributions_xnvsl)
+        prepared = prepared_observation
+        if prepared is None:
+            prepared = self.prepare_cross_observation_torch(
+                observed_spectra_xqvb,
+                reference=total,
+            )
         observed = torch.as_tensor(
-            observed_spectra_xqvb,
+            prepared.restored(prepared.observed_asvb),
             device=total.device,
             dtype=total.dtype,
         )
@@ -4959,7 +6399,7 @@ class GeometryConditionedSpectralModel:
         )
         if observed.ndim < 3 or total.ndim < 4:
             raise ValueError("Torch cross-likelihood inputs have too few dimensions.")
-        leading_shape = tuple(int(value) for value in observed.shape[:-3])
+        leading_shape = tuple(int(value) for value in prepared.leading_shape)
         if tuple(int(value) for value in total.shape[:-4]) != leading_shape:
             raise ValueError(
                 "Torch spectra and states require identical action axes."
@@ -5009,10 +6449,11 @@ class GeometryConditionedSpectralModel:
             device=total.device,
             dtype=total.dtype,
         )
-        for action_start in range(0, action_count, action_chunk):
-            action_stop = min(action_start + action_chunk, action_count)
-            for state_start in range(0, state_count, state_chunk):
-                state_stop = min(state_start + state_chunk, state_count)
+
+        def _evaluate_state_slab(state_start: int, state_stop: int) -> None:
+            """Evaluate one state slab across every action and sample chunk."""
+            for action_start in range(0, action_count, action_chunk):
+                action_stop = min(action_start + action_chunk, action_count)
                 total_block = total_flat[
                     action_start:action_stop,
                     state_start:state_stop,
@@ -5027,6 +6468,12 @@ class GeometryConditionedSpectralModel:
                 ]
                 for sample_start in range(0, sample_count, sample_chunk):
                     sample_stop = min(sample_start + sample_chunk, sample_count)
+                    prepared_block = prepared.block(
+                        action_start=action_start,
+                        action_stop=action_stop,
+                        sample_start=sample_start,
+                        sample_stop=sample_stop,
+                    )
                     result[
                         action_start:action_stop,
                         sample_start:sample_stop,
@@ -5040,7 +6487,120 @@ class GeometryConditionedSpectralModel:
                         uncollided_block,
                         features_block,
                         live_times_s_v,
+                        prepared_observation=prepared_block,
                     )
+
+        autotune_start = 0
+        if state_chunk_size is None and bool(total.is_cuda) and state_count > 256:
+            key = self._torch_cross_state_autotune_key(
+                total=total,
+                action_count=action_count,
+                sample_count=sample_count,
+                action_chunk=action_chunk,
+                sample_chunk=sample_chunk,
+            )
+            cached_chunk = self._torch_cross_state_chunk_cache.get(key)
+            if cached_chunk is not None:
+                state_chunk = min(int(cached_chunk), state_count)
+                self.last_torch_cross_chunk_diagnostics = {
+                    "mode": "cached_cuda_autotune",
+                    "selected_state_chunk_size": int(state_chunk),
+                    "shape_key": key,
+                }
+            else:
+                free_bytes, _ = torch.cuda.mem_get_info(total.device)
+                memory_limit = max(1, int(free_bytes) // 2)
+                memory_maximum = CROSS_LIKELIHOOD_STATE_CHUNK_SIZE
+                for candidate in (256, 512, 1024):
+                    estimate = self.estimate_cross_likelihood_working_set_bytes(
+                        num_actions=action_count,
+                        num_samples=sample_count,
+                        num_particles=state_count,
+                        num_isotopes=int(total.shape[-2]),
+                        num_views=int(total.shape[-3]),
+                        action_chunk_size=action_chunk,
+                        sample_chunk_size=sample_chunk,
+                        state_chunk_size=min(candidate, state_count),
+                        dtype_bytes=int(total.element_size()),
+                    )
+                    if estimate <= memory_limit:
+                        memory_maximum = candidate
+                candidates = self._torch_cross_state_autotune_candidates(
+                    state_count=state_count,
+                    memory_limited_maximum=memory_maximum,
+                )
+                trials: list[dict[str, float | int | str]] = []
+                for candidate in candidates:
+                    state_stop = autotune_start + candidate
+                    torch.cuda.synchronize(total.device)
+                    trial_start = time.perf_counter()
+                    try:
+                        _evaluate_state_slab(autotune_start, state_stop)
+                        torch.cuda.synchronize(total.device)
+                    except torch.cuda.OutOfMemoryError:
+                        torch.cuda.empty_cache()
+                        trials.append(
+                            {
+                                "state_chunk_size": int(candidate),
+                                "states_per_second": 0.0,
+                                "elapsed_s": float("inf"),
+                                "status": "cuda_oom",
+                            }
+                        )
+                        break
+                    elapsed = time.perf_counter() - trial_start
+                    trials.append(
+                        {
+                            "state_chunk_size": int(candidate),
+                            "states_per_second": float(
+                                candidate / max(elapsed, 1.0e-12)
+                            ),
+                            "elapsed_s": float(elapsed),
+                            "status": "ok",
+                        }
+                    )
+                    autotune_start = state_stop
+                successful = [
+                    trial for trial in trials if trial["status"] == "ok"
+                ]
+                if successful:
+                    selected = max(
+                        successful,
+                        key=lambda trial: float(trial["states_per_second"]),
+                    )
+                    state_chunk = int(selected["state_chunk_size"])
+                else:
+                    state_chunk = min(
+                        CROSS_LIKELIHOOD_STATE_CHUNK_SIZE,
+                        state_count,
+                    )
+                self._torch_cross_state_chunk_cache[key] = state_chunk
+                self.last_torch_cross_chunk_diagnostics = {
+                    "mode": "empirical_cuda_autotune",
+                    "selected_state_chunk_size": int(state_chunk),
+                    "memory_limited_maximum": int(memory_maximum),
+                    "trials": trials,
+                    "shape_key": key,
+                }
+                trial_summary = ",".join(
+                    f"{int(trial['state_chunk_size'])}:"
+                    f"{float(trial['states_per_second']):.3g}state/s"
+                    for trial in successful
+                )
+                print(
+                    "[full-spectrum] state-chunk-autotune "
+                    f"trials={trial_summary or 'none'} "
+                    f"selected={state_chunk}",
+                    flush=True,
+                )
+        else:
+            self.last_torch_cross_chunk_diagnostics = {
+                "mode": "explicit_or_non_cuda",
+                "selected_state_chunk_size": int(state_chunk),
+            }
+        for state_start in range(autotune_start, state_count, state_chunk):
+            state_stop = min(state_start + state_chunk, state_count)
+            _evaluate_state_slab(state_start, state_stop)
         return result.reshape(leading_shape + (sample_count, state_count))
 
     def log_likelihood_numpy(
@@ -5291,6 +6851,10 @@ class GeometryConditionedSpectralModel:
             device=total.device,
             dtype=total.dtype,
         )
+        prepared_observation = self.prepare_cross_observation_torch(
+            observed.unsqueeze(0),
+            reference=total,
+        )
         for state_start in range(0, state_count, state_chunk):
             state_stop = min(state_start + state_chunk, state_count)
             block = self._cross_log_likelihood_torch_unchunked(
@@ -5300,6 +6864,7 @@ class GeometryConditionedSpectralModel:
                 features[state_start:state_stop],
                 live_times_s_v,
                 return_view_prefixes=True,
+                prepared_observation=prepared_observation,
             )
             expected_shape = (
                 1,
@@ -5376,13 +6941,36 @@ class GeometryConditionedSpectralModel:
                 np.int64,
                 copy=False,
             )
-        source_mean, background_mean = self._pre_dead_time_mean_numpy(
-            total_line_contributions_xvsl,
-            uncollided_line_contributions_xvsl,
-            transport_features_xvslf,
-            live_times_s_v,
-            return_components=True,
+        component_discrepancy = self.physical_component_discrepancy
+        component_scale_marks = bool(
+            component_discrepancy is not None
+            and component_discrepancy.mark_latent_model
+            == "station_shared_two_point_component_scale"
         )
+        hierarchical_marks = bool(
+            component_discrepancy is not None
+            and component_discrepancy.mark_latent_model
+            == "photopeak_continuum_hierarchical"
+        )
+        if component_scale_marks:
+            direct_mean, scatter_mean, background_mean = (
+                self._pre_dead_time_mean_numpy(
+                    total_line_contributions_xvsl,
+                    uncollided_line_contributions_xvsl,
+                    transport_features_xvslf,
+                    live_times_s_v,
+                    return_physical_components=True,
+                )
+            )
+            source_mean = direct_mean + scatter_mean
+        else:
+            source_mean, background_mean = self._pre_dead_time_mean_numpy(
+                total_line_contributions_xvsl,
+                uncollided_line_contributions_xvsl,
+                transport_features_xvslf,
+                live_times_s_v,
+                return_components=True,
+            )
         live = np.asarray(live_times_s_v, dtype=np.float64)
         leading_shape = source_mean.shape[:-2]
         node_indices = rng.choice(
@@ -5397,7 +6985,6 @@ class GeometryConditionedSpectralModel:
         )
         pre_mean = background_mean[..., np.newaxis, :, :] + node_source
         pre_total = np.sum(pre_mean, axis=-1)
-        component_discrepancy = self.physical_component_discrepancy
         if (
             self.count_discrepancy_concentration is None
             and component_discrepancy is None
@@ -5453,11 +7040,33 @@ class GeometryConditionedSpectralModel:
             totals = rng.poisson(
                 recorded_total_mean * sampled_count_scale
             )
+        mark_pre_mean = pre_mean
+        if component_scale_marks:
+            component_nodes, component_weights = (
+                self._physical_mark_scale_nodes_numpy()
+            )
+            component_indices = rng.choice(
+                component_nodes.shape[0],
+                size=leading_shape + (int(sample_count),),
+                p=component_weights,
+            )
+            sampled_components = component_nodes[component_indices]
+            mark_pre_mean = (
+                background_mean[..., np.newaxis, :, :]
+                + sampled_scale[..., np.newaxis, np.newaxis]
+                * (
+                    direct_mean[..., np.newaxis, :, :]
+                    * sampled_components[..., 0, np.newaxis, np.newaxis]
+                    + scatter_mean[..., np.newaxis, :, :]
+                    * sampled_components[..., 1, np.newaxis, np.newaxis]
+                )
+            )
+        mark_total = np.sum(mark_pre_mean, axis=-1)
         probabilities = np.divide(
-            pre_mean,
-            pre_total[..., np.newaxis],
-            out=np.zeros_like(pre_mean),
-            where=pre_total[..., np.newaxis] > 0.0,
+            mark_pre_mean,
+            mark_total[..., np.newaxis],
+            out=np.zeros_like(mark_pre_mean),
+            where=mark_total[..., np.newaxis] > 0.0,
         )
         zero_rate = pre_total <= 0.0
         if np.any(zero_rate):
@@ -5468,9 +7077,204 @@ class GeometryConditionedSpectralModel:
                 fallback,
                 probabilities,
             )
+        if hierarchical_marks:
+            peak = np.asarray(self._photopeak_mask_b, dtype=np.bool_)
+            continuum = ~peak
+            peak_probability = np.sum(
+                probabilities[..., peak],
+                axis=-1,
+            )
+            base_concentration = self._base_mark_concentration_numpy(
+                total_line_contributions_xvsl,
+                uncollided_line_contributions_xvsl,
+            )
+            concentration = np.broadcast_to(
+                base_concentration[..., np.newaxis, :],
+                peak_probability.shape,
+            )
+            interior = (
+                (peak_probability > 0.0) & (peak_probability < 1.0)
+            )
+            sampled_peak_probability = peak_probability.copy()
+            sampled_peak_probability[interior] = rng.beta(
+                concentration[interior] * peak_probability[interior],
+                concentration[interior]
+                * (1.0 - peak_probability[interior]),
+            )
+            peak_totals = rng.binomial(
+                totals,
+                sampled_peak_probability,
+            )
+            continuum_totals = totals - peak_totals
+            peak_probabilities = np.divide(
+                probabilities[..., peak],
+                peak_probability[..., np.newaxis],
+                out=np.zeros_like(probabilities[..., peak]),
+                where=peak_probability[..., np.newaxis] > 0.0,
+            )
+            continuum_probability = 1.0 - peak_probability
+            continuum_probabilities = np.divide(
+                probabilities[..., continuum],
+                continuum_probability[..., np.newaxis],
+                out=np.zeros_like(probabilities[..., continuum]),
+                where=continuum_probability[..., np.newaxis] > 0.0,
+            )
+            zero_peak_probability = np.sum(
+                peak_probabilities,
+                axis=-1,
+            ) <= 0.0
+            if np.any(zero_peak_probability):
+                peak_fallback = np.zeros_like(peak_probabilities)
+                peak_fallback[..., 0] = 1.0
+                peak_probabilities = np.where(
+                    zero_peak_probability[..., np.newaxis],
+                    peak_fallback,
+                    peak_probabilities,
+                )
+            zero_continuum_probability = np.sum(
+                continuum_probabilities,
+                axis=-1,
+            ) <= 0.0
+            if np.any(zero_continuum_probability):
+                continuum_fallback = np.zeros_like(
+                    continuum_probabilities
+                )
+                continuum_fallback[..., 0] = 1.0
+                continuum_probabilities = np.where(
+                    zero_continuum_probability[..., np.newaxis],
+                    continuum_fallback,
+                    continuum_probabilities,
+                )
+            peak_alpha = (
+                peak_probabilities
+                * float(component_discrepancy.mark_uncollided_concentration)
+            )
+            positive_peak_alpha = peak_alpha > 0.0
+            peak_gamma_draws = rng.gamma(
+                shape=np.where(positive_peak_alpha, peak_alpha, 1.0)
+            )
+            peak_gamma_draws = np.where(
+                positive_peak_alpha,
+                peak_gamma_draws,
+                0.0,
+            )
+            peak_random_probabilities = np.divide(
+                peak_gamma_draws,
+                np.sum(peak_gamma_draws, axis=-1, keepdims=True),
+                out=peak_probabilities.copy(),
+                where=np.sum(
+                    peak_gamma_draws,
+                    axis=-1,
+                    keepdims=True,
+                )
+                > 0.0,
+            )
+            continuum_group_mask = (
+                self._continuum_group_mask_gb[:, continuum]
+            )
+            continuum_group_probabilities = np.einsum(
+                "...b,gb->...g",
+                continuum_probabilities,
+                continuum_group_mask,
+                optimize=True,
+            )
+            group_alpha = (
+                continuum_group_probabilities
+                * float(
+                    component_discrepancy.mark_continuum_group_concentration
+                )
+            )
+            positive_group_alpha = group_alpha > 0.0
+            group_gamma_draws = rng.gamma(
+                shape=np.where(positive_group_alpha, group_alpha, 1.0)
+            )
+            group_gamma_draws = np.where(
+                positive_group_alpha,
+                group_gamma_draws,
+                0.0,
+            )
+            random_group_probabilities = np.divide(
+                group_gamma_draws,
+                np.sum(group_gamma_draws, axis=-1, keepdims=True),
+                out=continuum_group_probabilities.copy(),
+                where=np.sum(
+                    group_gamma_draws,
+                    axis=-1,
+                    keepdims=True,
+                )
+                > 0.0,
+            )
+            probability_by_bin_group = np.einsum(
+                "...g,gb->...b",
+                continuum_group_probabilities,
+                continuum_group_mask,
+                optimize=True,
+            )
+            continuum_within_probabilities = np.divide(
+                continuum_probabilities,
+                probability_by_bin_group,
+                out=np.zeros_like(continuum_probabilities),
+                where=probability_by_bin_group > 0.0,
+            )
+            within_alpha = (
+                continuum_within_probabilities
+                * float(
+                    component_discrepancy.mark_uncollided_concentration
+                )
+            )
+            positive_within_alpha = within_alpha > 0.0
+            within_gamma_draws = rng.gamma(
+                shape=np.where(positive_within_alpha, within_alpha, 1.0)
+            )
+            within_gamma_draws = np.where(
+                positive_within_alpha,
+                within_gamma_draws,
+                0.0,
+            )
+            within_group_sums = np.einsum(
+                "...b,gb->...g",
+                within_gamma_draws,
+                continuum_group_mask,
+                optimize=True,
+            )
+            within_sum_by_bin = np.einsum(
+                "...g,gb->...b",
+                within_group_sums,
+                continuum_group_mask,
+                optimize=True,
+            )
+            random_within_probabilities = np.divide(
+                within_gamma_draws,
+                within_sum_by_bin,
+                out=continuum_within_probabilities.copy(),
+                where=within_sum_by_bin > 0.0,
+            )
+            random_group_by_bin = np.einsum(
+                "...g,gb->...b",
+                random_group_probabilities,
+                continuum_group_mask,
+                optimize=True,
+            )
+            continuum_random_probabilities = (
+                random_group_by_bin * random_within_probabilities
+            )
+            samples = np.zeros(probabilities.shape, dtype=np.int64)
+            samples[..., peak] = rng.multinomial(
+                peak_totals,
+                peak_random_probabilities,
+            )
+            samples[..., continuum] = rng.multinomial(
+                continuum_totals,
+                continuum_random_probabilities,
+            )
+            return samples
         if (
-            self.mark_concentration_source is not None
-            or component_discrepancy is not None
+            not component_scale_marks
+            and not hierarchical_marks
+            and (
+                self.mark_concentration_source is not None
+                or component_discrepancy is not None
+            )
         ):
             source_total = np.sum(node_source, axis=-1)
             source_fraction = np.divide(
@@ -5580,8 +7384,17 @@ class GeometryConditionedSpectralModel:
         live_times_s_v: NDArray[np.float64],
         *,
         target_line_mask_l: NDArray[np.bool_],
+        reference_mean_vb: NDArray[np.float64] | None = None,
     ) -> NDArray[np.float64]:
-        """Return deterministic proposal-only chart-by-strength log scores."""
+        """Return deterministic proposal-only chart-by-strength log scores.
+
+        ``reference_mean_vb`` may contain the spectrum already explained by
+        earlier blocks of a sequential importance proposal.  It changes only
+        the proposal residual and whitening; candidate templates remain the
+        target-isotope increment over the physical background.  The caller is
+        responsible for retaining this conditional proposal density in the
+        importance correction.
+        """
         observed = np.asarray(observed_spectrum_vb, dtype=np.float64)
         total = np.asarray(
             candidate_total_line_contributions_gvsl,
@@ -5625,10 +7438,21 @@ class GeometryConditionedSpectralModel:
             zero_features,
             live_times_s_v,
         )[0]
-        whitening = 1.0 / np.sqrt(
-            baseline + 1.0
-        )
-        residual = (observed - baseline) * whitening
+        if reference_mean_vb is None:
+            reference = baseline
+        else:
+            reference = np.asarray(reference_mean_vb, dtype=np.float64)
+            if (
+                reference.shape != observed.shape
+                or np.any(~np.isfinite(reference))
+                or np.any(reference < 0.0)
+            ):
+                raise ValueError(
+                    "Birth proposal reference mean must be finite, "
+                    "nonnegative, and observation-aligned."
+                )
+        whitening = 1.0 / np.sqrt(reference + 1.0)
+        residual = (observed - reference) * whitening
         basis = self._birth_proposal_nuisance_basis_numpy(mask)
         if basis.shape[1] > 0:
             residual = residual - (residual @ basis) @ basis.T
@@ -5688,6 +7512,7 @@ class GeometryConditionedSpectralModel:
         live_times_s_v: object,
         *,
         target_line_mask_l: object,
+        reference_mean_vb: object | None = None,
     ) -> object:
         """Return the Torch-equivalent proposal-only matched-filter scores."""
         import torch
@@ -5741,8 +7566,24 @@ class GeometryConditionedSpectralModel:
             zero_features,
             live_times_s_v,
         )[0]
-        whitening = torch.rsqrt(baseline + 1.0)
-        residual = (observed - baseline) * whitening
+        if reference_mean_vb is None:
+            reference = baseline
+        else:
+            reference = torch.as_tensor(
+                reference_mean_vb,
+                device=total.device,
+                dtype=torch.float64,
+            )
+            if (
+                tuple(reference.shape) != tuple(observed.shape)
+                or bool(torch.any(~torch.isfinite(reference)))
+                or bool(torch.any(reference < 0.0))
+            ):
+                raise ValueError(
+                    "Torch birth proposal reference mean is invalid."
+                )
+        whitening = torch.rsqrt(reference + 1.0)
+        residual = (observed - reference) * whitening
         basis = torch.as_tensor(
             np.array(
                 self._birth_proposal_nuisance_basis_numpy(
@@ -5881,11 +7722,16 @@ class GeometryConditionedSpectralModel:
             np.sum(expected_marks >= 1.0)
             - observed.shape[0]
         )
-        mark_tail_probability = (
-            float(stats.chi2.sf(mark_pearson, degrees))
-            if degrees > 0
-            else None
-        )
+        mark_tail_probability = None
+        mark_upper_tail_probability = None
+        if degrees > 0:
+            upper_tail = float(stats.chi2.sf(mark_pearson, degrees))
+            lower_tail = float(stats.chi2.cdf(mark_pearson, degrees))
+            mark_upper_tail_probability = upper_tail
+            mark_tail_probability = min(
+                1.0,
+                2.0 * min(upper_tail, lower_tail),
+            )
         threshold = float(stats.norm.ppf(0.5 + float(confidence) / 2.0))
         maximum_total_z = float(np.max(np.abs(total_z)))
         return {
@@ -5894,6 +7740,9 @@ class GeometryConditionedSpectralModel:
             "conditional_mark_pearson": mark_pearson,
             "conditional_mark_degrees_of_freedom": degrees,
             "conditional_mark_tail_probability": mark_tail_probability,
+            "conditional_mark_upper_tail_probability": (
+                mark_upper_tail_probability
+            ),
             "confidence": float(confidence),
         }
 
@@ -5919,13 +7768,36 @@ class GeometryConditionedSpectralModel:
         """
         observed = np.asarray(observed_spectrum_vb, dtype=np.float64)
         weights = np.asarray(particle_weights_n, dtype=np.float64)
-        source_mean, background_mean = self._pre_dead_time_mean_numpy(
-            total_line_contributions_nvsl,
-            uncollided_line_contributions_nvsl,
-            transport_features_nvslf,
-            live_times_s_v,
-            return_components=True,
+        component_discrepancy = self.physical_component_discrepancy
+        component_scale_marks = bool(
+            component_discrepancy is not None
+            and component_discrepancy.mark_latent_model
+            == "station_shared_two_point_component_scale"
         )
+        hierarchical_marks = bool(
+            component_discrepancy is not None
+            and component_discrepancy.mark_latent_model
+            == "photopeak_continuum_hierarchical"
+        )
+        if component_scale_marks:
+            direct_mean, scatter_mean, background_mean = (
+                self._pre_dead_time_mean_numpy(
+                    total_line_contributions_nvsl,
+                    uncollided_line_contributions_nvsl,
+                    transport_features_nvslf,
+                    live_times_s_v,
+                    return_physical_components=True,
+                )
+            )
+            source_mean = direct_mean + scatter_mean
+        else:
+            source_mean, background_mean = self._pre_dead_time_mean_numpy(
+                total_line_contributions_nvsl,
+                uncollided_line_contributions_nvsl,
+                transport_features_nvslf,
+                live_times_s_v,
+                return_components=True,
+            )
         if (
             observed.shape != source_mean.shape[-2:]
             or weights.shape != source_mean.shape[:1]
@@ -5953,7 +7825,6 @@ class GeometryConditionedSpectralModel:
             * float(self.dead_time_tau_s)
         )
         component_total_mean = pre_total / dead_time_scale
-        component_discrepancy = self.physical_component_discrepancy
         if (
             self.count_discrepancy_concentration is None
             and component_discrepancy is None
@@ -5997,78 +7868,349 @@ class GeometryConditionedSpectralModel:
             observed_total - posterior_total_mean
         ) / np.sqrt(posterior_total_variance)
 
-        probabilities = np.divide(
-            pre_mean,
-            pre_total[..., np.newaxis],
-            out=np.zeros_like(pre_mean),
-            where=pre_total[..., np.newaxis] > 0.0,
-        )
-        posterior_probabilities = np.einsum(
-            "nj,njvb->vb",
-            component_weights,
-            probabilities,
-            optimize=True,
-        )
-        expected_marks = observed_total[:, np.newaxis] * posterior_probabilities
-        if (
-            self.mark_concentration_source is None
-            and component_discrepancy is None
-        ):
-            dispersion = np.ones_like(pre_total)
-        else:
-            node_source_total = np.sum(
-                source_mean[:, np.newaxis, :, :]
+        if component_scale_marks:
+            mark_nodes, mark_weights = self._physical_mark_scale_nodes_numpy()
+            node_direct = (
+                direct_mean[:, np.newaxis, :, :]
                 * self._rate_scale_nodes_j[
                     np.newaxis, :, np.newaxis, np.newaxis
-                ],
-                axis=-1,
+                ]
             )
-            source_fraction = np.divide(
-                node_source_total,
-                pre_total,
-                out=np.zeros_like(pre_total),
-                where=pre_total > 0.0,
+            node_scatter = (
+                scatter_mean[:, np.newaxis, :, :]
+                * self._rate_scale_nodes_j[
+                    np.newaxis, :, np.newaxis, np.newaxis
+                ]
             )
-            base_concentration = self._base_mark_concentration_numpy(
+            marked_pre_mean = (
+                background_mean[:, np.newaxis, np.newaxis, :, :]
+                + node_direct[:, :, np.newaxis, :, :]
+                * mark_nodes[np.newaxis, np.newaxis, :, 0, np.newaxis, np.newaxis]
+                + node_scatter[:, :, np.newaxis, :, :]
+                * mark_nodes[np.newaxis, np.newaxis, :, 1, np.newaxis, np.newaxis]
+            )
+            marked_total = np.sum(marked_pre_mean, axis=-1)
+            mark_probabilities = np.divide(
+                marked_pre_mean,
+                marked_total[..., np.newaxis],
+                out=np.zeros_like(marked_pre_mean),
+                where=marked_total[..., np.newaxis] > 0.0,
+            )
+            joint_mark_weights = (
+                normalized[:, np.newaxis, np.newaxis]
+                * self._rate_scale_weights_j[np.newaxis, :, np.newaxis]
+                * mark_weights[np.newaxis, np.newaxis, :]
+            )
+            posterior_probabilities = np.einsum(
+                "njk,njkvb->vb",
+                joint_mark_weights,
+                mark_probabilities,
+                optimize=True,
+            )
+            expected_marks = (
+                observed_total[:, np.newaxis] * posterior_probabilities
+            )
+            component_mark_variance = (
+                observed_total[np.newaxis, np.newaxis, np.newaxis, :, np.newaxis]
+                * mark_probabilities
+                * (1.0 - mark_probabilities)
+            )
+            mark_variance = np.einsum(
+                "njk,njkvb->vb",
+                joint_mark_weights,
+                component_mark_variance
+                + np.square(
+                    observed_total[
+                        np.newaxis,
+                        np.newaxis,
+                        np.newaxis,
+                        :,
+                        np.newaxis,
+                    ]
+                    * mark_probabilities
+                ),
+                optimize=True,
+            ) - np.square(expected_marks)
+        elif hierarchical_marks:
+            probabilities = np.divide(
+                pre_mean,
+                pre_total[..., np.newaxis],
+                out=np.zeros_like(pre_mean),
+                where=pre_total[..., np.newaxis] > 0.0,
+            )
+            posterior_probabilities = np.einsum(
+                "nj,njvb->vb",
+                component_weights,
+                probabilities,
+                optimize=True,
+            )
+            expected_marks = (
+                observed_total[:, np.newaxis] * posterior_probabilities
+            )
+            peak = np.asarray(self._photopeak_mask_b, dtype=np.bool_)
+            peak_probability = np.sum(probabilities[..., peak], axis=-1)
+            continuum_probability = 1.0 - peak_probability
+            peak_conditional = np.divide(
+                probabilities[..., peak],
+                peak_probability[..., np.newaxis],
+                out=np.zeros_like(probabilities[..., peak]),
+                where=peak_probability[..., np.newaxis] > 0.0,
+            )
+            continuum_conditional = np.divide(
+                probabilities[..., ~peak],
+                continuum_probability[..., np.newaxis],
+                out=np.zeros_like(probabilities[..., ~peak]),
+                where=continuum_probability[..., np.newaxis] > 0.0,
+            )
+            peak_concentration = self._base_mark_concentration_numpy(
                 total_line_contributions_nvsl,
                 uncollided_line_contributions_nvsl,
+            )[:, np.newaxis, :]
+            peak_shape_concentration = float(
+                component_discrepancy.mark_uncollided_concentration
             )
-            concentration = base_concentration[:, np.newaxis, :] / np.maximum(
-                np.square(source_fraction),
-                1.0e-12,
+            peak_fraction_second = (
+                np.square(peak_probability)
+                + peak_probability
+                * continuum_probability
+                / (1.0 + peak_concentration)
             )
-            sample_size = observed_total[np.newaxis, np.newaxis, :]
-            dispersion = np.where(
-                source_fraction > 0.0,
-                (sample_size + concentration) / (1.0 + concentration),
-                1.0,
+            peak_conditional_second = (
+                np.square(peak_conditional)
+                + peak_conditional
+                * (1.0 - peak_conditional)
+                / (1.0 + peak_shape_concentration)
             )
-        component_mark_variance = (
-            observed_total[np.newaxis, np.newaxis, :, np.newaxis]
-            * probabilities
-            * (1.0 - probabilities)
-            * dispersion[..., np.newaxis]
-        )
-        mark_variance = np.einsum(
-            "nj,njvb->vb",
-            component_weights,
-            component_mark_variance
-            + np.square(
+            continuum_concentration = float(
+                component_discrepancy.mark_continuum_group_concentration
+            )
+            continuum_fraction_second = (
+                np.square(continuum_probability)
+                + peak_probability
+                * continuum_probability
+                / (1.0 + peak_concentration)
+            )
+            continuum_group_mask = (
+                self._continuum_group_mask_gb[:, ~peak]
+            )
+            continuum_group_probability = np.einsum(
+                "...b,gb->...g",
+                continuum_conditional,
+                continuum_group_mask,
+                optimize=True,
+            )
+            continuum_group_second = (
+                np.square(continuum_group_probability)
+                + continuum_group_probability
+                * (1.0 - continuum_group_probability)
+                / (1.0 + continuum_concentration)
+            )
+            continuum_group_probability_by_bin = np.einsum(
+                "...g,gb->...b",
+                continuum_group_probability,
+                continuum_group_mask,
+                optimize=True,
+            )
+            continuum_within_probability = np.divide(
+                continuum_conditional,
+                continuum_group_probability_by_bin,
+                out=np.zeros_like(continuum_conditional),
+                where=continuum_group_probability_by_bin > 0.0,
+            )
+            continuum_within_second = (
+                np.square(continuum_within_probability)
+                + continuum_within_probability
+                * (1.0 - continuum_within_probability)
+                / (1.0 + peak_shape_concentration)
+            )
+            continuum_group_second_by_bin = np.einsum(
+                "...g,gb->...b",
+                continuum_group_second,
+                continuum_group_mask,
+                optimize=True,
+            )
+            component_probability_second = np.zeros_like(probabilities)
+            component_probability_second[..., peak] = (
+                peak_fraction_second[..., np.newaxis]
+                * peak_conditional_second
+            )
+            component_probability_second[..., ~peak] = (
+                continuum_fraction_second[..., np.newaxis]
+                * continuum_group_second_by_bin
+                * continuum_within_second
+            )
+            posterior_probability_second = np.einsum(
+                "nj,njvb->vb",
+                component_weights,
+                component_probability_second,
+                optimize=True,
+            )
+            hierarchical_probability_variance = np.maximum(
+                posterior_probability_second
+                - np.square(posterior_probabilities),
+                0.0,
+            )
+            sample_size = observed_total[:, np.newaxis]
+            mark_variance = (
+                sample_size
+                * posterior_probabilities
+                * (1.0 - posterior_probabilities)
+                + sample_size
+                * np.maximum(sample_size - 1.0, 0.0)
+                * hierarchical_probability_variance
+            )
+        else:
+            probabilities = np.divide(
+                pre_mean,
+                pre_total[..., np.newaxis],
+                out=np.zeros_like(pre_mean),
+                where=pre_total[..., np.newaxis] > 0.0,
+            )
+            posterior_probabilities = np.einsum(
+                "nj,njvb->vb",
+                component_weights,
+                probabilities,
+                optimize=True,
+            )
+            expected_marks = (
+                observed_total[:, np.newaxis] * posterior_probabilities
+            )
+            if (
+                self.mark_concentration_source is None
+                and component_discrepancy is None
+            ):
+                dispersion = np.ones_like(pre_total)
+            else:
+                node_source_total = np.sum(
+                    source_mean[:, np.newaxis, :, :]
+                    * self._rate_scale_nodes_j[
+                        np.newaxis, :, np.newaxis, np.newaxis
+                    ],
+                    axis=-1,
+                )
+                source_fraction = np.divide(
+                    node_source_total,
+                    pre_total,
+                    out=np.zeros_like(pre_total),
+                    where=pre_total > 0.0,
+                )
+                base_concentration = self._base_mark_concentration_numpy(
+                    total_line_contributions_nvsl,
+                    uncollided_line_contributions_nvsl,
+                )
+                concentration = base_concentration[:, np.newaxis, :] / np.maximum(
+                    np.square(source_fraction),
+                    1.0e-12,
+                )
+                sample_size = observed_total[np.newaxis, np.newaxis, :]
+                dispersion = np.where(
+                    source_fraction > 0.0,
+                    (sample_size + concentration) / (1.0 + concentration),
+                    1.0,
+                )
+            component_mark_variance = (
                 observed_total[np.newaxis, np.newaxis, :, np.newaxis]
                 * probabilities
-            ),
-            optimize=True,
-        ) - np.square(expected_marks)
+                * (1.0 - probabilities)
+                * dispersion[..., np.newaxis]
+            )
+            mark_variance = np.einsum(
+                "nj,njvb->vb",
+                component_weights,
+                component_mark_variance
+                + np.square(
+                    observed_total[np.newaxis, np.newaxis, :, np.newaxis]
+                    * probabilities
+                ),
+                optimize=True,
+            ) - np.square(expected_marks)
         mark_variance = np.maximum(mark_variance, 1.0)
         mark_pearson = float(
             np.sum(np.square(observed - expected_marks) / mark_variance)
         )
         degrees = int(np.sum(expected_marks >= 1.0) - observed.shape[0])
-        mark_tail_probability = (
-            float(stats.chi2.sf(mark_pearson, degrees))
-            if degrees > 0
-            else None
-        )
+        mark_tail_probability = None
+        mark_upper_tail_probability = None
+        if hierarchical_marks:
+            seed_hash = hashlib.sha256()
+            seed_hash.update(self.contract_hash_sha256.encode("ascii"))
+            seed_hash.update(
+                np.ascontiguousarray(observed, dtype=np.float64).tobytes()
+            )
+            diagnostic_seed = int.from_bytes(
+                seed_hash.digest()[:8],
+                byteorder="little",
+                signed=False,
+            )
+            diagnostic_rng = np.random.Generator(
+                np.random.Philox(diagnostic_seed)
+            )
+            predictive_sample_count = 256
+            selected_indices = diagnostic_rng.choice(
+                normalized.size,
+                size=predictive_sample_count,
+                replace=True,
+                p=normalized,
+            )
+            predictive = self.sample_predictive_numpy(
+                np.asarray(
+                    total_line_contributions_nvsl,
+                    dtype=np.float64,
+                )[selected_indices],
+                np.asarray(
+                    uncollided_line_contributions_nvsl,
+                    dtype=np.float64,
+                )[selected_indices],
+                np.asarray(
+                    transport_features_nvslf,
+                    dtype=np.float64,
+                )[selected_indices],
+                live_times_s_v,
+                sample_count=1,
+                rng=diagnostic_rng,
+            )[:, 0]
+            predictive_total = np.sum(predictive, axis=-1)
+            predictive_expected = (
+                predictive_total[..., np.newaxis]
+                * posterior_probabilities[np.newaxis, :, :]
+            )
+            predictive_variance = (
+                predictive_total[..., np.newaxis]
+                * posterior_probabilities[np.newaxis, :, :]
+                * (1.0 - posterior_probabilities[np.newaxis, :, :])
+                + predictive_total[..., np.newaxis]
+                * np.maximum(
+                    predictive_total[..., np.newaxis] - 1.0,
+                    0.0,
+                )
+                * hierarchical_probability_variance[np.newaxis, :, :]
+            )
+            predictive_statistics = np.sum(
+                np.square(predictive - predictive_expected)
+                / np.maximum(predictive_variance, 1.0),
+                axis=(-2, -1),
+            )
+            upper_tail = (
+                1.0
+                + float(np.sum(predictive_statistics >= mark_pearson))
+            ) / float(predictive_sample_count + 1)
+            lower_tail = (
+                1.0
+                + float(np.sum(predictive_statistics <= mark_pearson))
+            ) / float(predictive_sample_count + 1)
+            mark_upper_tail_probability = upper_tail
+            mark_tail_probability = min(
+                1.0,
+                2.0 * min(upper_tail, lower_tail),
+            )
+        elif degrees > 0:
+            upper_tail = float(stats.chi2.sf(mark_pearson, degrees))
+            lower_tail = float(stats.chi2.cdf(mark_pearson, degrees))
+            mark_upper_tail_probability = upper_tail
+            mark_tail_probability = min(
+                1.0,
+                2.0 * min(upper_tail, lower_tail),
+            )
         threshold = float(stats.norm.ppf(0.5 + float(confidence) / 2.0))
         maximum_total_z = float(np.max(np.abs(total_z)))
         return {
@@ -6077,6 +8219,9 @@ class GeometryConditionedSpectralModel:
             "conditional_mark_pearson": mark_pearson,
             "conditional_mark_degrees_of_freedom": degrees,
             "conditional_mark_tail_probability": mark_tail_probability,
+            "conditional_mark_upper_tail_probability": (
+                mark_upper_tail_probability
+            ),
             "confidence": float(confidence),
         }
 
@@ -6084,7 +8229,15 @@ class GeometryConditionedSpectralModel:
         """Return immutable physics and validation provenance."""
         bin_width = float(self._energy_axis_keV[1] - self._energy_axis_keV[0])
         mark_model = (
-            "physical_component_fraction_dirichlet_multinomial"
+            "station_shared_physical_component_scale_multinomial"
+            if self.physical_component_discrepancy is not None
+            and self.physical_component_discrepancy.mark_latent_model
+            == "station_shared_two_point_component_scale"
+            else "photopeak_and_grouped_continuum_dirichlet_hierarchical"
+            if self.physical_component_discrepancy is not None
+            and self.physical_component_discrepancy.mark_latent_model
+            == "photopeak_continuum_hierarchical"
+            else "physical_component_fraction_dirichlet_multinomial"
             if self.physical_component_discrepancy is not None
             else
             "source_fraction_dirichlet_multinomial"
