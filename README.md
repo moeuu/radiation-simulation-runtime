@@ -29,6 +29,8 @@ uv run rotating-shield-sim serve --config configs/geant4/variance_reduction_exte
 uv run rotating-shield-sim run-plan PLAN.json
 uv run rotating-shield-sim run-adaptive-session PRIVATE_SCENARIO.json \
   --private-scene-profile ral-mix9
+uv run rotating-shield-sim run-adaptive-session PRIVATE_SCENARIO.json \
+  --resume-stage /private/logs/.run-001.stream-1234
 uv run rotating-shield-sim generate-ral-scenario PRIVATE_SCENARIO.json \
   --measurement-log-output /private/logs/run-001 \
   --run-id run-001 \
@@ -51,6 +53,16 @@ until the controller requests finalization.
 The optional `ral-mix9` private-scene profile validates Cs-137 x4, Co-60 x3, and
 Eu-154 x2 entirely inside the runtime; the counts and realized source data are not
 included in estimator-visible events.
+
+An interrupted adaptive acquisition can resume from its hidden stream stage with
+`--resume-stage`. The runtime authenticates the static acquisition identity and
+every durable record shard, discards an incomplete station tail, copies through the
+last `station_complete` boundary, restores pose/yaw/Fe/Pb state, and returns the
+adopted truth-free prefix in a schema-v2 ready event. The original stage is never
+modified. Resume under a different runtime commit fails closed unless
+`--resume-compatibility COMPATIBILITY.json` supplies explicit provenance. The same
+surface is available to Python callers through `AdaptiveRuntimeSession.resume(...)`
+and `AdaptiveRuntimeClient(..., resume_stage_path=...)`.
 
 `generate-ral-scenario` creates that private, action-free scenario. Omitting
 `--scene-seed` creates a fresh environment and source realization; an explicit seed

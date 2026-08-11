@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Sequence
+import json
 from pathlib import Path
 
 from runtime.adaptive import serve_adaptive_session
@@ -37,6 +38,21 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=tuple(RAL_PRIVATE_SOURCE_PROFILES),
         default=None,
     )
+    run_adaptive.add_argument(
+        "--resume-stage",
+        type=Path,
+        default=None,
+        help="Resume from a verified adaptive MeasurementLog stream stage.",
+    )
+    run_adaptive.add_argument(
+        "--resume-compatibility",
+        type=Path,
+        default=None,
+        help=(
+            "Explicit compatibility provenance required when resuming under a "
+            "different runtime commit."
+        ),
+    )
     generate_scenario = subparsers.add_parser("generate-ral-scenario")
     generate_scenario.add_argument("output", type=Path)
     generate_scenario.add_argument(
@@ -61,6 +77,16 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _load_resume_compatibility(path: Path | None) -> dict[str, object] | None:
+    """Load one JSON compatibility object supplied for adaptive resume."""
+    if path is None:
+        return None
+    payload = json.loads(path.expanduser().resolve().read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise TypeError("Adaptive resume compatibility must be a JSON object.")
+    return payload
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run one simulation-runtime command."""
     args = _build_parser().parse_args(argv)
@@ -78,11 +104,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "run-adaptive-session":
         import sys
 
+        if args.resume_compatibility is not None and args.resume_stage is None:
+            raise ValueError("--resume-compatibility requires --resume-stage.")
         return serve_adaptive_session(
             args.scenario,
             input_stream=sys.stdin,
             output_stream=sys.stdout,
             private_scene_profile=args.private_scene_profile,
+            resume_stage_dir=args.resume_stage,
+            resume_compatibility=_load_resume_compatibility(
+                args.resume_compatibility
+            ),
         )
     if args.command == "generate-ral-scenario":
         scene_seed = (

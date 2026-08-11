@@ -26,6 +26,7 @@ from runtime.measurement_log import (
     MeasurementLog,
     MeasurementLogRecord,
     MeasurementLogStreamWriter,
+    MeasurementLogValidationError,
 )
 from runtime.provenance import (
     canonical_json_bytes,
@@ -938,6 +939,84 @@ def _record_payload(record: MeasurementLogRecord) -> dict[str, object]:
     return payload
 
 
+def _resume_stage_repository_commit(stage_dir: str | Path) -> str:
+    """Read the immutable acquisition commit from one candidate resume stage."""
+    stage = Path(stage_dir)
+    if stage.is_symlink():
+        raise MeasurementLogValidationError(
+            "The adaptive resume stage must not be a symlink."
+        )
+    try:
+        raw = (stage / "repository_commit.txt").read_text(encoding="utf-8")
+    except OSError as exc:
+        raise MeasurementLogValidationError(
+            "The adaptive resume stage has no readable repository commit."
+        ) from exc
+    value = raw.removesuffix("\n")
+    if (
+        len(value) != 40
+        or value.lower() != value
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise MeasurementLogValidationError(
+            "The adaptive resume stage repository commit is invalid."
+        )
+    return value
+
+
+def _adaptive_resume_compatibility(
+    *,
+    prefix_repository_commit: str,
+    resume_execution_commit: str,
+    supplied: Mapping[str, object] | None,
+) -> dict[str, object]:
+    """Build explicit, durable compatibility provenance for one live resume."""
+    commits_match = prefix_repository_commit == resume_execution_commit
+    if not commits_match and not supplied:
+        raise MeasurementLogValidationError(
+            "Adaptive resume across runtime commits requires an explicit, "
+            "nonempty resume_compatibility mapping."
+        )
+    payload = dict(supplied or {})
+    for name, expected in (
+        ("prefix_repository_commit", prefix_repository_commit),
+        ("resume_execution_commit", resume_execution_commit),
+    ):
+        existing = payload.get(name)
+        if existing is not None and existing != expected:
+            raise MeasurementLogValidationError(
+                f"resume_compatibility.{name} disagrees with the runtime."
+            )
+        payload[name] = expected
+    payload["repository_commits_match"] = commits_match
+    payload.setdefault(
+        "compatibility_mode",
+        "identical_runtime_commit" if commits_match else "explicit_cross_commit",
+    )
+    return payload
+
+
+def _yaw_from_quaternion_wxyz(quaternion: Sequence[float]) -> float:
+    """Return Z-axis yaw from one finite WXYZ detector quaternion."""
+    values = np.asarray(quaternion, dtype=np.float64)
+    if values.shape != (4,) or np.any(~np.isfinite(values)):
+        raise MeasurementLogValidationError(
+            "The resumed detector quaternion must contain four finite values."
+        )
+    norm = float(np.linalg.norm(values))
+    if norm <= 0.0:
+        raise MeasurementLogValidationError(
+            "The resumed detector quaternion must have positive norm."
+        )
+    w, x, y, z = values / norm
+    return float(
+        math.atan2(
+            2.0 * (w * z + x * y),
+            1.0 - 2.0 * (y * y + z * z),
+        )
+    )
+
+
 class AdaptiveRuntimeSession:
     """Own one private scene while executing estimator-selected actions."""
 
@@ -947,8 +1026,9 @@ class AdaptiveRuntimeSession:
         context: RunContext,
         candidates: AdaptiveCandidateProvider,
         cui_truth_overlay: Mapping[str, object] | None = None,
+        resume_records: Sequence[MeasurementLogRecord] = (),
     ) -> None:
-        """Initialize live action resolution at the environment start pose."""
+        """Initialize live action resolution at the fresh or resumed pose."""
         self.observation_session = observation_session
         self.context = context
         self.candidates = candidates
@@ -957,10 +1037,30 @@ class AdaptiveRuntimeSession:
             if cui_truth_overlay is None
             else json.loads(json.dumps(dict(cui_truth_overlay), allow_nan=False))
         )
-        self.current_pose = candidates.initial_pose
-        self.current_base_yaw_rad = 0.0
-        self.current_pair_id = 0
+        self._resume_records = tuple(resume_records)
+        if self._resume_records:
+            latest = self._resume_records[-1]
+            if latest.metadata.get("station_complete") is not True:
+                raise MeasurementLogValidationError(
+                    "Adaptive resume must start after a completed station."
+                )
+            self.current_pose = tuple(latest.detector_pose_xyz)
+            self.current_base_yaw_rad = _yaw_from_quaternion_wxyz(
+                latest.detector_quat_wxyz
+            )
+            self.current_pair_id = int(latest.fe_orientation_index) * 8 + int(
+                latest.pb_orientation_index
+            )
+        else:
+            self.current_pose = candidates.initial_pose
+            self.current_base_yaw_rad = 0.0
+            self.current_pair_id = 0
         self._candidate_snapshot = candidates.snapshot(self.current_pose, 0)
+        if self.current_pair_id != 0:
+            self._candidate_snapshot = candidates.snapshot(
+                self.current_pose,
+                self.current_pair_id,
+            )
         self._closed = False
 
     @classmethod
@@ -971,6 +1071,40 @@ class AdaptiveRuntimeSession:
         private_scene_profile: str | None = None,
     ) -> AdaptiveRuntimeSession:
         """Open a private scenario that contains no acquisition action list."""
+        return cls._open(
+            scenario_path,
+            private_scene_profile=private_scene_profile,
+            resume_stage_dir=None,
+            resume_compatibility=None,
+        )
+
+    @classmethod
+    def resume(
+        cls,
+        scenario_path: str | Path,
+        *,
+        stage_dir: str | Path,
+        resume_compatibility: Mapping[str, object] | None = None,
+        private_scene_profile: str | None = None,
+    ) -> AdaptiveRuntimeSession:
+        """Resume after the last verified station boundary in a stream stage."""
+        return cls._open(
+            scenario_path,
+            private_scene_profile=private_scene_profile,
+            resume_stage_dir=stage_dir,
+            resume_compatibility=resume_compatibility,
+        )
+
+    @classmethod
+    def _open(
+        cls,
+        scenario_path: str | Path,
+        *,
+        private_scene_profile: str | None,
+        resume_stage_dir: str | Path | None,
+        resume_compatibility: Mapping[str, object] | None,
+    ) -> AdaptiveRuntimeSession:
+        """Open one fresh or verified-resume private adaptive session."""
         path = Path(scenario_path).expanduser().resolve()
         scenario = _load_json_object(path)
         if set(scenario) != _SCENARIO_FIELDS or scenario.get("schema_version") != 1:
@@ -994,9 +1128,14 @@ class AdaptiveRuntimeSession:
         scene = scenario["scene"]
         if not isinstance(environment, dict) or not isinstance(scene, dict):
             raise TypeError("Scenario environment and scene must be JSON objects.")
-        commit = repository_commit(runtime_root)
-        if len(commit) != 40:
+        execution_commit = repository_commit(runtime_root)
+        if len(execution_commit) != 40:
             raise RuntimeError("Acquisition runtime must execute from a Git commit.")
+        prefix_commit = (
+            execution_commit
+            if resume_stage_dir is None
+            else _resume_stage_repository_commit(resume_stage_dir)
+        )
         run_metadata = dict(scenario["metadata"])
         run_metadata["repository_source_snapshot_sha256"] = (
             repository_source_snapshot_sha256(runtime_root)
@@ -1007,24 +1146,37 @@ class AdaptiveRuntimeSession:
             environment=environment,
             obstacle_layout_path=scenario["obstacle_layout_path"],
             isotopes=isotopes,
-            repository_commit=commit,
+            repository_commit=prefix_commit,
             resolved_config_sha256=resolved_hash,
             repository_root=runtime_root,
         )
         scene_description = build_scene_description(scene)
         _validate_private_scene_profile(scene_description, private_scene_profile)
-        writer = MeasurementLogStreamWriter(
-            output_dir,
-            run_id=str(scenario["run_id"]),
-            repository_commit=commit,
-            runtime_config=logged_config,
-            environment=environment,
-            forward_model_manifest=forward,
-            isotopes=isotopes,
-            metadata=run_metadata,
-            obstacle_layout_path=scenario["obstacle_layout_path"],
-            source_layout_path=None,
-        )
+        writer_arguments = {
+            "run_id": str(scenario["run_id"]),
+            "repository_commit": prefix_commit,
+            "runtime_config": logged_config,
+            "environment": environment,
+            "forward_model_manifest": forward,
+            "isotopes": isotopes,
+            "metadata": run_metadata,
+            "obstacle_layout_path": scenario["obstacle_layout_path"],
+            "source_layout_path": None,
+        }
+        if resume_stage_dir is None:
+            writer = MeasurementLogStreamWriter(output_dir, **writer_arguments)
+        else:
+            writer = MeasurementLogStreamWriter.resume_from_stage(
+                output_dir,
+                stage_dir=resume_stage_dir,
+                resume_execution_commit=execution_commit,
+                resume_compatibility=_adaptive_resume_compatibility(
+                    prefix_repository_commit=prefix_commit,
+                    resume_execution_commit=execution_commit,
+                    supplied=resume_compatibility,
+                ),
+                **writer_arguments,
+            )
         simulation_runtime = create_simulation_runtime(
             backend,
             sources=scene_description.to_point_sources(),
@@ -1053,7 +1205,7 @@ class AdaptiveRuntimeSession:
                 runtime_config=raw_config,
             )
             context = RunContext(
-                repository_commit=commit,
+                repository_commit=prefix_commit,
                 runtime_config=logged_config,
                 environment=environment,
                 sim_backend=backend,
@@ -1062,7 +1214,7 @@ class AdaptiveRuntimeSession:
                 obstacle_layout_path=scenario["obstacle_layout_path"],
                 source_layout_path=None,
                 source_rate_model="detector_cps_1m",
-                metadata=run_metadata,
+                metadata=writer.metadata,
                 run_id=str(scenario["run_id"]),
                 source_rate_semantics=SOURCE_RATE_SEMANTICS,
                 forward_model_manifest=forward,
@@ -1074,6 +1226,9 @@ class AdaptiveRuntimeSession:
                 context,
                 provider,
                 cui_truth_overlay=_cui_truth_overlay(scene_description),
+                resume_records=(
+                    tuple(writer.records) if resume_stage_dir is not None else ()
+                ),
             )
         except BaseException:
             observation.close()
@@ -1081,6 +1236,20 @@ class AdaptiveRuntimeSession:
 
     def ready_payload(self) -> dict[str, object]:
         """Return the initial truth-free handshake."""
+        if self._resume_records:
+            return {
+                "type": "ready",
+                "schema_version": 2,
+                "context": _context_payload(self.context),
+                "candidates": self._candidate_snapshot.to_dict(),
+                "resume": {
+                    "record_count": len(self._resume_records),
+                    "records": [
+                        _record_payload(record) for record in self._resume_records
+                    ],
+                    "next_station_id": int(self._resume_records[-1].station_id) + 1,
+                },
+            }
         return {
             "type": "ready",
             "schema_version": 1,
@@ -1267,12 +1436,26 @@ def serve_adaptive_session(
     input_stream: TextIO,
     output_stream: TextIO,
     private_scene_profile: str | None = None,
+    resume_stage_dir: str | Path | None = None,
+    resume_compatibility: Mapping[str, object] | None = None,
 ) -> int:
-    """Serve one private acquisition session over JSON lines."""
-    session = AdaptiveRuntimeSession.open(
-        scenario_path,
-        private_scene_profile=private_scene_profile,
-    )
+    """Serve one fresh or verified-resume acquisition over JSON lines."""
+    if resume_stage_dir is None:
+        if resume_compatibility is not None:
+            raise ValueError(
+                "resume_compatibility requires a resume_stage_dir."
+            )
+        session = AdaptiveRuntimeSession.open(
+            scenario_path,
+            private_scene_profile=private_scene_profile,
+        )
+    else:
+        session = AdaptiveRuntimeSession.resume(
+            scenario_path,
+            stage_dir=resume_stage_dir,
+            resume_compatibility=resume_compatibility,
+            private_scene_profile=private_scene_profile,
+        )
     try:
         _write_event(output_stream, session.ready_payload())
         for line in input_stream:

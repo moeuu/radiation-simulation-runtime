@@ -17,13 +17,18 @@ from runtime.adaptive import (
     ADAPTIVE_EVENT_PREFIX,
     AdaptiveCandidateProvider,
     AdaptiveRuntimeSession,
+    _adaptive_resume_compatibility,
     _pose_is_clear,
     _validate_private_scene_profile,
     serve_adaptive_session,
 )
 from runtime.adaptive_client import AdaptiveRuntimeClient
+from runtime.adaptive_client import parse_adaptive_resume_prefix
 from runtime.measurement_log import MeasurementLogRecord
 from runtime.records import RunContext
+from runtime.scenarios import build_random_ral_mix9_scenario, write_private_scenario
+from sim.protocol import SimulationCommand, SimulationObservation
+from sim.runtime import SimulationRuntime
 
 
 def _environment() -> dict[str, object]:
@@ -233,6 +238,26 @@ def test_ral_cs4_co3_eu0_profile_accepts_explicit_absence() -> None:
         _validate_private_scene_profile(scene, "ral-cs4-co3-eu0")
 
 
+def test_cross_commit_resume_requires_explicit_compatibility_provenance() -> None:
+    """Runtime code changes must fail closed without a durable review record."""
+    with pytest.raises(ValueError, match="across runtime commits"):
+        _adaptive_resume_compatibility(
+            prefix_repository_commit="a" * 40,
+            resume_execution_commit="b" * 40,
+            supplied=None,
+        )
+
+    payload = _adaptive_resume_compatibility(
+        prefix_repository_commit="a" * 40,
+        resume_execution_commit="b" * 40,
+        supplied={"compatibility_review": "physics-contract-unchanged"},
+    )
+
+    assert payload["compatibility_mode"] == "explicit_cross_commit"
+    assert payload["repository_commits_match"] is False
+    assert payload["compatibility_review"] == "physics-contract-unchanged"
+
+
 class _FakeObservationSession:
     """Persist selected actions as deterministic records for session tests."""
 
@@ -271,6 +296,46 @@ class _FakeObservationSession:
 
     def close(self) -> None:
         """Mark the fake observation session closed."""
+        self.closed = True
+
+
+class _DurableFakeRuntime(SimulationRuntime):
+    """Return production-axis spectra while exercising the real stream writer."""
+
+    def __init__(self) -> None:
+        """Initialize reset and close state."""
+        self.reset_payload: dict[str, Any] | None = None
+        self.closed = False
+
+    def reset(self, payload: dict[str, Any] | None = None) -> None:
+        """Retain one private reset payload without exposing it."""
+        self.reset_payload = dict(payload or {})
+
+    def step(self, command: SimulationCommand) -> SimulationObservation:
+        """Return one exact deterministic spectrum at the commanded pose."""
+        half_yaw = 0.5 * float(command.target_base_yaw_rad)
+        return SimulationObservation(
+            step_id=command.step_id,
+            detector_pose_xyz=command.target_pose_xyz,
+            detector_quat_wxyz=(
+                float(np.cos(half_yaw)),
+                0.0,
+                0.0,
+                float(np.sin(half_yaw)),
+            ),
+            fe_orientation_index=command.fe_orientation_index,
+            pb_orientation_index=command.pb_orientation_index,
+            spectrum_counts=np.ones(851, dtype=np.int64).tolist(),
+            energy_bin_edges_keV=np.linspace(0.0, 1702.0, 852).tolist(),
+            metadata={
+                "detector_response_sampling_mode": (
+                    "multinomial_marking_with_nonparalyzable_event_time"
+                )
+            },
+        )
+
+    def close(self) -> None:
+        """Mark the fake runtime closed."""
         self.closed = True
 
 
@@ -404,6 +469,141 @@ def test_same_station_views_preserve_the_arrival_base_yaw() -> None:
     assert observation.actions[1].command.travel_waypoints_xyz is None
 
 
+def test_resumed_session_restores_pose_pair_yaw_and_completed_prefix() -> None:
+    """A resumed handshake must restore causal motion state and prior records."""
+    yaw = 0.75
+    record = MeasurementLogRecord(
+        step_id=0,
+        action_id=0,
+        station_id=0,
+        detector_pose_xyz=(1.25, 0.75, 0.5),
+        detector_quat_wxyz=(
+            float(np.cos(0.5 * yaw)),
+            0.0,
+            0.0,
+            float(np.sin(0.5 * yaw)),
+        ),
+        fe_orientation_index=3,
+        pb_orientation_index=4,
+        live_time_s=10.0,
+        travel_time_s=2.0,
+        shield_actuation_time_s=1.0,
+        energy_bin_edges_keV=np.asarray([0.0, 1.0, 2.0]),
+        spectrum_counts=np.asarray([2, 3], dtype=np.int64),
+        metadata={
+            "full_spectrum_contract_hash_sha256": "a" * 64,
+            "station_complete": True,
+        },
+    )
+    observation = _FakeObservationSession()
+    observation.writer.records.append(record)
+    provider = AdaptiveCandidateProvider(_environment(), None)
+    session = AdaptiveRuntimeSession(
+        observation,  # type: ignore[arg-type]
+        _context(),
+        provider,
+        resume_records=(record,),
+    )
+
+    ready = session.ready_payload()
+    prefix = parse_adaptive_resume_prefix(ready["resume"])
+    current = ready["candidates"]
+    event = session.step(
+        {
+            "type": "step",
+            "candidate_index": 0,
+            "fe_orientation_index": 3,
+            "pb_orientation_index": 5,
+            "dwell_time_s": 10.0,
+            "station_id": 1,
+            "station_complete": True,
+        }
+    )
+
+    assert ready["schema_version"] == 2
+    assert len(prefix.records) == 1
+    assert prefix.records[0].step_id == record.step_id
+    np.testing.assert_array_equal(
+        prefix.records[0].spectrum_counts,
+        record.spectrum_counts,
+    )
+    assert prefix.next_station_id == 1
+    assert tuple(current["candidate_poses_xyz"][0]) == record.detector_pose_xyz
+    assert current["current_pair_id"] == 28
+    assert event["record"]["step_id"] == 1
+    assert observation.actions[-1].command.target_base_yaw_rad == pytest.approx(yaw)
+
+
+def test_public_resume_adopts_verified_stage_and_continues_step_ids(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """The public API must copy a completed prefix and publish its continuation."""
+    runtime_config = (
+        Path(__file__).resolve().parents[1]
+        / "configs/geant4/variance_reduction_external_no_isaac_32threads.json"
+    )
+    scenario = build_random_ral_mix9_scenario(
+        scene_seed=31415,
+        runtime_config_path=runtime_config,
+        measurement_log_output_dir=tmp_path / "measurement-log",
+        run_id="adaptive-resume-integration",
+        candidate_count=16,
+    )
+    scenario_path = write_private_scenario(tmp_path / "scenario.json", scenario)
+    runtimes: list[_DurableFakeRuntime] = []
+
+    def create_runtime(*args: object, **kwargs: object) -> _DurableFakeRuntime:
+        """Return a separately observable fake runtime for each open."""
+        runtime = _DurableFakeRuntime()
+        runtimes.append(runtime)
+        return runtime
+
+    monkeypatch.setattr("runtime.adaptive.create_simulation_runtime", create_runtime)
+    first = AdaptiveRuntimeSession.open(scenario_path)
+    first.step(
+        {
+            "type": "step",
+            "candidate_index": 0,
+            "fe_orientation_index": 2,
+            "pb_orientation_index": 3,
+            "dwell_time_s": 1.0,
+            "station_id": 0,
+            "station_complete": True,
+        }
+    )
+    source_stage = first.observation_session.writer.stage_dir
+    first.close()
+
+    resumed = AdaptiveRuntimeSession.resume(
+        scenario_path,
+        stage_dir=source_stage,
+    )
+    ready = resumed.ready_payload()
+    resumed_event = resumed.step(
+        {
+            "type": "step",
+            "candidate_index": 0,
+            "fe_orientation_index": 4,
+            "pb_orientation_index": 5,
+            "dwell_time_s": 1.0,
+            "station_id": 1,
+            "station_complete": True,
+        }
+    )
+    log, published = resumed.finalize()
+
+    assert ready["schema_version"] == 2
+    assert ready["resume"]["record_count"] == 1
+    assert resumed_event["record"]["step_id"] == 1
+    assert published["record_count"] == 2
+    assert [record.step_id for record in log.records] == [0, 1]
+    assert log.records[1].metadata["resume_prefix_record_count"] == 1
+    assert source_stage.is_dir()
+    assert len(runtimes) == 2
+    assert all(runtime.closed for runtime in runtimes)
+
+
 class _FakeAdaptiveSession:
     """Expose a deterministic session surface for protocol tests."""
 
@@ -531,6 +731,53 @@ def test_adaptive_protocol_supports_estimator_ranked_runtime_refinement(
     assert status == 0
     assert fake.requests == [refine]
     assert [event["type"] for event in events] == ["ready", "candidates", "aborted"]
+
+
+def test_adaptive_protocol_routes_resume_stage_through_public_session_api(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """The server entrypoint must adopt a stage through the public resume API."""
+    fake = _FakeAdaptiveSession()
+    captured: dict[str, object] = {}
+
+    def resume(
+        cls: type[AdaptiveRuntimeSession],
+        path: Path,
+        *,
+        stage_dir: Path,
+        resume_compatibility: dict[str, object] | None = None,
+        private_scene_profile: str | None = None,
+    ) -> _FakeAdaptiveSession:
+        """Capture public resume arguments and return a fake live session."""
+        captured.update(
+            {
+                "path": path,
+                "stage_dir": stage_dir,
+                "resume_compatibility": resume_compatibility,
+                "private_scene_profile": private_scene_profile,
+            }
+        )
+        return fake
+
+    monkeypatch.setattr(AdaptiveRuntimeSession, "resume", classmethod(resume))
+    output_stream = StringIO()
+    status = serve_adaptive_session(
+        tmp_path / "private-scenario.json",
+        input_stream=StringIO(json.dumps({"type": "abort"}) + "\n"),
+        output_stream=output_stream,
+        private_scene_profile="ral-mix9",
+        resume_stage_dir=tmp_path / ".measurement-log.stream-7",
+        resume_compatibility={"review": "approved"},
+    )
+
+    assert status == 0
+    assert captured == {
+        "path": tmp_path / "private-scenario.json",
+        "stage_dir": tmp_path / ".measurement-log.stream-7",
+        "resume_compatibility": {"review": "approved"},
+        "private_scene_profile": "ral-mix9",
+    }
 
 
 def test_adaptive_protocol_uses_private_prefix_for_cui_overlay(

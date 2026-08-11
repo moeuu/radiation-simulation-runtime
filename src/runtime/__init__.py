@@ -1,5 +1,11 @@
 """Runtime contracts shared by live acquisition and estimator replay."""
 
+from runtime.adaptive import AdaptiveRuntimeSession, serve_adaptive_session
+from runtime.adaptive_client import (
+    AdaptiveResumePrefix,
+    AdaptiveRuntimeClient,
+    parse_adaptive_resume_prefix,
+)
 from runtime.assets import simulation_runtime_root, standard_geant4_config_path
 from runtime.forward_model_manifest import (
     CANONICAL_UNITS,
@@ -27,6 +33,9 @@ from runtime.prefix import (
 
 __all__ = [
     "CANONICAL_UNITS",
+    "AdaptiveResumePrefix",
+    "AdaptiveRuntimeClient",
+    "AdaptiveRuntimeSession",
     "MEASUREMENT_LOG_SCHEMA_VERSION",
     "MeasurementLog",
     "MeasurementLogRecord",
@@ -41,6 +50,8 @@ __all__ = [
     "materialize_measurement_log_prefix",
     "measurement_records_sha256",
     "production_line_mu_by_isotope",
+    "parse_adaptive_resume_prefix",
+    "serve_adaptive_session",
     "simulation_runtime_root",
     "standard_geant4_config_path",
     "validate_forward_model_manifest",

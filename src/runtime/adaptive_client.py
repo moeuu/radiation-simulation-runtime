@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -13,6 +14,14 @@ import numpy as np
 from runtime.adaptive import ADAPTIVE_CUI_OVERLAY_PREFIX, ADAPTIVE_EVENT_PREFIX
 from runtime.measurement_log import MeasurementLogRecord
 from runtime.records import RunContext, validate_truth_free_estimator_input
+
+
+@dataclass(frozen=True, slots=True)
+class AdaptiveResumePrefix:
+    """Store the verified completed-station prefix returned during resume."""
+
+    records: tuple[MeasurementLogRecord, ...]
+    next_station_id: int
 
 
 def _strict_fields(
@@ -72,6 +81,56 @@ def parse_adaptive_record(payload: object) -> MeasurementLogRecord:
         ),
         spectrum_counts=np.asarray(raw_counts, dtype=np.int64),
         metadata=payload["metadata"],
+    )
+
+
+def parse_adaptive_resume_prefix(payload: object) -> AdaptiveResumePrefix:
+    """Parse and validate one truth-free adaptive resume handshake prefix."""
+    if not isinstance(payload, dict):
+        raise TypeError("Adaptive resume prefix must be an object.")
+    validate_truth_free_estimator_input(payload, path="adaptive.resume")
+    _strict_fields(
+        payload,
+        {"record_count", "records", "next_station_id"},
+        name="adaptive resume prefix",
+    )
+    raw_count = payload["record_count"]
+    raw_next_station = payload["next_station_id"]
+    raw_records = payload["records"]
+    if isinstance(raw_count, bool) or not isinstance(raw_count, int):
+        raise TypeError("Adaptive resume record_count must be an integer.")
+    if isinstance(raw_next_station, bool) or not isinstance(raw_next_station, int):
+        raise TypeError("Adaptive resume next_station_id must be an integer.")
+    if not isinstance(raw_records, list) or not raw_records:
+        raise TypeError("Adaptive resume records must be a nonempty list.")
+    records = tuple(parse_adaptive_record(record) for record in raw_records)
+    if raw_count != len(records):
+        raise ValueError("Adaptive resume record_count disagrees with records.")
+    station_ids = [int(record.station_id) for record in records]
+    if [int(record.step_id) for record in records] != list(range(len(records))):
+        raise ValueError("Adaptive resume step_id must equal causal record order.")
+    if [int(record.action_id) for record in records] != list(range(len(records))):
+        raise ValueError("Adaptive resume action_id must equal causal record order.")
+    if sorted(set(station_ids)) != list(range(station_ids[-1] + 1)):
+        raise ValueError(
+            "Adaptive resume stations must be contiguous and zero based."
+        )
+    for index, record in enumerate(records):
+        station_end = index + 1 == len(records) or (
+            station_ids[index + 1] != station_ids[index]
+        )
+        if (record.metadata.get("station_complete") is True) is not station_end:
+            raise ValueError(
+                "Adaptive resume records must end every station exactly once."
+            )
+    expected_next_station = station_ids[-1] + 1
+    if raw_next_station != expected_next_station:
+        raise ValueError(
+            "Adaptive resume next_station_id disagrees with the durable prefix."
+        )
+    return AdaptiveResumePrefix(
+        records=records,
+        next_station_id=expected_next_station,
     )
 
 
@@ -243,6 +302,8 @@ class AdaptiveRuntimeClient:
         *,
         runtime_root: str | Path,
         private_scene_profile: str | None = None,
+        resume_stage_path: str | Path | None = None,
+        resume_compatibility_path: str | Path | None = None,
         output_hook: Callable[[str], None] = print,
     ) -> None:
         """Start one persistent runtime-owned adaptive subprocess."""
@@ -261,6 +322,23 @@ class AdaptiveRuntimeClient:
         ]
         if private_scene_profile is not None:
             command.extend(("--private-scene-profile", private_scene_profile))
+        if resume_compatibility_path is not None and resume_stage_path is None:
+            raise ValueError(
+                "resume_compatibility_path requires resume_stage_path."
+            )
+        if resume_stage_path is not None:
+            stage = Path(resume_stage_path).expanduser().resolve()
+            if not stage.is_dir():
+                raise FileNotFoundError(f"Adaptive resume stage is missing: {stage}")
+            command.extend(("--resume-stage", stage.as_posix()))
+        if resume_compatibility_path is not None:
+            compatibility = Path(resume_compatibility_path).expanduser().resolve()
+            if not compatibility.is_file():
+                raise FileNotFoundError(
+                    "Adaptive resume compatibility file is missing: "
+                    f"{compatibility}"
+                )
+            command.extend(("--resume-compatibility", compatibility.as_posix()))
         self.command = command
         self.output_hook = output_hook
         self.process = subprocess.Popen(
@@ -371,10 +449,12 @@ class AdaptiveRuntimeClient:
 
 
 __all__ = [
+    "AdaptiveResumePrefix",
     "AdaptiveRuntimeClient",
     "adaptive_step_request",
     "candidate_index_for_pose",
     "parse_adaptive_record",
+    "parse_adaptive_resume_prefix",
     "parse_candidate_snapshot",
     "parse_cui_overlay_payload",
     "parse_run_context",
