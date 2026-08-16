@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
 from typing import Any
 
 import numpy as np
@@ -11,6 +13,25 @@ from runtime.contracts import FULL_SPECTRUM_CONTRACT_HASH_METADATA_KEY
 from runtime.session import AcquisitionAction, ObservationSession
 from sim.protocol import SimulationCommand, SimulationObservation
 from sim.runtime import SimulationRuntime
+
+
+def test_observation_model_import_is_independent_of_sim_import_order() -> None:
+    """The replay observation model must import in a fresh interpreter."""
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from measurement.observation_model import "
+                "build_runtime_observation_model"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 class _FakeRuntime(SimulationRuntime):
@@ -132,4 +153,3 @@ def test_action_parser_rejects_unknown_fields() -> None:
                 "estimator_state": {},
             }
         )
-
