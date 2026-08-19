@@ -69,10 +69,10 @@ and `AdaptiveRuntimeClient(..., resume_stage_path=...)`.
 is reserved for exact replay or paired estimator comparisons. The command does not
 choose station count, view count, shield programs, estimator settings, or a stopping
 rule. Those remain private to the estimator or experiment harness controlling the
-session. `--source-profile ral-cs4-co3-eu0` keeps Cs-137, Co-60, and Eu-154 in the
-truth-free inference contract while privately realizing exactly four Cs-137, three
-Co-60, and zero Eu-154 sources. This permits a genuine absent-isotope/ghost test
-without leaking Eu absence to an estimator.
+session. `--source-profile ral-cs4-co3-eu0` defines both the private truth and the
+truth-free candidate contract as Cs-137 plus Co-60: it realizes exactly four
+Cs-137 and three Co-60 sources, and Eu-154 is not offered to the estimator. Use
+`ral-mix9` when Eu-154 must remain in the candidate set.
 
 ## Common adaptive workspace
 
