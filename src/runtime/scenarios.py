@@ -46,6 +46,10 @@ RAL_PRIVATE_SOURCE_PROFILES = {
     "ral-mix9": RAL_MIX9_ISOTOPE_SEQUENCE,
     "ral-cs4-co3-eu0": RAL_CS4_CO3_EU0_ISOTOPE_SEQUENCE,
 }
+RAL_PRIVATE_CANDIDATE_ISOTOPES = {
+    profile: tuple(sorted(set(isotope_sequence)))
+    for profile, isotope_sequence in RAL_PRIVATE_SOURCE_PROFILES.items()
+}
 _MAX_FRESH_SEED = (1 << 48) - 18
 
 
@@ -98,6 +102,7 @@ def build_random_ral_mix9_scenario(
             f"Unknown RA-L source profile: {source_profile!r}."
         )
     isotope_sequence = RAL_PRIVATE_SOURCE_PROFILES[source_profile]
+    candidate_isotopes = RAL_PRIVATE_CANDIDATE_ISOTOPES[source_profile]
     if not isinstance(run_id, str) or not run_id.strip():
         raise ValueError("run_id must be a nonempty string.")
     config_path = Path(runtime_config_path).expanduser().resolve()
@@ -125,7 +130,6 @@ def build_random_ral_mix9_scenario(
         detector_position=(1.0, 1.0, 0.5),
     )
     obstacle_seed = named_stream_seed(seed, "physical_obstacle_environment")
-    source_seed = named_stream_seed(seed, "physical_surface_sources")
     candidate_seed = named_stream_seed(seed, "adaptive_candidate_workspace")
     grid = build_obstacle_grid(
         mode="random",
@@ -149,7 +153,7 @@ def build_random_ral_mix9_scenario(
         ),
         obstacle_height_m=obstacle_height_m,
         rng_seed=obstacle_seed,
-        isotopes=RAL_MIX9_ISOTOPES,
+        isotopes=candidate_isotopes,
         include_room_boundaries=include_room_boundaries,
         room_boundary_thickness_m=room_boundary_thickness_m,
     )
@@ -245,7 +249,7 @@ def build_random_ral_mix9_scenario(
         ),
         "environment": environment_payload,
         "scene": scene_payload,
-        "isotopes": list(RAL_MIX9_ISOTOPES),
+        "isotopes": list(candidate_isotopes),
         "metadata": run_metadata,
         "obstacle_layout_path": None,
     }
@@ -277,6 +281,7 @@ __all__ = [
     "RAL_CS4_CO3_EU0_ISOTOPE_SEQUENCE",
     "RAL_MIX9_ISOTOPES",
     "RAL_MIX9_ISOTOPE_SEQUENCE",
+    "RAL_PRIVATE_CANDIDATE_ISOTOPES",
     "RAL_PRIVATE_SOURCE_PROFILES",
     "build_random_ral_mix9_scenario",
     "generate_fresh_scene_seed",

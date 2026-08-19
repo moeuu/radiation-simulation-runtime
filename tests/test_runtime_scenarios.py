@@ -110,10 +110,10 @@ def test_ral_scenario_has_exact_mix9_and_resolvable_same_isotope_spacing(
         assert float(np.min(distances)) >= 3.0 - 1.0e-12
 
 
-def test_ral_cs4_co3_eu0_keeps_absent_eu_in_candidate_contract(
+def test_ral_cs4_co3_eu0_uses_cs_co_candidate_contract(
     tmp_path: Path,
 ) -> None:
-    """An absent truth isotope must remain inferable as a zero-source case."""
+    """The explicit Cs/Co experiment must not infer an excluded Eu isotope."""
     scenario = build_random_ral_mix9_scenario(
         scene_seed=321,
         runtime_config_path=_runtime_config(),
@@ -126,7 +126,10 @@ def test_ral_cs4_co3_eu0_keeps_absent_eu_in_candidate_contract(
     counts = Counter(source["isotope"] for source in sources)
 
     assert counts == {"Co-60": 3, "Cs-137": 4}
-    assert set(scenario["isotopes"]) == {"Co-60", "Cs-137", "Eu-154"}
+    assert set(scenario["isotopes"]) == {"Co-60", "Cs-137"}
+    assert set(
+        scenario["scene"]["transport_mu_by_isotope"]
+    ) == {"Co-60", "Cs-137"}
     assert scenario["metadata"]["private_source_profile"] == (
         "ral-cs4-co3-eu0"
     )
