@@ -1077,10 +1077,10 @@ def _validate_full_spectrum_contract_alignment(
     line_isotopes = tuple(
         sorted(set(raw_line_isotopes))
     )
-    if line_isotopes != isotope_order:
+    if not set(isotope_order).issubset(line_isotopes):
         raise MeasurementLogValidationError(
-            "Full-spectrum line isotopes must equal the canonical "
-            "run-manifest isotope order."
+            "Full-spectrum line isotopes must cover the canonical "
+            "run-manifest isotope set."
         )
     contract_hash = _validate_sha256(
         contract.get("contract_hash_sha256"),

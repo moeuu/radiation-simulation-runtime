@@ -509,3 +509,43 @@ def test_full_spectrum_alignment_rejects_duplicate_manifest_isotopes(
             runtime_config=loaded.runtime_config,
             records=loaded.records,
         )
+
+
+def test_full_spectrum_alignment_allows_authenticated_isotope_superset(
+    tmp_path: Path,
+) -> None:
+    """A candidate subset may use a model with additional authenticated lines."""
+    loaded = load_measurement_log(
+        make_measurement_log(tmp_path / "measurement-log")
+    )
+    manifest = json.loads(json.dumps(dict(loaded.run_manifest)))
+    runtime = json.loads(json.dumps(dict(loaded.runtime_config)))
+    manifest["isotopes"] = ["Co-60", "Cs-137"]
+    runtime["candidate_isotopes"] = ["Co-60", "Cs-137"]
+
+    _validate_full_spectrum_contract_alignment(
+        run_manifest=manifest,
+        runtime_config=runtime,
+        records=loaded.records,
+    )
+
+
+def test_full_spectrum_alignment_requires_every_candidate_line(
+    tmp_path: Path,
+) -> None:
+    """A run isotope absent from the authenticated line basis must fail closed."""
+    loaded = load_measurement_log(
+        make_measurement_log(tmp_path / "measurement-log")
+    )
+    manifest = json.loads(json.dumps(dict(loaded.run_manifest)))
+    manifest["isotopes"] = ["Co-60", "Cs-137", "Eu-154", "Xe-133"]
+
+    with pytest.raises(
+        MeasurementLogValidationError,
+        match="must cover",
+    ):
+        _validate_full_spectrum_contract_alignment(
+            run_manifest=manifest,
+            runtime_config=loaded.runtime_config,
+            records=loaded.records,
+        )
