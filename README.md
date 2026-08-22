@@ -126,6 +126,10 @@ is common physical/calibration input: an estimator chooses whether and how to in
 these nuisance columns in its own likelihood. Runtime calibration never imports or
 calls PF or MLE code.
 
-## License
+## Citation and license
 
-Released under the [MIT License](LICENSE).
+If this software contributes to research, use the metadata in
+[`CITATION.cff`](CITATION.cff) to cite the exact software repository. Citation is
+a scholarly request, not an additional license condition. Repository-authored
+software and documentation are released under the [MIT License](LICENSE);
+third-party dependencies and externally sourced data retain their own terms.

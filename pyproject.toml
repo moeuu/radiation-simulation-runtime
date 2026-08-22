@@ -7,9 +7,16 @@ name = "rotating-shield-simulation-runtime"
 version = "0.1.0"
 description = "Shared high-fidelity simulation and observation runtime for rotating-shield estimators"
 readme = "README.md"
+authors = [{ name = "Eiji Morita" }]
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.12"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Scientific/Engineering :: Physics",
+]
 dependencies = [
     "matplotlib>=3.10.7",
     "numpy>=2.3.5",
