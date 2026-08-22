@@ -18,3 +18,6 @@ Estimator configuration is not part of the acquisition identity. PF particle cou
 MLE regularization, DSS policy, and hybrid settings belong to their estimator repos
 and must never be inserted into the shared runtime config.
 
+The staged plan for consolidating estimator-neutral APIs and the PF-compatible
+CUI shell is documented in
+[`cross_repository_api_roadmap.md`](cross_repository_api_roadmap.md).

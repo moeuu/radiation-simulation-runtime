@@ -31,6 +31,7 @@ rotating-shield-sim = "runtime.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
+py-modules = ["runtime_defaults"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

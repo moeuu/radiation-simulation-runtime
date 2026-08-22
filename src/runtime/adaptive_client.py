@@ -5,23 +5,33 @@ from __future__ import annotations
 import json
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TextIO
 
 import numpy as np
 
-from runtime.adaptive import ADAPTIVE_CUI_OVERLAY_PREFIX, ADAPTIVE_EVENT_PREFIX
+from runtime.adaptive_protocol import (
+    ADAPTIVE_CUI_OVERLAY_PREFIX,
+    ADAPTIVE_EVENT_PREFIX,
+    AdaptiveAbortedEvent,
+    AdaptiveBootstrap,
+    AdaptiveCandidateSnapshot,
+    AdaptiveCandidatesEvent,
+    AdaptivePublishedEvent,
+    AdaptiveReadyEvent,
+    AdaptiveRecordEvent,
+    AdaptiveRefineRequest,
+    AdaptiveResumePrefix,
+    AdaptiveSessionEvent,
+    AdaptiveStepRequest,
+    parse_adaptive_event,
+)
 from runtime.measurement_log import MeasurementLogRecord
-from runtime.records import RunContext, validate_truth_free_estimator_input
-
-
-@dataclass(frozen=True, slots=True)
-class AdaptiveResumePrefix:
-    """Store the verified completed-station prefix returned during resume."""
-
-    records: tuple[MeasurementLogRecord, ...]
-    next_station_id: int
+from runtime.records import (
+    RunContext,
+    measurement_record_from_payload,
+    validate_truth_free_estimator_input,
+)
 
 
 def _strict_fields(
@@ -44,165 +54,28 @@ def parse_adaptive_record(payload: object) -> MeasurementLogRecord:
     """Parse one truth-free durable record returned by the runtime."""
     if not isinstance(payload, dict):
         raise TypeError("Adaptive record must be an object.")
-    validate_truth_free_estimator_input(payload, path="adaptive.record")
-    expected = {
-        "step_id",
-        "action_id",
-        "station_id",
-        "detector_pose_xyz",
-        "detector_quat_wxyz",
-        "fe_orientation_index",
-        "pb_orientation_index",
-        "live_time_s",
-        "travel_time_s",
-        "shield_actuation_time_s",
-        "energy_bin_edges_keV",
-        "spectrum_counts",
-        "metadata",
-    }
-    _strict_fields(payload, expected, name="adaptive record")
-    raw_counts = np.asarray(payload["spectrum_counts"])
-    if raw_counts.ndim != 1 or not np.issubdtype(raw_counts.dtype, np.integer):
-        raise TypeError("Adaptive spectrum_counts must contain exact integers.")
-    return MeasurementLogRecord(
-        step_id=payload["step_id"],
-        action_id=payload["action_id"],
-        station_id=payload["station_id"],
-        detector_pose_xyz=payload["detector_pose_xyz"],
-        detector_quat_wxyz=payload["detector_quat_wxyz"],
-        fe_orientation_index=payload["fe_orientation_index"],
-        pb_orientation_index=payload["pb_orientation_index"],
-        live_time_s=payload["live_time_s"],
-        travel_time_s=payload["travel_time_s"],
-        shield_actuation_time_s=payload["shield_actuation_time_s"],
-        energy_bin_edges_keV=np.asarray(
-            payload["energy_bin_edges_keV"],
-            dtype=np.float64,
-        ),
-        spectrum_counts=np.asarray(raw_counts, dtype=np.int64),
-        metadata=payload["metadata"],
-    )
+    return measurement_record_from_payload(payload)
 
 
 def parse_adaptive_resume_prefix(payload: object) -> AdaptiveResumePrefix:
     """Parse and validate one truth-free adaptive resume handshake prefix."""
     if not isinstance(payload, dict):
         raise TypeError("Adaptive resume prefix must be an object.")
-    validate_truth_free_estimator_input(payload, path="adaptive.resume")
-    _strict_fields(
-        payload,
-        {"record_count", "records", "next_station_id"},
-        name="adaptive resume prefix",
-    )
-    raw_count = payload["record_count"]
-    raw_next_station = payload["next_station_id"]
-    raw_records = payload["records"]
-    if isinstance(raw_count, bool) or not isinstance(raw_count, int):
-        raise TypeError("Adaptive resume record_count must be an integer.")
-    if isinstance(raw_next_station, bool) or not isinstance(raw_next_station, int):
-        raise TypeError("Adaptive resume next_station_id must be an integer.")
-    if not isinstance(raw_records, list) or not raw_records:
-        raise TypeError("Adaptive resume records must be a nonempty list.")
-    records = tuple(parse_adaptive_record(record) for record in raw_records)
-    if raw_count != len(records):
-        raise ValueError("Adaptive resume record_count disagrees with records.")
-    station_ids = [int(record.station_id) for record in records]
-    if [int(record.step_id) for record in records] != list(range(len(records))):
-        raise ValueError("Adaptive resume step_id must equal causal record order.")
-    if [int(record.action_id) for record in records] != list(range(len(records))):
-        raise ValueError("Adaptive resume action_id must equal causal record order.")
-    if sorted(set(station_ids)) != list(range(station_ids[-1] + 1)):
-        raise ValueError(
-            "Adaptive resume stations must be contiguous and zero based."
-        )
-    for index, record in enumerate(records):
-        station_end = index + 1 == len(records) or (
-            station_ids[index + 1] != station_ids[index]
-        )
-        if (record.metadata.get("station_complete") is True) is not station_end:
-            raise ValueError(
-                "Adaptive resume records must end every station exactly once."
-            )
-    expected_next_station = station_ids[-1] + 1
-    if raw_next_station != expected_next_station:
-        raise ValueError(
-            "Adaptive resume next_station_id disagrees with the durable prefix."
-        )
-    return AdaptiveResumePrefix(
-        records=records,
-        next_station_id=expected_next_station,
-    )
+    return AdaptiveResumePrefix.from_payload(payload)
 
 
 def parse_run_context(payload: object) -> RunContext:
     """Parse the truth-free runtime handshake context."""
     if not isinstance(payload, dict):
         raise TypeError("Adaptive runtime context must be an object.")
-    validate_truth_free_estimator_input(payload, path="adaptive.context")
-    expected = {
-        "repository_commit",
-        "runtime_config",
-        "environment",
-        "sim_backend",
-        "spectrum_count_method",
-        "isotopes",
-        "obstacle_layout_path",
-        "source_rate_model",
-        "metadata",
-        "run_id",
-        "source_rate_semantics",
-        "forward_model_manifest",
-        "runtime_config_sha256",
-        "schema_version",
-    }
-    _strict_fields(payload, expected, name="adaptive context")
-    return RunContext(
-        repository_commit=payload["repository_commit"],
-        runtime_config=payload["runtime_config"],
-        environment=payload["environment"],
-        sim_backend=payload["sim_backend"],
-        spectrum_count_method=payload["spectrum_count_method"],
-        isotopes=tuple(payload["isotopes"]),
-        obstacle_layout_path=payload["obstacle_layout_path"],
-        source_layout_path=None,
-        source_rate_model=payload["source_rate_model"],
-        metadata=payload["metadata"],
-        run_id=payload["run_id"],
-        source_rate_semantics=payload["source_rate_semantics"],
-        forward_model_manifest=payload["forward_model_manifest"],
-        runtime_config_sha256=payload["runtime_config_sha256"],
-        schema_version=payload["schema_version"],
-    )
+    return RunContext.from_payload(payload)
 
 
 def parse_candidate_snapshot(payload: object) -> dict[str, object]:
     """Validate one runtime-owned reachable candidate snapshot."""
     if not isinstance(payload, dict):
         raise TypeError("Adaptive candidates must be an object.")
-    validate_truth_free_estimator_input(payload, path="adaptive.candidates")
-    _strict_fields(
-        payload,
-        {
-            "candidate_poses_xyz",
-            "travel_costs",
-            "allowed_pair_ids",
-            "current_pair_id",
-        },
-        name="adaptive candidates",
-    )
-    poses = np.asarray(payload["candidate_poses_xyz"], dtype=np.float64)
-    costs = np.asarray(payload["travel_costs"], dtype=np.float64)
-    pair_ids = np.asarray(payload["allowed_pair_ids"])
-    if poses.ndim != 2 or poses.shape[1:] != (3,) or not len(poses):
-        raise ValueError("Runtime candidate poses must have nonempty shape (C, 3).")
-    if costs.shape != (len(poses),) or np.any(~np.isfinite(costs)) or np.any(costs < 0.0):
-        raise ValueError("Runtime travel costs must align with candidate poses.")
-    if pair_ids.shape != (64,) or not np.array_equal(
-        np.sort(pair_ids.astype(np.int64, copy=False)),
-        np.arange(64, dtype=np.int64),
-    ):
-        raise ValueError("Adaptive runtime must expose every Fe/Pb pair 0..63.")
-    return dict(payload)
+    return AdaptiveCandidateSnapshot.from_payload(payload).to_payload()
 
 
 def parse_cui_overlay_payload(payload: object) -> dict[str, object]:
@@ -380,6 +253,19 @@ class AdaptiveRuntimeClient:
             f"return_code={return_code}."
         )
 
+    def read_session_event(self) -> AdaptiveSessionEvent:
+        """Read and parse the next event through the typed protocol API."""
+        return parse_adaptive_event(self.read_event())
+
+    def read_ready_event(self) -> AdaptiveReadyEvent:
+        """Read and require the initial typed adaptive handshake event."""
+        event = self.read_session_event()
+        if not isinstance(event, AdaptiveReadyEvent):
+            raise RuntimeError(
+                "Shared adaptive runtime did not emit a ready handshake."
+            )
+        return event
+
     def request(self, payload: Mapping[str, object]) -> dict[str, Any]:
         """Send one causal controller decision and wait for its response."""
         if self.input is None:
@@ -388,6 +274,29 @@ class AdaptiveRuntimeClient:
         self.input.write(json.dumps(dict(payload), allow_nan=False) + "\n")
         self.input.flush()
         return self.read_event()
+
+    def request_step(self, request: AdaptiveStepRequest) -> AdaptiveRecordEvent:
+        """Execute one typed acquisition request and parse its record event."""
+        if not isinstance(request, AdaptiveStepRequest):
+            raise TypeError("request must be an AdaptiveStepRequest.")
+        event = parse_adaptive_event(self.request(request.to_payload()))
+        if not isinstance(event, AdaptiveRecordEvent):
+            raise RuntimeError("Shared adaptive runtime did not emit a record event.")
+        return event
+
+    def request_refinement(
+        self,
+        request: AdaptiveRefineRequest,
+    ) -> AdaptiveCandidatesEvent:
+        """Execute one typed refinement request and parse its candidate event."""
+        if not isinstance(request, AdaptiveRefineRequest):
+            raise TypeError("request must be an AdaptiveRefineRequest.")
+        event = parse_adaptive_event(self.request(request.to_payload()))
+        if not isinstance(event, AdaptiveCandidatesEvent):
+            raise RuntimeError(
+                "Shared adaptive runtime did not emit a candidates event."
+            )
+        return event
 
     def request_cui_overlay(self, *, include_truth: bool) -> dict[str, object]:
         """Request private CUI overlay data outside the estimator protocol."""
@@ -432,6 +341,15 @@ class AdaptiveRuntimeClient:
             raise subprocess.CalledProcessError(return_code, self.command)
         return event
 
+    def finalize_event(self) -> AdaptivePublishedEvent:
+        """Finalize the runtime and parse its typed publication event."""
+        event = parse_adaptive_event(self.finalize())
+        if not isinstance(event, AdaptivePublishedEvent):
+            raise RuntimeError(
+                "Shared adaptive runtime did not emit a published event."
+            )
+        return event
+
     def abort(self) -> None:
         """Best-effort close of an incomplete acquisition session."""
         if self.process.poll() is not None:
@@ -449,10 +367,21 @@ class AdaptiveRuntimeClient:
 
 
 __all__ = [
+    "AdaptiveAbortedEvent",
+    "AdaptiveBootstrap",
+    "AdaptiveCandidateSnapshot",
+    "AdaptiveCandidatesEvent",
+    "AdaptivePublishedEvent",
+    "AdaptiveReadyEvent",
+    "AdaptiveRecordEvent",
+    "AdaptiveRefineRequest",
     "AdaptiveResumePrefix",
     "AdaptiveRuntimeClient",
+    "AdaptiveSessionEvent",
+    "AdaptiveStepRequest",
     "adaptive_step_request",
     "candidate_index_for_pose",
+    "parse_adaptive_event",
     "parse_adaptive_record",
     "parse_adaptive_resume_prefix",
     "parse_candidate_snapshot",

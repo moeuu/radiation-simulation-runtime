@@ -11,6 +11,7 @@ from runtime.measurement_log import (
     MeasurementLogRecord,
     load_measurement_log,
     measurement_log_sha256,
+    measurement_records_content_sha256,
     write_measurement_log,
 )
 from runtime.provenance import canonical_json_bytes
@@ -29,25 +30,6 @@ class MeasurementLogPrefix:
     measurement_log_sha256: str
 
 
-def _record_payload(record: MeasurementLogRecord) -> dict[str, object]:
-    """Return all raw estimator-visible record fields deterministically."""
-    return {
-        "step_id": record.step_id,
-        "action_id": record.action_id,
-        "station_id": record.station_id,
-        "detector_pose_xyz": list(record.detector_pose_xyz),
-        "detector_quat_wxyz": list(record.detector_quat_wxyz),
-        "fe_orientation_index": record.fe_orientation_index,
-        "pb_orientation_index": record.pb_orientation_index,
-        "live_time_s": record.live_time_s,
-        "travel_time_s": record.travel_time_s,
-        "shield_actuation_time_s": record.shield_actuation_time_s,
-        "energy_bin_edges_keV": record.energy_bin_edges_keV.tolist(),
-        "spectrum_counts": record.spectrum_counts.tolist(),
-        "metadata": dict(record.metadata),
-    }
-
-
 def measurement_records_sha256(
     records: Sequence[MeasurementLogRecord],
 ) -> str:
@@ -55,9 +37,7 @@ def measurement_records_sha256(
     rows = tuple(records)
     if not rows:
         raise ValueError("At least one record is required for a lineage digest.")
-    return sha256(
-        canonical_json_bytes([_record_payload(record) for record in rows])
-    ).hexdigest()
+    return measurement_records_content_sha256(rows)
 
 
 def covered_station_boundaries_sha256(
@@ -168,16 +148,16 @@ def materialize_measurement_log_prefix(
                 source_run_id=log.context.run_id,
             )
         )
-    metadata = dict(log.context.metadata)
+    metadata = dict(log.run_manifest.get("metadata", {}))
     metadata.pop("station_boundary_attestation", None)
     metadata["measurement_log_prefix"] = prefix_metadata
     saved = write_measurement_log(
         target,
         run_id=log.context.run_id,
         repository_commit=log.context.repository_commit,
-        runtime_config=log.context.runtime_config,
-        environment=log.context.environment,
-        forward_model_manifest=log.context.forward_model_manifest,
+        runtime_config=log.runtime_config,
+        environment=log.environment,
+        forward_model_manifest=log.forward_model_manifest,
         isotopes=log.context.isotopes,
         records=records,
         metadata=metadata,

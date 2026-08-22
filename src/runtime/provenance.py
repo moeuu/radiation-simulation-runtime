@@ -1,10 +1,12 @@
-"""Provide deterministic PF configuration and repository provenance helpers."""
+"""Provide legacy provenance and strict JSON contracts for runtime artifacts."""
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import asdict, is_dataclass
 import hashlib
 import json
+import math
 from pathlib import Path
 import subprocess
 from typing import Any
@@ -13,7 +15,11 @@ import numpy as np
 
 
 def json_safe(value: Any) -> Any:
-    """Convert supported configuration values into canonical JSON objects."""
+    """Convert values under the legacy schema-v1 provenance policy.
+
+    This compatibility function stringifies unsupported values and mapping
+    keys. New artifact schemas must use :func:`strict_canonical_json_bytes`.
+    """
     if is_dataclass(value):
         return json_safe(asdict(value))
     if isinstance(value, dict):
@@ -36,7 +42,7 @@ def json_safe(value: Any) -> Any:
 
 
 def canonical_json_bytes(value: Any) -> bytes:
-    """Serialize canonical schema-v1 JSON with stable indentation and newline."""
+    """Serialize legacy schema-v1 JSON without changing existing digests."""
     text = json.dumps(
         json_safe(value),
         sort_keys=True,
@@ -48,8 +54,54 @@ def canonical_json_bytes(value: Any) -> bytes:
 
 
 def sha256_json(value: Any) -> str:
-    """Return the SHA-256 digest of canonical JSON bytes."""
+    """Return the legacy schema-v1 canonical JSON digest."""
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
+
+
+def _strict_json_value(value: Any, *, location: str) -> Any:
+    """Return JSON-native data while rejecting lossy or unstable coercions."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"{location} must not contain NaN or infinity.")
+        return value
+    if isinstance(value, Mapping):
+        normalized: dict[str, Any] = {}
+        for key, nested in value.items():
+            if not isinstance(key, str):
+                raise TypeError(f"{location} keys must be JSON strings.")
+            normalized[key] = _strict_json_value(
+                nested,
+                location=f"{location}.{key}",
+            )
+        return normalized
+    if isinstance(value, (list, tuple)):
+        return [
+            _strict_json_value(item, location=f"{location}[{index}]")
+            for index, item in enumerate(value)
+        ]
+    raise TypeError(
+        f"{location} contains unsupported JSON value {type(value).__name__}."
+    )
+
+
+def strict_canonical_json_bytes(value: Any) -> bytes:
+    """Serialize a new-schema JSON value without implicit type coercion."""
+    normalized = _strict_json_value(value, location="payload")
+    text = json.dumps(
+        normalized,
+        sort_keys=True,
+        indent=2,
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    return f"{text}\n".encode("utf-8")
+
+
+def strict_sha256_json(value: Any) -> str:
+    """Return the strict new-schema canonical JSON digest."""
+    return hashlib.sha256(strict_canonical_json_bytes(value)).hexdigest()
 
 
 def repository_commit(repository_root: Path | None = None) -> str:

@@ -17,6 +17,19 @@ from scipy.stats import qmc
 from measurement.kernels import ShieldParams
 from measurement.obstacles import ObstacleGrid
 from measurement.shielding import generate_octant_orientations
+from runtime.adaptive_protocol import (
+    ADAPTIVE_CUI_OVERLAY_PREFIX,
+    ADAPTIVE_EVENT_PREFIX,
+    AdaptiveBootstrap,
+    AdaptiveCandidateSnapshot,
+    AdaptiveCandidatesEvent,
+    AdaptivePublishedEvent,
+    AdaptiveReadyEvent,
+    AdaptiveRecordEvent,
+    AdaptiveRefineRequest,
+    AdaptiveResumePrefix,
+    AdaptiveStepRequest,
+)
 from runtime.forward_model_manifest import (
     SOURCE_RATE_SEMANTICS,
     build_forward_model_manifest,
@@ -43,8 +56,6 @@ from sim.isaacsim_app.scene_builder import build_scene_description
 from sim.protocol import SimulationCommand
 from sim.runtime import create_simulation_runtime, load_runtime_config
 
-ADAPTIVE_EVENT_PREFIX = "adaptive-session "
-ADAPTIVE_CUI_OVERLAY_PREFIX = "adaptive-cui-overlay "
 _SCENARIO_FIELDS = frozenset(
     {
         "schema_version",
@@ -59,18 +70,6 @@ _SCENARIO_FIELDS = frozenset(
         "obstacle_layout_path",
     }
 )
-_STEP_FIELDS = frozenset(
-    {
-        "type",
-        "candidate_index",
-        "fe_orientation_index",
-        "pb_orientation_index",
-        "dwell_time_s",
-        "station_id",
-        "station_complete",
-    }
-)
-_REFINE_FIELDS = frozenset({"type", "candidate_indices"})
 _CUI_OVERLAY_FIELDS = frozenset({"type", "include_truth"})
 _PRIVATE_SCENE_PROFILE_COUNTS = {
     "ral-mix9": {"Co-60": 3, "Cs-137": 4, "Eu-154": 2},
@@ -574,25 +573,6 @@ def _grid_distances(
     return distances
 
 
-@dataclass(frozen=True, slots=True)
-class AdaptiveCandidateSnapshot:
-    """Expose reachable truth-free poses and runtime-owned motion costs."""
-
-    candidate_poses_xyz: tuple[tuple[float, float, float], ...]
-    travel_costs: tuple[float, ...]
-    allowed_pair_ids: tuple[int, ...]
-    current_pair_id: int
-
-    def to_dict(self) -> dict[str, object]:
-        """Return the estimator-visible candidate payload."""
-        return {
-            "candidate_poses_xyz": [list(pose) for pose in self.candidate_poses_xyz],
-            "travel_costs": list(self.travel_costs),
-            "allowed_pair_ids": list(self.allowed_pair_ids),
-            "current_pair_id": int(self.current_pair_id),
-        }
-
-
 class AdaptiveCandidateProvider:
     """Generate reachable poses without exposing realized source truth."""
 
@@ -896,49 +876,6 @@ class AdaptiveCandidateProvider:
         )
 
 
-def _context_payload(context: RunContext) -> dict[str, object]:
-    """Serialize the estimator-neutral live run context."""
-    payload = {
-        "repository_commit": context.repository_commit,
-        "runtime_config": dict(context.runtime_config),
-        "environment": dict(context.environment),
-        "sim_backend": context.sim_backend,
-        "spectrum_count_method": context.spectrum_count_method,
-        "isotopes": list(context.isotopes),
-        "obstacle_layout_path": context.obstacle_layout_path,
-        "source_rate_model": context.source_rate_model,
-        "metadata": dict(context.metadata),
-        "run_id": context.run_id,
-        "source_rate_semantics": dict(context.source_rate_semantics),
-        "forward_model_manifest": dict(context.forward_model_manifest),
-        "runtime_config_sha256": context.runtime_config_sha256,
-        "schema_version": context.schema_version,
-    }
-    validate_truth_free_estimator_input(payload, path="adaptive.context")
-    return payload
-
-
-def _record_payload(record: MeasurementLogRecord) -> dict[str, object]:
-    """Serialize one durably staged truth-free raw measurement record."""
-    payload = {
-        "step_id": record.step_id,
-        "action_id": record.action_id,
-        "station_id": record.station_id,
-        "detector_pose_xyz": list(record.detector_pose_xyz),
-        "detector_quat_wxyz": list(record.detector_quat_wxyz),
-        "fe_orientation_index": record.fe_orientation_index,
-        "pb_orientation_index": record.pb_orientation_index,
-        "live_time_s": record.live_time_s,
-        "travel_time_s": record.travel_time_s,
-        "shield_actuation_time_s": record.shield_actuation_time_s,
-        "energy_bin_edges_keV": record.energy_bin_edges_keV.tolist(),
-        "spectrum_counts": record.spectrum_counts.tolist(),
-        "metadata": dict(record.metadata),
-    }
-    validate_truth_free_estimator_input(payload, path="adaptive.record")
-    return payload
-
-
 def _resume_stage_repository_commit(stage_dir: str | Path) -> str:
     """Read the immutable acquisition commit from one candidate resume stage."""
     stage = Path(stage_dir)
@@ -1237,42 +1174,34 @@ class AdaptiveRuntimeSession:
     def ready_payload(self) -> dict[str, object]:
         """Return the initial truth-free handshake."""
         if self._resume_records:
-            return {
-                "type": "ready",
-                "schema_version": 2,
-                "context": _context_payload(self.context),
-                "candidates": self._candidate_snapshot.to_dict(),
-                "resume": {
-                    "record_count": len(self._resume_records),
-                    "records": [
-                        _record_payload(record) for record in self._resume_records
-                    ],
-                    "next_station_id": int(self._resume_records[-1].station_id) + 1,
-                },
-            }
-        return {
-            "type": "ready",
-            "schema_version": 1,
-            "context": _context_payload(self.context),
-            "candidates": self._candidate_snapshot.to_dict(),
-            "bootstrap": {
-                "candidate_index": int(
+            return AdaptiveReadyEvent(
+                schema_version=2,
+                context=self.context,
+                candidates=self._candidate_snapshot,
+                resume=AdaptiveResumePrefix(
+                    records=self._resume_records,
+                    next_station_id=int(self._resume_records[-1].station_id) + 1,
+                ),
+            ).to_payload()
+        return AdaptiveReadyEvent(
+            schema_version=1,
+            context=self.context,
+            candidates=self._candidate_snapshot,
+            bootstrap=AdaptiveBootstrap(
+                candidate_index=int(
                     np.argmin(self._candidate_snapshot.travel_costs)
                 ),
-                "fe_orientation_index": 0,
-                "pb_orientation_index": 0,
-            },
-        }
+                fe_orientation_index=0,
+                pb_orientation_index=0,
+            ),
+        ).to_payload()
 
     def step(self, request: Mapping[str, Any]) -> dict[str, object]:
         """Execute one estimator selection and return its durable record."""
         if self._closed:
             raise RuntimeError("Adaptive runtime session is closed.")
-        if set(request) != _STEP_FIELDS or request.get("type") != "step":
-            raise ValueError("Adaptive step request fields disagree with schema 1.")
-        candidate_index = request["candidate_index"]
-        if isinstance(candidate_index, bool) or not isinstance(candidate_index, int):
-            raise TypeError("candidate_index must be an integer.")
+        typed_request = AdaptiveStepRequest.from_payload(request)
+        candidate_index = typed_request.candidate_index
         if not 0 <= candidate_index < len(self._candidate_snapshot.candidate_poses_xyz):
             raise ValueError("candidate_index is outside the current runtime snapshot.")
         target = self._candidate_snapshot.candidate_poses_xyz[candidate_index]
@@ -1281,8 +1210,9 @@ class AdaptiveRuntimeSession:
             self.current_pose,
             target,
         )
-        requested_pair_id = int(request["fe_orientation_index"]) * 8 + int(
-            request["pb_orientation_index"]
+        requested_pair_id = (
+            typed_request.fe_orientation_index * 8
+            + typed_request.pb_orientation_index
         )
         shield_actuation_time = self._shield_actuation_time_s(requested_pair_id)
         delta_x = target[0] - self.current_pose[0]
@@ -1293,15 +1223,15 @@ class AdaptiveRuntimeSession:
             else math.atan2(delta_y, delta_x)
         )
         action = AcquisitionAction(
-            station_id=request["station_id"],
-            station_complete=request["station_complete"],
+            station_id=typed_request.station_id,
+            station_complete=typed_request.station_complete,
             command=SimulationCommand(
                 step_id=len(self.observation_session.writer.records),
                 target_pose_xyz=target,
                 target_base_yaw_rad=yaw,
-                fe_orientation_index=request["fe_orientation_index"],
-                pb_orientation_index=request["pb_orientation_index"],
-                dwell_time_s=request["dwell_time_s"],
+                fe_orientation_index=typed_request.fe_orientation_index,
+                pb_orientation_index=typed_request.pb_orientation_index,
+                dwell_time_s=typed_request.dwell_time_s,
                 travel_time_s=travel_time,
                 shield_actuation_time_s=shield_actuation_time,
                 travel_waypoints_xyz=travel_waypoints or None,
@@ -1318,25 +1248,18 @@ class AdaptiveRuntimeSession:
             self.current_pose,
             self.current_pair_id,
         )
-        return {
-            "type": "record",
-            "record": _record_payload(record),
-            "candidates": self._candidate_snapshot.to_dict(),
-        }
+        return AdaptiveRecordEvent(
+            record=record,
+            candidates=self._candidate_snapshot,
+        ).to_payload()
 
     def refine(self, request: Mapping[str, Any]) -> dict[str, object]:
         """Refine runtime-owned candidates around estimator-ranked seed indices."""
         if self._closed:
             raise RuntimeError("Adaptive runtime session is closed.")
-        if set(request) != _REFINE_FIELDS or request.get("type") != "refine":
-            raise ValueError("Adaptive refine request fields disagree with schema 1.")
-        raw_indices = request["candidate_indices"]
-        if not isinstance(raw_indices, list) or not raw_indices:
-            raise TypeError("candidate_indices must be a nonempty JSON list.")
+        typed_request = AdaptiveRefineRequest.from_payload(request)
         indices: list[int] = []
-        for value in raw_indices:
-            if isinstance(value, bool) or not isinstance(value, int):
-                raise TypeError("candidate_indices must contain integers.")
+        for value in typed_request.candidate_indices:
             if not 0 <= value < len(self._candidate_snapshot.candidate_poses_xyz):
                 raise ValueError("A candidate refinement index is out of range.")
             if value not in indices:
@@ -1351,10 +1274,9 @@ class AdaptiveRuntimeSession:
             self.current_pair_id,
             seeds,
         )
-        return {
-            "type": "candidates",
-            "candidates": self._candidate_snapshot.to_dict(),
-        }
+        return AdaptiveCandidatesEvent(
+            candidates=self._candidate_snapshot,
+        ).to_payload()
 
     def cui_overlay(self, request: Mapping[str, Any]) -> dict[str, object]:
         """Return private CUI overlay data outside estimator-visible events."""
@@ -1402,11 +1324,10 @@ class AdaptiveRuntimeSession:
             raise RuntimeError("Adaptive runtime session is already closed.")
         log = self.observation_session.finalize()
         self._closed = True
-        return log, {
-            "type": "published",
-            "path": log.path.resolve().as_posix(),
-            "record_count": len(log.records),
-        }
+        return log, AdaptivePublishedEvent(
+            path=log.path.resolve().as_posix(),
+            record_count=len(log.records),
+        ).to_payload()
 
     def close(self) -> None:
         """Close without publishing when the controller aborts."""

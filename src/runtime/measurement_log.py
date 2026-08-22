@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import tempfile
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 from collections.abc import Mapping, Sequence
@@ -21,6 +22,7 @@ from numpy.typing import NDArray
 
 from measurement.model import EnvironmentConfig
 from measurement.obstacles import ObstacleGrid
+from runtime.artifacts import ArtifactInventory
 from runtime.provenance import canonical_json_bytes, json_safe
 from runtime.contracts import FULL_SPECTRUM_CONTRACT_HASH_METADATA_KEY
 from runtime.forward_model_manifest import (
@@ -63,6 +65,7 @@ _STREAM_RECORD_PATTERN = re.compile(r"^record_([0-9]{8})\.npz$")
 _STREAM_METADATA_TEMP_PATTERN = re.compile(
     r"^\.observation_metadata\.jsonl\.tmp-[0-9]+$"
 )
+_NPZ_MEMBER_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _MODEL_KEYS = REQUIRED_MODEL_NAMES
 _SOURCE_RATE_SEMANTICS = SOURCE_RATE_SEMANTICS
 _INDEX_CONVENTIONS = {
@@ -718,6 +721,265 @@ class MeasurementLogRecord:
         )
 
 
+def _readonly_exact_array(
+    value: NDArray[Any],
+    *,
+    dtype: np.dtype[Any],
+    name: str,
+) -> NDArray[Any]:
+    """Copy one exact-dtype array into immutable C-contiguous storage."""
+    array = np.asarray(value)
+    if array.dtype != dtype:
+        raise TypeError(f"{name} must have exact dtype {dtype}.")
+    result = np.array(array, dtype=dtype, copy=True, order="C")
+    result.setflags(write=False)
+    return result
+
+
+@dataclass(frozen=True, eq=False, slots=True)
+class MeasurementLogArrayView:
+    """Expose aligned immutable arrays from one causal MeasurementLog prefix."""
+
+    step_id: NDArray[np.int64]
+    action_id: NDArray[np.int64]
+    station_id: NDArray[np.int64]
+    detector_pose_xyz: NDArray[np.float64]
+    detector_quat_wxyz: NDArray[np.float64]
+    fe_orientation_index: NDArray[np.int64]
+    pb_orientation_index: NDArray[np.int64]
+    live_time_s: NDArray[np.float64]
+    travel_time_s: NDArray[np.float64]
+    shield_actuation_time_s: NDArray[np.float64]
+    energy_bin_edges_keV: NDArray[np.float64]
+    spectrum_counts: NDArray[np.int64]
+
+    def __post_init__(self) -> None:
+        """Validate alignment and freeze every public NumPy array."""
+        integer_names = (
+            "step_id",
+            "action_id",
+            "station_id",
+            "fe_orientation_index",
+            "pb_orientation_index",
+            "spectrum_counts",
+        )
+        float_names = (
+            "detector_pose_xyz",
+            "detector_quat_wxyz",
+            "live_time_s",
+            "travel_time_s",
+            "shield_actuation_time_s",
+            "energy_bin_edges_keV",
+        )
+        for name in integer_names:
+            object.__setattr__(
+                self,
+                name,
+                _readonly_exact_array(
+                    getattr(self, name),
+                    dtype=np.dtype(np.int64),
+                    name=name,
+                ),
+            )
+        for name in float_names:
+            object.__setattr__(
+                self,
+                name,
+                _readonly_exact_array(
+                    getattr(self, name),
+                    dtype=np.dtype(np.float64),
+                    name=name,
+                ),
+            )
+        record_count = int(self.step_id.size)
+        vector_names = (
+            "step_id",
+            "action_id",
+            "station_id",
+            "fe_orientation_index",
+            "pb_orientation_index",
+            "live_time_s",
+            "travel_time_s",
+            "shield_actuation_time_s",
+        )
+        if any(getattr(self, name).shape != (record_count,) for name in vector_names):
+            raise ValueError("MeasurementLog array vectors must align by record.")
+        if self.detector_pose_xyz.shape != (record_count, 3):
+            raise ValueError("detector_pose_xyz must have shape (N, 3).")
+        if self.detector_quat_wxyz.shape != (record_count, 4):
+            raise ValueError("detector_quat_wxyz must have shape (N, 4).")
+        if self.energy_bin_edges_keV.ndim != 1:
+            raise ValueError("energy_bin_edges_keV must be one-dimensional.")
+        energy_bin_count = max(int(self.energy_bin_edges_keV.size) - 1, 0)
+        if self.spectrum_counts.shape != (record_count, energy_bin_count):
+            raise ValueError("spectrum_counts must align with records and energy bins.")
+        if self.energy_bin_edges_keV.size and (
+            self.energy_bin_edges_keV.size < 2
+            or np.any(np.diff(self.energy_bin_edges_keV) <= 0.0)
+        ):
+            raise ValueError("energy_bin_edges_keV must strictly increase.")
+
+    @property
+    def record_count(self) -> int:
+        """Return the number of causally ordered observation rows."""
+        return int(self.step_id.size)
+
+    @property
+    def energy_bin_count(self) -> int:
+        """Return the number of raw full-spectrum bins per observation."""
+        return int(self.spectrum_counts.shape[1])
+
+    def as_mapping(self) -> Mapping[str, NDArray[Any]]:
+        """Return the canonical storage names in an immutable mapping."""
+        return MappingProxyType(
+            {
+                "step_id": self.step_id,
+                "action_id": self.action_id,
+                "station_id": self.station_id,
+                "detector_pose_xyz": self.detector_pose_xyz,
+                "detector_quat_wxyz": self.detector_quat_wxyz,
+                "fe_orientation_index": self.fe_orientation_index,
+                "pb_orientation_index": self.pb_orientation_index,
+                "live_time_s": self.live_time_s,
+                "travel_time_s": self.travel_time_s,
+                "shield_actuation_time_s": self.shield_actuation_time_s,
+                "energy_bin_edges_keV": self.energy_bin_edges_keV,
+                "spectrum_counts": self.spectrum_counts,
+            }
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class MeasurementStation:
+    """Describe one contiguous station group inside a causal record prefix."""
+
+    station_id: int
+    start_index: int
+    stop_index: int
+    records: tuple[MeasurementLogRecord, ...]
+    marked_complete: bool
+
+    def __post_init__(self) -> None:
+        """Validate the half-open range and aligned immutable record group."""
+        if isinstance(self.station_id, bool) or not isinstance(self.station_id, int):
+            raise TypeError("station_id must be an integer.")
+        if self.station_id < 0:
+            raise ValueError("station_id must be nonnegative.")
+        if any(
+            isinstance(value, bool) or not isinstance(value, int)
+            for value in (self.start_index, self.stop_index)
+        ):
+            raise TypeError("Station indices must be integers.")
+        if self.start_index < 0 or self.stop_index <= self.start_index:
+            raise ValueError("Station indices must describe a nonempty half-open range.")
+        if len(self.records) != self.stop_index - self.start_index:
+            raise ValueError("Station records must align with its half-open range.")
+        if any(record.station_id != self.station_id for record in self.records):
+            raise ValueError("Station records must share the declared station_id.")
+        if not isinstance(self.marked_complete, bool):
+            raise TypeError("marked_complete must be a boolean.")
+
+    @property
+    def record_count(self) -> int:
+        """Return the number of shield-view records acquired at the station."""
+        return self.stop_index - self.start_index
+
+    @property
+    def record_slice(self) -> slice:
+        """Return the half-open row slice occupied by this station."""
+        return slice(self.start_index, self.stop_index)
+
+
+@dataclass(frozen=True, slots=True)
+class MeasurementLogStationView:
+    """Expose station groups and explicit identities for one causal prefix."""
+
+    records: tuple[MeasurementLogRecord, ...]
+    stations: tuple[MeasurementStation, ...]
+    isotopes: tuple[str, ...]
+    energy_bin_edges_keV: NDArray[np.float64]
+    source_log_sha256: str | None
+    records_content_sha256: str
+
+    def __post_init__(self) -> None:
+        """Freeze the shared energy axis and validate explicit digests."""
+        edges = _readonly_exact_array(
+            self.energy_bin_edges_keV,
+            dtype=np.dtype(np.float64),
+            name="energy_bin_edges_keV",
+        )
+        if edges.size and (edges.size < 2 or np.any(np.diff(edges) <= 0.0)):
+            raise ValueError("energy_bin_edges_keV must strictly increase.")
+        for name, digest in (
+            ("source_log_sha256", self.source_log_sha256),
+            ("records_content_sha256", self.records_content_sha256),
+        ):
+            if digest is not None and _SHA256_PATTERN.fullmatch(digest) is None:
+                raise ValueError(f"{name} must be a lowercase SHA-256 digest.")
+        object.__setattr__(self, "energy_bin_edges_keV", edges)
+
+    @property
+    def record_count(self) -> int:
+        """Return the number of records in this exact prefix."""
+        return len(self.records)
+
+    @property
+    def station_count(self) -> int:
+        """Return the number of station groups in this exact prefix."""
+        return len(self.stations)
+
+    @property
+    def complete_station_count(self) -> int:
+        """Return the leading count of durably marked complete stations."""
+        count = 0
+        for station in self.stations:
+            if not station.marked_complete:
+                break
+            count += 1
+        return count
+
+    def array_view(self) -> MeasurementLogArrayView:
+        """Return immutable aligned arrays for the exact selected prefix."""
+        return _array_view_from_records(
+            self.records,
+            self.isotopes,
+            energy_bin_edges_keV=self.energy_bin_edges_keV,
+        )
+
+    def prefix(
+        self,
+        station_count: int,
+        *,
+        require_complete: bool = True,
+    ) -> "MeasurementLogStationView":
+        """Return a station-aligned prefix with an independent records digest."""
+        if isinstance(station_count, bool) or not isinstance(station_count, int):
+            raise TypeError("station_count must be an integer.")
+        if station_count < 0 or station_count > len(self.stations):
+            raise ValueError("station_count must lie within the available stations.")
+        if not isinstance(require_complete, bool):
+            raise TypeError("require_complete must be a boolean.")
+        selected_stations = self.stations[:station_count]
+        if require_complete and any(
+            not station.marked_complete for station in selected_stations
+        ):
+            raise ValueError(
+                "A durable station prefix requires station_complete=true on every "
+                "selected station boundary."
+            )
+        stop_index = 0 if not selected_stations else selected_stations[-1].stop_index
+        return _station_view_from_records(
+            self.records[:stop_index],
+            self.isotopes,
+            energy_bin_edges_keV=self.energy_bin_edges_keV,
+            source_log_sha256=self.source_log_sha256,
+        )
+
+    def complete_prefix(self) -> "MeasurementLogStationView":
+        """Return the longest leading prefix with durable completion markers."""
+        return self.prefix(self.complete_station_count)
+
+
 @dataclass(frozen=True)
 class MeasurementLog:
     """Store a validated MeasurementLog bundle without evaluation truth."""
@@ -766,7 +1028,13 @@ class MeasurementLog:
 
     @property
     def log_sha256(self) -> str:
-        """Return the shared raw-file inventory digest for the log directory."""
+        """Return the directory digest, including for a path-retaining prefix.
+
+        This legacy property identifies the on-disk source bundle. It does not
+        identify the selected records of an in-memory :meth:`prefix` result.
+        New prefix consumers should compare :attr:`source_log_sha256` and
+        :attr:`records_content_sha256` explicitly.
+        """
         if self.path is None:
             raise MeasurementLogValidationError(
                 "An in-memory MeasurementLog prefix has no independent directory digest."
@@ -774,9 +1042,44 @@ class MeasurementLog:
         return measurement_log_sha256(self.path)
 
     @property
+    def source_log_sha256(self) -> str | None:
+        """Return the source bundle digest, or null for a pathless in-memory log."""
+        return None if self.path is None else measurement_log_sha256(self.path)
+
+    @property
+    def records_content_sha256(self) -> str:
+        """Return the digest of exactly the records selected by this object."""
+        return measurement_records_content_sha256(self.records)
+
+    @property
     def content_sha256(self) -> str:
-        """Return the canonical log digest under its legacy consumer name."""
+        """Return the source directory digest under its legacy consumer name."""
         return self.log_sha256
+
+    def array_view(self) -> MeasurementLogArrayView:
+        """Return exact read-only arrays for all records selected by this object."""
+        return _array_view_from_records(
+            self.records,
+            self.context.isotopes,
+            energy_bin_edges_keV=_measurement_log_energy_edges(self),
+        )
+
+    def station_view(self) -> MeasurementLogStationView:
+        """Return grouped stations with separate source and records identities."""
+        return _station_view_from_records(
+            self.records,
+            self.context.isotopes,
+            energy_bin_edges_keV=_measurement_log_energy_edges(self),
+            source_log_sha256=self.source_log_sha256,
+        )
+
+    def artifact_inventory(self) -> ArtifactInventory:
+        """Return the verified generic file inventory of the source bundle."""
+        if self.path is None:
+            raise MeasurementLogValidationError(
+                "A pathless in-memory MeasurementLog has no artifact inventory."
+            )
+        return measurement_log_artifact_inventory(self.path)
 
     def prefix(self, record_count: int) -> "MeasurementLog":
         """Return an in-memory causal prefix without inspecting a future record."""
@@ -804,6 +1107,39 @@ class MeasurementLog:
 def _sha256_bytes(payload: bytes) -> str:
     """Return the SHA-256 digest for bytes."""
     return hashlib.sha256(payload).hexdigest()
+
+
+def _record_content_payload(record: MeasurementLogRecord) -> dict[str, object]:
+    """Return every estimator-visible record field for a content digest."""
+    return {
+        "step_id": record.step_id,
+        "action_id": record.action_id,
+        "station_id": record.station_id,
+        "detector_pose_xyz": list(record.detector_pose_xyz),
+        "detector_quat_wxyz": list(record.detector_quat_wxyz),
+        "fe_orientation_index": record.fe_orientation_index,
+        "pb_orientation_index": record.pb_orientation_index,
+        "live_time_s": record.live_time_s,
+        "travel_time_s": record.travel_time_s,
+        "shield_actuation_time_s": record.shield_actuation_time_s,
+        "energy_bin_edges_keV": record.energy_bin_edges_keV.tolist(),
+        "spectrum_counts": record.spectrum_counts.tolist(),
+        "metadata": dict(record.metadata),
+    }
+
+
+def measurement_records_content_sha256(
+    records: Sequence[MeasurementLogRecord],
+) -> str:
+    """Hash exactly one causal record selection, including an empty selection."""
+    if isinstance(records, (str, bytes)) or not isinstance(records, Sequence):
+        raise TypeError("records must be a sequence of MeasurementLogRecord values.")
+    rows = tuple(records)
+    if any(not isinstance(record, MeasurementLogRecord) for record in rows):
+        raise TypeError("records must contain only MeasurementLogRecord values.")
+    return _sha256_bytes(
+        canonical_json_bytes([_record_content_payload(record) for record in rows])
+    )
 
 
 def _sha256_file(path: Path) -> str:
@@ -856,9 +1192,56 @@ def _write_deterministic_npz(
             archive.writestr(member, buffer.getvalue())
 
 
-def measurement_log_sha256(path: str | Path) -> str:
-    """Return the shared digest of every non-truth regular artifact in a log."""
+def write_deterministic_npz(
+    path: str | Path,
+    arrays: Mapping[str, NDArray[Any]],
+) -> Path:
+    """Atomically publish arrays with the byte-stable runtime NPZ encoding."""
+    if not isinstance(arrays, Mapping) or not arrays:
+        raise TypeError("arrays must be a nonempty mapping.")
+    if any(not isinstance(name, str) or not name for name in arrays):
+        raise TypeError("Deterministic NPZ array names must be nonempty strings.")
+    if any(_NPZ_MEMBER_NAME_PATTERN.fullmatch(name) is None for name in arrays):
+        raise ValueError(
+            "Deterministic NPZ array names must be safe Python identifiers."
+        )
+    normalized_arrays = {
+        name: np.asanyarray(value) for name, value in arrays.items()
+    }
+    if any(array.dtype.hasobject for array in normalized_arrays.values()):
+        raise TypeError("Deterministic NPZ arrays must not contain Python objects.")
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=target.parent,
+        prefix=f".{target.name}.",
+        suffix=".tmp",
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        _write_deterministic_npz(temporary, normalized_arrays)
+        with temporary.open("rb") as handle:
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+        directory_descriptor = os.open(target.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    return target
+
+
+def measurement_log_artifact_inventory(path: str | Path) -> ArtifactInventory:
+    """Return every non-truth regular MeasurementLog file and its digest."""
     root = Path(path).resolve()
+    if not root.is_dir():
+        raise MeasurementLogValidationError(
+            f"MeasurementLog directory does not exist: {root}."
+        )
     inventory: dict[str, str] = {}
     for candidate in sorted(root.rglob("*")):
         relative = candidate.relative_to(root).as_posix()
@@ -881,7 +1264,12 @@ def measurement_log_sha256(path: str | Path) -> str:
                 f"MeasurementLog artifact {relative} is not a regular file."
             )
         inventory[relative] = _sha256_file(candidate)
-    return _sha256_bytes(canonical_json_bytes(inventory))
+    return ArtifactInventory(inventory)
+
+
+def measurement_log_sha256(path: str | Path) -> str:
+    """Return the shared digest of every non-truth regular artifact in a log."""
+    return measurement_log_artifact_inventory(path).sha256
 
 
 def _validate_sha256(value: object, field_name: str) -> str:
@@ -1283,6 +1671,146 @@ def _records_to_arrays(
         "energy_bin_edges_keV": energy_edges.astype(np.float64, copy=True),
         "spectrum_counts": spectra.astype(np.int64, copy=False),
     }
+
+
+def _measurement_log_energy_edges(log: MeasurementLog) -> NDArray[np.float64]:
+    """Return the canonical energy edges even when the selected log is empty."""
+    if log.records:
+        return np.asarray(log.records[0].energy_bin_edges_keV, dtype=np.float64)
+    contract = log.runtime_config.get("full_spectrum_generative_model")
+    if not isinstance(contract, Mapping):
+        raise MeasurementLogValidationError(
+            "An empty MeasurementLog requires full_spectrum_generative_model."
+        )
+    bin_count = _required_json_integer(
+        contract,
+        "energy_bin_count",
+        location="runtime_config.full_spectrum_generative_model",
+        minimum=1,
+    )
+    energy_min = _required_json_number(
+        contract,
+        "energy_min_keV",
+        location="runtime_config.full_spectrum_generative_model",
+    )
+    energy_max = _required_json_number(
+        contract,
+        "energy_max_keV",
+        location="runtime_config.full_spectrum_generative_model",
+    )
+    bin_width = _required_json_number(
+        contract,
+        "bin_width_keV",
+        location="runtime_config.full_spectrum_generative_model",
+    )
+    if bin_width <= 0.0:
+        raise MeasurementLogValidationError("bin_width_keV must be positive.")
+    energy_axis = energy_min + np.arange(bin_count, dtype=np.float64) * bin_width
+    if not np.isclose(energy_axis[-1], energy_max, rtol=0.0, atol=1.0e-9):
+        raise MeasurementLogValidationError(
+            "The empty-log energy dimensions do not define the declared axis."
+        )
+    return np.concatenate(
+        (energy_axis, np.asarray([energy_axis[-1] + bin_width], dtype=np.float64))
+    )
+
+
+def _array_view_from_records(
+    records: Sequence[MeasurementLogRecord],
+    isotopes: Sequence[str],
+    *,
+    energy_bin_edges_keV: NDArray[np.float64],
+) -> MeasurementLogArrayView:
+    """Build one immutable dense array view for a causal record selection."""
+    rows = tuple(records)
+    expected_edges = np.asarray(energy_bin_edges_keV, dtype=np.float64)
+    if expected_edges.ndim != 1 or expected_edges.size < 2:
+        raise MeasurementLogValidationError(
+            "MeasurementLog array views require a nonempty energy-bin axis."
+        )
+    if rows:
+        arrays = _records_to_arrays(rows, isotopes)
+        if not np.array_equal(arrays["energy_bin_edges_keV"], expected_edges):
+            raise MeasurementLogValidationError(
+                "Selected records differ from the MeasurementLog energy-bin axis."
+            )
+    else:
+        bin_count = int(expected_edges.size - 1)
+        arrays = {
+            "step_id": np.zeros(0, dtype=np.int64),
+            "action_id": np.zeros(0, dtype=np.int64),
+            "station_id": np.zeros(0, dtype=np.int64),
+            "detector_pose_xyz": np.zeros((0, 3), dtype=np.float64),
+            "detector_quat_wxyz": np.zeros((0, 4), dtype=np.float64),
+            "fe_orientation_index": np.zeros(0, dtype=np.int64),
+            "pb_orientation_index": np.zeros(0, dtype=np.int64),
+            "live_time_s": np.zeros(0, dtype=np.float64),
+            "travel_time_s": np.zeros(0, dtype=np.float64),
+            "shield_actuation_time_s": np.zeros(0, dtype=np.float64),
+            "energy_bin_edges_keV": expected_edges.copy(),
+            "spectrum_counts": np.zeros((0, bin_count), dtype=np.int64),
+        }
+    return MeasurementLogArrayView(**arrays)
+
+
+def _station_view_from_records(
+    records: Sequence[MeasurementLogRecord],
+    isotopes: Sequence[str],
+    *,
+    energy_bin_edges_keV: NDArray[np.float64],
+    source_log_sha256: str | None,
+) -> MeasurementLogStationView:
+    """Group one causal prefix without inferring durable completion markers."""
+    rows = tuple(records)
+    isotope_names = tuple(str(isotope) for isotope in isotopes)
+    if rows:
+        _validate_record_sequence(rows, isotope_names)
+        expected_edges = np.asarray(energy_bin_edges_keV, dtype=np.float64)
+        if not np.array_equal(rows[0].energy_bin_edges_keV, expected_edges):
+            raise MeasurementLogValidationError(
+                "Station view records differ from the MeasurementLog energy axis."
+            )
+    stations: list[MeasurementStation] = []
+    start_index = 0
+    for index, record in enumerate(rows):
+        station_end = index + 1 == len(rows) or (
+            rows[index + 1].station_id != record.station_id
+        )
+        marked_complete = _station_complete_marker(
+            record.metadata,
+            location=f"records[{index}].metadata",
+        )
+        if marked_complete and not station_end:
+            raise MeasurementLogValidationError(
+                "station_complete=true must appear only on a station's final record."
+            )
+        if not station_end:
+            continue
+        stop_index = index + 1
+        stations.append(
+            MeasurementStation(
+                station_id=int(record.station_id),
+                start_index=start_index,
+                stop_index=stop_index,
+                records=rows[start_index:stop_index],
+                marked_complete=marked_complete,
+            )
+        )
+        start_index = stop_index
+    if any(station.marked_complete for station in stations) and any(
+        not station.marked_complete for station in stations[:-1]
+    ):
+        raise MeasurementLogValidationError(
+            "A marker-aware station prefix may leave only its final station incomplete."
+        )
+    return MeasurementLogStationView(
+        records=rows,
+        stations=tuple(stations),
+        isotopes=isotope_names,
+        energy_bin_edges_keV=np.asarray(energy_bin_edges_keV, dtype=np.float64),
+        source_log_sha256=source_log_sha256,
+        records_content_sha256=measurement_records_content_sha256(rows),
+    )
 
 
 def _metadata_line(
