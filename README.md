@@ -124,9 +124,8 @@ moving their algorithms into this package:
 - `MeasurementLog.view()`, `MeasurementLog.prefix_view(...)`, and
   `MeasurementLogView.from_records(...)` provide read-only array and station views
   without synthesizing manifests. File-backed logs additionally expose an
-  authenticated artifact inventory. Published prefix manifests bind their covered
-  records to an algorithm-qualified digest and retain the bare SHA-256 only as a
-  transitional alias.
+  authenticated artifact inventory. Live record prefixes bind their covered records
+  to an algorithm-qualified digest without publishing a second log bundle.
 - `CUIRoute`, `CUIScene`, and the responsive CUI shell standardize route,
   obstacle, URL, and page structure. Each estimator supplies its own result panel
   specifications and renders particles, grids, density surfaces, or combined plots

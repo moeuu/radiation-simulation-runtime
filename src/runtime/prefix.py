@@ -1,17 +1,13 @@
-"""Causal prefix publication for a raw full-spectrum MeasurementLog."""
+"""Stable digests for ordered live MeasurementLog record prefixes."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from hashlib import sha256
-from pathlib import Path
 from collections.abc import Sequence
 
 from runtime.measurement_log import (
     MeasurementLogRecord,
-    load_measurement_log,
     measurement_records_content_sha256,
-    write_measurement_log,
 )
 from runtime.provenance import DigestIdentity, canonical_json_bytes
 
@@ -22,21 +18,6 @@ MEASUREMENT_RECORDS_DIGEST_ALGORITHM = (
 STATION_BOUNDARIES_DIGEST_ALGORITHM = (
     "rotating-shield-runtime.station-boundaries-v1+canonical-json-sha256"
 )
-
-
-@dataclass(frozen=True, slots=True)
-class MeasurementLogPrefix:
-    """Describe one published causal raw-log prefix."""
-
-    output_dir: Path
-    record_count: int
-    covered_step_ids: tuple[int, ...]
-    data_cutoff_step: int
-    data_cutoff_station: int
-    covered_records_sha256: str
-    measurement_log_sha256: str
-    covered_records_digest: DigestIdentity
-    measurement_log_digest: DigestIdentity
 
 
 def measurement_records_sha256(
@@ -109,120 +90,11 @@ def covered_station_boundaries_digest(
     )
 
 
-def _prefix_stop_index(
-    records: tuple[MeasurementLogRecord, ...],
-    *,
-    cutoff_step: int,
-    cutoff_station: int,
-    assert_station_complete: bool,
-) -> int:
-    """Validate an exact station boundary and return its record index."""
-    matching = [
-        index for index, record in enumerate(records)
-        if record.step_id == int(cutoff_step)
-    ]
-    if not matching:
-        raise ValueError(f"cutoff_step {cutoff_step} is absent from the log.")
-    stop = matching[0]
-    record = records[stop]
-    if record.station_id != int(cutoff_station):
-        raise ValueError(
-            f"cutoff_step {cutoff_step} belongs to station {record.station_id}, "
-            f"not cutoff_station {cutoff_station}."
-        )
-    if stop + 1 < len(records) and records[stop + 1].station_id == record.station_id:
-        raise ValueError(f"cutoff_step {cutoff_step} is not station-complete.")
-    if record.metadata.get("station_complete") is not True and not assert_station_complete:
-        raise ValueError(
-            "The cutoff record lacks metadata.station_complete=true; an external "
-            "validated schedule must explicitly attest this boundary."
-        )
-    return stop
-
-
-def materialize_measurement_log_prefix(
-    run_dir: str | Path,
-    output_dir: str | Path,
-    *,
-    cutoff_step: int,
-    cutoff_station: int,
-    assert_station_complete: bool = False,
-) -> MeasurementLogPrefix:
-    """Publish one truth-free raw-log prefix using the shared writer."""
-    source = Path(run_dir).resolve()
-    target = Path(output_dir).resolve()
-    if not isinstance(assert_station_complete, bool):
-        raise TypeError("assert_station_complete must be a boolean.")
-    if source == target or source in target.parents:
-        raise ValueError("output_dir must not be the source log or its descendant.")
-    log = load_measurement_log(source)
-    stop = _prefix_stop_index(
-        log.records,
-        cutoff_step=cutoff_step,
-        cutoff_station=cutoff_station,
-        assert_station_complete=assert_station_complete,
-    )
-    records = log.records[: stop + 1]
-    records_digest = measurement_records_digest(records)
-    writer_marked_complete = records[-1].metadata.get("station_complete") is True
-    prefix_metadata = {
-        "schema_version": 1,
-        "source_run_id": log.context.run_id,
-        "data_cutoff_step": records[-1].step_id,
-        "data_cutoff_station": records[-1].station_id,
-        "covered_records_digest": records_digest.to_payload(),
-        # Transitional alias for consumers that predate algorithm-bound digests.
-        "covered_records_sha256": records_digest.sha256,
-        "station_boundary_attestation": (
-            "covered_prefix_markers_v1"
-            if writer_marked_complete
-            else "external_validated_schedule"
-        ),
-    }
-    if writer_marked_complete:
-        prefix_metadata["covered_station_boundaries_sha256"] = (
-            covered_station_boundaries_sha256(
-                records,
-                source_run_id=log.context.run_id,
-            )
-        )
-    metadata = dict(log.run_manifest.get("metadata", {}))
-    metadata.pop("station_boundary_attestation", None)
-    metadata["measurement_log_prefix"] = prefix_metadata
-    saved = write_measurement_log(
-        target,
-        run_id=log.context.run_id,
-        repository_commit=log.context.repository_commit,
-        runtime_config=log.runtime_config,
-        environment=log.environment,
-        forward_model_manifest=log.forward_model_manifest,
-        isotopes=log.context.isotopes,
-        records=records,
-        metadata=metadata,
-        obstacle_layout_path=log.context.obstacle_layout_path,
-        source_layout_path=None,
-    )
-    log_inventory_digest = saved.artifact_inventory().digest
-    return MeasurementLogPrefix(
-        output_dir=saved.path,
-        record_count=len(records),
-        covered_step_ids=tuple(record.step_id for record in records),
-        data_cutoff_step=records[-1].step_id,
-        data_cutoff_station=records[-1].station_id,
-        covered_records_sha256=records_digest.sha256,
-        measurement_log_sha256=log_inventory_digest.sha256,
-        covered_records_digest=records_digest,
-        measurement_log_digest=log_inventory_digest,
-    )
-
-
 __all__ = [
     "MEASUREMENT_RECORDS_DIGEST_ALGORITHM",
-    "MeasurementLogPrefix",
     "STATION_BOUNDARIES_DIGEST_ALGORITHM",
     "covered_station_boundaries_digest",
     "covered_station_boundaries_sha256",
-    "materialize_measurement_log_prefix",
     "measurement_records_digest",
     "measurement_records_sha256",
 ]

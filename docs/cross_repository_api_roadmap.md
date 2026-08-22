@@ -62,7 +62,7 @@ truth boundaries, observation statistics, or estimator algorithms.
 | Public-host discovery and occupied-port handling | PF, MLE, and orchestrator delegate | runtime CUI API |
 | Route, station-view, waypoint, scene, and page shell | all CUI consumers use PF-compatible contracts | runtime truth-free CUI DTOs |
 | Adaptive event dictionaries and process lifecycle | typed consumers retain only controller decisions | typed runtime adaptive-session API |
-| MeasurementLog v2 validation and prefix writing | runtime and orchestrator | runtime; orchestrator keeps only legacy readers |
+| MeasurementLog v2 validation, views, and record-prefix digests | runtime and orchestrator | runtime; orchestrator keeps only legacy readers |
 | PF/MLE solver and posterior state | PF/MLE repositories and orchestrator | estimator owners; no runtime dependency reversal |
 
 ## Canonical CUI contract
@@ -143,8 +143,8 @@ estimator access to realized truth.
 
 - Add a public read-only array view and artifact inventory to the runtime
   `MeasurementLog` API.
-- Delegate orchestrator MeasurementLog v2 validation and prefix publication to
-  runtime APIs.
+- Delegate orchestrator MeasurementLog v2 validation, read-only views, and record
+  prefix digests to runtime APIs.
 - Retain orchestrator-local schema-v1 readers only for historical artifacts.
 - Freeze byte-level conformance fixtures before replacing legacy digest code.
 

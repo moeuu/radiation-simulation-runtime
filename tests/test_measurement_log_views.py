@@ -7,6 +7,8 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import runtime
+import runtime.prefix as runtime_prefix
 
 from runtime import (
     ArtifactInventory,
@@ -23,6 +25,15 @@ from runtime.measurement_log import (
 )
 from runtime.prefix import measurement_records_sha256
 from tests.runtime_test_support import make_measurement_log
+
+
+def test_runtime_exposes_views_and_digests_without_prefix_bundle_writer() -> None:
+    """Completed logs must not launch a second materialized-prefix workflow."""
+    for name in ("MeasurementLogPrefix", "materialize_measurement_log_prefix"):
+        assert not hasattr(runtime, name)
+        assert not hasattr(runtime_prefix, name)
+        assert name not in runtime.__all__
+        assert name not in runtime_prefix.__all__
 
 
 def test_array_view_preserves_exact_dtypes_alignment_and_immutability(
