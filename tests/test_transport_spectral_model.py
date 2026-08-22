@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
+import os
 from pathlib import Path
+import platform
+import subprocess
+import sys
 import warnings
 
 import numpy as np
@@ -43,6 +47,99 @@ from measurement.geometry_family import (
     GEOMETRY_FAMILY_APPLICABILITY_SHA256,
 )
 from tests.runtime_test_support import approved_full_spectrum_model
+
+
+@pytest.mark.parametrize(
+    "kernel_environment",
+    (
+        {"OPENBLAS_CORETYPE": "Haswell"},
+        {"OPENBLAS_CORETYPE": "SkylakeX"},
+        {"NPY_ENABLE_CPU_FEATURES": "X86_V2"},
+    ),
+    ids=("openblas-haswell", "openblas-skylakex", "numpy-x86-v2"),
+)
+def test_profile_contract_hash_is_portable_across_cpu_kernels(
+    kernel_environment: dict[str, str],
+) -> None:
+    """Derived-array identity must not depend on the runner CPU kernel."""
+    if platform.machine().lower() not in {"amd64", "x86_64"}:
+        pytest.skip("OpenBLAS x86 kernel selection is unavailable.")
+    repository_root = Path(__file__).resolve().parents[1]
+    model_path = (
+        repository_root
+        / "configs/geant4/models/profiles/ral_eu154_physics_only.json"
+    )
+    expected_hash = json.loads(model_path.read_text(encoding="utf-8"))[
+        "contract_hash_sha256"
+    ]
+    child_code = "\n".join(
+        (
+            "import json",
+            "from pathlib import Path",
+            (
+                "from spectrum.transport_spectral import "
+                "GeometryConditionedSpectralModel"
+            ),
+            f"path = Path({str(model_path)!r})",
+            "payload = json.loads(path.read_text(encoding='utf-8'))",
+            (
+                "model = GeometryConditionedSpectralModel."
+                "from_manifest_payload(payload)"
+            ),
+            "print(model.contract_hash_sha256)",
+        )
+    )
+    child_environment = os.environ.copy()
+    child_environment.update(kernel_environment)
+
+    completed = subprocess.run(
+        (sys.executable, "-c", child_code),
+        cwd=repository_root,
+        env=child_environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == expected_hash
+
+
+def test_portable_derived_array_digest_ignores_only_roundoff_noise() -> None:
+    """Portable identity must retain material changes and reject nonfinite data."""
+    baseline = np.asarray((0.25, -0.0), dtype=np.float64)
+    roundoff = baseline.copy()
+    roundoff[0] = np.nextafter(roundoff[0], np.inf)
+    positive_zero = np.asarray((0.25, 0.0), dtype=np.float64)
+    material_change = baseline.copy()
+    material_change[0] += 2.0e-13
+
+    baseline_digest = transport_spectral._portable_derived_array_digest(
+        baseline
+    )
+
+    assert (
+        transport_spectral._portable_derived_array_digest(roundoff)
+        == baseline_digest
+    )
+    assert (
+        transport_spectral._portable_derived_array_digest(positive_zero)
+        == baseline_digest
+    )
+    assert (
+        transport_spectral._portable_derived_array_digest(material_change)
+        != baseline_digest
+    )
+    assert (
+        transport_spectral._portable_derived_array_digest(
+            baseline.reshape((1, 2))
+        )
+        != baseline_digest
+    )
+    with pytest.raises(ValueError, match="finite"):
+        transport_spectral._portable_derived_array_digest(
+            np.asarray((np.nan,), dtype=np.float64)
+        )
 
 
 def test_continuous_rate_scale_quadrature_integrates_uniform_moments() -> None:

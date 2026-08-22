@@ -1,9 +1,9 @@
 {
   "covered_records_digest": {
     "algorithm": "rotating-shield-runtime.measurement-records-v2+canonical-json-sha256",
-    "sha256": "9bab0f792c0439002c1998b4b4ee7ac3e7ba372f6d5c7203bc4fa769b9869ca2"
+    "sha256": "dfd0358fa79d2ef9f892bb9d7fa275216dc100e8bb526cc84914021ce34c36be"
   },
-  "covered_records_sha256": "9bab0f792c0439002c1998b4b4ee7ac3e7ba372f6d5c7203bc4fa769b9869ca2",
+  "covered_records_sha256": "dfd0358fa79d2ef9f892bb9d7fa275216dc100e8bb526cc84914021ce34c36be",
   "covered_station_boundaries_sha256": "4da943fe1f01571cec5f8d79412437707049dffa5aaae4442709cbddd8c84803",
   "data_cutoff_station": 0,
   "data_cutoff_step": 1,

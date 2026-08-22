@@ -8,8 +8,8 @@
         "Co-60",
         "Am-241"
       ],
-      "model_contract_hash_sha256": "764287e4d1e3e66d0eae6fcde09d85790dc5883ae2ea511693483dcd47e300c8",
-      "model_file_sha256": "67dfb3fb5a9779822537177428b74a2b06a81807e76f22c9261ef0dc19cfabe6",
+      "model_contract_hash_sha256": "a1bf37084cc2aceb8134ea5c0362ca7f21a76d48b9ab04edb725de5070845c95",
+      "model_file_sha256": "705b5174045659c524c2f4ecfc0af4bd7d6e08ccc60ec5bff6fcfd537df89281",
       "model_path": "configs/geant4/models/profiles/fukushima_am241_physics_only.json"
     },
     "fukushima_cs134": {
@@ -19,8 +19,8 @@
         "Co-60",
         "Cs-134"
       ],
-      "model_contract_hash_sha256": "945fde3ffefac7c3511afefe220a1eb47af76636f0318b02918cb12486b2daf7",
-      "model_file_sha256": "64b8f63aba26fb3fff7958fb71b3733697a9b8a2a9898e1e60cfc381ddbb2b18",
+      "model_contract_hash_sha256": "a68eed6f3e66e8704b9aaf541b77690f66b49f15a0ef5a9f1fb7e5ef39e97da3",
+      "model_file_sha256": "d15c4ed600d92ee17264e256e0afcc9a0235ff5fb7572db49b011d9fa5be9d0f",
       "model_path": "configs/geant4/models/profiles/fukushima_cs134_physics_only.json"
     },
     "fukushima_eu152": {
@@ -30,8 +30,8 @@
         "Co-60",
         "Eu-152"
       ],
-      "model_contract_hash_sha256": "f810ee61161b11b11b7a3729facc165462f96c85c3e5908d8e12637a323ccdf2",
-      "model_file_sha256": "2013e4f8d972a41ca8bd372db3334bd31ef1e4ef02440026bb967d13592bd155",
+      "model_contract_hash_sha256": "60eb01f5dd8566b2525370b9e263b0e3a0c9d5c4f95d1dba0aa69fcbab2a6bd0",
+      "model_file_sha256": "5c34652438763686e04c6b4f034b0e195296137db7264c8206a86a6b28fc0ac9",
       "model_path": "configs/geant4/models/profiles/fukushima_eu152_physics_only.json"
     },
     "fukushima_eu154": {
@@ -41,8 +41,8 @@
         "Co-60",
         "Eu-154"
       ],
-      "model_contract_hash_sha256": "ca335f47ab30e68f706299787f104584bebdf33e201e764b2120309ffb3bf87c",
-      "model_file_sha256": "51b07f67fb19552ee1627656aac596fe5cdc287d0cd72e231f56884f03f9abfc",
+      "model_contract_hash_sha256": "15db0fe453b08a74292f39952bf6e579cc321a79b2922a78748b094c4d281792",
+      "model_file_sha256": "048a786c734369b1c73a3943a9b7a920055c1944779481af98358b7c0e647f3f",
       "model_path": "configs/geant4/models/profiles/fukushima_eu154_physics_only.json"
     },
     "fukushima_nb94": {
@@ -52,8 +52,8 @@
         "Co-60",
         "Nb-94"
       ],
-      "model_contract_hash_sha256": "a46e473d8a2a49517e25a23a9308807494ca3c28d8c192946b95154c23d0159f",
-      "model_file_sha256": "2a2268a93db6efd71f477594fa94de09ced2a5e77018d792253c201d68b5979c",
+      "model_contract_hash_sha256": "915da1ec21fb57db192669f4edefe4f462b9a6e637f1ee32351745438cdbf793",
+      "model_file_sha256": "19d92c06885b7924fc8966dca8b41df8c7ec258f243da84a648d42ede333b0fb",
       "model_path": "configs/geant4/models/profiles/fukushima_nb94_physics_only.json"
     },
     "fukushima_sb125": {
@@ -63,8 +63,8 @@
         "Co-60",
         "Sb-125"
       ],
-      "model_contract_hash_sha256": "279cd198096efa9b3ddcaf4efeded29caef5ea5bd4f65db77c4e9517b1761e1b",
-      "model_file_sha256": "595c0d5b44925bf274177358d52a94ec88fbdd83cdda8a7d3f5af0edf3fbb7fb",
+      "model_contract_hash_sha256": "79ad32da4f5d0874ce60a944e99af08840c942b92899e015e82aa72fdab548d0",
+      "model_file_sha256": "3782f8a4c30a6178a87a138d1c54e50a0b4384e36ffd9b8347846f8c7dfcad81",
       "model_path": "configs/geant4/models/profiles/fukushima_sb125_physics_only.json"
     },
     "ral_eu154": {
@@ -74,8 +74,8 @@
         "Co-60",
         "Eu-154"
       ],
-      "model_contract_hash_sha256": "ca335f47ab30e68f706299787f104584bebdf33e201e764b2120309ffb3bf87c",
-      "model_file_sha256": "51b07f67fb19552ee1627656aac596fe5cdc287d0cd72e231f56884f03f9abfc",
+      "model_contract_hash_sha256": "15db0fe453b08a74292f39952bf6e579cc321a79b2922a78748b094c4d281792",
+      "model_file_sha256": "048a786c734369b1c73a3943a9b7a920055c1944779481af98358b7c0e647f3f",
       "model_path": "configs/geant4/models/profiles/ral_eu154_physics_only.json"
     }
   },

@@ -33,7 +33,7 @@
   "background_rate_cps": 12.0,
   "background_semantics": "independent_pre_dead_time_pulse_rate_added_once",
   "bin_width_keV": 2.0,
-  "contract_hash_sha256": "279cd198096efa9b3ddcaf4efeded29caef5ea5bd4f65db77c4e9517b1761e1b",
+  "contract_hash_sha256": "79ad32da4f5d0874ce60a944e99af08840c942b92899e015e82aa72fdab548d0",
   "dead_time_application_count": 1,
   "dead_time_model": "nonparalyzable_mean_then_component_gamma_poisson_total",
   "dead_time_tau_s": 5.813e-09,

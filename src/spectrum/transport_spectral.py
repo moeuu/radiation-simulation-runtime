@@ -399,6 +399,36 @@ def _array_digest(array: NDArray[np.float64]) -> bytes:
     return digest.digest()
 
 
+_DERIVED_CONTRACT_ARRAY_DECIMALS = 13
+
+
+def _portable_derived_array_digest(array: NDArray[np.float64]) -> bytes:
+    """Hash a derived float64 array independently of CPU math kernels."""
+    contiguous = np.ascontiguousarray(array, dtype=np.float64)
+    if np.any(~np.isfinite(contiguous)):
+        raise ValueError("Contract arrays must contain only finite values.")
+    # Canonicalize only the digest copy. Inference and observation arrays retain
+    # their original float64 values and therefore their existing physics.
+    canonical = np.asarray(
+        np.round(
+            contiguous,
+            decimals=_DERIVED_CONTRACT_ARRAY_DECIMALS,
+        ),
+        dtype="<f8",
+        order="C",
+    ).copy()
+    canonical[canonical == 0.0] = 0.0
+    digest = hashlib.sha256()
+    digest.update(
+        b"portable-derived-float64-rounded-"
+        + str(_DERIVED_CONTRACT_ARRAY_DECIMALS).encode("ascii")
+        + b"-v1"
+    )
+    digest.update(str(tuple(int(value) for value in canonical.shape)).encode())
+    digest.update(canonical.tobytes())
+    return digest.digest()
+
+
 def _logdiffexp_numpy(
     log_large: NDArray[np.float64],
     log_small: NDArray[np.float64],
@@ -2787,7 +2817,10 @@ class GeometryConditionedSpectralModel:
     def _build_contract_hash(self) -> str:
         """Return the physical model digest independent of validation results."""
         digest = hashlib.sha256()
-        digest.update(b"geometry_conditioned_spectral_model_v3")
+        digest.update(
+            b"geometry_conditioned_spectral_model_v3_"
+            b"portable_derived_arrays_v1"
+        )
         digest.update(
             json.dumps(
                 {
@@ -2885,8 +2918,8 @@ class GeometryConditionedSpectralModel:
                     self.physical_component_discrepancy.to_payload()
                 ).encode("ascii")
             )
+        digest.update(_array_digest(self._energy_axis_keV))
         for array in (
-            self._energy_axis_keV,
             self.response_operator_br,
             self.background_shape_b,
             self._direct_line_shapes_lb,
@@ -2897,10 +2930,10 @@ class GeometryConditionedSpectralModel:
             self._fe_compton_fraction_l,
             self._pb_compton_fraction_l,
             self._obstacle_compton_fraction_l,
-            self._rate_scale_nodes_j,
-            self._rate_scale_weights_j,
         ):
-            digest.update(_array_digest(array))
+            digest.update(_portable_derived_array_digest(array))
+        digest.update(_array_digest(self._rate_scale_nodes_j))
+        digest.update(_array_digest(self._rate_scale_weights_j))
         return digest.hexdigest()
 
     @property
