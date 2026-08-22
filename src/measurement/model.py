@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 from numbers import Real
-from typing import Tuple
 
 import numpy as np
 
@@ -50,7 +49,7 @@ class EnvironmentConfig:
     size_x: float = 10.0
     size_y: float = 20.0
     size_z: float = 10.0
-    detector_position: Tuple[float, float, float] | None = None
+    detector_position: tuple[float, float, float] | None = None
 
     def __post_init__(self) -> None:
         """Validate finite positive room geometry and an in-room detector."""
@@ -106,12 +105,12 @@ class PointSource:
     """
 
     isotope: str
-    position: Tuple[float, float, float]
+    position: tuple[float, float, float]
     intensity_cps_1m: float
     surface_chart_id: int | None = None
-    surface_uv: Tuple[float, float] | None = None
-    surface_normal: Tuple[float, float, float] | None = None
-    transport_position: Tuple[float, float, float] | None = None
+    surface_uv: tuple[float, float] | None = None
+    surface_normal: tuple[float, float, float] | None = None
+    transport_position: tuple[float, float, float] | None = None
     surface_emission_policy_sha256: str | None = None
 
     def __post_init__(self) -> None:

@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 from numbers import Real
-from typing import Dict
 
 import numpy as np
 from numpy.typing import NDArray
@@ -84,7 +83,7 @@ class MeasurementGeometry:
     poses: NDArray[np.float64]
     orientations: NDArray[np.float64]
     shield_params: ShieldParams
-    mu_by_isotope: Dict[str, object]
+    mu_by_isotope: dict[str, object]
 
     def __post_init__(self) -> None:
         """Validate and freeze canonical floating-point geometry arrays."""

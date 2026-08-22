@@ -1,4 +1,4 @@
-"""Tests for shared causal MeasurementLog v2 prefix publication."""
+"""Tests for shared causal MeasurementLog prefix publication."""
 
 from runtime.measurement_log import load_measurement_log
 from runtime.prefix import materialize_measurement_log_prefix

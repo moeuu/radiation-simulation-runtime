@@ -18,7 +18,7 @@ from numbers import Real
 from pathlib import Path
 import subprocess
 import tempfile
-from typing import Mapping, Sequence
+from collections.abc import Mapping, Sequence
 
 import numpy as np
 from numpy.typing import NDArray

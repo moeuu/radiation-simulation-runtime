@@ -7,7 +7,8 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
-from typing import Any, Sequence
+from typing import Any
+from collections.abc import Sequence
 
 from measurement.obstacle_assets import (
     DEFAULT_TRANSPORT_ISOTOPES,

@@ -251,7 +251,7 @@ def test_physics_only_hierarchical_marks_round_trip_and_match_torch() -> None:
     )
     model_path = (
         Path(__file__).resolve().parents[1]
-        / "configs/geant4/models/profiles/ral_eu154_physics_only_v4.json"
+        / "configs/geant4/models/profiles/ral_eu154_physics_only.json"
     )
     model = GeometryConditionedSpectralModel.from_manifest_payload(
         json.loads(model_path.read_text(encoding="utf-8"))
@@ -1689,7 +1689,7 @@ def test_legacy_component_candidate_without_physics_contract_is_rejected() -> No
         / "configs"
         / "geant4"
         / "models"
-        / "geometry_conditioned_full_spectrum_ral_eu154_component_v4.json"
+        / "geometry_conditioned_full_spectrum_ral_eu154_component.json"
     )
     with pytest.raises(ValueError, match="does not exactly reconstruct"):
         GeometryConditionedSpectralModel.from_manifest_payload(
@@ -1703,7 +1703,7 @@ def test_acceptance_contract_file_is_predeclared_and_hash_stable() -> None:
         Path(__file__).resolve().parents[1]
         / "configs"
         / "validation"
-        / "full_spectrum_acceptance_v1.json"
+        / "full_spectrum_acceptance.json"
     )
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload == full_spectrum_acceptance_contract_payload()

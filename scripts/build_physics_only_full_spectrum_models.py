@@ -17,6 +17,10 @@ from measurement.shielding import (
 from spectrum.additive_scatter import (
     PhysicsOnlyNoncollidedTransportResponse,
 )
+from spectrum.isotope_profiles import (
+    available_isotope_profiles,
+    require_isotope_profile,
+)
 from spectrum.transport_spectral import (
     GeometryConditionedSpectralModel,
     PhysicalComponentDiscrepancy,
@@ -36,14 +40,13 @@ def _canonical_bytes(payload: object) -> bytes:
     ).encode("utf-8")
 
 
-def build_assets(repository_root: Path) -> None:
-    """Replace registry profile targets with non-empirical model assets."""
+def build_assets(repository_root: Path) -> dict[str, object]:
+    """Build the complete current profile registry and its model assets."""
     registry_path = (
         repository_root
-        / "configs/geant4/models/isotope_profile_model_registry_v1.json"
+        / "configs/geant4/models/isotope_profile_model_registry.json"
     )
-    registry = json.loads(registry_path.read_text(encoding="utf-8"))
-    profiles = registry["profiles"]
+    profiles: dict[str, object] = {}
     response = PhysicsOnlyNoncollidedTransportResponse(
         detector_radius_m=DEFAULT_DETECTOR_CRYSTAL_RADIUS_CM / 100.0,
         fe_scatter_distance_m=(
@@ -57,10 +60,10 @@ def build_assets(repository_root: Path) -> None:
         )
         / 100.0,
     )
-    for profile_name, entry in sorted(profiles.items()):
-        isotopes = tuple(str(value) for value in entry["isotopes"])
+    for profile_name in available_isotope_profiles():
+        profile = require_isotope_profile(profile_name)
         model = GeometryConditionedSpectralModel.standard_native(
-            isotopes,
+            profile.isotopes,
             dead_time_tau_s=5.813e-9,
             background_rate_cps=12.0,
             physical_component_discrepancy=(
@@ -70,22 +73,28 @@ def build_assets(repository_root: Path) -> None:
         )
         relative_path = (
             "configs/geant4/models/profiles/"
-            f"{profile_name}_physics_only_v4.json"
+            f"{profile_name}_physics_only.json"
         )
         model_path = repository_root / relative_path
+        model_path.parent.mkdir(parents=True, exist_ok=True)
         model_bytes = _canonical_bytes(model.manifest_payload())
         model_path.write_bytes(model_bytes)
-        entry.update(
-            {
-                "model_path": relative_path,
-                "model_file_sha256": hashlib.sha256(model_bytes).hexdigest(),
-                "model_contract_hash_sha256": model.contract_hash_sha256,
-                "calibration_status": (
-                    "physics_only_no_scene_fit_runtime_unvalidated"
-                ),
-            }
-        )
+        profiles[profile_name] = {
+            "isotopes": list(profile.isotopes),
+            "model_path": relative_path,
+            "model_file_sha256": hashlib.sha256(model_bytes).hexdigest(),
+            "model_contract_hash_sha256": model.contract_hash_sha256,
+            "calibration_status": (
+                "physics_only_no_scene_fit_runtime_unvalidated"
+            ),
+        }
+    registry = {
+        "model": "isotope_profile_full_spectrum_registry",
+        "profiles": profiles,
+        "schema_version": 1,
+    }
     registry_bytes = _canonical_bytes(registry)
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
     registry_path.write_bytes(registry_bytes)
     registry_hash = hashlib.sha256(registry_bytes).hexdigest()
     standard_config_path = (
@@ -97,6 +106,7 @@ def build_assets(repository_root: Path) -> None:
     )
     standard_config["full_spectrum_model_registry_file_sha256"] = registry_hash
     standard_config_path.write_bytes(_canonical_bytes(standard_config))
+    return registry
 
 
 def main() -> None:

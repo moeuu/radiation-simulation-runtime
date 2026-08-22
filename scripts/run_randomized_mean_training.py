@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Sequence
+from collections.abc import Sequence
 
 from sim.runtime import load_runtime_config
 from spectrum.mean_calibration_runner import (
@@ -38,14 +38,14 @@ _DEFAULT_CONFIG = (
     / "variance_reduction_external_no_isaac_32threads.json"
 )
 _DEFAULT_OUTPUT_ROOT = (
-    _ROOT / "results" / "mean_calibration" / "randomized_geometry_family_v4"
+    _ROOT / "results" / "mean_calibration" / "randomized_geometry_family"
 )
 _DEFAULT_MODEL = (
     _ROOT
     / "configs"
     / "geant4"
     / "models"
-    / "geometry_conditioned_full_spectrum_randomized_mean_v3.json"
+    / "geometry_conditioned_full_spectrum_randomized_mean.json"
 )
 
 

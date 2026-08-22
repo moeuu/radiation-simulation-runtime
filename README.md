@@ -2,12 +2,12 @@
 
 This repository is the common simulation and observation-generation boundary for
 the rotating-shield estimators. It owns Geant4, environments, source realization,
-detector and Fe/Pb shield geometry, spectrum generation, and raw MeasurementLog v2
+detector and Fe/Pb shield geometry, spectrum generation, and raw MeasurementLog
 publication. It contains no PF, MLE, or hybrid estimator.
 
 ```text
 Rotating-shield-simulation-runtime
-  SimulationCommand -> Geant4 -> raw integer spectrum -> MeasurementLog v2
+  SimulationCommand -> Geant4 -> raw integer spectrum -> MeasurementLog
                                            |
                   +------------------------+------------------------+
                   |                        |                        |
@@ -37,12 +37,18 @@ uv run rotating-shield-sim generate-ral-scenario PRIVATE_SCENARIO.json \
   --runtime-config configs/geant4/variance_reduction_external_no_isaac_32threads.json \
   --source-profile ral-mix9
 uv run rotating-shield-sim calibrate-discrepancy CALIBRATION_ROWS.npz \
-  discrepancy-calibration.json --calibration-id ral-independent-v1
+  discrepancy-calibration.json --calibration-id ral-independent
 ```
 
 `run-plan` reads source truth only from the private plan, durably records each raw
 observation before returning it to a controller, and never writes source truth into
-MeasurementLog v2.
+MeasurementLog.
+
+The shared geometry-conditioned spectrum model exposes exact NumPy and Torch
+predictive samplers. Its Torch path keeps renewal/Gamma-Poisson totals, calibrated
+energy marks, and integer spectra on the caller's device and supports canonical
+per-action seeds, allowing PF planning to continue directly into the Torch cross
+likelihood without a bulk device-to-host round trip.
 
 `run-adaptive-session` is the closed-loop boundary. Its private scenario contains
 the realized sources, environment/obstacles, physical runtime configuration, and
@@ -58,7 +64,7 @@ An interrupted adaptive acquisition can resume from its hidden stream stage with
 `--resume-stage`. The runtime authenticates the static acquisition identity and
 every durable record shard, discards an incomplete station tail, copies through the
 last `station_complete` boundary, restores pose/yaw/Fe/Pb state, and returns the
-adopted truth-free prefix in a schema-v2 ready event. The original stage is never
+adopted truth-free prefix in a canonical ready event. The original stage is never
 modified. Resume under a different runtime commit fails closed unless
 `--resume-compatibility COMPATIBILITY.json` supplies explicit provenance. The same
 surface is available to Python callers through `AdaptiveRuntimeSession.resume(...)`

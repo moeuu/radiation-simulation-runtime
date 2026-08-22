@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
 import numpy as np
@@ -12,6 +14,7 @@ from measurement.obstacles import ObstacleGrid
 from measurement.source_surfaces import generate_surface_sources
 from measurement.surface_charts import build_surface_chart_geometry
 from runtime_environment import build_runtime_obstacle_environment
+from scripts.build_physics_only_full_spectrum_models import build_assets
 from sim.runtime import load_runtime_config
 from sim.geant4_app.app import Geant4AppConfig
 from spectrum.isotope_profiles import (
@@ -124,12 +127,63 @@ def test_every_isotope_profile_resolves_an_authenticated_pf_model(
     assert model.runtime_ready is True
 
 
+def test_profile_directory_contains_only_registered_models() -> None:
+    """Profile assets must not retain superseded unreferenced generations."""
+    root = Path(__file__).resolve().parents[1]
+    registry_path = (
+        root
+        / "configs/geant4/models/isotope_profile_model_registry.json"
+    )
+    registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    registered = {
+        root / entry["model_path"]
+        for entry in registry["profiles"].values()
+    }
+    profile_directory = root / "configs/geant4/models/profiles"
+    present = set(profile_directory.glob("*.json"))
+
+    assert present == registered
+
+
+def test_profile_builder_reproduces_current_registry(tmp_path: Path) -> None:
+    """The sole profile builder must reproduce every committed profile asset."""
+    root = Path(__file__).resolve().parents[1]
+    config_path = (
+        tmp_path
+        / "configs/geant4/variance_reduction_external_no_isaac_32threads.json"
+    )
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text("{}\n", encoding="utf-8")
+
+    generated = build_assets(tmp_path)
+    committed_path = (
+        root
+        / "configs/geant4/models/isotope_profile_model_registry.json"
+    )
+    committed = json.loads(committed_path.read_text(encoding="utf-8"))
+
+    assert generated == committed
+    for entry in generated["profiles"].values():
+        relative_path = Path(entry["model_path"])
+        assert (tmp_path / relative_path).read_bytes() == (
+            root / relative_path
+        ).read_bytes()
+    generated_registry_path = (
+        tmp_path
+        / "configs/geant4/models/isotope_profile_model_registry.json"
+    )
+    generated_config = json.loads(config_path.read_text(encoding="utf-8"))
+    assert generated_config["full_spectrum_model_registry_file_sha256"] == (
+        hashlib.sha256(generated_registry_path.read_bytes()).hexdigest()
+    )
+
+
 def test_profile_registry_digest_fails_closed() -> None:
     """A stale or substituted profile registry must not select a PF model."""
     root = Path(__file__).resolve().parents[1]
     registry_path = (
         root
-        / "configs/geant4/models/isotope_profile_model_registry_v1.json"
+        / "configs/geant4/models/isotope_profile_model_registry.json"
     )
 
     with pytest.raises(ValueError, match="registry SHA-256"):

@@ -31,7 +31,7 @@ identity. The runtime intentionally rejects an Eu-152 or Nb-94 profile paired
 with the legacy Eu-154 model; selecting a truth isotope without a matching PF
 state would make correct inference impossible.
 
-`configs/geant4/models/isotope_profile_model_registry_v1.json` binds every
+`configs/geant4/models/isotope_profile_model_registry.json` binds every
 profile to one model file, file digest, and model-contract digest. The RA-L
 Eu-154 entry includes the designated-training discrepancy model. Other
 profiles currently use their matching physical line mean and are explicitly
@@ -89,7 +89,7 @@ uv run python scripts/run_decay_cascade_comparison.py
 ```
 
 The immutable design is
-`configs/validation/decay_cascade_comparison_v1.json`. It compares Co-60,
+`configs/validation/decay_cascade_comparison.json`. It compares Co-60,
 Eu-152, and Eu-154 at 1.5, 2.5, and 4.0 m with the exact detector assembly from
 the standard runtime configuration. Independent isotope/distance cases run in
 bounded process-parallel workers, and each Geant4 process remains

@@ -1,10 +1,11 @@
-"""Read-only record views exported by the shared MeasurementLog v2 runtime."""
+"""Read-only record views exported by the shared MeasurementLog runtime."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any
+from collections.abc import Mapping
 
 from runtime.measurement_log import (
     MEASUREMENT_LOG_SCHEMA_VERSION,
@@ -34,7 +35,7 @@ def validate_truth_free_estimator_input(
 
 @dataclass(frozen=True)
 class RunContext:
-    """Expose estimator-neutral run metadata derived from MeasurementLog v2."""
+    """Expose estimator-neutral run metadata derived from a MeasurementLog."""
 
     repository_commit: str
     runtime_config: Mapping[str, Any]

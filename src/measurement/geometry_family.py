@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import TYPE_CHECKING, Mapping, Sequence
+from typing import TYPE_CHECKING
+from collections.abc import Mapping, Sequence
 
 import numpy as np
 

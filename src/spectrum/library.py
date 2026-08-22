@@ -14,7 +14,7 @@ import hashlib
 import json
 import math
 from types import MappingProxyType
-from typing import Dict, List, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 
 
 @dataclass(frozen=True)
@@ -301,18 +301,18 @@ _NUCLIDES: Mapping[str, Nuclide] = MappingProxyType(
 
 
 # Positive lines used by the native full-spectrum contract.
-KEY_LINES_KEV: Dict[str, List[float]] = {
+KEY_LINES_KEV: dict[str, list[float]] = {
     isotope: [float(line.energy_keV) for line in nuclide.lines]
     for isotope, nuclide in _NUCLIDES.items()
 }
 
 
-def get_detection_lines_keV(isotope: str) -> List[float]:
+def get_detection_lines_keV(isotope: str) -> list[float]:
     """Return configured positive transport lines in keV."""
     return list(KEY_LINES_KEV.get(isotope, []))
 
 
-def default_library() -> Dict[str, Nuclide]:
+def default_library() -> dict[str, Nuclide]:
     """Return an independent mapping of supported evaluated nuclides."""
     return dict(_NUCLIDES)
 

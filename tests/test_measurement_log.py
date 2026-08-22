@@ -24,7 +24,7 @@ from measurement.obstacles import ObstacleGrid
 from tests.runtime_test_support import make_measurement_log, records
 
 
-def test_schema_v2_round_trip_preserves_raw_integer_spectra(tmp_path) -> None:
+def test_measurement_log_round_trip_preserves_raw_integer_spectra(tmp_path) -> None:
     """Canonical storage must preserve the event histogram without projection."""
     root = make_measurement_log(tmp_path / "measurement-log")
 
@@ -326,7 +326,7 @@ def test_environment_rejects_hollow_asset_serialized_as_solid_box() -> None:
         transport_boxes_m=(solid_envelope,),
     )
     payload = {
-        "environment_model_id": "hollow-contract-test.v1",
+        "environment_model_id": "hollow-contract-test",
         "size_x": 3.0,
         "size_y": 3.0,
         "size_z": 2.5,

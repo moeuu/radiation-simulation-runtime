@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Sequence
+from typing import Literal
+from collections.abc import Sequence
 
 from measurement.obstacle_assets import (
     DEFAULT_TRANSPORT_ISOTOPES,

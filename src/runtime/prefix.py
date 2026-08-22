@@ -1,11 +1,11 @@
-"""Causal prefix publication for raw full-spectrum MeasurementLog v2."""
+"""Causal prefix publication for a raw full-spectrum MeasurementLog."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
-from typing import Sequence
+from collections.abc import Sequence
 
 from runtime.measurement_log import (
     MeasurementLogRecord,

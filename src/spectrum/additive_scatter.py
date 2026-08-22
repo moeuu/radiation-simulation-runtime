@@ -16,7 +16,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 from types import MappingProxyType
-from typing import Mapping, Sequence
+from collections.abc import Mapping, Sequence
 
 import numpy as np
 from numpy.typing import NDArray

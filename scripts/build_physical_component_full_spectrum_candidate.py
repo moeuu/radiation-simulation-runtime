@@ -6,7 +6,7 @@ import argparse
 import json
 import math
 from pathlib import Path
-from typing import Mapping, Sequence
+from collections.abc import Mapping, Sequence
 
 import numpy as np
 from scipy import stats
@@ -58,31 +58,31 @@ except ModuleNotFoundError:
 
 _ROOT = Path(__file__).resolve().parents[1]
 _DEFAULT_TRAINING_ROOT = (
-    _ROOT / "results" / "randomized_component_training_v2"
+    _ROOT / "results" / "randomized_component_training"
 )
 _DEFAULT_BASE_MODEL = (
     _ROOT
     / "configs"
     / "geant4"
     / "models"
-    / "geometry_conditioned_full_spectrum_randomized_mean_v3.json"
+    / "geometry_conditioned_full_spectrum_randomized_mean.json"
 )
 _DEFAULT_MEAN_CORRECTION = (
     _ROOT
     / "configs"
     / "geant4"
     / "models"
-    / "low_rank_spectral_mean_correction_randomized_v4.json"
+    / "low_rank_spectral_mean_correction_randomized.json"
 )
 _DEFAULT_MEAN_TRAINING_ROOT = (
-    _ROOT / "results" / "mean_calibration" / "randomized_geometry_family_v4"
+    _ROOT / "results" / "mean_calibration" / "randomized_geometry_family"
 )
 _DEFAULT_OUTPUT_MODEL = (
     _ROOT
     / "configs"
     / "geant4"
     / "models"
-    / "geometry_conditioned_full_spectrum_ral_eu154_component_v4.json"
+    / "geometry_conditioned_full_spectrum_ral_eu154_component.json"
 )
 _DEFAULT_SELECTION = (
     _DEFAULT_TRAINING_ROOT / "component_discrepancy_selection.json"

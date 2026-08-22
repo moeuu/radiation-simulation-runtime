@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from typing import Callable, Dict, Iterable
+from collections.abc import Callable, Iterable
 
 import numpy as np
 from numpy.typing import NDArray
@@ -297,7 +297,7 @@ def energy_dependent_efficiency(e_keV: np.ndarray | float) -> np.ndarray:
 
 def build_response_matrix(
     energy_axis: NDArray[np.float64],
-    library: Dict[str, Nuclide],
+    library: dict[str, Nuclide],
     resolution_fn: Callable[[float], float],
     efficiency_fn: Callable[[float], float],
     bin_width_keV: float | None = None,

@@ -22,7 +22,7 @@ import json
 import math
 import os
 from pathlib import Path
-from typing import Mapping, Sequence
+from collections.abc import Mapping, Sequence
 
 import numpy as np
 from numpy.typing import NDArray

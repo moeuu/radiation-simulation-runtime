@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
-from typing import Sequence, Tuple
+from collections.abc import Sequence
 
 import numpy as np
 from numpy.typing import NDArray
@@ -276,7 +276,7 @@ def line_resolved_shield_mu_by_isotope(
     return result
 
 
-def cartesian_to_spherical(vec: NDArray[np.float64]) -> Tuple[float, float, float]:
+def cartesian_to_spherical(vec: NDArray[np.float64]) -> tuple[float, float, float]:
     """
     Convert a Cartesian vector to spherical coordinates (r, theta, phi).
 
@@ -464,7 +464,7 @@ def resolve_mu_values(
     isotope: str,
     default_fe: float,
     default_pb: float,
-) -> Tuple[float, float]:
+) -> tuple[float, float]:
     """
     Resolve per-isotope attenuation coefficients for Fe/Pb.
 

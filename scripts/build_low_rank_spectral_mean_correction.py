@@ -6,7 +6,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
-from typing import Mapping, Sequence
+from collections.abc import Mapping, Sequence
 
 import numpy as np
 
@@ -28,27 +28,27 @@ _DEFAULT_TRAINING_ROOT = (
     _ROOT
     / "results"
     / "mean_calibration"
-    / "randomized_geometry_family_v4"
+    / "randomized_geometry_family"
 )
 _DEFAULT_BASE_MODEL = (
     _ROOT
     / "configs"
     / "geant4"
     / "models"
-    / "geometry_conditioned_full_spectrum_randomized_mean_v3.json"
+    / "geometry_conditioned_full_spectrum_randomized_mean.json"
 )
 _DEFAULT_OUTPUT = (
     _ROOT
     / "configs"
     / "geant4"
     / "models"
-    / "low_rank_spectral_mean_correction_randomized_v4.json"
+    / "low_rank_spectral_mean_correction_randomized.json"
 )
 _DEFAULT_SELECTION = (
     _ROOT
     / "results"
-    / "randomized_component_training_v2"
-    / "low_rank_mean_selection_v4.json"
+    / "randomized_component_training"
+    / "low_rank_mean_selection.json"
 )
 _TRAINING_SCENE_SEEDS = DESIGNATED_TRAINING_SCENE_SEEDS
 _TRAINING_SCENARIOS = tuple(

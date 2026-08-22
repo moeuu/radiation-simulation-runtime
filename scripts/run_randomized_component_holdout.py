@@ -11,7 +11,7 @@ import argparse
 from contextlib import AbstractContextManager
 import json
 from pathlib import Path
-from typing import Sequence
+from collections.abc import Sequence
 
 import numpy as np
 
@@ -47,9 +47,9 @@ _DEFAULT_CANDIDATE = (
     / "configs"
     / "geant4"
     / "models"
-    / "geometry_conditioned_full_spectrum_ral_eu154_component_v4.json"
+    / "geometry_conditioned_full_spectrum_ral_eu154_component.json"
 )
-_DEFAULT_OUTPUT = _ROOT / "results" / "randomized_component_holdout_v4"
+_DEFAULT_OUTPUT = _ROOT / "results" / "randomized_component_holdout"
 
 
 def _parser() -> argparse.ArgumentParser:

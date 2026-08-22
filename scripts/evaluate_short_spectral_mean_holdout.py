@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Mapping, Sequence
+from collections.abc import Mapping, Sequence
 
 import numpy as np
 
@@ -23,14 +23,14 @@ _DEFAULT_BASE_MODEL = (
     / "configs"
     / "geant4"
     / "models"
-    / "geometry_conditioned_full_spectrum_exact_v1.json"
+    / "geometry_conditioned_full_spectrum_exact.json"
 )
 _DEFAULT_CANDIDATE_MODEL = (
     _ROOT
     / "configs"
     / "geant4"
     / "models"
-    / "geometry_conditioned_full_spectrum_ral_eu154_training_v4.json"
+    / "geometry_conditioned_full_spectrum_ral_eu154_training.json"
 )
 
 

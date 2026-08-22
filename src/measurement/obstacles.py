@@ -7,7 +7,8 @@ import json
 import math
 from numbers import Real
 from pathlib import Path
-from typing import Iterable, Literal, Mapping, Sequence
+from typing import Literal
+from collections.abc import Iterable, Mapping, Sequence
 
 import numpy as np
 

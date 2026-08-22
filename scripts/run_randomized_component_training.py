@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from contextlib import AbstractContextManager
 from pathlib import Path
-from typing import Sequence
+from collections.abc import Sequence
 
 from spectrum.full_spectrum_acceptance_runner import (
     ACCEPTANCE_ISOTOPES,
@@ -34,7 +34,7 @@ _DEFAULT_CONFIG = (
     / "geant4"
     / "variance_reduction_external_no_isaac_32threads.json"
 )
-_DEFAULT_OUTPUT = _ROOT / "results" / "randomized_component_training_v2"
+_DEFAULT_OUTPUT = _ROOT / "results" / "randomized_component_training"
 
 
 def _parser() -> argparse.ArgumentParser:

@@ -73,7 +73,7 @@ def test_predeclared_design_loads_without_hidden_defaults() -> None:
         Path(__file__).resolve().parents[1]
         / "configs"
         / "validation"
-        / "decay_cascade_comparison_v1.json"
+        / "decay_cascade_comparison.json"
     )
     design = load_decay_cascade_comparison_design(path)
     assert design.isotopes == ("Co-60", "Eu-152", "Eu-154")

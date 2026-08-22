@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from typing import Mapping
+from collections.abc import Mapping
 
 
 OBSTACLE_MATERIAL_CONTRACT_ID = "known_composite_materials_xcom_v1"

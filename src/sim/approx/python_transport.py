@@ -34,6 +34,7 @@ from spectrum.library import default_library
 from spectrum.response_matrix import (
     NATIVE_GEANT4_BIN_COUNT,
     NATIVE_GEANT4_BIN_WIDTH_KEV,
+    NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256,
     backscatter_energy,
     build_native_geant4_detector_response_matrix,
     compton_continuum_shape,
@@ -557,8 +558,9 @@ class PythonTransportSpectrumModel:
                 np.asarray(total_mean / live_time, dtype=np.float64),
                 np.asarray(live_time, dtype=np.float64),
                 dead_time_tau_s=float(self.dead_time_s),
+                sample_count=1,
                 rng=rng,
-            )
+            )[0]
         )
         if total_count <= 0:
             return np.zeros(expected.shape, dtype=np.int64)
@@ -602,6 +604,17 @@ class PythonTransportSpectrumModel:
             "dead_time_s": float(self.dead_time_s),
             "background_rate_cps": float(self.background_rate_cps),
             "raw_integer_spectrum": True,
+            "detector_scoring_mode": "incident_gamma_energy",
+            "detector_response_applied_in_native": True,
+            "detector_response_sampling_mode": (
+                "multinomial_marking_with_nonparalyzable_event_time"
+            ),
+            "detector_response_sampling_model": (
+                "shared_native_response_matrix_conditional_multinomial"
+            ),
+            "detector_response_sampling_contract_sha256": (
+                NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
+            ),
         }
         if self.detector_model:
             metadata["detector_model"] = dict(self.detector_model)

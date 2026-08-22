@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
 from measurement.model import PointSource
+from sim.approx.python_transport import PythonTransportSpectrumModel
 from sim.isaacsim_app.stage_backend import StageMaterialInfo
+from sim.protocol import SimulationCommand
 from sim.transport import build_source_transport_result, make_transport_segment
 
 
@@ -33,3 +36,54 @@ def test_build_source_transport_result_tracks_obstacle_and_scatter() -> None:
     assert len(result.lines) == 1
     assert result.lines[0].total_transmission <= 1.0
     assert result.lines[0].scatter_counts >= 0.0
+
+
+def test_python_transport_samples_one_renewal_total() -> None:
+    """The analytic observation path must request exactly one renewal draw."""
+    model = PythonTransportSpectrumModel(
+        rng_seed=17,
+        dead_time_s=5.813e-9,
+    )
+    expected = np.zeros_like(model.energy_axis_keV)
+    expected[100:103] = np.asarray([8.0, 5.0, 2.0])
+
+    sampled = model.sample_spectrum(expected, step_id=3, live_time_s=1.0)
+
+    assert sampled.shape == expected.shape
+    assert sampled.dtype == np.dtype(np.int64)
+    assert np.all(sampled >= 0)
+    assert int(np.sum(sampled)) > 0
+
+
+def test_python_transport_observation_preserves_integer_event_histogram() -> None:
+    """Analytic observations must retain exact integer counts through the wire type."""
+    model = PythonTransportSpectrumModel(
+        sources=[
+            PointSource(
+                isotope="Cs-137",
+                position=(1.0, 1.0, 0.0),
+                intensity_cps_1m=300_000.0,
+            )
+        ],
+        rng_seed=19,
+        dead_time_s=5.813e-9,
+    )
+    command = SimulationCommand(
+        step_id=0,
+        target_pose_xyz=(0.5, 0.5, 0.5),
+        target_base_yaw_rad=0.0,
+        fe_orientation_index=0,
+        pb_orientation_index=0,
+        dwell_time_s=0.1,
+    )
+
+    observation = model.observe(
+        command,
+        detector_pose_xyz=command.target_pose_xyz,
+        backend_label="analytic",
+    )
+
+    assert observation.metadata["detector_response_sampling_mode"] == (
+        "multinomial_marking_with_nonparalyzable_event_time"
+    )
+    assert all(isinstance(value, int) for value in observation.spectrum_counts)

@@ -7,7 +7,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
-from typing import Mapping, Sequence
+from collections.abc import Mapping, Sequence
 
 from measurement.source_boundary import (
     SURFACE_EMISSION_EPSILON_M,

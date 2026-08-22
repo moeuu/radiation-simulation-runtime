@@ -4,11 +4,11 @@
 
 This repository is the sole production owner of rotating-shield simulation,
 environment generation, detector and shield geometry, Geant4 transport, raw
-observation generation, and MeasurementLog v2 publication.
+observation generation, and MeasurementLog publication.
 
 - Do not add PF, MLE, hybrid inference, estimator planning, posterior summaries,
   or estimator-specific rescue logic.
-- Estimators connect through `SimulationCommand` and immutable MeasurementLog v2
+- Estimators connect through `SimulationCommand` and immutable MeasurementLog
   artifacts. They must not receive realized source truth.
 - Keep Geant4 physics fidelity and the event-level observation distribution
   unchanged when optimizing runtime performance.
@@ -23,4 +23,3 @@ observation generation, and MeasurementLog v2 publication.
 - Production spectra are exact nonnegative int64 unit-weight event histograms.
 - Background and non-paralyzable dead time are applied exactly once.
 - Runtime shortcuts that change physics or observation statistics are forbidden.
-

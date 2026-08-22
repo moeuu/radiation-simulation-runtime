@@ -1,4 +1,4 @@
-"""Materialize a completed MeasurementLog v2 stream stage for diagnosis.
+"""Materialize a completed MeasurementLog stream stage for diagnosis.
 
 The source stage is copied through the runtime's verified resume reader.  The
 source write-ahead log is never modified or removed, and no truth payload is

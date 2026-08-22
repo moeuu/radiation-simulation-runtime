@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Sequence
+from collections.abc import Sequence
 
 from sim.runtime import load_runtime_config
 from spectrum.additive_scatter import (

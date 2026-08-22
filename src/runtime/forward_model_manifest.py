@@ -1,4 +1,4 @@
-"""Strict physical identity contract for full-spectrum MeasurementLog v2."""
+"""Strict physical identity contract for a full-spectrum MeasurementLog."""
 
 from __future__ import annotations
 

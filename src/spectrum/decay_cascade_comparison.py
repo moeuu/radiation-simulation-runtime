@@ -15,7 +15,7 @@ import json
 import math
 from pathlib import Path
 import subprocess
-from typing import Mapping, Sequence
+from collections.abc import Mapping, Sequence
 
 import numpy as np
 from numpy.typing import NDArray

@@ -24,7 +24,8 @@ import json
 import math
 import os
 from pathlib import Path
-from typing import Callable, Mapping, Protocol, Sequence
+from typing import Protocol
+from collections.abc import Callable, Mapping, Sequence
 
 import numpy as np
 from numpy.typing import NDArray

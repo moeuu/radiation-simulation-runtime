@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Mapping, Sequence
+from collections.abc import Mapping, Sequence
 
 import numpy as np
 
@@ -37,27 +37,27 @@ _DEFAULT_BASE_MODEL = (
     / "configs"
     / "geant4"
     / "models"
-    / "geometry_conditioned_full_spectrum_exact_v1.json"
+    / "geometry_conditioned_full_spectrum_exact.json"
 )
 _DEFAULT_OUTPUT_MODEL = (
     _ROOT
     / "configs"
     / "geant4"
     / "models"
-    / "geometry_conditioned_full_spectrum_ral_eu154_training_v4.json"
+    / "geometry_conditioned_full_spectrum_ral_eu154_training.json"
 )
 _DEFAULT_SELECTION = (
     _ROOT
     / "results"
     / "full_spectrum_short_diagnostic"
-    / "training_selection_view_conditioned_v4.json"
+    / "training_selection_view_conditioned.json"
 )
 _DEFAULT_MEAN_CORRECTION = (
     _ROOT
     / "configs"
     / "geant4"
     / "models"
-    / "low_rank_spectral_mean_correction_v1.json"
+    / "low_rank_spectral_mean_correction.json"
 )
 _DEFAULT_MEAN_TRAINING_ROOT = (
     _ROOT

@@ -16,7 +16,7 @@ import math
 from pathlib import Path
 import time
 from types import MappingProxyType
-from typing import Mapping, Sequence
+from collections.abc import Mapping, Sequence
 
 import numpy as np
 from numpy.typing import NDArray
@@ -3669,7 +3669,7 @@ class GeometryConditionedSpectralModel:
         if not isinstance(descriptor, Mapping):
             raise RuntimeError(
                 "Physical-component discrepancy requires an authenticated "
-                "geometry_family descriptor in MeasurementLog v2."
+                "geometry_family descriptor in the MeasurementLog."
             )
         try:
             validate_geometry_family_descriptor(
@@ -4214,7 +4214,7 @@ class GeometryConditionedSpectralModel:
         if bool(invalid.item()):
             raise ValueError(
                 "Torch spectrum transport values are invalid or uncollided "
-                "contributions exceed total incident contributions."
+                "contributions cannot exceed total incident contributions."
             )
         uncollided = torch.minimum(uncollided, total)
         (
@@ -6881,6 +6881,39 @@ class GeometryConditionedSpectralModel:
                 1,
             )
         return result
+
+    def sample_predictive_torch(
+        self,
+        total_line_contributions_xvsl: object,
+        uncollided_line_contributions_xvsl: object,
+        transport_features_xvslf: object,
+        live_times_s_v: object,
+        *,
+        sample_count: int,
+        generator: object | None = None,
+        action_seeds_a: object | None = None,
+    ) -> object:
+        """Draw exact future spectra without leaving the Torch device.
+
+        An explicit device-matched generator is required for an unseeded
+        action batch.  When ``action_seeds_a`` is supplied, its leading action
+        axis is sampled with independent canonical streams, so action ordering
+        and outer chunking cannot alter any action's draws.
+        """
+        from spectrum.predictive_torch import (
+            sample_geometry_conditioned_predictive_torch,
+        )
+
+        return sample_geometry_conditioned_predictive_torch(
+            self,
+            total_line_contributions_xvsl,
+            uncollided_line_contributions_xvsl,
+            transport_features_xvslf,
+            live_times_s_v,
+            sample_count=sample_count,
+            generator=generator,
+            action_seeds_a=action_seeds_a,
+        )
 
     def sample_predictive_numpy(
         self,

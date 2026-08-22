@@ -12,7 +12,8 @@ from pathlib import Path
 import re
 import shutil
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any
+from collections.abc import Mapping, Sequence
 import zipfile
 
 import numpy as np
@@ -554,7 +555,7 @@ class MeasurementLogRecord:
 
     @property
     def spectrum_variance(self) -> None:
-        """Return no derived variance because schema v2 stores raw counts only."""
+        """Return no derived variance because MeasurementLog stores raw counts."""
         return None
 
     @property
@@ -719,7 +720,7 @@ class MeasurementLogRecord:
 
 @dataclass(frozen=True)
 class MeasurementLog:
-    """Store a validated MeasurementLog v2 bundle without evaluation truth."""
+    """Store a validated MeasurementLog bundle without evaluation truth."""
 
     run_manifest: Mapping[str, Any]
     runtime_config: Mapping[str, Any]
@@ -1242,7 +1243,7 @@ def _records_to_arrays(
             energy_edges,
         ):
             raise MeasurementLogValidationError(
-                "Every schema-v2 record must use identical energy-bin edges."
+                "Every MeasurementLog record must use identical energy-bin edges."
             )
     count = len(records)
     spectra = np.stack(
@@ -1315,7 +1316,7 @@ def _write_measurement_log_unpublished(
     obstacle_layout_path: str | None = None,
     source_layout_path: str | None = None,
 ) -> MeasurementLog:
-    """Write a complete canonical MeasurementLog v2 bundle and reload it."""
+    """Write a complete canonical MeasurementLog bundle and reload it."""
     _validate_source_layout_sentinel(
         source_layout_path,
         location="run_manifest.source_layout_path",
@@ -1549,7 +1550,7 @@ def _load_json_object(path: Path) -> dict[str, Any]:
 
 
 def _validate_run_manifest(payload: Mapping[str, Any]) -> dict[str, Any]:
-    """Validate the canonical schema-v2 manifest without legacy aliases."""
+    """Validate the canonical manifest without legacy aliases."""
     if set(payload) != _RUN_MANIFEST_FIELDS:
         missing = sorted(_RUN_MANIFEST_FIELDS - set(payload))
         unknown = sorted(set(payload) - _RUN_MANIFEST_FIELDS)
@@ -1710,7 +1711,7 @@ def _validate_run_manifest(payload: Mapping[str, Any]) -> dict[str, Any]:
     conventions = payload.get("index_conventions")
     if conventions != _INDEX_CONVENTIONS:
         raise MeasurementLogValidationError(
-            "index_conventions do not match schema-v2 causal index semantics."
+            "index_conventions do not match canonical causal index semantics."
         )
     artifact_hashes = payload.get("artifact_hashes")
     if not isinstance(artifact_hashes, Mapping):

@@ -7,7 +7,7 @@ import hashlib
 import json
 from pathlib import Path
 from types import MappingProxyType
-from typing import Mapping, Sequence
+from collections.abc import Mapping, Sequence
 
 from spectrum.library import require_nuclide
 

@@ -9,7 +9,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from numbers import Integral, Real
 import re
-from typing import Callable, Dict, TypeVar
+from typing import TypeVar
+from collections.abc import Callable
 
 import numpy as np
 from numpy.typing import NDArray
@@ -31,7 +32,6 @@ from spectrum.additive_scatter import (
     AdditiveNoncollidedTransportResponse,
     DETECTOR_CONE_AIR_XCOM_SINGLE_SCATTER_BASIS_SEMANTICS,
     DETECTOR_CONE_SCATTER_BASIS_SEMANTICS,
-    DETECTOR_CONE_SINGLE_SCATTER_BASIS_SEMANTICS,
     PhysicsOnlyNoncollidedTransportResponse,
     klein_nishina_forward_cone_fraction_numpy,
     klein_nishina_forward_cone_fraction_torch,
@@ -229,7 +229,7 @@ def _normalize_isotope_key(isotope: str) -> str:
 
 def resolve_obstacle_mu_cm_inv(
     isotope: str,
-    mu_by_isotope: Dict[str, float] | None = None,
+    mu_by_isotope: dict[str, float] | None = None,
 ) -> float:
     """Resolve concrete obstacle attenuation coefficient in 1/cm for an isotope."""
     table = mu_by_isotope if mu_by_isotope is not None else CONCRETE_MU_CM_INV
@@ -1336,7 +1336,7 @@ class ContinuousKernel:
     attenuation exp(-mu * L) for Fe/Pb shells.
     """
 
-    mu_by_isotope: Dict[str, object] | None = None
+    mu_by_isotope: dict[str, object] | None = None
     shield_params: ShieldParams = field(default_factory=ShieldParams)
     octant_shield: OctantShield = OctantShield()
     orientations: NDArray[np.float64] = field(
@@ -1347,7 +1347,7 @@ class ContinuousKernel:
     gpu_dtype: str = "float32"
     obstacle_grid: ObstacleGrid | None = None
     obstacle_height_m: float = 2.0
-    obstacle_mu_by_isotope: Dict[str, float] | None = None
+    obstacle_mu_by_isotope: dict[str, float] | None = None
     obstacle_buildup_coeff: float = 0.0
     detector_radius_m: float = 0.0
     detector_aperture_radius_m: float | None = None
@@ -1355,7 +1355,7 @@ class ContinuousKernel:
     detector_aperture_sampling: str = "solid_angle_cone"
     source_extent_radius_m: float = 0.0
     source_extent_samples: int = 1
-    line_mu_by_isotope: Dict[str, object] | None = None
+    line_mu_by_isotope: dict[str, object] | None = None
     additive_scatter_response: (
         AdditiveNoncollidedTransportResponse
         | PhysicsOnlyNoncollidedTransportResponse
@@ -7194,7 +7194,7 @@ def expected_counts_single_isotope(
     duration: float,
     isotope_id: str | None = None,
     kernel: ContinuousKernel | None = None,
-    mu_by_isotope: Dict[str, object] | None = None,
+    mu_by_isotope: dict[str, object] | None = None,
     shield_params: ShieldParams | None = None,
     use_gpu: bool | None = None,
     gpu_device: str = "cuda",

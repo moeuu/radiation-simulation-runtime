@@ -27,3 +27,18 @@ The profile registry hash proves which model asset was loaded. It does not
 claim independent accuracy validation. `runtime_ready` permits normal runs;
 `production_ready` remains validation metadata and does not couple ordinary
 startup to the optional long all-64 evaluation.
+
+## Versioned asset retention
+
+Only model assets referenced by the current runtime, registry, builders, tests,
+or documentation are kept in this production repository. Superseded training
+and profile generations remain recoverable from Git history instead of living
+beside the active assets. The profile directory is intentionally limited to the
+seven `physics_only` files authenticated by
+`isotope_profile_model_registry.json`.
+
+Generation suffixes are omitted when only one active asset exists. Explicit
+serialized schema numbers and stable contract identifiers remain versioned
+when their values participate in authentication or compatibility checks.
+MeasurementLog publication is fixed at schema version 2 and has no schema-1
+compatibility writer or loader.

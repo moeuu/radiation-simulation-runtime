@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
-from typing import Sequence
+from collections.abc import Sequence
 
 import numpy as np
 from numpy.typing import NDArray

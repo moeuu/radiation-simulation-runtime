@@ -8,7 +8,7 @@ from datetime import datetime
 import json
 from pathlib import Path
 import shutil
-from typing import Mapping, Sequence
+from collections.abc import Mapping, Sequence
 
 import matplotlib
 
@@ -26,7 +26,7 @@ from spectrum.decay_cascade_comparison import (
 
 _ROOT = Path(__file__).resolve().parents[1]
 _DEFAULT_DESIGN = (
-    _ROOT / "configs" / "validation" / "decay_cascade_comparison_v1.json"
+    _ROOT / "configs" / "validation" / "decay_cascade_comparison.json"
 )
 _DEFAULT_RUNTIME_CONFIG = (
     _ROOT
@@ -252,4 +252,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

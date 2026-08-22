@@ -7,7 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
-from typing import Mapping, Sequence
+from collections.abc import Mapping, Sequence
 
 import numpy as np
 
@@ -55,7 +55,7 @@ _DEFAULT_OUTPUT = (
 _IMPLEMENTATION_STATIC_PATHS = (
     Path("pyproject.toml"),
     Path("uv.lock"),
-    Path("configs/validation/full_spectrum_acceptance_v1.json"),
+    Path("configs/validation/full_spectrum_acceptance.json"),
     Path("scripts/run_full_spectrum_all64_acceptance.py"),
 )
 
