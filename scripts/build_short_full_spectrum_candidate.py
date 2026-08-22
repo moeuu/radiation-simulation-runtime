@@ -83,7 +83,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Select a global discrepancy from declared training artifacts "
-            "without reading any holdout or failed PF replay."
+            "without reading any holdout or failed PF run."
         )
     )
     parser.add_argument("--training-root", type=Path, default=_DEFAULT_TRAINING_ROOT)
