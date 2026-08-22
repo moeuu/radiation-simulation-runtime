@@ -1,0 +1,46 @@
+{
+  "record": {
+    "action_id": 0,
+    "detector_pose_xyz": [
+      1.0,
+      2.0,
+      0.5
+    ],
+    "detector_quat_wxyz": [
+      1.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "energy_bin_edges_keV": [
+      10.0,
+      20.0,
+      30.0
+    ],
+    "fe_orientation_index": 1,
+    "live_time_s": 3.0,
+    "metadata": {
+      "full_spectrum_contract_hash_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "station_complete": true
+    },
+    "pb_orientation_index": 2,
+    "shield_actuation_time_s": 0.5,
+    "spectrum_counts": [
+      7,
+      11
+    ],
+    "station_id": 0,
+    "step_id": 0,
+    "travel_time_s": 4.0
+  },
+  "record_digest": {
+    "algorithm": "rotating-shield-runtime.measurement-records-v2+canonical-json-sha256",
+    "sha256": "8037f91a03a300eb36138ffa5cc16bd0e4616720aeaa26a2a1bf0de5ae9d2e3a"
+  },
+  "schema_version": 1,
+  "source_run_id": "golden-run",
+  "station_boundaries_digest": {
+    "algorithm": "rotating-shield-runtime.station-boundaries-v1+canonical-json-sha256",
+    "sha256": "976f990166783884c41a06ad1ed336f846ed9ce638da8533c57865c818980224"
+  }
+}

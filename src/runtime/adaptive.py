@@ -19,7 +19,9 @@ from measurement.obstacles import ObstacleGrid
 from measurement.shielding import generate_octant_orientations
 from runtime.adaptive_protocol import (
     ADAPTIVE_CUI_OVERLAY_PREFIX,
+    ADAPTIVE_CUI_OVERLAY_FRAMING,
     ADAPTIVE_EVENT_PREFIX,
+    ADAPTIVE_EVENT_FRAMING,
     AdaptiveBootstrap,
     AdaptiveCandidateSnapshot,
     AdaptiveCandidatesEvent,
@@ -1339,15 +1341,13 @@ class AdaptiveRuntimeSession:
 def _write_event(stream: TextIO, payload: Mapping[str, object]) -> None:
     """Write one distinguishable, flushed JSON protocol event."""
     validate_truth_free_estimator_input(payload, path="adaptive.event")
-    encoded = json.dumps(dict(payload), allow_nan=False, sort_keys=True)
-    stream.write(f"{ADAPTIVE_EVENT_PREFIX}{encoded}\n")
+    stream.write(ADAPTIVE_EVENT_FRAMING.encode(payload))
     stream.flush()
 
 
 def _write_cui_overlay_event(stream: TextIO, payload: Mapping[str, object]) -> None:
     """Write one private CUI overlay event without estimator validation."""
-    encoded = json.dumps(dict(payload), allow_nan=False, sort_keys=True)
-    stream.write(f"{ADAPTIVE_CUI_OVERLAY_PREFIX}{encoded}\n")
+    stream.write(ADAPTIVE_CUI_OVERLAY_FRAMING.encode(payload))
     stream.flush()
 
 

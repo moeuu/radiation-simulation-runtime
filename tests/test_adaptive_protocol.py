@@ -3,18 +3,22 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+import io
 from typing import Any
 
 import numpy as np
 import pytest
 
 from runtime.adaptive_client import (
+    AdaptiveProtocolDirection,
+    AdaptiveProtocolObservation,
     AdaptiveRuntimeClient,
     adaptive_step_request,
     parse_candidate_snapshot,
     parse_run_context,
 )
 from runtime.adaptive_protocol import (
+    ADAPTIVE_EVENT_PREFIX,
     AdaptiveAbortedEvent,
     AdaptiveBootstrap,
     AdaptiveCandidateSnapshot,
@@ -342,6 +346,141 @@ def test_typed_client_ready_and_finalize_methods_require_expected_events() -> No
     assert isinstance(client.read_ready_event(), AdaptiveReadyEvent)
     client.finalize = finalize
     assert client.finalize_event() == AdaptivePublishedEvent("/tmp/log", 1)
+
+
+def test_concise_typed_client_aliases_delegate_without_new_wire_shapes() -> None:
+    """Public lifecycle vocabulary must remain a thin typed transport layer."""
+    client = AdaptiveRuntimeClient.__new__(AdaptiveRuntimeClient)
+    ready = AdaptiveReadyEvent.from_payload(
+        {
+            "type": "ready",
+            "schema_version": 1,
+            "context": _context_payload(),
+            "candidates": _candidate_payload(),
+            "bootstrap": {
+                "candidate_index": 0,
+                "fe_orientation_index": 0,
+                "pb_orientation_index": 0,
+            },
+        }
+    )
+    record = AdaptiveRecordEvent.from_payload(
+        {
+            "type": "record",
+            "record": measurement_record_to_payload(_record()),
+            "candidates": _candidate_payload(),
+        }
+    )
+    candidates = AdaptiveCandidatesEvent.from_payload(
+        {"type": "candidates", "candidates": _candidate_payload()}
+    )
+    published = AdaptivePublishedEvent("/tmp/log", 1)
+    client.read_ready_event = lambda: ready
+    client.request_step = lambda request: record
+    client.request_refinement = lambda request: candidates
+    client.finalize_event = lambda: published
+
+    assert client.handshake() is ready
+    assert client.acquire(
+        AdaptiveStepRequest(0, 0, 0, 1.0, 0, True)
+    ) is record
+    assert client.refine_candidates(
+        AdaptiveRefineRequest.from_indices([0])
+    ) is candidates
+    assert client.finalize_log() is published
+
+
+def test_protocol_observer_receives_ordered_immutable_truth_free_payloads() -> None:
+    """Transcript wiring should observe exact request/event pairs in order."""
+    client = AdaptiveRuntimeClient.__new__(AdaptiveRuntimeClient)
+    observations: list[AdaptiveProtocolObservation] = []
+    client.protocol_observer = observations.append
+    client._observation_sequence = 0
+    client.input = io.StringIO()
+    client.output = io.StringIO(
+        ADAPTIVE_EVENT_PREFIX
+        + '{"type":"published","path":"/tmp/log","record_count":1}\n'
+    )
+    client.process = type("Process", (), {"poll": lambda self: None})()
+
+    response = client.request({"type": "finalize"})
+
+    assert response["type"] == "published"
+    assert [item.sequence_id for item in observations] == [0, 1]
+    assert [item.direction for item in observations] == [
+        AdaptiveProtocolDirection.REQUEST,
+        AdaptiveProtocolDirection.EVENT,
+    ]
+    assert observations[0].to_payload()["payload"] == {"type": "finalize"}
+    with pytest.raises(TypeError):
+        observations[1].payload["type"] = "changed"
+
+
+def test_context_manager_sends_abort_and_waits_with_configured_timeout() -> None:
+    """Leaving an unfinished client scope must perform bounded termination."""
+    class Pipe:
+        """Record writes and closure without discarding buffered test data."""
+
+        def __init__(self) -> None:
+            """Initialize an open empty pipe."""
+            self.writes: list[str] = []
+            self.closed = False
+
+        def write(self, value: str) -> int:
+            """Record one write and return its character count."""
+            self.writes.append(value)
+            return len(value)
+
+        def flush(self) -> None:
+            """Accept one no-op flush."""
+
+        def close(self) -> None:
+            """Mark the pipe closed."""
+            self.closed = True
+
+    class Process:
+        """Complete gracefully when the client waits after abort."""
+
+        def __init__(self) -> None:
+            """Initialize a running process and empty wait record."""
+            self.return_code: int | None = None
+            self.wait_timeouts: list[float | None] = []
+
+        def poll(self) -> int | None:
+            """Return the current synthetic process state."""
+            return self.return_code
+
+        def wait(self, timeout: float | None = None) -> int:
+            """Record the timeout and complete successfully."""
+            self.wait_timeouts.append(timeout)
+            self.return_code = 0
+            return 0
+
+    client = AdaptiveRuntimeClient.__new__(AdaptiveRuntimeClient)
+    input_pipe = Pipe()
+    output_pipe = Pipe()
+    process = Process()
+    observations: list[AdaptiveProtocolObservation] = []
+    client.input = input_pipe
+    client.output = output_pipe
+    client.process = process
+    client.command = ["runtime"]
+    client.protocol_observer = observations.append
+    client._observation_sequence = 0
+    client.terminate_timeout_s = 0.75
+    client._closed = False
+    client._finalized = False
+
+    with client:
+        pass
+
+    assert input_pipe.writes == ['{"type": "abort"}\n']
+    assert input_pipe.closed and output_pipe.closed
+    assert process.wait_timeouts == [0.75]
+    assert observations[0].direction is AdaptiveProtocolDirection.REQUEST
+    assert observations[0].payload["type"] == "abort"
+    client.close()
+    assert process.wait_timeouts == [0.75]
 
 
 def test_typed_parser_rejects_unknown_or_truth_bearing_event_fields() -> None:

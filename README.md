@@ -106,6 +106,31 @@ configuration or take the same actions. A PF-controlled and an MLE-controlled ru
 normally create separate causal sessions and may use different station programs,
 budgets, and stopping times while relying on the same runtime implementation.
 
+## Shared estimator-neutral Python APIs
+
+Estimator repositories consume runtime-owned wire and artifact mechanics without
+moving their algorithms into this package:
+
+- `ResolvedForwardContext.from_log(...)` and `.from_run_context(...)` authenticate
+  and construct the environment, obstacles, spectrum model, and observation model
+  once. PF particles and MLE surfaces remain in their own repositories.
+- `AdaptiveRuntimeClient` exposes typed `handshake()`, `acquire()`,
+  `refine_candidates()`, and `finalize_log()` calls. It is a context manager with
+  bounded termination and an optional immutable protocol observer.
+- `MeasurementLog.view()`, `MeasurementLog.prefix_view(...)`, and
+  `MeasurementLogView.from_records(...)` provide read-only array and station views
+  without synthesizing manifests. File-backed logs additionally expose an
+  authenticated artifact inventory.
+- `CUIRoute`, `CUIScene`, and the PF-reference five-panel shell standardize route,
+  obstacle, URL, and page structure while leaving particles, density surfaces, and
+  combined estimator plots to their owners.
+- `AtomicBundlePublisher`, `DurableJSONLWriter`, `ArtifactInventory`, strict JSON,
+  digest identities, and CLI JSON framing provide versioned mechanical contracts.
+
+Legacy bare SHA-256 fields remain readable, but new cross-repository data should
+carry the corresponding algorithm identifier so different historical digest
+normalizations cannot be compared as if they were equivalent.
+
 ## Shared discrepancy calibration contract
 
 `calibrate-discrepancy` fits a versioned, estimator-neutral spectral discrepancy

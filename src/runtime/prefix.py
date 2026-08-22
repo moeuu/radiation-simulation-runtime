@@ -10,11 +10,18 @@ from collections.abc import Sequence
 from runtime.measurement_log import (
     MeasurementLogRecord,
     load_measurement_log,
-    measurement_log_sha256,
     measurement_records_content_sha256,
     write_measurement_log,
 )
-from runtime.provenance import canonical_json_bytes
+from runtime.provenance import DigestIdentity, canonical_json_bytes
+
+
+MEASUREMENT_RECORDS_DIGEST_ALGORITHM = (
+    "rotating-shield-runtime.measurement-records-v2+canonical-json-sha256"
+)
+STATION_BOUNDARIES_DIGEST_ALGORITHM = (
+    "rotating-shield-runtime.station-boundaries-v1+canonical-json-sha256"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,6 +35,8 @@ class MeasurementLogPrefix:
     data_cutoff_station: int
     covered_records_sha256: str
     measurement_log_sha256: str
+    covered_records_digest: DigestIdentity
+    measurement_log_digest: DigestIdentity
 
 
 def measurement_records_sha256(
@@ -38,6 +47,16 @@ def measurement_records_sha256(
     if not rows:
         raise ValueError("At least one record is required for a lineage digest.")
     return measurement_records_content_sha256(rows)
+
+
+def measurement_records_digest(
+    records: Sequence[MeasurementLogRecord],
+) -> DigestIdentity:
+    """Return the v2 record digest together with its stable algorithm ID."""
+    return DigestIdentity(
+        algorithm=MEASUREMENT_RECORDS_DIGEST_ALGORITHM,
+        sha256=measurement_records_sha256(records),
+    )
 
 
 def covered_station_boundaries_sha256(
@@ -73,6 +92,21 @@ def covered_station_boundaries_sha256(
         "station_end_steps": entries,
     }
     return sha256(canonical_json_bytes(payload)).hexdigest()
+
+
+def covered_station_boundaries_digest(
+    records: Sequence[MeasurementLogRecord],
+    *,
+    source_run_id: str,
+) -> DigestIdentity:
+    """Return the station-boundary digest with its stable algorithm ID."""
+    return DigestIdentity(
+        algorithm=STATION_BOUNDARIES_DIGEST_ALGORITHM,
+        sha256=covered_station_boundaries_sha256(
+            records,
+            source_run_id=source_run_id,
+        ),
+    )
 
 
 def _prefix_stop_index(
@@ -164,20 +198,28 @@ def materialize_measurement_log_prefix(
         obstacle_layout_path=log.context.obstacle_layout_path,
         source_layout_path=None,
     )
+    records_digest = measurement_records_digest(records)
+    log_inventory_digest = saved.artifact_inventory().digest
     return MeasurementLogPrefix(
         output_dir=saved.path,
         record_count=len(records),
         covered_step_ids=tuple(record.step_id for record in records),
         data_cutoff_step=records[-1].step_id,
         data_cutoff_station=records[-1].station_id,
-        covered_records_sha256=measurement_records_sha256(records),
-        measurement_log_sha256=measurement_log_sha256(saved.path),
+        covered_records_sha256=records_digest.sha256,
+        measurement_log_sha256=log_inventory_digest.sha256,
+        covered_records_digest=records_digest,
+        measurement_log_digest=log_inventory_digest,
     )
 
 
 __all__ = [
+    "MEASUREMENT_RECORDS_DIGEST_ALGORITHM",
     "MeasurementLogPrefix",
+    "STATION_BOUNDARIES_DIGEST_ALGORITHM",
+    "covered_station_boundaries_digest",
     "covered_station_boundaries_sha256",
     "materialize_measurement_log_prefix",
+    "measurement_records_digest",
     "measurement_records_sha256",
 ]

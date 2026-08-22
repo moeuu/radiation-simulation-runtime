@@ -22,6 +22,8 @@ def test_prefix_is_published_by_shared_runtime(tmp_path) -> None:
 
     assert prefix.record_count == 2
     assert prefix.covered_step_ids == (0, 1)
+    assert prefix.covered_records_digest.sha256 == prefix.covered_records_sha256
+    assert prefix.measurement_log_digest.sha256 == prefix.measurement_log_sha256
     assert len(loaded.records) == 2
     assert loaded.context.metadata["measurement_log_prefix"][
         "data_cutoff_step"

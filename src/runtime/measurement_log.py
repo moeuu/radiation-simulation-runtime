@@ -23,7 +23,7 @@ from numpy.typing import NDArray
 from measurement.model import EnvironmentConfig
 from measurement.obstacles import ObstacleGrid
 from runtime.artifacts import ArtifactInventory
-from runtime.provenance import canonical_json_bytes, json_safe
+from runtime.provenance import DigestIdentity, canonical_json_bytes, json_safe
 from runtime.contracts import FULL_SPECTRUM_CONTRACT_HASH_METADATA_KEY
 from runtime.forward_model_manifest import (
     CANONICAL_UNITS,
@@ -980,6 +980,122 @@ class MeasurementLogStationView:
         return self.prefix(self.complete_station_count)
 
 
+@dataclass(frozen=True, slots=True)
+class MeasurementLogView:
+    """Expose one pathless causal record prefix under a typed run context."""
+
+    context: "RunContext"
+    records: tuple[MeasurementLogRecord, ...]
+    energy_bin_edges_keV: NDArray[np.float64]
+    source_log_sha256: str | None = None
+
+    def __post_init__(self) -> None:
+        """Validate and freeze the context, records, energy axis, and identity."""
+        from runtime.records import RunContext
+
+        if not isinstance(self.context, RunContext):
+            raise TypeError("context must be a RunContext.")
+        rows = tuple(self.records)
+        if any(not isinstance(record, MeasurementLogRecord) for record in rows):
+            raise TypeError("records must contain MeasurementLogRecord values.")
+        edges = _readonly_exact_array(
+            self.energy_bin_edges_keV,
+            dtype=np.dtype(np.float64),
+            name="energy_bin_edges_keV",
+        )
+        if edges.size < 2 or np.any(np.diff(edges) <= 0.0):
+            raise MeasurementLogValidationError(
+                "MeasurementLog view energy-bin edges must strictly increase."
+            )
+        if (
+            self.source_log_sha256 is not None
+            and _SHA256_PATTERN.fullmatch(self.source_log_sha256) is None
+        ):
+            raise ValueError(
+                "source_log_sha256 must be a lowercase SHA-256 digest or null."
+            )
+        _array_view_from_records(
+            rows,
+            self.context.isotopes,
+            energy_bin_edges_keV=edges,
+        )
+        object.__setattr__(self, "records", rows)
+        object.__setattr__(self, "energy_bin_edges_keV", edges)
+
+    @classmethod
+    def from_records(
+        cls,
+        context: "RunContext",
+        records: Sequence[MeasurementLogRecord],
+        *,
+        source_log_sha256: str | None = None,
+    ) -> "MeasurementLogView":
+        """Build a validated pathless view without synthesizing a log manifest."""
+        from runtime.records import RunContext
+
+        if not isinstance(context, RunContext):
+            raise TypeError("context must be a RunContext.")
+        rows = tuple(records)
+        edges = (
+            np.asarray(rows[0].energy_bin_edges_keV, dtype=np.float64)
+            if rows
+            else _energy_edges_from_runtime_config(context.runtime_config)
+        )
+        return cls(
+            context=context,
+            records=rows,
+            energy_bin_edges_keV=edges,
+            source_log_sha256=source_log_sha256,
+        )
+
+    @classmethod
+    def from_log(cls, log: "MeasurementLog") -> "MeasurementLogView":
+        """Build a read-only view that retains the source bundle identity."""
+        if not isinstance(log, MeasurementLog):
+            raise TypeError("log must be a MeasurementLog.")
+        return cls(
+            context=log.context,
+            records=log.records,
+            energy_bin_edges_keV=_measurement_log_energy_edges(log),
+            source_log_sha256=log.source_log_sha256,
+        )
+
+    @property
+    def records_content_sha256(self) -> str:
+        """Return the digest of exactly the records visible through this view."""
+        return measurement_records_content_sha256(self.records)
+
+    def array_view(self) -> MeasurementLogArrayView:
+        """Return exact immutable arrays for the selected causal records."""
+        return _array_view_from_records(
+            self.records,
+            self.context.isotopes,
+            energy_bin_edges_keV=self.energy_bin_edges_keV,
+        )
+
+    def station_view(self) -> MeasurementLogStationView:
+        """Return station groups for the selected causal records."""
+        return _station_view_from_records(
+            self.records,
+            self.context.isotopes,
+            energy_bin_edges_keV=self.energy_bin_edges_keV,
+            source_log_sha256=self.source_log_sha256,
+        )
+
+    def prefix(self, record_count: int) -> "MeasurementLogView":
+        """Return an independently validated leading causal record view."""
+        if isinstance(record_count, bool) or not isinstance(record_count, int):
+            raise TypeError("record_count must be an integer.")
+        if record_count < 0 or record_count > len(self.records):
+            raise ValueError("record_count must lie within the available records.")
+        return MeasurementLogView(
+            context=self.context,
+            records=self.records[:record_count],
+            energy_bin_edges_keV=self.energy_bin_edges_keV,
+            source_log_sha256=self.source_log_sha256,
+        )
+
+
 @dataclass(frozen=True)
 class MeasurementLog:
     """Store a validated MeasurementLog bundle without evaluation truth."""
@@ -1047,6 +1163,11 @@ class MeasurementLog:
         return None if self.path is None else measurement_log_sha256(self.path)
 
     @property
+    def source_log_digest(self) -> DigestIdentity | None:
+        """Return the algorithm-bound source inventory digest when file-backed."""
+        return None if self.path is None else self.artifact_inventory().digest
+
+    @property
     def records_content_sha256(self) -> str:
         """Return the digest of exactly the records selected by this object."""
         return measurement_records_content_sha256(self.records)
@@ -1058,20 +1179,19 @@ class MeasurementLog:
 
     def array_view(self) -> MeasurementLogArrayView:
         """Return exact read-only arrays for all records selected by this object."""
-        return _array_view_from_records(
-            self.records,
-            self.context.isotopes,
-            energy_bin_edges_keV=_measurement_log_energy_edges(self),
-        )
+        return MeasurementLogView.from_log(self).array_view()
 
     def station_view(self) -> MeasurementLogStationView:
         """Return grouped stations with separate source and records identities."""
-        return _station_view_from_records(
-            self.records,
-            self.context.isotopes,
-            energy_bin_edges_keV=_measurement_log_energy_edges(self),
-            source_log_sha256=self.source_log_sha256,
-        )
+        return MeasurementLogView.from_log(self).station_view()
+
+    def view(self) -> MeasurementLogView:
+        """Return the typed path-independent view of this immutable log."""
+        return MeasurementLogView.from_log(self)
+
+    def prefix_view(self, record_count: int) -> MeasurementLogView:
+        """Return a pathless causal prefix with separate source and record IDs."""
+        return self.view().prefix(record_count)
 
     def artifact_inventory(self) -> ArtifactInventory:
         """Return the verified generic file inventory of the source bundle."""
@@ -1673,11 +1793,11 @@ def _records_to_arrays(
     }
 
 
-def _measurement_log_energy_edges(log: MeasurementLog) -> NDArray[np.float64]:
-    """Return the canonical energy edges even when the selected log is empty."""
-    if log.records:
-        return np.asarray(log.records[0].energy_bin_edges_keV, dtype=np.float64)
-    contract = log.runtime_config.get("full_spectrum_generative_model")
+def _energy_edges_from_runtime_config(
+    runtime_config: Mapping[str, Any],
+) -> NDArray[np.float64]:
+    """Return canonical energy edges from an embedded runtime model contract."""
+    contract = runtime_config.get("full_spectrum_generative_model")
     if not isinstance(contract, Mapping):
         raise MeasurementLogValidationError(
             "An empty MeasurementLog requires full_spectrum_generative_model."
@@ -1713,6 +1833,13 @@ def _measurement_log_energy_edges(log: MeasurementLog) -> NDArray[np.float64]:
     return np.concatenate(
         (energy_axis, np.asarray([energy_axis[-1] + bin_width], dtype=np.float64))
     )
+
+
+def _measurement_log_energy_edges(log: MeasurementLog) -> NDArray[np.float64]:
+    """Return the canonical energy edges even when the selected log is empty."""
+    if log.records:
+        return np.asarray(log.records[0].energy_bin_edges_keV, dtype=np.float64)
+    return _energy_edges_from_runtime_config(log.runtime_config)
 
 
 def _array_view_from_records(

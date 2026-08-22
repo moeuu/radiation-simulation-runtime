@@ -12,6 +12,7 @@ from runtime import (
     ArtifactInventory,
     MeasurementLogArrayView,
     MeasurementLogStationView,
+    MeasurementLogView,
     build_artifact_inventory,
     measurement_log_artifact_inventory,
     measurement_records_content_sha256,
@@ -86,6 +87,24 @@ def test_empty_prefix_views_keep_the_energy_contract_and_separate_identity(
     assert stations.records_content_sha256 == measurement_records_content_sha256(())
     assert stations.records_content_sha256 != stations.source_log_sha256
     assert empty.log_sha256 == log.log_sha256
+
+
+def test_records_view_avoids_synthesizing_a_measurement_log_manifest(
+    tmp_path: Path,
+) -> None:
+    """Live records should become shared views directly from their RunContext."""
+    log = load_measurement_log(make_measurement_log(tmp_path / "measurement-log"))
+
+    live = MeasurementLogView.from_records(log.context, log.records[:3])
+    prefix = log.prefix_view(3)
+
+    assert live.source_log_sha256 is None
+    assert prefix.source_log_sha256 == log.log_sha256
+    assert live.records_content_sha256 == prefix.records_content_sha256
+    np.testing.assert_array_equal(live.array_view().step_id, [0, 1, 2])
+    assert [station.station_id for station in live.station_view().stations] == [0, 1]
+    empty = MeasurementLogView.from_records(log.context, ())
+    assert empty.array_view().spectrum_counts.shape == (0, 851)
 
 
 def test_station_view_preserves_durable_prefix_semantics(tmp_path: Path) -> None:

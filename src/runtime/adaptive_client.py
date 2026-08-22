@@ -5,14 +5,19 @@ from __future__ import annotations
 import json
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, TextIO
 
 import numpy as np
 
 from runtime.adaptive_protocol import (
     ADAPTIVE_CUI_OVERLAY_PREFIX,
+    ADAPTIVE_CUI_OVERLAY_FRAMING,
     ADAPTIVE_EVENT_PREFIX,
+    ADAPTIVE_EVENT_FRAMING,
     AdaptiveAbortedEvent,
     AdaptiveBootstrap,
     AdaptiveCandidateSnapshot,
@@ -27,6 +32,7 @@ from runtime.adaptive_protocol import (
     parse_adaptive_event,
 )
 from runtime.measurement_log import MeasurementLogRecord
+from runtime.provenance import strict_canonical_json_bytes, strict_json_loads
 from runtime.records import (
     RunContext,
     measurement_record_from_payload,
@@ -166,6 +172,81 @@ def candidate_index_for_pose(
     return int(matches[0])
 
 
+class AdaptiveProtocolDirection(StrEnum):
+    """Identify one estimator-visible direction on the adaptive wire."""
+
+    REQUEST = "request"
+    EVENT = "event"
+
+
+def _freeze_protocol_value(value: object) -> object:
+    """Recursively freeze already strict JSON data for observer delivery."""
+    if isinstance(value, dict):
+        return MappingProxyType(
+            {
+                str(key): _freeze_protocol_value(nested)
+                for key, nested in value.items()
+            }
+        )
+    if isinstance(value, list):
+        return tuple(_freeze_protocol_value(nested) for nested in value)
+    return value
+
+
+def _thaw_protocol_value(value: object) -> object:
+    """Return mutable JSON data from an immutable observer payload."""
+    if isinstance(value, Mapping):
+        return {
+            str(key): _thaw_protocol_value(nested)
+            for key, nested in value.items()
+        }
+    if isinstance(value, tuple):
+        return [_thaw_protocol_value(nested) for nested in value]
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class AdaptiveProtocolObservation:
+    """Store one ordered truth-free request or event for transcript observers."""
+
+    sequence_id: int
+    direction: AdaptiveProtocolDirection
+    payload: Mapping[str, object]
+
+    def __post_init__(self) -> None:
+        """Validate ordering and retain an immutable strict JSON payload."""
+        if (
+            isinstance(self.sequence_id, bool)
+            or not isinstance(self.sequence_id, int)
+            or self.sequence_id < 0
+        ):
+            raise ValueError("Adaptive observation sequence_id must be nonnegative.")
+        if not isinstance(self.direction, AdaptiveProtocolDirection):
+            raise TypeError("Adaptive observation direction is invalid.")
+        if not isinstance(self.payload, Mapping):
+            raise TypeError("Adaptive observation payload must be an object.")
+        normalized = strict_json_loads(strict_canonical_json_bytes(self.payload))
+        if not isinstance(normalized, dict):  # pragma: no cover - mapping invariant
+            raise TypeError("Adaptive observation payload must remain an object.")
+        validate_truth_free_estimator_input(
+            normalized,
+            path="adaptive.observation",
+        )
+        frozen = _freeze_protocol_value(normalized)
+        if not isinstance(frozen, Mapping):  # pragma: no cover - defensive
+            raise TypeError("Adaptive observation payload must remain a mapping.")
+        object.__setattr__(self, "payload", frozen)
+
+    def to_payload(self) -> dict[str, object]:
+        """Return strict JSON data suitable for a durable transcript."""
+        return {
+            "schema_version": 1,
+            "sequence_id": self.sequence_id,
+            "direction": self.direction.value,
+            "payload": _thaw_protocol_value(self.payload),
+        }
+
+
 class AdaptiveRuntimeClient:
     """Drive the shared runtime without opening its private physical scenario."""
 
@@ -178,6 +259,8 @@ class AdaptiveRuntimeClient:
         resume_stage_path: str | Path | None = None,
         resume_compatibility_path: str | Path | None = None,
         output_hook: Callable[[str], None] = print,
+        protocol_observer: Callable[[AdaptiveProtocolObservation], None] | None = None,
+        terminate_timeout_s: float = 10.0,
     ) -> None:
         """Start one persistent runtime-owned adaptive subprocess."""
         scenario = Path(scenario_path).expanduser().resolve()
@@ -214,6 +297,20 @@ class AdaptiveRuntimeClient:
             command.extend(("--resume-compatibility", compatibility.as_posix()))
         self.command = command
         self.output_hook = output_hook
+        if protocol_observer is not None and not callable(protocol_observer):
+            raise TypeError("protocol_observer must be callable or null.")
+        if (
+            isinstance(terminate_timeout_s, bool)
+            or not isinstance(terminate_timeout_s, (int, float))
+            or not np.isfinite(float(terminate_timeout_s))
+            or float(terminate_timeout_s) <= 0.0
+        ):
+            raise ValueError("terminate_timeout_s must be finite and positive.")
+        self.protocol_observer = protocol_observer
+        self.terminate_timeout_s = float(terminate_timeout_s)
+        self._observation_sequence = 0
+        self._closed = False
+        self._finalized = False
         self.process = subprocess.Popen(
             command,
             cwd=root,
@@ -229,6 +326,32 @@ class AdaptiveRuntimeClient:
             self.process.kill()
             raise RuntimeError("Shared runtime did not expose adaptive pipes.")
 
+    def _observe(
+        self,
+        direction: AdaptiveProtocolDirection,
+        payload: Mapping[str, object],
+    ) -> None:
+        """Deliver one ordered immutable protocol observation when configured."""
+        observer = getattr(self, "protocol_observer", None)
+        sequence = int(getattr(self, "_observation_sequence", 0))
+        observation = AdaptiveProtocolObservation(
+            sequence_id=sequence,
+            direction=direction,
+            payload=payload,
+        )
+        self._observation_sequence = sequence + 1
+        if observer is not None:
+            observer(observation)
+
+    def _write_request(self, payload: Mapping[str, object]) -> None:
+        """Validate, observe, and flush one estimator-visible request."""
+        if self.input is None:
+            raise RuntimeError("Adaptive runtime input is closed.")
+        validate_truth_free_estimator_input(payload, path="adaptive.request")
+        self._observe(AdaptiveProtocolDirection.REQUEST, payload)
+        self.input.write(json.dumps(dict(payload), allow_nan=False) + "\n")
+        self.input.flush()
+
     def read_event(self) -> dict[str, Any]:
         """Read the next framed event while relaying runtime diagnostics."""
         assert self.output is not None
@@ -242,10 +365,9 @@ class AdaptiveRuntimeClient:
             if not line.startswith(ADAPTIVE_EVENT_PREFIX):
                 self.output_hook(line)
                 continue
-            payload = json.loads(line.removeprefix(ADAPTIVE_EVENT_PREFIX))
-            if not isinstance(payload, dict):
-                raise TypeError("Adaptive runtime event must be an object.")
+            payload = ADAPTIVE_EVENT_FRAMING.parse(line)
             validate_truth_free_estimator_input(payload, path="adaptive.event")
+            self._observe(AdaptiveProtocolDirection.EVENT, payload)
             return payload
         return_code = self.process.poll()
         raise RuntimeError(
@@ -266,13 +388,13 @@ class AdaptiveRuntimeClient:
             )
         return event
 
+    def handshake(self) -> AdaptiveReadyEvent:
+        """Read the typed initial handshake under the concise public API."""
+        return self.read_ready_event()
+
     def request(self, payload: Mapping[str, object]) -> dict[str, Any]:
         """Send one causal controller decision and wait for its response."""
-        if self.input is None:
-            raise RuntimeError("Adaptive runtime input is closed.")
-        validate_truth_free_estimator_input(payload, path="adaptive.request")
-        self.input.write(json.dumps(dict(payload), allow_nan=False) + "\n")
-        self.input.flush()
+        self._write_request(payload)
         return self.read_event()
 
     def request_step(self, request: AdaptiveStepRequest) -> AdaptiveRecordEvent:
@@ -283,6 +405,10 @@ class AdaptiveRuntimeClient:
         if not isinstance(event, AdaptiveRecordEvent):
             raise RuntimeError("Shared adaptive runtime did not emit a record event.")
         return event
+
+    def acquire(self, request: AdaptiveStepRequest) -> AdaptiveRecordEvent:
+        """Acquire one typed observation through the concise public API."""
+        return self.request_step(request)
 
     def request_refinement(
         self,
@@ -297,6 +423,13 @@ class AdaptiveRuntimeClient:
                 "Shared adaptive runtime did not emit a candidates event."
             )
         return event
+
+    def refine_candidates(
+        self,
+        request: AdaptiveRefineRequest,
+    ) -> AdaptiveCandidatesEvent:
+        """Refine runtime-owned candidates through the concise public API."""
+        return self.request_refinement(request)
 
     def request_cui_overlay(self, *, include_truth: bool) -> dict[str, object]:
         """Request private CUI overlay data outside the estimator protocol."""
@@ -314,9 +447,7 @@ class AdaptiveRuntimeClient:
         for raw_line in self.output:
             line = raw_line.rstrip("\n")
             if line.startswith(ADAPTIVE_CUI_OVERLAY_PREFIX):
-                payload = json.loads(
-                    line.removeprefix(ADAPTIVE_CUI_OVERLAY_PREFIX)
-                )
+                payload = ADAPTIVE_CUI_OVERLAY_FRAMING.parse(line)
                 return parse_cui_overlay_payload(payload)
             if line.startswith(ADAPTIVE_EVENT_PREFIX):
                 raise RuntimeError(
@@ -339,6 +470,11 @@ class AdaptiveRuntimeClient:
         return_code = self.process.wait()
         if return_code != 0:
             raise subprocess.CalledProcessError(return_code, self.command)
+        self._finalized = True
+        self._closed = True
+        if self.output is not None:
+            self.output.close()
+            self.output = None
         return event
 
     def finalize_event(self) -> AdaptivePublishedEvent:
@@ -350,20 +486,72 @@ class AdaptiveRuntimeClient:
             )
         return event
 
+    def finalize_log(self) -> AdaptivePublishedEvent:
+        """Finalize and return the typed published-log event."""
+        return self.finalize_event()
+
+    def terminate(self, timeout: float | None = None) -> None:
+        """End an incomplete session within a bounded graceful shutdown window."""
+        if bool(getattr(self, "_closed", False)):
+            return
+        configured = float(getattr(self, "terminate_timeout_s", 10.0))
+        timeout_s = configured if timeout is None else timeout
+        if (
+            isinstance(timeout_s, bool)
+            or not isinstance(timeout_s, (int, float))
+            or not np.isfinite(float(timeout_s))
+            or float(timeout_s) <= 0.0
+        ):
+            raise ValueError("terminate timeout must be finite and positive.")
+        timeout_value = float(timeout_s)
+        if self.process.poll() is None:
+            try:
+                self._write_request({"type": "abort"})
+            except (BrokenPipeError, OSError, RuntimeError, ValueError):
+                pass
+            if self.input is not None:
+                try:
+                    self.input.close()
+                finally:
+                    self.input = None
+            try:
+                self.process.wait(timeout=timeout_value)
+            except subprocess.TimeoutExpired:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=min(timeout_value, 2.0))
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait()
+        if self.input is not None:
+            self.input.close()
+            self.input = None
+        if self.output is not None:
+            self.output.close()
+            self.output = None
+        self._closed = True
+
+    def close(self) -> None:
+        """Close this client using its configured bounded termination policy."""
+        self.terminate()
+
+    def __enter__(self) -> "AdaptiveRuntimeClient":
+        """Return this client for deterministic session ownership."""
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: object,
+    ) -> None:
+        """Terminate any session that was not already finalized."""
+        del exc_type, exc, traceback
+        self.close()
+
     def abort(self) -> None:
         """Best-effort close of an incomplete acquisition session."""
-        if self.process.poll() is not None:
-            return
-        try:
-            self.request({"type": "abort"})
-        except (BrokenPipeError, OSError, RuntimeError, ValueError):
-            self.process.terminate()
-        finally:
-            try:
-                self.process.wait(timeout=10.0)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait()
+        self.terminate()
 
 
 __all__ = [
@@ -372,6 +560,8 @@ __all__ = [
     "AdaptiveCandidateSnapshot",
     "AdaptiveCandidatesEvent",
     "AdaptivePublishedEvent",
+    "AdaptiveProtocolDirection",
+    "AdaptiveProtocolObservation",
     "AdaptiveReadyEvent",
     "AdaptiveRecordEvent",
     "AdaptiveRefineRequest",

@@ -22,7 +22,7 @@ state, and estimator-specific planning remain in their owning repositories.
 
 ## Implemented foundation
 
-The current worktree implements the low-risk portion of phase 1:
+The current worktree implements the estimator-neutral portions of phases 1–3:
 
 - `runtime.artifacts` owns strict atomic bytes, text, JSON, and file-copy
   publication;
@@ -34,14 +34,18 @@ The current worktree implements the low-risk portion of phase 1:
 - `runtime.defaults` is packaged, including the legacy `runtime_defaults`
   wheel shim and shared PF-style CUI host/port/path values;
 - `runtime.cui` owns strict configuration, browser URLs, managed safe static
-  serving, and the immutable truth-free `CUIRoute`;
-- PF delegates provenance, atomic publication, defaults, NPZ, and CUI serving
-  to runtime while retaining its estimator-specific renderer;
-- the orchestrator delegates CUI configuration, serving, and route extraction,
-  while retaining combined PF/MLE rendering;
-- MLE uses the same URL text, PF-style panels, managed-server safety, and truth
-  modes. It intentionally retains a compatibility implementation until its
-  pinned runtime revision is advanced to a release containing these APIs.
+  serving, the immutable truth-free `CUIRoute`, correctly ordered `CUIScene`
+  geometry, and the PF-reference five-panel HTML shell;
+- `ResolvedForwardContext` owns authenticated physical-input reconstruction for
+  replay and live consumers, without owning any estimator state;
+- adaptive ready, record, candidate, refinement, abort, and publication messages
+  are frozen DTOs, and the client owns bounded lifecycle plus transcript observing;
+- `MeasurementLogView.from_records` owns live array/station conversion, while
+  file-backed logs expose generic inventories and pathless prefix views;
+- digest identities and golden fixtures distinguish the runtime v2 record digest
+  from the orchestrator's historical compatibility normalization;
+- bundle publication, durable JSONL append, strict JSON/config identity, forward
+  fixture parsing, and prefixed CLI JSON framing are shared mechanical APIs.
 
 No phase-1 extraction changes transport physics, detector response, source
 truth boundaries, observation statistics, or estimator algorithms.
@@ -51,12 +55,12 @@ truth boundaries, observation statistics, or estimator algorithms.
 | Concern | Current duplication | Target owner |
 | --- | --- | --- |
 | Canonical JSON and repository provenance | PF now delegates; MLE/orchestrator retain repository adapters | runtime public API, with repository-root adapters |
-| Atomic bytes, JSON, and latest-image publication | PF now delegates common operations; MLE/orchestrator retain specialized publishers | runtime public API |
+| Atomic bytes, JSON, latest-image, and bundle publication | Consumers retain only format-specific byte encoders | runtime public API |
 | Deterministic NPZ writing | PF now uses the public API; orchestrator still has legacy formats | runtime public API |
-| Static HTTP serving and browser URL construction | PF/orchestrator now delegate; MLE is behavior-compatible pending its runtime pin | runtime CUI API |
-| Public-host discovery and occupied-port handling | PF/orchestrator now delegate; MLE is behavior-compatible pending its runtime pin | runtime CUI API |
-| Route, station-view, and waypoint extraction | orchestrator now consumes `CUIRoute`; PF remains the visual baseline | runtime truth-free CUI route DTO |
-| Adaptive event dictionaries | PF, MLE, orchestrator controllers | typed runtime adaptive-session API |
+| Static HTTP serving and browser URL construction | PF, MLE, and orchestrator delegate | runtime CUI API |
+| Public-host discovery and occupied-port handling | PF, MLE, and orchestrator delegate | runtime CUI API |
+| Route, station-view, waypoint, scene, and page shell | all CUI consumers use PF-compatible contracts | runtime truth-free CUI DTOs |
+| Adaptive event dictionaries and process lifecycle | typed consumers retain only controller decisions | typed runtime adaptive-session API |
 | MeasurementLog v2 validation and prefix writing | runtime and orchestrator | runtime; orchestrator keeps only legacy readers |
 | PF/MLE solver and posterior state | PF/MLE repositories and orchestrator | estimator owners; no runtime dependency reversal |
 
@@ -135,13 +139,12 @@ The runtime private CUI channel remains the only live source of realized truth.
 
 ### Phase 4: estimator service contracts
 
-PF and MLE backends can share a small, separately versioned estimator-service
-contract containing run requests, progress events, result envelopes, and
-artifact references. This contract must not contain simulation physics or
-realized truth. The current orchestrator policy forbids active imports from the
-sibling estimator repositories, so direct solver reuse requires an explicit
-ownership-policy change or a neutral published distribution; copying solver
-code is not an acceptable transition.
+PF and MLE backends use a small, separately versioned estimator-service wire
+contract containing capabilities, execution requests/responses, artifact
+references, and controller-owned execution receipts. It contains neither
+simulation physics nor realized truth. Each service adapter invokes the solver
+inside its owning estimator repository; the orchestrator uses a subprocess
+client and never imports or copies either solver.
 
 ## Compatibility and acceptance gates
 

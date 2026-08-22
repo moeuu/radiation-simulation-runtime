@@ -8,6 +8,7 @@ from numbers import Real
 
 import numpy as np
 
+from runtime.cli_events import CLIJSONEventFraming
 from runtime.measurement_log import MeasurementLogRecord
 from runtime.records import (
     RunContext,
@@ -18,6 +19,10 @@ from runtime.records import (
 
 ADAPTIVE_EVENT_PREFIX = "adaptive-session "
 ADAPTIVE_CUI_OVERLAY_PREFIX = "adaptive-cui-overlay "
+ADAPTIVE_EVENT_FRAMING = CLIJSONEventFraming(ADAPTIVE_EVENT_PREFIX)
+ADAPTIVE_CUI_OVERLAY_FRAMING = CLIJSONEventFraming(
+    ADAPTIVE_CUI_OVERLAY_PREFIX
+)
 
 
 def _strict_fields(

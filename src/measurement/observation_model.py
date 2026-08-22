@@ -29,6 +29,7 @@ from spectrum.additive_scatter import (
     PhysicsOnlyNoncollidedTransportResponse,
 )
 from spectrum.transport_spectral import (
+    GeometryConditionedSpectralModel,
     geometry_conditioned_model_from_runtime_config,
 )
 
@@ -170,6 +171,9 @@ def build_runtime_observation_model(
     runtime_config: Mapping[str, Any] | None,
     *,
     isotopes: Sequence[str],
+    authenticated_full_spectrum_model: (
+        GeometryConditionedSpectralModel | None
+    ) = None,
 ) -> RuntimeObservationModel:
     """Build the shared observation model used by PF, planning, and validation."""
     if runtime_config is None:
@@ -257,11 +261,36 @@ def build_runtime_observation_model(
         "full_spectrum_model_registry_path",
         "isotope_experiment_profile",
     }
-    full_spectrum_model = (
-        geometry_conditioned_model_from_runtime_config(payload)
-        if full_spectrum_selector_keys.intersection(payload)
-        else None
-    )
+    if authenticated_full_spectrum_model is not None:
+        if not isinstance(
+            authenticated_full_spectrum_model,
+            GeometryConditionedSpectralModel,
+        ):
+            raise TypeError(
+                "authenticated_full_spectrum_model must be a "
+                "GeometryConditionedSpectralModel or None."
+            )
+        if not full_spectrum_selector_keys.intersection(payload):
+            raise ValueError(
+                "An authenticated full-spectrum model requires a matching "
+                "runtime model selector."
+            )
+        authenticated_full_spectrum_model.require_runtime_ready()
+        if (
+            payload.get("full_spectrum_contract_hash_sha256")
+            != authenticated_full_spectrum_model.contract_hash_sha256
+        ):
+            raise ValueError(
+                "The authenticated full-spectrum model does not match the "
+                "runtime contract hash."
+            )
+        full_spectrum_model = authenticated_full_spectrum_model
+    else:
+        full_spectrum_model = (
+            geometry_conditioned_model_from_runtime_config(payload)
+            if full_spectrum_selector_keys.intersection(payload)
+            else None
+        )
     obstacle_mu_by_isotope = _obstacle_mu_by_isotope_from_runtime_config(
         payload,
         isotopes=isotope_order,
@@ -306,6 +335,8 @@ def continuous_kernel_from_observation_model(
     *,
     obstacle_grid: ObstacleGrid | None,
     use_gpu: bool,
+    gpu_device: str = "cuda",
+    gpu_dtype: str = "float32",
 ) -> ContinuousKernel:
     """Build a ContinuousKernel from the shared runtime observation model."""
     if not isinstance(use_gpu, bool):
@@ -328,4 +359,6 @@ def continuous_kernel_from_observation_model(
         line_mu_by_isotope=model.line_mu_by_isotope,
         additive_scatter_response=model.additive_scatter_response,
         use_gpu=use_gpu,
+        gpu_device=gpu_device,
+        gpu_dtype=gpu_dtype,
     )

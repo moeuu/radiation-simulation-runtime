@@ -16,16 +16,26 @@ from urllib.request import urlopen
 import numpy as np
 import pytest
 import runtime.cui as cui_module
+from measurement.model import EnvironmentConfig
+from measurement.obstacles import ObstacleGrid
 
 from runtime import (
+    CUIAcquisitionFrame,
     CUIDashboardConfig,
+    CUIPanelSpec,
     CUIRoute,
+    CUIScene,
     CUIServerHandle,
+    CUIStatus,
+    CUITruthDisplayMode,
     CUI_URL_MESSAGE_PREFIX,
     cui_browser_url,
     cui_route_from_records,
+    pf_reference_panel_specs,
     resolve_cui_public_host,
     start_cui_server,
+    write_cui_index,
+    write_cui_status,
 )
 from tests.runtime_test_support import records
 
@@ -627,3 +637,92 @@ def test_route_rejects_pose_changes_inside_one_station() -> None:
 
     with pytest.raises(ValueError, match="share one pose"):
         cui_route_from_records((base[0], moved))
+
+
+def test_scene_preserves_asymmetric_obstacle_xy_order() -> None:
+    """Scene footprints must retain runtime (x, y) cell coordinates exactly."""
+    environment = EnvironmentConfig(size_x=6.0, size_y=4.0, size_z=3.0)
+    grid = ObstacleGrid(
+        origin=(0.5, 1.0),
+        cell_size=0.5,
+        grid_shape=(4, 3),
+        blocked_cells=((2, 1),),
+    )
+
+    scene = CUIScene.from_environment(
+        environment,
+        grid,
+        obstacle_height_m=1.5,
+    )
+
+    np.testing.assert_allclose(
+        scene.obstacle_boxes_xyz[0],
+        [1.5, 1.5, 0.0, 2.0, 2.0, 1.5],
+    )
+    np.testing.assert_allclose(
+        scene.obstacle_footprints_xy[0],
+        [[1.5, 1.5], [2.0, 1.5], [2.0, 2.0], [1.5, 2.0]],
+    )
+
+
+def test_pf_reference_shell_and_status_use_shared_five_panel_order(
+    tmp_path: Path,
+) -> None:
+    """Estimator variants should replace only the estimator-specific slots."""
+    panels = pf_reference_panel_specs(
+        estimator_title="Surface MLE 3D",
+        estimator_filename="latest_mle_3d.png",
+        labeled_estimator_title="Surface MLE hotspots",
+        labeled_estimator_filename="latest_mle_hotspots_3d.png",
+    )
+
+    index = write_cui_index(tmp_path, panels, title="MLE dashboard")
+    status = CUIStatus(
+        phase="estimating",
+        message="station complete",
+        step_id=4,
+        station_id=2,
+    )
+    status_path = write_cui_status(tmp_path / "status.json", status)
+
+    markup = index.read_text(encoding="utf-8")
+    offsets = [markup.index(f'id="{panel.panel_id}"') for panel in panels]
+    assert offsets == sorted(offsets)
+    assert "latest_mle_3d.png" in markup
+    assert json.loads(status_path.read_text(encoding="utf-8")) == (
+        status.to_payload()
+    )
+    with pytest.raises(ValueError, match="exactly five"):
+        write_cui_index(tmp_path, panels[:-1])
+
+
+def test_acquisition_frame_declares_truth_mode_without_truth_payload() -> None:
+    """Truth visibility is explicit while realized source values remain elsewhere."""
+    frame = CUIAcquisitionFrame(
+        route=cui_route_from_records(records(1)),
+        status=CUIStatus(phase="running", message=""),
+        truth_display_mode=CUITruthDisplayMode.HIDDEN,
+    )
+
+    payload = frame.to_payload()
+    assert payload["truth_display_mode"] == "hidden"
+    assert "source" not in json.dumps(payload, sort_keys=True).lower()
+
+
+def test_shared_cui_truth_modes_match_estimator_cli_contract() -> None:
+    """The shared enum must expose the three established estimator modes."""
+    assert tuple(mode.value for mode in CUITruthDisplayMode) == (
+        "hidden",
+        "evaluation_live",
+        "post_run",
+    )
+
+
+@pytest.mark.parametrize(
+    "filename",
+    ("../panel.png", ".hidden.png", "nested/panel.png", "panel.jpg"),
+)
+def test_panel_spec_rejects_nonportable_image_names(filename: str) -> None:
+    """Panel files must remain directly serveable by the safe static server."""
+    with pytest.raises(ValueError, match="visible PNG"):
+        CUIPanelSpec("panel", "Panel", filename)
