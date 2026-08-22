@@ -561,6 +561,40 @@ def test_route_normalizes_waypoints_station_visits_and_latest_observation() -> N
         route.measurement_stations_xyz[0, 0] = 100.0
 
 
+def test_route_preserves_nearby_distinct_travel_segments() -> None:
+    """Display normalization must not merge merely close authored routes."""
+    base = records(2)
+    first_segment = np.asarray(
+        [[0.0, 0.0, 0.4], [0.25, 0.25, 0.4]],
+        dtype=np.float64,
+    )
+    second_segment = first_segment.copy()
+    second_segment[1, 0] += 1.0e-8
+    assert np.allclose(first_segment, second_segment)
+    inputs = (
+        replace(
+            base[0],
+            metadata={
+                **dict(base[0].metadata),
+                "travel_waypoints_xyz": first_segment.tolist(),
+            },
+        ),
+        replace(
+            base[1],
+            metadata={
+                **dict(base[1].metadata),
+                "travel_waypoints_xyz": second_segment.tolist(),
+            },
+        ),
+    )
+
+    route = cui_route_from_records(inputs)
+
+    assert len(route.travel_path_segments_xyz) == 2
+    np.testing.assert_array_equal(route.travel_path_segments_xyz[0], first_segment)
+    np.testing.assert_array_equal(route.travel_path_segments_xyz[1], second_segment)
+
+
 def test_route_ignores_singleton_waypoints_and_rejects_bad_shape() -> None:
     """PF-compatible singleton paths are skipped while corrupt matrices fail."""
     base = records(1)[0]

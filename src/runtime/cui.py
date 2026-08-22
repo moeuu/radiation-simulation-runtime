@@ -565,7 +565,7 @@ def cui_route_from_records(
         if segment is not None and not (
             segments
             and segments[-1].shape == segment.shape
-            and np.allclose(segments[-1], segment)
+            and np.array_equal(segments[-1], segment)
         ):
             segments.append(segment)
         current = _readonly_float_vector(
