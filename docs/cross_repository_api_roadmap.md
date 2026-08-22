@@ -35,7 +35,8 @@ The current worktree implements the estimator-neutral portions of phases 1–3:
   wheel shim and shared PF-style CUI host/port/path values;
 - `runtime.cui` owns strict configuration, browser URLs, managed safe static
   serving, the immutable truth-free `CUIRoute`, correctly ordered `CUIScene`
-  geometry, and the PF-reference five-panel HTML shell;
+  geometry, and the responsive panel HTML shell. Estimator repositories own the
+  number, identity, and rendering of result panels;
 - `ResolvedForwardContext` owns authenticated physical-input reconstruction for
   replay and live consumers, without owning any estimator state;
 - adaptive ready, record, candidate, refinement, abort, and publication messages
@@ -66,22 +67,26 @@ truth boundaries, observation statistics, or estimator algorithms.
 
 ## Canonical CUI contract
 
-The live Particle Filter split view is the compatibility baseline. A CUI
-implementation should provide a directly clickable URL and refresh completed
-image files every two seconds. The standard filenames and ordering are:
+The live Particle Filter split view is the compatibility baseline for URL,
+responsive layout, and shared acquisition context. A CUI implementation should
+provide a directly clickable URL and periodically refresh completed image files.
+The shared structure is:
 
 1. `latest_experiment_overview.png`
 2. `latest_robot_2d.png`
-3. the estimator-specific 3-D result (`latest_pf_3d.png` or
-   `latest_mle_3d.png`)
-4. an optional labeled or secondary estimator panel
-5. `latest_spectrum.png`
+3. one or more estimator-owned result panels
+4. `latest_spectrum.png`
+
+The result-panel identifiers, filenames, titles, count, and renderers are not a
+cross-estimator contract. PF keeps its particle and labeled-particle views; MLE
+keeps its grid, likelihood-surface, or hotspot views. The shared shell accepts
+these owner-defined panels without interpreting or transforming estimator state.
 
 All implementations should use the same dark, responsive split-view shell,
 metric coordinate limits, isotope colors, obstacle rendering, runtime-provided
 travel waypoints, station visit labels, and current robot marker. A combined
-orchestrator view may add navigation and both estimator panels without changing
-the shared filenames.
+orchestrator view may add navigation and compose both sets of estimator-owned
+result panels without renaming their artifacts.
 
 The human-readable URL event is:
 
@@ -123,7 +128,8 @@ estimator access to realized truth.
 - Publish packaged runtime defaults.
 - Publish the CUI server, URL, and route APIs.
 - Keep existing PF/MLE/orchestrator entry points as thin compatibility wrappers.
-- Make every `latest_*` update atomic and retain the PF five-panel result set.
+- Make every `latest_*` update atomic and retain the shared page structure while
+  letting each estimator define and render its own result panels.
 
 ### Phase 2: typed adaptive session
 

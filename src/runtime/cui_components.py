@@ -1,4 +1,4 @@
-"""Shared PF-reference scene, status, and five-panel CUI components."""
+"""Estimator-neutral scene, status, panel, and CUI shell components."""
 
 from __future__ import annotations
 
@@ -18,13 +18,7 @@ from runtime.artifacts import atomic_write_json, atomic_write_text
 from runtime.cui import CUIRoute
 
 
-PF_REFERENCE_PANEL_ORDER = (
-    "overview",
-    "robot",
-    "estimator",
-    "estimator-labeled",
-    "spectrum",
-)
+_SHARED_CONTEXT_PANEL_IDS = frozenset({"overview", "robot", "spectrum"})
 
 
 def _readonly_vector(value: object, *, name: str) -> NDArray[np.float64]:
@@ -50,7 +44,7 @@ class CUITruthDisplayMode(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class CUIPanelSpec:
-    """Describe one image panel in the shared PF-reference dashboard shell."""
+    """Describe one owner-rendered image in the shared dashboard shell."""
 
     panel_id: str
     title: str
@@ -82,14 +76,22 @@ class CUIPanelSpec:
             raise ValueError("CUI panel column_span must be 1 or 2.")
 
 
-def pf_reference_panel_specs(
-    *,
-    estimator_title: str = "Particle filter 3D",
-    estimator_filename: str = "latest_pf_3d.png",
-    labeled_estimator_title: str = "Particle filter 3D with source labels",
-    labeled_estimator_filename: str = "latest_pf_3d_labeled.png",
+def shared_cui_panel_specs(
+    result_panels: Sequence[CUIPanelSpec],
 ) -> tuple[CUIPanelSpec, ...]:
-    """Return the canonical five-panel order with estimator-specific 3-D slots."""
+    """Place owner-defined result panels in the shared dashboard structure."""
+    result_values = tuple(result_panels)
+    if not result_values:
+        raise ValueError("The shared CUI structure requires a result panel.")
+    if any(not isinstance(panel, CUIPanelSpec) for panel in result_values):
+        raise TypeError("result_panels must contain CUIPanelSpec values.")
+    result_ids = tuple(panel.panel_id for panel in result_values)
+    if len(set(result_ids)) != len(result_ids):
+        raise ValueError("CUI result panel identifiers must be unique.")
+    if _SHARED_CONTEXT_PANEL_IDS.intersection(result_ids):
+        raise ValueError(
+            "CUI result panel identifiers must not replace shared context panels."
+        )
     return (
         CUIPanelSpec(
             "overview",
@@ -98,13 +100,7 @@ def pf_reference_panel_specs(
             2,
         ),
         CUIPanelSpec("robot", "Robot position 2D", "latest_robot_2d.png"),
-        CUIPanelSpec("estimator", estimator_title, estimator_filename),
-        CUIPanelSpec(
-            "estimator-labeled",
-            labeled_estimator_title,
-            labeled_estimator_filename,
-            2,
-        ),
+        *result_values,
         CUIPanelSpec(
             "spectrum",
             "Raw native full spectrum",
@@ -282,16 +278,17 @@ def write_cui_index(
     index_filename: str = "index.html",
     asset_base_href: str | None = None,
 ) -> Path:
-    """Publish the common PF-reference responsive five-panel HTML shell."""
+    """Publish a responsive shell for owner-defined image panels."""
     root_path = Path(root)
     root_path.mkdir(parents=True, exist_ok=True)
     panel_values = tuple(panels)
-    if len(panel_values) != 5 or any(
-        not isinstance(panel, CUIPanelSpec) for panel in panel_values
-    ):
-        raise ValueError("The shared CUI shell requires exactly five panel specs.")
-    if tuple(panel.panel_id for panel in panel_values) != PF_REFERENCE_PANEL_ORDER:
-        raise ValueError("CUI panels must follow the PF reference panel order.")
+    if not panel_values:
+        raise ValueError("The shared CUI shell requires at least one panel spec.")
+    if any(not isinstance(panel, CUIPanelSpec) for panel in panel_values):
+        raise TypeError("panels must contain CUIPanelSpec values.")
+    panel_ids = tuple(panel.panel_id for panel in panel_values)
+    if len(set(panel_ids)) != len(panel_ids):
+        raise ValueError("CUI panel identifiers must be unique.")
     if isinstance(refresh_interval_ms, bool) or not isinstance(
         refresh_interval_ms,
         int,
@@ -397,13 +394,12 @@ def write_cui_status(path: str | Path, status: CUIStatus) -> Path:
 
 
 __all__ = [
-    "PF_REFERENCE_PANEL_ORDER",
     "CUIAcquisitionFrame",
     "CUIPanelSpec",
     "CUIScene",
     "CUIStatus",
     "CUITruthDisplayMode",
-    "pf_reference_panel_specs",
+    "shared_cui_panel_specs",
     "write_cui_index",
     "write_cui_status",
 ]

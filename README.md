@@ -128,9 +128,10 @@ moving their algorithms into this package:
   authenticated artifact inventory. Published prefix manifests bind their covered
   records to an algorithm-qualified digest and retain the bare SHA-256 only as a
   transitional alias.
-- `CUIRoute`, `CUIScene`, and the PF-reference five-panel shell standardize route,
-  obstacle, URL, and page structure while leaving particles, density surfaces, and
-  combined estimator plots to their owners.
+- `CUIRoute`, `CUIScene`, and the responsive CUI shell standardize route,
+  obstacle, URL, and page structure. Each estimator supplies its own result panel
+  specifications and renders particles, grids, density surfaces, or combined plots
+  inside those panels.
 - `AtomicBundlePublisher`, `DurableJSONLWriter`, `ArtifactInventory`, strict JSON,
   digest identities, and CLI JSON framing provide versioned mechanical contracts.
 

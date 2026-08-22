@@ -31,7 +31,7 @@ from runtime import (
     CUI_URL_MESSAGE_PREFIX,
     cui_browser_url,
     cui_route_from_records,
-    pf_reference_panel_specs,
+    shared_cui_panel_specs,
     resolve_cui_public_host,
     start_cui_server,
     write_cui_index,
@@ -665,16 +665,24 @@ def test_scene_preserves_asymmetric_obstacle_xy_order() -> None:
     )
 
 
-def test_pf_reference_shell_and_status_use_shared_five_panel_order(
+def test_shared_shell_keeps_owner_defined_result_panels(
     tmp_path: Path,
 ) -> None:
-    """Estimator variants should replace only the estimator-specific slots."""
-    panels = pf_reference_panel_specs(
-        estimator_title="Surface MLE 3D",
-        estimator_filename="latest_mle_3d.png",
-        labeled_estimator_title="Surface MLE hotspots",
-        labeled_estimator_filename="latest_mle_hotspots_3d.png",
+    """Estimator result identity and count must remain owner-defined."""
+    mle_results = (
+        CUIPanelSpec(
+            "mle-grid",
+            "Surface MLE grid",
+            "latest_mle_grid.png",
+        ),
+        CUIPanelSpec(
+            "mle-hotspots",
+            "Surface MLE hotspots",
+            "latest_mle_hotspots.png",
+            2,
+        ),
     )
+    panels = shared_cui_panel_specs(mle_results)
 
     index = write_cui_index(tmp_path, panels, title="MLE dashboard")
     status = CUIStatus(
@@ -688,32 +696,98 @@ def test_pf_reference_shell_and_status_use_shared_five_panel_order(
     markup = index.read_text(encoding="utf-8")
     offsets = [markup.index(f'id="{panel.panel_id}"') for panel in panels]
     assert offsets == sorted(offsets)
-    assert "latest_mle_3d.png" in markup
+    assert tuple(panel.panel_id for panel in panels) == (
+        "overview",
+        "robot",
+        "mle-grid",
+        "mle-hotspots",
+        "spectrum",
+    )
+    assert "latest_mle_grid.png" in markup
+    assert "Particle filter" not in markup
     assert "height: calc(50vh - 70px)" in markup
     assert "object-fit: contain" in markup
     assert '<link rel="icon" href="data:,">' in markup
     assert json.loads(status_path.read_text(encoding="utf-8")) == (
         status.to_payload()
     )
-    with pytest.raises(ValueError, match="exactly five"):
-        write_cui_index(tmp_path, panels[:-1])
+
+
+def test_shared_shell_accepts_a_different_number_of_particle_result_panels(
+    tmp_path: Path,
+) -> None:
+    """The shell must not force MLE grids into PF particle panel slots."""
+    particle_results = (
+        CUIPanelSpec("particles", "Particles", "latest_particles.png"),
+        CUIPanelSpec(
+            "particle-labels",
+            "Particles with labels",
+            "latest_particle_labels.png",
+            2,
+        ),
+        CUIPanelSpec(
+            "posterior-summary",
+            "Posterior summary",
+            "latest_posterior_summary.png",
+            2,
+        ),
+    )
+    panels = shared_cui_panel_specs(particle_results)
+
+    index = write_cui_index(tmp_path, panels, title="PF dashboard")
+
+    markup = index.read_text(encoding="utf-8")
+    assert len(panels) == 6
+    assert all(panel.image_filename in markup for panel in particle_results)
+
+
+def test_shared_panel_structure_protects_context_panel_identifiers() -> None:
+    """Estimator result slots cannot silently replace shared route context."""
+    with pytest.raises(ValueError, match="must not replace shared context"):
+        shared_cui_panel_specs(
+            (CUIPanelSpec("robot", "Estimator robot", "result.png"),)
+        )
+
+    with pytest.raises(ValueError, match="requires a result panel"):
+        shared_cui_panel_specs(())
+
+
+def test_cui_shell_requires_nonempty_unique_panel_identifiers(
+    tmp_path: Path,
+) -> None:
+    """Generic shell validation should not depend on estimator semantics."""
+    panel = CUIPanelSpec("result", "Result", "result.png")
+    with pytest.raises(ValueError, match="at least one"):
+        write_cui_index(tmp_path, ())
+    with pytest.raises(ValueError, match="identifiers must be unique"):
+        write_cui_index(tmp_path, (panel, panel))
 
 
 def test_shared_cui_shell_can_resolve_assets_from_a_parent_page(tmp_path: Path) -> None:
     """Estimator subpages must reuse the shell without copying root images."""
     page = write_cui_index(
         tmp_path / "pf",
-        pf_reference_panel_specs(),
+        shared_cui_panel_specs(
+            (CUIPanelSpec("particles", "Particles", "latest_particles.png"),)
+        ),
         asset_base_href="../",
     )
 
     markup = page.read_text(encoding="utf-8")
     assert '<base href="../">' in markup
-    assert 'src="latest_pf_3d.png"' in markup
+    assert 'src="latest_particles.png"' in markup
     with pytest.raises(ValueError, match="safe relative"):
         write_cui_index(
             tmp_path / "unsafe",
-            pf_reference_panel_specs(),
+            shared_cui_panel_specs(
+                (
+                    CUIPanelSpec(
+                        "particles",
+                        "Particles",
+                        "latest_particles.png",
+                    ),
+                )
+            ),
             asset_base_href="https://example.invalid/",
         )
 
