@@ -280,6 +280,7 @@ def write_cui_index(
     title: str = "Rotating-shield radiation estimation",
     refresh_interval_ms: int = 1200,
     index_filename: str = "index.html",
+    asset_base_href: str | None = None,
 ) -> Path:
     """Publish the common PF-reference responsive five-panel HTML shell."""
     root_path = Path(root)
@@ -306,6 +307,40 @@ def write_cui_index(
         or index_path.suffix != ".html"
     ):
         raise ValueError("index_filename must be one visible HTML filename.")
+    base_element = ""
+    if asset_base_href is not None:
+        if (
+            not isinstance(asset_base_href, str)
+            or not asset_base_href
+            or not asset_base_href.endswith("/")
+            or asset_base_href.startswith("/")
+            or "\\" in asset_base_href
+            or "\x00" in asset_base_href
+            or "?" in asset_base_href
+            or "#" in asset_base_href
+            or ":" in asset_base_href
+        ):
+            raise ValueError(
+                "asset_base_href must be a safe relative directory reference."
+            )
+        components = asset_base_href[:-1].split("/")
+        if any(
+            not component
+            or component == "."
+            or (
+                component != ".."
+                and any(
+                    character
+                    not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."
+                    for character in component
+                )
+            )
+            for component in components
+        ):
+            raise ValueError(
+                "asset_base_href must be a safe relative directory reference."
+            )
+        base_element = f'<base href="{html.escape(asset_base_href)}">\n'
     sections = "\n".join(
         (
             f'<section class="panel span-{panel.column_span}">'
@@ -326,7 +361,7 @@ def write_cui_index(
     )
     document = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+{base_element}<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{html.escape(title)}</title>
 <style>
 :root {{ color-scheme: dark; font-family: Inter, system-ui, sans-serif; }}

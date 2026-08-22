@@ -696,6 +696,25 @@ def test_pf_reference_shell_and_status_use_shared_five_panel_order(
         write_cui_index(tmp_path, panels[:-1])
 
 
+def test_shared_cui_shell_can_resolve_assets_from_a_parent_page(tmp_path: Path) -> None:
+    """Estimator subpages must reuse the shell without copying root images."""
+    page = write_cui_index(
+        tmp_path / "pf",
+        pf_reference_panel_specs(),
+        asset_base_href="../",
+    )
+
+    markup = page.read_text(encoding="utf-8")
+    assert '<base href="../">' in markup
+    assert 'src="latest_pf_3d.png"' in markup
+    with pytest.raises(ValueError, match="safe relative"):
+        write_cui_index(
+            tmp_path / "unsafe",
+            pf_reference_panel_specs(),
+            asset_base_href="https://example.invalid/",
+        )
+
+
 def test_acquisition_frame_declares_truth_mode_without_truth_payload() -> None:
     """Truth visibility is explicit while realized source values remain elsewhere."""
     frame = CUIAcquisitionFrame(
