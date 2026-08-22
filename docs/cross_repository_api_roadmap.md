@@ -148,15 +148,6 @@ estimator access to realized truth.
 - Retain orchestrator-local schema-v1 readers only for historical artifacts.
 - Freeze byte-level conformance fixtures before replacing legacy digest code.
 
-### Phase 4: estimator service contracts
-
-PF and MLE backends use a small, separately versioned estimator-service wire
-contract containing capabilities, execution requests/responses, artifact
-references, and controller-owned execution receipts. It contains neither
-simulation physics nor realized truth. Each service adapter invokes the solver
-inside its owning estimator repository; the orchestrator uses a subprocess
-client and never imports or copies either solver.
-
 ## Compatibility and acceptance gates
 
 - Existing CLI commands and result filenames remain readable during migration.
