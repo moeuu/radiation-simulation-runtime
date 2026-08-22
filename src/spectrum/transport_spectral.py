@@ -8439,7 +8439,7 @@ def geometry_conditioned_model_from_runtime_config(
     *,
     run_root: str | Path | None = None,
 ) -> GeometryConditionedSpectralModel:
-    """Reconstruct and verify the sole live/replay spectrum contract."""
+    """Reconstruct and verify the estimator-visible spectrum contract."""
     if not isinstance(runtime_config, Mapping):
         raise TypeError("Resolved runtime configuration must be a mapping.")
     from spectrum.isotope_profiles import resolve_profile_model_runtime_config

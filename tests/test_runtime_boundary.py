@@ -16,7 +16,7 @@ from sim.runtime import SimulationRuntime
 
 
 def test_observation_model_import_is_independent_of_sim_import_order() -> None:
-    """The replay observation model must import in a fresh interpreter."""
+    """The observation model must import in a fresh interpreter."""
     completed = subprocess.run(
         [
             sys.executable,
@@ -131,7 +131,7 @@ def test_session_persists_raw_observation_before_returning() -> None:
 
 
 def test_session_rejects_noncausal_step_id() -> None:
-    """Action numbering cannot skip or replay an observation."""
+    """Action numbering cannot skip or duplicate an observation."""
     session = ObservationSession(
         simulation_runtime=_FakeRuntime(),
         writer=_FakeWriter(),  # type: ignore[arg-type]

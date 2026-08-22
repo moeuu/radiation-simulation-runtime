@@ -33,7 +33,7 @@ from runtime.measurement_log import (
     _canonical_isotope_names,
     _validate_environment_payload,
     _validate_run_identity,
-    _validate_runtime_replay_contract,
+    _validate_runtime_observation_contract,
     validate_forward_model_manifest,
 )
 from runtime.provenance import sha256_json, strict_canonical_json_bytes
@@ -255,7 +255,7 @@ def _resolve_context(
         field_name="forward_model_manifest",
     )
     _validate_environment_payload(environment_payload)
-    _validate_runtime_replay_contract(
+    _validate_runtime_observation_contract(
         runtime_config,
         isotopes=isotopes,
     )

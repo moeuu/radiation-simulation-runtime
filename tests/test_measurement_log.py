@@ -302,7 +302,7 @@ def test_loader_rejects_environment_numeric_coercion(
 
 
 def test_environment_rejects_hollow_asset_serialized_as_solid_box() -> None:
-    """MeasurementLog must bind PF replay to authored shell components."""
+    """MeasurementLog must bind estimator inputs to authored shell components."""
     component = ObstacleComponent(
         name="cabinet_left_wall",
         center_xyz=(1.05, 1.5, 1.0),

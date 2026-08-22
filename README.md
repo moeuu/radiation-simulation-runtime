@@ -14,11 +14,10 @@ Rotating-shield-simulation-runtime
       Rotating-shield-particle-filter  radiation-surface-mle-estimator  estimator orchestrator
 ```
 
-For a fair same-observation comparison, run acquisition once and replay the exact
-same MeasurementLog with every estimator. For estimator-controlled closed-loop
-missions, each estimator gets a separate causal acquisition session, while this
-repository still supplies the identical simulator implementation and physics
-configuration.
+Each estimator-controlled mission gets a separate causal acquisition session so its
+controller can choose the next position and shield posture from the observations seen
+so far. This repository supplies the same simulator implementation and physics
+configuration to every live session.
 
 ## Commands
 
@@ -72,10 +71,10 @@ and `AdaptiveRuntimeClient(..., resume_stage_path=...)`.
 
 `generate-ral-scenario` creates that private, action-free scenario. Omitting
 `--scene-seed` creates a fresh environment and source realization; an explicit seed
-is reserved for exact replay or paired estimator comparisons. The command does not
-choose station count, view count, shield programs, estimator settings, or a stopping
-rule. Those remain private to the estimator or experiment harness controlling the
-session. `--source-profile ral-cs4-co3-eu0` defines both the private truth and the
+is reserved for reproducing a previously declared validation scene. The command does
+not choose station count, view count, shield programs, estimator settings, or a
+stopping rule. Those remain private to the estimator or experiment harness controlling
+the session. `--source-profile ral-cs4-co3-eu0` defines both the private truth and the
 truth-free candidate contract as Cs-137 plus Co-60: it realizes exactly four
 Cs-137 and three Co-60 sources, and Eu-154 is not offered to the estimator. Use
 `ral-mix9` when Eu-154 must remain in the candidate set.

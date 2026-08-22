@@ -330,7 +330,7 @@ def _finite_real_array(
 
 
 def _validate_environment_payload(payload: Mapping[str, Any]) -> None:
-    """Validate the exact room inputs consumed by replay and surface support."""
+    """Validate the exact room inputs consumed by estimators and surface support."""
     if not isinstance(payload, Mapping):
         raise MeasurementLogValidationError("environment must be an object.")
     required = {
@@ -344,7 +344,7 @@ def _validate_environment_payload(payload: Mapping[str, Any]) -> None:
     missing = sorted(required - set(payload))
     if missing:
         raise MeasurementLogValidationError(
-            "environment is missing replay fields: " + ", ".join(missing)
+            "environment is missing required fields: " + ", ".join(missing)
         )
     model_id = payload["environment_model_id"]
     if not isinstance(model_id, str) or not model_id.strip():
@@ -430,16 +430,16 @@ def _validate_environment_payload(payload: Mapping[str, Any]) -> None:
             )
     except (TypeError, ValueError) as exc:
         raise MeasurementLogValidationError(
-            f"environment is incompatible with replay geometry: {exc}"
+            f"environment is incompatible with runtime geometry: {exc}"
         ) from exc
 
 
-def _validate_runtime_replay_contract(
+def _validate_runtime_observation_contract(
     runtime_config: Mapping[str, Any],
     *,
     isotopes: Sequence[str],
 ) -> None:
-    """Validate explicit runtime fields that replay must never default."""
+    """Validate explicit fields required by estimator-visible observations."""
     if not isinstance(runtime_config, Mapping):
         raise MeasurementLogValidationError("runtime_config must be an object.")
     if runtime_config.get("simulation_runtime_schema_version") != 1 or isinstance(
@@ -452,8 +452,10 @@ def _validate_runtime_replay_contract(
     forbidden_estimator_fields = sorted(
         key
         for key in runtime_config
-        if key in {"effective_pf_replay", "estimator_profile", "pure_pf_schema_version"}
-        or key.startswith(("dss_", "joint_", "pf_", "structural_rj_"))
+        if key in {"estimator_profile", "pure_pf_schema_version"}
+        or key.startswith(
+            ("dss_", "effective_pf_", "joint_", "pf_", "structural_rj_")
+        )
     )
     if forbidden_estimator_fields:
         raise MeasurementLogValidationError(
@@ -1994,7 +1996,7 @@ def _write_measurement_log_unpublished(
         isotopes,
         location="isotopes",
     )
-    _validate_runtime_replay_contract(
+    _validate_runtime_observation_contract(
         runtime_config,
         isotopes=isotope_names,
     )
@@ -2642,7 +2644,7 @@ def load_measurement_log(path: str | Path) -> MeasurementLog:
         manifest["isotopes"],
         location="run_manifest.isotopes",
     )
-    _validate_runtime_replay_contract(
+    _validate_runtime_observation_contract(
         runtime_config,
         isotopes=manifest_isotopes,
     )
@@ -2792,7 +2794,7 @@ class MeasurementLogStreamWriter:
             isotopes,
             location="isotopes",
         )
-        _validate_runtime_replay_contract(
+        _validate_runtime_observation_contract(
             runtime_config,
             isotopes=isotope_names,
         )
@@ -2886,7 +2888,7 @@ class MeasurementLogStreamWriter:
             isotopes,
             location="isotopes",
         )
-        _validate_runtime_replay_contract(
+        _validate_runtime_observation_contract(
             runtime_config,
             isotopes=isotope_names,
         )

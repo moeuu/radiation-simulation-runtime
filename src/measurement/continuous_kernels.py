@@ -73,7 +73,7 @@ def validate_orientation_pair_indices(
 
     Production shield-pair identifiers are serialized as zero-based indices.
     Negative Python-style indexing and implicit floating-point truncation would
-    silently reinterpret a corrupt live/replay record as another physical
+    silently reinterpret a corrupt acquisition record as another physical
     shield posture, so both are rejected at the physics boundary.
     """
     if isinstance(orientation_count, bool) or not isinstance(

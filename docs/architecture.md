@@ -6,8 +6,8 @@ planning, summaries, and evaluation adapters.
 
 The process boundary is intentional. Estimators submit a versioned
 `SimulationCommand`; the runtime returns a raw `SimulationObservation` and writes
-the corresponding MeasurementLog record first. Complete-log replay and live
-closed-loop operation therefore share the same physics and serialization path.
+the corresponding MeasurementLog record first. Every live closed-loop controller
+therefore uses the same physics and serialization path.
 
 MeasurementLog contains detector poses, timing, Fe/Pb orientation indices, the raw
 integer spectrum, energy edges, environment geometry, and immutable forward-model

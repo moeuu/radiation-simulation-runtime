@@ -1,4 +1,4 @@
-"""Runtime contracts shared by live acquisition and estimator replay."""
+"""Runtime contracts shared by live acquisition and external evaluation."""
 
 from __future__ import annotations
 

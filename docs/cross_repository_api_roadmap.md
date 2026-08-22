@@ -38,7 +38,7 @@ The current worktree implements the estimator-neutral portions of phases 1–3:
   geometry, and the responsive panel HTML shell. Estimator repositories own the
   number, identity, and rendering of result panels;
 - `ResolvedForwardContext` owns authenticated physical-input reconstruction for
-  replay and live consumers, without owning any estimator state;
+  live consumers and external evaluators, without owning any estimator state;
 - adaptive ready, record, candidate, refinement, abort, and publication messages
   are frozen DTOs, and the client owns bounded lifecycle plus transcript observing;
 - `MeasurementLogView.from_records` owns live array/station conversion, while

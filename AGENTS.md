@@ -8,8 +8,9 @@ observation generation, and MeasurementLog publication.
 
 - Do not add PF, MLE, hybrid inference, estimator planning, posterior summaries,
   or estimator-specific rescue logic.
-- Estimators connect through `SimulationCommand` and immutable MeasurementLog
-  artifacts. They must not receive realized source truth.
+- Estimators connect through `SimulationCommand` and the typed adaptive-session
+  protocol. The runtime persists immutable MeasurementLog artifacts for audit and
+  recovery; estimators must not receive realized source truth.
 - Keep Geant4 physics fidelity and the event-level observation distribution
   unchanged when optimizing runtime performance.
 - Use Python 3.12 and `uv`; run `uv run pytest` after changes.
