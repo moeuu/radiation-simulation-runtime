@@ -16,7 +16,6 @@ from scipy.stats import qmc
 
 from measurement.kernels import ShieldParams
 from measurement.obstacles import ObstacleGrid
-from measurement.shielding import generate_octant_orientations
 from runtime.adaptive_protocol import (
     ADAPTIVE_CUI_OVERLAY_PREFIX,
     ADAPTIVE_CUI_OVERLAY_FRAMING,
@@ -31,6 +30,10 @@ from runtime.adaptive_protocol import (
     AdaptiveRefineRequest,
     AdaptiveResumePrefix,
     AdaptiveStepRequest,
+)
+from runtime.shield_timing import (
+    DEFAULT_SHIELD_ANGULAR_SPEED_RAD_S,
+    shield_pair_transition_time_s,
 )
 from runtime.forward_model_manifest import (
     SOURCE_RATE_SEMANTICS,
@@ -266,7 +269,10 @@ class AdaptiveMotionConfig:
                 minimum=0.0,
             ),
             shield_angular_speed_rad_s=_finite_number(
-                raw.get("shield_angular_speed_rad_s", math.pi / 4.0),
+                raw.get(
+                    "shield_angular_speed_rad_s",
+                    DEFAULT_SHIELD_ANGULAR_SPEED_RAD_S,
+                ),
                 field_name="adaptive_measurement.shield_angular_speed_rad_s",
                 positive=True,
             ),
@@ -862,6 +868,9 @@ class AdaptiveCandidateProvider:
             travel_costs=tuple(costs),
             allowed_pair_ids=tuple(range(64)),
             current_pair_id=int(current_pair_id),
+            shield_angular_speed_rad_s=(
+                self.motion.shield_angular_speed_rad_s
+            ),
         )
 
     def snapshot(
@@ -1297,28 +1306,13 @@ class AdaptiveRuntimeSession:
 
     def _shield_actuation_time_s(self, target_pair_id: int) -> float:
         """Return parallel Fe/Pb actuator time from physical octant angles."""
-        if not 0 <= int(target_pair_id) < 64:
-            raise ValueError("target_pair_id must lie in [0, 63].")
-        orientations = np.asarray(generate_octant_orientations(), dtype=float)
-        current_fe, current_pb = divmod(int(self.current_pair_id), 8)
-        target_fe, target_pb = divmod(int(target_pair_id), 8)
-
-        def angle(first: int, second: int) -> float:
-            """Return the shortest angular displacement between two normals."""
-            cosine = float(
-                np.clip(
-                    np.dot(orientations[first], orientations[second]),
-                    -1.0,
-                    1.0,
-                )
-            )
-            return float(math.acos(cosine))
-
-        displacement = max(
-            angle(current_fe, target_fe),
-            angle(current_pb, target_pb),
+        return shield_pair_transition_time_s(
+            self.current_pair_id,
+            target_pair_id,
+            shield_angular_speed_rad_s=(
+                self.candidates.motion.shield_angular_speed_rad_s
+            ),
         )
-        return displacement / float(self.candidates.motion.shield_angular_speed_rad_s)
 
     def finalize(self) -> tuple[MeasurementLog, dict[str, object]]:
         """Publish the immutable log and close the live session."""

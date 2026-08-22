@@ -63,6 +63,7 @@ def test_open_room_candidates_include_runtime_start_and_motion_costs() -> None:
     assert len({round(pose[2], 6) for pose in snapshot.candidate_poses_xyz}) > 3
     assert snapshot.allowed_pair_ids == tuple(range(64))
     assert snapshot.current_pair_id == 19
+    assert snapshot.shield_angular_speed_rad_s == pytest.approx(np.pi / 4.0)
 
 
 def test_obstacle_candidates_exclude_disconnected_free_cells() -> None:
@@ -368,6 +369,7 @@ def test_runtime_executes_only_the_current_selected_observation() -> None:
         _context(),
         provider,
     )
+    quoted_time_s = session._candidate_snapshot.quote_shield_program_time_s((30,))
 
     event = session.step(
         {
@@ -386,8 +388,46 @@ def test_runtime_executes_only_the_current_selected_observation() -> None:
     record = observation.writer.records[0]
     assert record.fe_orientation_index == 3
     assert record.pb_orientation_index == 6
-    assert record.shield_actuation_time_s > 0.0
+    assert record.shield_actuation_time_s == pytest.approx(quoted_time_s)
     assert record.metadata["station_complete"] is True
+
+
+def test_shield_program_quote_equals_sequential_executed_record_times() -> None:
+    """One pre-station quote must equal every later pair transition combined."""
+    environment = _environment()
+    environment["adaptive_measurement"] = {
+        "candidate_count": 16,
+        "shield_angular_speed_rad_s": 2.0,
+    }
+    observation = _FakeObservationSession()
+    provider = AdaptiveCandidateProvider(environment, None)
+    session = AdaptiveRuntimeSession(
+        observation,  # type: ignore[arg-type]
+        _context(),
+        provider,
+    )
+    program = (1, 9, 63)
+    quoted_time_s = session._candidate_snapshot.quote_shield_program_time_s(
+        program
+    )
+
+    for index, pair_id in enumerate(program):
+        fe_index, pb_index = divmod(pair_id, 8)
+        session.step(
+            {
+                "type": "step",
+                "candidate_index": 0,
+                "fe_orientation_index": fe_index,
+                "pb_orientation_index": pb_index,
+                "dwell_time_s": 1.0,
+                "station_id": 0,
+                "station_complete": index == len(program) - 1,
+            }
+        )
+
+    assert sum(
+        record.shield_actuation_time_s for record in observation.writer.records
+    ) == pytest.approx(quoted_time_s)
 
 
 def test_refined_current_pose_remains_available_for_same_station_views() -> None:

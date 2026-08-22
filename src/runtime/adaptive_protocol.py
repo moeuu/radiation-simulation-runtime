@@ -16,6 +16,10 @@ from runtime.records import (
     measurement_record_to_payload,
     validate_truth_free_estimator_input,
 )
+from runtime.shield_timing import (
+    DEFAULT_SHIELD_ANGULAR_SPEED_RAD_S,
+    shield_program_actuation_time_s,
+)
 
 ADAPTIVE_EVENT_PREFIX = "adaptive-session "
 ADAPTIVE_CUI_OVERLAY_PREFIX = "adaptive-cui-overlay "
@@ -72,6 +76,7 @@ class AdaptiveCandidateSnapshot:
     travel_costs: tuple[float, ...]
     allowed_pair_ids: tuple[int, ...]
     current_pair_id: int
+    shield_angular_speed_rad_s: float = DEFAULT_SHIELD_ANGULAR_SPEED_RAD_S
 
     def __post_init__(self) -> None:
         """Validate and normalize every candidate snapshot field."""
@@ -118,10 +123,36 @@ class AdaptiveCandidateSnapshot:
         )
         if current_pair_id > 63:
             raise ValueError("current_pair_id must lie in [0, 63].")
+        angular_speed = self.shield_angular_speed_rad_s
+        if isinstance(angular_speed, (bool, np.bool_)) or not isinstance(
+            angular_speed,
+            Real,
+        ):
+            raise TypeError(
+                "shield_angular_speed_rad_s must be a finite number."
+            )
+        parsed_angular_speed = float(angular_speed)
+        if not np.isfinite(parsed_angular_speed) or parsed_angular_speed <= 0.0:
+            raise ValueError(
+                "shield_angular_speed_rad_s must be finite and positive."
+            )
         object.__setattr__(self, "candidate_poses_xyz", tuple(poses))
         object.__setattr__(self, "travel_costs", costs)
         object.__setattr__(self, "allowed_pair_ids", pair_ids)
         object.__setattr__(self, "current_pair_id", current_pair_id)
+        object.__setattr__(
+            self,
+            "shield_angular_speed_rad_s",
+            parsed_angular_speed,
+        )
+
+    def quote_shield_program_time_s(self, pair_ids: Sequence[int]) -> float:
+        """Quote exact sequential shield actuation time from current state."""
+        return shield_program_actuation_time_s(
+            self.current_pair_id,
+            pair_ids,
+            shield_angular_speed_rad_s=self.shield_angular_speed_rad_s,
+        )
 
     def to_payload(self) -> dict[str, object]:
         """Serialize this snapshot to its existing wire representation."""
@@ -130,6 +161,7 @@ class AdaptiveCandidateSnapshot:
             "travel_costs": list(self.travel_costs),
             "allowed_pair_ids": list(self.allowed_pair_ids),
             "current_pair_id": self.current_pair_id,
+            "shield_angular_speed_rad_s": self.shield_angular_speed_rad_s,
         }
 
     def to_dict(self) -> dict[str, object]:
@@ -145,21 +177,29 @@ class AdaptiveCandidateSnapshot:
         if not isinstance(payload, Mapping):
             raise TypeError("Adaptive candidates must be an object.")
         validate_truth_free_estimator_input(payload, path="adaptive.candidates")
-        _strict_fields(
-            payload,
-            {
-                "candidate_poses_xyz",
-                "travel_costs",
-                "allowed_pair_ids",
-                "current_pair_id",
-            },
-            name="adaptive candidates",
-        )
+        legacy_fields = {
+            "candidate_poses_xyz",
+            "travel_costs",
+            "allowed_pair_ids",
+            "current_pair_id",
+        }
+        current_fields = legacy_fields | {"shield_angular_speed_rad_s"}
+        actual_fields = set(payload)
+        if actual_fields not in (legacy_fields, current_fields):
+            raise ValueError(
+                "adaptive candidates fields disagree with the adaptive protocol: "
+                f"missing={sorted(current_fields - actual_fields)}, "
+                f"unknown={sorted(actual_fields - current_fields)}."
+            )
         return cls(
             candidate_poses_xyz=payload["candidate_poses_xyz"],
             travel_costs=payload["travel_costs"],
             allowed_pair_ids=payload["allowed_pair_ids"],
             current_pair_id=payload["current_pair_id"],
+            shield_angular_speed_rad_s=payload.get(
+                "shield_angular_speed_rad_s",
+                DEFAULT_SHIELD_ANGULAR_SPEED_RAD_S,
+            ),
         )
 
 

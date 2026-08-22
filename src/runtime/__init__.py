@@ -44,6 +44,7 @@ _EXPORT_MODULES = {
     "CUI_URL_MESSAGE_PREFIX": "runtime.cui",
     "cui_browser_url": "runtime.cui",
     "cui_route_from_records": "runtime.cui",
+    "cui_scene_from_run_context": "runtime.cui_components",
     "resolve_cui_public_host": "runtime.cui",
     "start_cui_server": "runtime.cui",
     "CUIAcquisitionFrame": "runtime.cui_components",
@@ -97,6 +98,8 @@ _EXPORT_MODULES = {
     "strict_canonical_json_bytes": "runtime.provenance",
     "strict_json_loads": "runtime.provenance",
     "strict_sha256_json": "runtime.provenance",
+    "shield_pair_transition_time_s": "runtime.shield_timing",
+    "shield_program_actuation_time_s": "runtime.shield_timing",
 }
 
 
@@ -179,6 +182,7 @@ __all__ = [
     "covered_station_boundaries_sha256",
     "cui_browser_url",
     "cui_route_from_records",
+    "cui_scene_from_run_context",
     "load_measurement_log",
     "load_strict_json",
     "line_energy_weight_by_isotope",
@@ -200,6 +204,8 @@ __all__ = [
     "strict_canonical_json_bytes",
     "strict_json_loads",
     "strict_sha256_json",
+    "shield_pair_transition_time_s",
+    "shield_program_actuation_time_s",
     "validate_forward_model_manifest",
     "write_deterministic_npz",
     "write_cui_index",

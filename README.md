@@ -121,6 +121,9 @@ moving their algorithms into this package:
 - `candidate_index_for_pose(...)` accepts either the legacy candidate mapping or
   an `AdaptiveCandidateSnapshot`, so typed controllers do not serialize a DTO back
   to a dictionary just to retain a selected pose.
+- `AdaptiveCandidateSnapshot.quote_shield_program_time_s(...)` quotes the exact
+  sequential Fe/Pb actuation time from the current shield state before a station is
+  executed, using the same parallel-actuator timing function as acquisition.
 - `MeasurementLog.view()`, `MeasurementLog.prefix_view(...)`, and
   `MeasurementLogView.from_records(...)` provide read-only array and station views
   without synthesizing manifests. File-backed logs additionally expose an
@@ -130,6 +133,9 @@ moving their algorithms into this package:
   obstacle, URL, and page structure. Each estimator supplies its own result panel
   specifications and renders particles, grids, density surfaces, or combined plots
   inside those panels.
+- `cui_scene_from_run_context(...)` resolves embedded or root-confined file-backed
+  obstacle geometry from a truth-free `RunContext` without constructing a spectral
+  response model.
 - `AtomicBundlePublisher`, `DurableJSONLWriter`, `ArtifactInventory`, strict JSON,
   digest identities, and CLI JSON framing provide versioned mechanical contracts.
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
 import io
+import math
 from typing import Any
 
 import numpy as np
@@ -68,6 +69,7 @@ def _candidate_payload() -> dict[str, object]:
         "travel_costs": [0.0, 0.5],
         "allowed_pair_ids": list(range(64)),
         "current_pair_id": 0,
+        "shield_angular_speed_rad_s": math.pi / 4.0,
     }
 
 
@@ -130,6 +132,43 @@ def test_candidate_snapshot_is_frozen_and_wire_compatible() -> None:
     with pytest.raises(FrozenInstanceError):
         snapshot.current_pair_id = 1
     assert parse_candidate_snapshot(_candidate_payload()) == _candidate_payload()
+
+
+def test_candidate_snapshot_quotes_sequential_shield_program_time() -> None:
+    """A quote must advance Fe/Pb state through every planned pair."""
+    payload = _candidate_payload()
+    payload["shield_angular_speed_rad_s"] = 2.0
+    snapshot = AdaptiveCandidateSnapshot.from_payload(payload)
+    octant_step_angle = math.acos(1.0 / 3.0)
+
+    assert snapshot.quote_shield_program_time_s((1, 9, 9)) == pytest.approx(
+        2.0 * octant_step_angle / 2.0
+    )
+    assert snapshot.quote_shield_program_time_s((0,)) == 0.0
+
+
+def test_candidate_snapshot_accepts_legacy_payload_with_historical_speed() -> None:
+    """Legacy snapshots remain readable under the historical default speed."""
+    payload = _candidate_payload()
+    del payload["shield_angular_speed_rad_s"]
+
+    snapshot = AdaptiveCandidateSnapshot.from_payload(payload)
+
+    assert snapshot.shield_angular_speed_rad_s == pytest.approx(math.pi / 4.0)
+    assert snapshot.to_payload()["shield_angular_speed_rad_s"] == pytest.approx(
+        math.pi / 4.0
+    )
+
+
+@pytest.mark.parametrize("pair_ids", [(), (True,), (64,), ("1",)])
+def test_candidate_snapshot_rejects_invalid_shield_programs(
+    pair_ids: tuple[object, ...],
+) -> None:
+    """Shield quotes must reject empty, coercible, and out-of-domain programs."""
+    snapshot = AdaptiveCandidateSnapshot.from_payload(_candidate_payload())
+
+    with pytest.raises((TypeError, ValueError)):
+        snapshot.quote_shield_program_time_s(pair_ids)
 
 
 def test_candidate_index_accepts_typed_snapshot_and_legacy_mapping() -> None:

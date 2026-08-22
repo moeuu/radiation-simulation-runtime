@@ -31,13 +31,39 @@ from runtime import (
     CUI_URL_MESSAGE_PREFIX,
     cui_browser_url,
     cui_route_from_records,
+    cui_scene_from_run_context,
     shared_cui_panel_specs,
     resolve_cui_public_host,
     start_cui_server,
     write_cui_index,
     write_cui_status,
 )
+from runtime.records import RunContext
 from tests.runtime_test_support import records
+
+
+def _cui_run_context(
+    environment: dict[str, object],
+    *,
+    obstacle_layout_path: str | None = None,
+) -> RunContext:
+    """Return one minimal truth-free context for lightweight CUI tests."""
+    return RunContext(
+        repository_commit="a" * 40,
+        runtime_config={},
+        environment=environment,
+        sim_backend="test",
+        spectrum_count_method="joint_full_spectrum_generative",
+        isotopes=("Cs-137",),
+        obstacle_layout_path=obstacle_layout_path,
+        source_layout_path=None,
+        source_rate_model="detector_cps_1m",
+        metadata={},
+        run_id="cui-scene-test",
+        source_rate_semantics={"unit": "counts_per_second"},
+        forward_model_manifest={},
+        runtime_config_sha256="b" * 64,
+    )
 
 
 def _fetch_text(url: str) -> str:
@@ -697,6 +723,138 @@ def test_scene_preserves_asymmetric_obstacle_xy_order() -> None:
         scene.obstacle_footprints_xy[0],
         [[1.5, 1.5], [2.0, 1.5], [2.0, 2.0], [1.5, 2.0]],
     )
+
+
+def test_cui_scene_payload_round_trips_strict_schema() -> None:
+    """Saved live-manifest geometry must reconstruct the immutable CUI scene."""
+    scene = CUIScene(
+        bounds_min_xyz=np.asarray([0.0, 0.0, 0.0]),
+        bounds_max_xyz=np.asarray([4.0, 3.0, 2.0]),
+        obstacle_boxes_xyz=np.asarray(
+            [[0.5, 0.6, 0.0, 1.0, 1.2, 1.5]],
+        ),
+    )
+
+    parsed = CUIScene.from_payload(scene.to_payload())
+
+    assert parsed.to_payload() == scene.to_payload()
+    assert not parsed.bounds_max_xyz.flags.writeable
+    assert not parsed.obstacle_boxes_xyz.flags.writeable
+
+
+@pytest.mark.parametrize(
+    "mutation, message",
+    [
+        ({"schema_version": True}, "schema_version"),
+        ({"schema_version": 2}, "schema_version"),
+        ({"unexpected": None}, "fields disagree"),
+    ],
+)
+def test_cui_scene_payload_rejects_incompatible_schema(
+    mutation: dict[str, object],
+    message: str,
+) -> None:
+    """Manifest scene parsing must reject versions and unknown fields."""
+    payload = {
+        "schema_version": 1,
+        "bounds_min_xyz": [0.0, 0.0, 0.0],
+        "bounds_max_xyz": [1.0, 1.0, 1.0],
+        "obstacle_boxes_xyz": [],
+    }
+    payload.update(mutation)
+
+    with pytest.raises(ValueError, match=message):
+        CUIScene.from_payload(payload)
+
+
+def test_cui_scene_from_context_resolves_embedded_obstacles(tmp_path: Path) -> None:
+    """The lightweight API should build room and embedded obstacle geometry."""
+    grid = ObstacleGrid(
+        origin=(0.5, 1.0),
+        cell_size=0.5,
+        grid_shape=(4, 3),
+        blocked_cells=((2, 1),),
+    )
+    context = _cui_run_context(
+        {
+            "size_x": 6.0,
+            "size_y": 4.0,
+            "size_z": 3.0,
+            "detector_position": [0.5, 0.5, 0.5],
+            "obstacle_grid": grid.to_dict(),
+        }
+    )
+
+    scene = cui_scene_from_run_context(
+        context,
+        runtime_asset_root=tmp_path.resolve(),
+    )
+
+    np.testing.assert_allclose(scene.bounds_max_xyz, [6.0, 4.0, 3.0])
+    np.testing.assert_allclose(
+        scene.obstacle_boxes_xyz,
+        [[1.5, 1.5, 0.0, 2.0, 2.0, 3.0]],
+    )
+
+
+def test_cui_scene_from_context_resolves_confined_file_asset(
+    tmp_path: Path,
+) -> None:
+    """A relative obstacle asset should resolve only inside the explicit root."""
+    asset_root = (tmp_path / "runtime-assets").resolve()
+    layout = asset_root / "obstacles" / "layout.json"
+    grid = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(2, 2),
+        blocked_cells=(),
+        collision_boxes_m=((0.2, 0.3, 0.0, 0.8, 0.9, 1.2),),
+    )
+    grid.save(layout)
+    context = _cui_run_context(
+        {
+            "size_x": 2.0,
+            "size_y": 2.0,
+            "size_z": 1.5,
+            "detector_position": [0.1, 0.1, 0.4],
+            "obstacle_grid": None,
+        },
+        obstacle_layout_path="obstacles/layout.json",
+    )
+
+    scene = cui_scene_from_run_context(
+        context,
+        runtime_asset_root=asset_root,
+    )
+
+    np.testing.assert_allclose(
+        scene.obstacle_boxes_xyz,
+        [[0.2, 0.3, 0.0, 0.8, 0.9, 1.2]],
+    )
+
+
+def test_cui_scene_from_context_rejects_unsafe_asset_inputs(
+    tmp_path: Path,
+) -> None:
+    """Asset roots and paths must fail closed before reading outside data."""
+    context = _cui_run_context(
+        {
+            "size_x": 2.0,
+            "size_y": 2.0,
+            "size_z": 1.5,
+            "detector_position": [0.1, 0.1, 0.4],
+            "obstacle_grid": None,
+        },
+        obstacle_layout_path="../outside.json",
+    )
+
+    with pytest.raises(ValueError, match="absolute path"):
+        cui_scene_from_run_context(context, runtime_asset_root=Path("relative"))
+    with pytest.raises(ValueError, match="parent-directory traversal"):
+        cui_scene_from_run_context(
+            context,
+            runtime_asset_root=tmp_path.resolve(),
+        )
 
 
 def test_shared_shell_keeps_owner_defined_result_panels(

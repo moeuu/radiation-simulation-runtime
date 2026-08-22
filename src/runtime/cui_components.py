@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 import html
@@ -16,6 +16,9 @@ from measurement.model import EnvironmentConfig
 from measurement.obstacles import ObstacleGrid
 from runtime.artifacts import atomic_write_json, atomic_write_text
 from runtime.cui import CUIRoute
+from runtime.forward_model_manifest import resolve_file_backed_model_asset
+from runtime.provenance import load_strict_json
+from runtime.records import RunContext, validate_truth_free_estimator_input
 
 
 _SHARED_CONTEXT_PANEL_IDS = frozenset({"overview", "robot", "spectrum"})
@@ -241,6 +244,112 @@ class CUIScene:
             "obstacle_boxes_xyz": self.obstacle_boxes_xyz.tolist(),
         }
 
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, object]) -> "CUIScene":
+        """Parse one exact schema-v1 scene saved in a live manifest."""
+        if not isinstance(payload, Mapping):
+            raise TypeError("CUI scene payload must be an object.")
+        expected = {
+            "schema_version",
+            "bounds_min_xyz",
+            "bounds_max_xyz",
+            "obstacle_boxes_xyz",
+        }
+        actual = set(payload)
+        if actual != expected:
+            raise ValueError(
+                "CUI scene payload fields disagree with schema 1: "
+                f"missing={sorted(expected - actual)}, "
+                f"unknown={sorted(actual - expected)}."
+            )
+        schema_version = payload["schema_version"]
+        if (
+            isinstance(schema_version, (bool, np.bool_))
+            or not isinstance(schema_version, (int, np.integer))
+            or int(schema_version) != 1
+        ):
+            raise ValueError("CUI scene schema_version must be exactly 1.")
+        return cls(
+            bounds_min_xyz=payload["bounds_min_xyz"],
+            bounds_max_xyz=payload["bounds_max_xyz"],
+            obstacle_boxes_xyz=payload["obstacle_boxes_xyz"],
+        )
+
+
+def _cui_runtime_asset_root(value: str | Path) -> Path:
+    """Return one explicit absolute directory for CUI asset resolution."""
+    supplied = Path(value)
+    if not supplied.is_absolute():
+        raise ValueError("runtime_asset_root must be an absolute path.")
+    try:
+        resolved = supplied.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("runtime_asset_root must exist.") from exc
+    if not resolved.is_dir():
+        raise ValueError("runtime_asset_root must be an existing directory.")
+    return resolved
+
+
+def _cui_obstacle_grid(
+    context: RunContext,
+    *,
+    runtime_asset_root: Path,
+) -> ObstacleGrid | None:
+    """Resolve embedded or root-confined file-backed obstacle geometry."""
+    raw_embedded = context.environment.get("obstacle_grid")
+    if raw_embedded is not None:
+        if not isinstance(raw_embedded, Mapping):
+            raise ValueError("environment.obstacle_grid must be an object or null.")
+        return ObstacleGrid.from_dict(dict(raw_embedded))
+    if context.obstacle_layout_path is None:
+        return None
+    resolved = resolve_file_backed_model_asset(
+        context.obstacle_layout_path,
+        field_name="obstacle_layout_path",
+        repository_root=runtime_asset_root,
+    )
+    payload = load_strict_json(resolved)
+    if not isinstance(payload, dict):
+        raise ValueError("File-backed obstacle layout must be a JSON object.")
+    return ObstacleGrid.from_dict(payload)
+
+
+def cui_scene_from_run_context(
+    context: RunContext,
+    *,
+    runtime_asset_root: str | Path,
+) -> CUIScene:
+    """Build a truth-free CUI scene without constructing spectral models."""
+    if not isinstance(context, RunContext):
+        raise TypeError("context must be a RunContext.")
+    validate_truth_free_estimator_input(
+        context.to_payload(),
+        path="cui.run_context",
+    )
+    asset_root = _cui_runtime_asset_root(runtime_asset_root)
+    environment_payload = context.environment
+    required = {"size_x", "size_y", "size_z", "detector_position"}
+    missing = sorted(required - set(environment_payload))
+    if missing:
+        raise ValueError(
+            "CUI environment is missing required fields: " + ", ".join(missing)
+        )
+    environment = EnvironmentConfig(
+        size_x=environment_payload["size_x"],
+        size_y=environment_payload["size_y"],
+        size_z=environment_payload["size_z"],
+        detector_position=environment_payload["detector_position"],
+    )
+    obstacle_grid = _cui_obstacle_grid(
+        context,
+        runtime_asset_root=asset_root,
+    )
+    return CUIScene.from_environment(
+        environment,
+        obstacle_grid,
+        obstacle_height_m=environment.size_z,
+    )
+
 
 @dataclass(frozen=True, slots=True)
 class CUIAcquisitionFrame:
@@ -399,6 +508,7 @@ __all__ = [
     "CUIScene",
     "CUIStatus",
     "CUITruthDisplayMode",
+    "cui_scene_from_run_context",
     "shared_cui_panel_specs",
     "write_cui_index",
     "write_cui_status",
