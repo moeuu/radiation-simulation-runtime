@@ -9,11 +9,14 @@ from typing import Any
 import numpy as np
 import pytest
 
+import runtime
+import runtime.adaptive_client as adaptive_client_module
 from runtime.adaptive_client import (
     AdaptiveProtocolDirection,
     AdaptiveProtocolObservation,
     AdaptiveRuntimeClient,
     adaptive_step_request,
+    candidate_index_for_pose,
     parse_candidate_snapshot,
     parse_run_context,
 )
@@ -127,6 +130,30 @@ def test_candidate_snapshot_is_frozen_and_wire_compatible() -> None:
     with pytest.raises(FrozenInstanceError):
         snapshot.current_pair_id = 1
     assert parse_candidate_snapshot(_candidate_payload()) == _candidate_payload()
+
+
+def test_candidate_index_accepts_typed_snapshot_and_legacy_mapping() -> None:
+    """Pose lookup must consume typed snapshots without a dictionary round trip."""
+    payload = _candidate_payload()
+    snapshot = AdaptiveCandidateSnapshot.from_payload(payload)
+
+    assert candidate_index_for_pose(snapshot, (1.0, 0.5, 0.5)) == 1
+    assert candidate_index_for_pose(payload, (0.5, 0.5, 0.5)) == 0
+
+
+def test_candidate_index_rejects_invalid_target_pose() -> None:
+    """Pose lookup must fail clearly before attempting malformed broadcasting."""
+    snapshot = AdaptiveCandidateSnapshot.from_payload(_candidate_payload())
+
+    with pytest.raises(ValueError, match="three finite"):
+        candidate_index_for_pose(snapshot, (1.0, 0.5))
+
+
+def test_estimator_facing_exports_exclude_truth_overlay_parser() -> None:
+    """Public client exports must expose pose lookup but no truth parser."""
+    assert runtime.candidate_index_for_pose is candidate_index_for_pose
+    assert "parse_cui_overlay_payload" not in adaptive_client_module.__all__
+    assert not hasattr(adaptive_client_module, "parse_cui_overlay_payload")
 
 
 def test_public_dto_constructors_reject_coercible_invalid_values() -> None:

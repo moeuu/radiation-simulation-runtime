@@ -116,11 +116,18 @@ moving their algorithms into this package:
   once. PF particles and MLE surfaces remain in their own repositories.
 - `AdaptiveRuntimeClient` exposes typed `handshake()`, `acquire()`,
   `refine_candidates()`, and `finalize_log()` calls. It is a context manager with
-  bounded termination and an optional immutable protocol observer.
+  bounded termination and an optional immutable protocol observer. This client is
+  estimator-facing: it rejects `request_cui_overlay(include_truth=True)` and also
+  rejects any unexpected truth-bearing overlay response.
+- `candidate_index_for_pose(...)` accepts either the legacy candidate mapping or
+  an `AdaptiveCandidateSnapshot`, so typed controllers do not serialize a DTO back
+  to a dictionary just to retain a selected pose.
 - `MeasurementLog.view()`, `MeasurementLog.prefix_view(...)`, and
   `MeasurementLogView.from_records(...)` provide read-only array and station views
   without synthesizing manifests. File-backed logs additionally expose an
-  authenticated artifact inventory.
+  authenticated artifact inventory. Published prefix manifests bind their covered
+  records to an algorithm-qualified digest and retain the bare SHA-256 only as a
+  transitional alias.
 - `CUIRoute`, `CUIScene`, and the PF-reference five-panel shell standardize route,
   obstacle, URL, and page structure while leaving particles, density surfaces, and
   combined estimator plots to their owners.

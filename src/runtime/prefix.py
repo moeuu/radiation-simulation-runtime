@@ -163,12 +163,16 @@ def materialize_measurement_log_prefix(
         assert_station_complete=assert_station_complete,
     )
     records = log.records[: stop + 1]
+    records_digest = measurement_records_digest(records)
     writer_marked_complete = records[-1].metadata.get("station_complete") is True
     prefix_metadata = {
         "schema_version": 1,
         "source_run_id": log.context.run_id,
         "data_cutoff_step": records[-1].step_id,
         "data_cutoff_station": records[-1].station_id,
+        "covered_records_digest": records_digest.to_payload(),
+        # Transitional alias for consumers that predate algorithm-bound digests.
+        "covered_records_sha256": records_digest.sha256,
         "station_boundary_attestation": (
             "covered_prefix_markers_v1"
             if writer_marked_complete
@@ -198,7 +202,6 @@ def materialize_measurement_log_prefix(
         obstacle_layout_path=log.context.obstacle_layout_path,
         source_layout_path=None,
     )
-    records_digest = measurement_records_digest(records)
     log_inventory_digest = saved.artifact_inventory().digest
     return MeasurementLogPrefix(
         output_dir=saved.path,

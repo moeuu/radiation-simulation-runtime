@@ -689,6 +689,9 @@ def test_pf_reference_shell_and_status_use_shared_five_panel_order(
     offsets = [markup.index(f'id="{panel.panel_id}"') for panel in panels]
     assert offsets == sorted(offsets)
     assert "latest_mle_3d.png" in markup
+    assert "height: calc(50vh - 70px)" in markup
+    assert "object-fit: contain" in markup
+    assert '<link rel="icon" href="data:,">' in markup
     assert json.loads(status_path.read_text(encoding="utf-8")) == (
         status.to_payload()
     )

@@ -823,8 +823,53 @@ def test_adaptive_protocol_uses_private_prefix_for_cui_overlay(
     ]
 
 
-def test_adaptive_client_requests_truth_only_on_private_cui_protocol() -> None:
-    """The client must keep CUI truth outside estimator-validated events."""
+def test_adaptive_client_rejects_truth_before_writing_cui_request() -> None:
+    """The estimator-facing client must not open the runtime truth channel."""
+    response = {
+        "type": "cui_overlay",
+        "schema_version": 1,
+        "truth": None,
+    }
+    client = AdaptiveRuntimeClient.__new__(AdaptiveRuntimeClient)
+    client.input = StringIO()
+    client.output = StringIO(
+        ADAPTIVE_CUI_OVERLAY_PREFIX + json.dumps(response) + "\n"
+    )
+    client.output_hook = lambda message: None
+    client.process = SimpleNamespace(poll=lambda: None)
+
+    with pytest.raises(ValueError, match="cannot request realized truth"):
+        client.request_cui_overlay(include_truth=True)
+
+    assert client.input.getvalue() == ""
+
+
+def test_adaptive_client_accepts_only_truth_free_cui_response() -> None:
+    """The estimator-facing CUI channel must require a null truth member."""
+    response = {
+        "type": "cui_overlay",
+        "schema_version": 1,
+        "truth": None,
+    }
+    client = AdaptiveRuntimeClient.__new__(AdaptiveRuntimeClient)
+    client.input = StringIO()
+    client.output = StringIO(
+        ADAPTIVE_CUI_OVERLAY_PREFIX + json.dumps(response) + "\n"
+    )
+    client.output_hook = lambda message: None
+    client.process = SimpleNamespace(poll=lambda: None)
+
+    payload = client.request_cui_overlay(include_truth=False)
+
+    assert json.loads(client.input.getvalue()) == {
+        "type": "cui_overlay",
+        "include_truth": False,
+    }
+    assert payload == response
+
+
+def test_adaptive_client_rejects_unexpected_truth_cui_response() -> None:
+    """A runtime response cannot inject realized truth into the client."""
     response = {
         "type": "cui_overlay",
         "schema_version": 1,
@@ -843,10 +888,5 @@ def test_adaptive_client_requests_truth_only_on_private_cui_protocol() -> None:
     client.output_hook = lambda message: None
     client.process = SimpleNamespace(poll=lambda: None)
 
-    payload = client.request_cui_overlay(include_truth=True)
-
-    assert json.loads(client.input.getvalue()) == {
-        "type": "cui_overlay",
-        "include_truth": True,
-    }
-    assert payload == response
+    with pytest.raises(ValueError, match="cannot receive realized truth"):
+        client.request_cui_overlay(include_truth=False)

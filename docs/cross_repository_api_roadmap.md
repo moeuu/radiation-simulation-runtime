@@ -102,13 +102,18 @@ one. Explicit public hosts and IPv6 literals must produce valid browser URLs.
 CUI truth has three explicit modes:
 
 - `hidden`: never request or render evaluation truth;
-- `evaluation_live`: request the private overlay for live evaluation only;
-- `post_run`: request the private overlay only after estimator decisions are
-  complete and render a final evaluation frame.
+- `evaluation_live`: an external evaluation renderer may request the private
+  overlay for live evaluation only;
+- `post_run`: an external evaluator may request the private overlay only after
+  estimator decisions are complete and render a final evaluation frame.
 
 `post_run` is the default. Truth overlay objects must not be stored in estimator
 state, planner inputs, estimator result manifests, or MeasurementLog artifacts.
-The runtime private CUI channel remains the only live source of realized truth.
+`AdaptiveRuntimeClient` is estimator-facing and therefore rejects both requests
+for truth and unexpected truth-bearing overlay responses. The runtime private CUI
+channel remains available only to a separately owned evaluation renderer. The
+`CUITruthDisplayMode` enum describes that renderer policy; it does not grant an
+estimator access to realized truth.
 
 ## Migration phases
 

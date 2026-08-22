@@ -363,17 +363,22 @@ def write_cui_index(
 <html lang="en"><head><meta charset="utf-8">
 {base_element}<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{html.escape(title)}</title>
+<link rel="icon" href="data:,">
 <style>
-:root {{ color-scheme: dark; font-family: Inter, system-ui, sans-serif; }}
-body {{ margin: 0; background: #0d1117; color: #e6edf3; }}
-header {{ padding: 12px 16px 4px; }}
-h1 {{ margin: 0; font-size: 18px; }}
+:root {{ color-scheme: dark; font-family: sans-serif; }}
+body {{ margin: 0; background: #111; color: #eee; }}
+header {{ padding: 10px 16px; background: #1d1d1d; border-bottom: 1px solid #333; }}
+h1 {{ margin: 0; font-size: 16px; font-weight: 600; }}
 main {{ display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 10px; padding: 10px; }}
-.panel {{ min-width: 0; background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 8px; }}
+.panel {{ min-width: 0; background: #181818; border: 1px solid #333; padding: 8px; }}
 .span-2 {{ grid-column: 1 / -1; }}
-h2 {{ margin: 0 0 6px; font-size: 14px; font-weight: 600; }}
-img {{ display: block; width: 100%; height: auto; background: #fff; }}
-@media (max-width: 900px) {{ main {{ grid-template-columns: 1fr; }} .span-2 {{ grid-column: auto; }} }}
+h2 {{ margin: 0 0 8px; font-size: 16px; font-weight: 600; }}
+img {{ display: block; width: 100%; height: calc(50vh - 70px); object-fit: contain; background: #fff; }}
+@media (max-width: 900px) {{
+  main {{ grid-template-columns: 1fr; }}
+  .span-2 {{ grid-column: auto; }}
+  img {{ height: auto; min-height: 240px; }}
+}}
 </style></head><body><header><h1>{html.escape(title)}</h1></header><main>
 {sections}
 </main><script>

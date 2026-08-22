@@ -84,8 +84,8 @@ def parse_candidate_snapshot(payload: object) -> dict[str, object]:
     return AdaptiveCandidateSnapshot.from_payload(payload).to_payload()
 
 
-def parse_cui_overlay_payload(payload: object) -> dict[str, object]:
-    """Parse private CUI overlay data that must not enter estimators."""
+def _parse_truth_free_cui_overlay_payload(payload: object) -> dict[str, object]:
+    """Parse a CUI overlay only when it contains no realized truth."""
     if not isinstance(payload, dict):
         raise TypeError("CUI overlay payload must be an object.")
     _strict_fields(
@@ -95,42 +95,10 @@ def parse_cui_overlay_payload(payload: object) -> dict[str, object]:
     )
     if payload.get("type") != "cui_overlay" or payload.get("schema_version") != 1:
         raise ValueError("Adaptive CUI overlay schema is incompatible.")
-    truth = payload.get("truth")
-    if truth is None:
-        return dict(payload)
-    if not isinstance(truth, dict):
-        raise TypeError("CUI truth overlay must be an object or null.")
-    _strict_fields(
-        truth,
-        {"schema_version", "semantics", "true_sources", "true_strengths"},
-        name="adaptive CUI truth overlay",
-    )
-    if truth.get("schema_version") != 1:
-        raise ValueError("CUI truth overlay schema is incompatible.")
-    sources = truth["true_sources"]
-    strengths = truth["true_strengths"]
-    if not isinstance(sources, dict) or not isinstance(strengths, dict):
-        raise TypeError("CUI truth sources and strengths must be objects.")
-    if set(sources) != set(strengths):
-        raise ValueError("CUI truth sources and strengths isotope sets differ.")
-    for isotope, raw_positions in sources.items():
-        if not isinstance(isotope, str):
-            raise TypeError("CUI truth isotope keys must be strings.")
-        positions = np.asarray(raw_positions, dtype=np.float64)
-        if positions.size == 0:
-            positions = positions.reshape((0, 3))
-        if (
-            positions.ndim != 2
-            or positions.shape[1] != 3
-            or np.any(~np.isfinite(positions))
-        ):
-            raise ValueError("CUI truth positions must have finite shape (N, 3).")
-        raw_strengths = np.asarray(strengths[isotope], dtype=np.float64).reshape(-1)
-        if (
-            raw_strengths.shape != (positions.shape[0],)
-            or np.any(~np.isfinite(raw_strengths))
-        ):
-            raise ValueError("CUI truth strengths must align with positions.")
+    if payload.get("truth") is not None:
+        raise ValueError(
+            "Estimator-facing AdaptiveRuntimeClient cannot receive realized truth."
+        )
     return dict(payload)
 
 
@@ -156,12 +124,31 @@ def adaptive_step_request(
 
 
 def candidate_index_for_pose(
-    candidates: Mapping[str, object],
+    candidates: Mapping[str, object] | AdaptiveCandidateSnapshot,
     pose_xyz: Sequence[float],
 ) -> int:
-    """Locate one exact retained pose in a new runtime candidate snapshot."""
-    poses = np.asarray(candidates["candidate_poses_xyz"], dtype=np.float64)
+    """Locate one exact retained pose in a mapping or typed snapshot."""
+    if isinstance(candidates, AdaptiveCandidateSnapshot):
+        raw_poses = candidates.candidate_poses_xyz
+    elif isinstance(candidates, Mapping):
+        raw_poses = candidates["candidate_poses_xyz"]
+    else:
+        raise TypeError(
+            "candidates must be a mapping or AdaptiveCandidateSnapshot."
+        )
+    poses = np.asarray(raw_poses, dtype=np.float64)
+    if (
+        poses.ndim != 2
+        or poses.shape[0] == 0
+        or poses.shape[1] != 3
+        or np.any(~np.isfinite(poses))
+    ):
+        raise ValueError(
+            "candidate_poses_xyz must have finite nonempty shape (C, 3)."
+        )
     target = np.asarray(pose_xyz, dtype=np.float64)
+    if target.shape != (3,) or np.any(~np.isfinite(target)):
+        raise ValueError("pose_xyz must contain exactly three finite coordinates.")
     matches = np.flatnonzero(
         np.all(np.isclose(poses, target[None, :], rtol=0.0, atol=1.0e-10), axis=1)
     )
@@ -432,14 +419,19 @@ class AdaptiveRuntimeClient:
         return self.request_refinement(request)
 
     def request_cui_overlay(self, *, include_truth: bool) -> dict[str, object]:
-        """Request private CUI overlay data outside the estimator protocol."""
+        """Request only a truth-free CUI overlay for estimator-owned rendering."""
         if self.input is None:
             raise RuntimeError("Adaptive runtime input is closed.")
         if not isinstance(include_truth, bool):
             raise TypeError("include_truth must be a boolean.")
+        if include_truth:
+            raise ValueError(
+                "AdaptiveRuntimeClient is estimator-facing and cannot request "
+                "realized truth."
+            )
         payload = {
             "type": "cui_overlay",
-            "include_truth": include_truth,
+            "include_truth": False,
         }
         self.input.write(json.dumps(payload, allow_nan=False) + "\n")
         self.input.flush()
@@ -448,7 +440,7 @@ class AdaptiveRuntimeClient:
             line = raw_line.rstrip("\n")
             if line.startswith(ADAPTIVE_CUI_OVERLAY_PREFIX):
                 payload = ADAPTIVE_CUI_OVERLAY_FRAMING.parse(line)
-                return parse_cui_overlay_payload(payload)
+                return _parse_truth_free_cui_overlay_payload(payload)
             if line.startswith(ADAPTIVE_EVENT_PREFIX):
                 raise RuntimeError(
                     "Shared runtime emitted an estimator event during a CUI "
@@ -575,6 +567,5 @@ __all__ = [
     "parse_adaptive_record",
     "parse_adaptive_resume_prefix",
     "parse_candidate_snapshot",
-    "parse_cui_overlay_payload",
     "parse_run_context",
 ]
