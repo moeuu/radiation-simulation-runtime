@@ -19,6 +19,7 @@ from runtime.measurement_log import (
     _validate_record_sequence,
     load_measurement_log,
 )
+from runtime.records import validate_truth_free_estimator_input
 from measurement.obstacle_assets import KnownObstacleInstance, ObstacleComponent
 from measurement.obstacles import ObstacleGrid
 from tests.runtime_test_support import make_measurement_log, records
@@ -137,8 +138,7 @@ def test_record_accepts_truth_free_source_position_contract_label() -> None:
     )
 
     assert (
-        updated.metadata["source_position_semantics"]
-        == "air_side_native_emission_xyz"
+        updated.metadata["source_position_semantics"] == "air_side_native_emission_xyz"
     )
 
 
@@ -156,6 +156,42 @@ def test_record_rejects_realized_source_positions() -> None:
                 **dict(valid.metadata),
                 "source_positions": [[1.0, 2.0, 3.0]],
             },
+        )
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    (
+        "private_source_profile",
+        "scenario_family",
+        "scene_seed",
+        "scene_rng_provenance",
+        "source_profile",
+    ),
+)
+def test_record_rejects_private_scenario_metadata(field_name: str) -> None:
+    """Estimator-visible metadata must not identify private scene generation."""
+    valid = records(1)[0]
+
+    with pytest.raises(MeasurementLogValidationError, match="realized truth"):
+        replace(
+            valid,
+            metadata={**dict(valid.metadata), field_name: "private"},
+        )
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ("private_source_profile", "scene_seed", "scene_rng_provenance"),
+)
+def test_estimator_runtime_config_rejects_private_scene_fields(
+    field_name: str,
+) -> None:
+    """Current-scene generation inputs cannot hide in physical config."""
+    with pytest.raises(MeasurementLogValidationError, match="realized truth"):
+        validate_truth_free_estimator_input(
+            {"context": {"runtime_config": {field_name: "private"}}},
+            path="adaptive.event",
         )
 
 
@@ -412,9 +448,7 @@ def test_prefix_rejects_coercion_and_range_clamping(
     record_count: object,
 ) -> None:
     """A requested causal prefix cannot be truncated or silently clamped."""
-    loaded = load_measurement_log(
-        make_measurement_log(tmp_path / "measurement-log")
-    )
+    loaded = load_measurement_log(make_measurement_log(tmp_path / "measurement-log"))
 
     with pytest.raises(MeasurementLogValidationError):
         loaded.prefix(record_count)  # type: ignore[arg-type]
@@ -435,9 +469,7 @@ def test_full_spectrum_alignment_rejects_coerced_schema_dimensions(
     invalid: object,
 ) -> None:
     """Schema-v3 dimensions stay exact across model, runtime, and log."""
-    loaded = load_measurement_log(
-        make_measurement_log(tmp_path / "measurement-log")
-    )
+    loaded = load_measurement_log(make_measurement_log(tmp_path / "measurement-log"))
     runtime = json.loads(json.dumps(dict(loaded.runtime_config)))
     if location == "model":
         runtime["full_spectrum_generative_model"][field_name] = invalid
@@ -467,17 +499,15 @@ def test_full_spectrum_alignment_requires_exact_isotope_strings(
     invalid: object,
 ) -> None:
     """Numeric and empty isotope IDs cannot align through string coercion."""
-    loaded = load_measurement_log(
-        make_measurement_log(tmp_path / "measurement-log")
-    )
+    loaded = load_measurement_log(make_measurement_log(tmp_path / "measurement-log"))
     manifest = json.loads(json.dumps(dict(loaded.run_manifest)))
     runtime = json.loads(json.dumps(dict(loaded.runtime_config)))
     if location == "manifest":
         manifest["isotopes"][0] = invalid
     else:
-        runtime["full_spectrum_generative_model"]["line_identity"][0][
-            "isotope"
-        ] = invalid
+        runtime["full_spectrum_generative_model"]["line_identity"][0]["isotope"] = (
+            invalid
+        )
 
     with pytest.raises(
         MeasurementLogValidationError,
@@ -494,9 +524,7 @@ def test_full_spectrum_alignment_rejects_duplicate_manifest_isotopes(
     tmp_path: Path,
 ) -> None:
     """The canonical run-manifest isotope set cannot contain duplicates."""
-    loaded = load_measurement_log(
-        make_measurement_log(tmp_path / "measurement-log")
-    )
+    loaded = load_measurement_log(make_measurement_log(tmp_path / "measurement-log"))
     manifest = json.loads(json.dumps(dict(loaded.run_manifest)))
     manifest["isotopes"].append(manifest["isotopes"][0])
 
@@ -515,9 +543,7 @@ def test_full_spectrum_alignment_allows_authenticated_isotope_superset(
     tmp_path: Path,
 ) -> None:
     """A candidate subset may use a model with additional authenticated lines."""
-    loaded = load_measurement_log(
-        make_measurement_log(tmp_path / "measurement-log")
-    )
+    loaded = load_measurement_log(make_measurement_log(tmp_path / "measurement-log"))
     manifest = json.loads(json.dumps(dict(loaded.run_manifest)))
     runtime = json.loads(json.dumps(dict(loaded.runtime_config)))
     manifest["isotopes"] = ["Co-60", "Cs-137"]
@@ -534,9 +560,7 @@ def test_full_spectrum_alignment_requires_every_candidate_line(
     tmp_path: Path,
 ) -> None:
     """A run isotope absent from the authenticated line basis must fail closed."""
-    loaded = load_measurement_log(
-        make_measurement_log(tmp_path / "measurement-log")
-    )
+    loaded = load_measurement_log(make_measurement_log(tmp_path / "measurement-log"))
     manifest = json.loads(json.dumps(dict(loaded.run_manifest)))
     manifest["isotopes"] = ["Co-60", "Cs-137", "Eu-154", "Xe-133"]
 

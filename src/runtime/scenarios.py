@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import secrets
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -63,16 +64,12 @@ def _source_payload(source: object) -> dict[str, object]:
     return {
         "isotope": str(source.isotope),
         "position": [float(value) for value in source.position],
-        "transport_position": [
-            float(value) for value in source.transport_position
-        ],
+        "transport_position": [float(value) for value in source.transport_position],
         "intensity_cps_1m": float(source.intensity_cps_1m),
         "surface_chart_id": int(source.surface_chart_id),
         "surface_uv": [float(value) for value in source.surface_uv],
         "surface_normal": [float(value) for value in source.surface_normal],
-        "surface_emission_policy_sha256": str(
-            source.surface_emission_policy_sha256
-        ),
+        "surface_emission_policy_sha256": str(source.surface_emission_policy_sha256),
     }
 
 
@@ -98,9 +95,7 @@ def build_random_ral_mix9_scenario(
     """
     seed = normalize_random_seed(scene_seed)
     if source_profile not in RAL_PRIVATE_SOURCE_PROFILES:
-        raise ValueError(
-            f"Unknown RA-L source profile: {source_profile!r}."
-        )
+        raise ValueError(f"Unknown RA-L source profile: {source_profile!r}.")
     isotope_sequence = RAL_PRIVATE_SOURCE_PROFILES[source_profile]
     candidate_isotopes = RAL_PRIVATE_CANDIDATE_ISOTOPES[source_profile]
     if not isinstance(run_id, str) or not run_id.strip():
@@ -110,13 +105,9 @@ def build_random_ral_mix9_scenario(
         raise FileNotFoundError(f"Runtime configuration is missing: {config_path}")
     config = load_runtime_config(config_path)
     obstacle_height_m = float(config.get("obstacle_height_m", 2.0))
-    chart_max_edge_m = float(
-        config.get("structural_rj_surface_chart_max_edge_m", 1.0)
-    )
+    chart_max_edge_m = float(config.get("structural_rj_surface_chart_max_edge_m", 1.0))
     include_room_boundaries = bool(config.get("author_room_boundary_prims", False))
-    room_boundary_thickness_m = float(
-        config.get("room_boundary_thickness_m", 0.1)
-    )
+    room_boundary_thickness_m = float(config.get("room_boundary_thickness_m", 0.1))
     environment_model_id = str(
         config.get(
             "environment_model_id",
@@ -174,9 +165,7 @@ def build_random_ral_mix9_scenario(
         "size_x": float(environment.size_x),
         "size_y": float(environment.size_y),
         "size_z": float(environment.size_z),
-        "detector_position": [
-            float(value) for value in environment.detector_position
-        ],
+        "detector_position": [float(value) for value in environment.detector_position],
         "obstacle_grid": grid.to_dict(),
         "obstacle_instances": obstacle_payload,
         "adaptive_measurement": {
@@ -217,9 +206,7 @@ def build_random_ral_mix9_scenario(
     run_metadata = dict(metadata or {})
     run_metadata.update(
         {
-            "scenario_family": (
-                "ral_random_physical_surface_v1:" + source_profile
-            ),
+            "scenario_family": ("ral_random_physical_surface_v1:" + source_profile),
             "private_source_profile": source_profile,
             "scene_seed": int(seed),
             "scene_rng_provenance": named_rng_provenance(
@@ -230,9 +217,7 @@ def build_random_ral_mix9_scenario(
                     "adaptive_candidate_workspace",
                 ),
             ),
-            "same_isotope_min_distance_m": float(
-                same_isotope_min_distance_m
-            ),
+            "same_isotope_min_distance_m": float(same_isotope_min_distance_m),
             "measurement_actions_precomputed": False,
         }
     )
@@ -242,10 +227,7 @@ def build_random_ral_mix9_scenario(
         "backend": "geant4",
         "runtime_config_path": config_path.as_posix(),
         "output_dir": (
-            Path(measurement_log_output_dir)
-            .expanduser()
-            .resolve()
-            .as_posix()
+            Path(measurement_log_output_dir).expanduser().resolve().as_posix()
         ),
         "environment": environment_payload,
         "scene": scene_payload,
@@ -261,20 +243,105 @@ def write_private_scenario(
 ) -> Path:
     """Write one private scenario without replacing an existing artifact."""
     target = Path(path).expanduser().resolve()
-    if target.exists():
-        raise FileExistsError(f"Refusing to replace private scenario {target}.")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(
+    return _write_private_json_exclusive(
+        target,
+        scenario,
+        artifact_name="private scenario",
+    )
+
+
+def _write_private_json_exclusive(
+    target: Path,
+    payload: Mapping[str, object],
+    *,
+    artifact_name: str,
+) -> Path:
+    """Create one owner-only JSON file without an overwrite race."""
+    serialized = (
         json.dumps(
-            dict(scenario),
+            dict(payload),
             indent=2,
             sort_keys=True,
             allow_nan=False,
         )
-        + "\n",
-        encoding="utf-8",
-    )
+        + "\n"
+    ).encode("utf-8")
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    target.parent.chmod(0o700)
+    try:
+        descriptor = os.open(
+            target,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+    except FileExistsError:
+        raise FileExistsError(
+            f"Refusing to replace {artifact_name} {target}."
+        ) from None
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        target.unlink(missing_ok=True)
+        raise
     return target
+
+
+def build_private_truth_manifest(
+    scenario: Mapping[str, object],
+) -> dict[str, object]:
+    """Return private evaluation truth joined to estimator output by run ID."""
+    if not isinstance(scenario, Mapping):
+        raise TypeError("scenario must be a mapping.")
+    run_id = scenario.get("run_id")
+    scene = scenario.get("scene")
+    metadata = scenario.get("metadata")
+    if not isinstance(run_id, str) or not run_id.strip():
+        raise ValueError("scenario.run_id must be a nonempty string.")
+    if not isinstance(scene, Mapping) or not isinstance(scene.get("sources"), list):
+        raise ValueError("scenario.scene.sources must be a JSON array.")
+    if not isinstance(metadata, Mapping):
+        raise ValueError("scenario.metadata must be a JSON object.")
+    required_metadata = (
+        "private_source_profile",
+        "scene_seed",
+        "scene_rng_provenance",
+    )
+    missing = [key for key in required_metadata if key not in metadata]
+    if missing:
+        raise ValueError(
+            "Private scenario metadata lacks truth-manifest fields: "
+            + ", ".join(missing)
+        )
+    return json.loads(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "run_id": run_id,
+                "source_profile": metadata["private_source_profile"],
+                "scene_seed": metadata["scene_seed"],
+                "scene_rng_provenance": metadata["scene_rng_provenance"],
+                "sources": scene["sources"],
+            },
+            sort_keys=True,
+            allow_nan=False,
+        )
+    )
+
+
+def write_private_truth_manifest(
+    path: str | Path,
+    manifest: Mapping[str, object],
+) -> Path:
+    """Publish one immutable private truth manifest outside estimator artifacts."""
+    target = Path(path).expanduser().resolve()
+    return _write_private_json_exclusive(
+        target,
+        manifest,
+        artifact_name="private truth manifest",
+    )
 
 
 __all__ = [
@@ -283,7 +350,9 @@ __all__ = [
     "RAL_MIX9_ISOTOPE_SEQUENCE",
     "RAL_PRIVATE_CANDIDATE_ISOTOPES",
     "RAL_PRIVATE_SOURCE_PROFILES",
+    "build_private_truth_manifest",
     "build_random_ral_mix9_scenario",
     "generate_fresh_scene_seed",
     "write_private_scenario",
+    "write_private_truth_manifest",
 ]

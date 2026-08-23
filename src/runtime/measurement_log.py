@@ -91,6 +91,16 @@ _FORBIDDEN_TRUTH_VALUE_TERMS = (
     "sourcepositions",
     "pointsources",
 )
+_FORBIDDEN_PRIVATE_METADATA_KEYS = frozenset(
+    {
+        "physicalsurfacesources",
+        "privatesourceprofile",
+        "scenariofamily",
+        "scenerngprovenance",
+        "sceneseed",
+        "sourceprofile",
+    }
+)
 _NON_REALIZED_SOURCE_CONTRACT_KEYS = frozenset(
     {
         "sourcepositionsemantics",
@@ -149,8 +159,7 @@ def _indicates_realized_truth(name: str, *, key: bool) -> bool:
     if key:
         return name in _REALIZED_SOURCE_KEYS
     return any(
-        term in name
-        for term in ("sourcelayout", "sourcepositions", "pointsources")
+        term in name for term in ("sourcelayout", "sourcepositions", "pointsources")
     )
 
 
@@ -163,13 +172,20 @@ def _validate_truth_free_payload(value: object, *, location: str) -> None:
                     f"{location} keys must be exact JSON strings."
                 )
             normalized = _normalized_contract_name(key)
+            metadata_location = "metadata" in {
+                part.casefold() for part in location.split(".")
+            }
+            runtime_config_root = location.casefold().endswith("runtime_config")
             aggregate_validation_metric = location.endswith(
                 ".full_spectrum_generative_model.validation.metrics"
             )
             if (
                 _indicates_realized_truth(normalized, key=True)
-                and not aggregate_validation_metric
-            ):
+                or (
+                    (metadata_location or runtime_config_root)
+                    and normalized in _FORBIDDEN_PRIVATE_METADATA_KEYS
+                )
+            ) and not aggregate_validation_metric:
                 raise MeasurementLogValidationError(
                     f"{location}.{key} contains estimator-visible realized truth."
                 )
@@ -188,21 +204,18 @@ def _validate_truth_free_payload(value: object, *, location: str) -> None:
     if isinstance(value, str):
         normalized = _normalized_contract_name(value)
         lower_value = value.casefold()
-        truth_path = (
-            "truth" in normalized
-            and (
-                "/" in value
-                or "\\" in value
-                or lower_value.endswith(
-                    (
-                        ".json",
-                        ".jsonl",
-                        ".npy",
-                        ".npz",
-                        ".csv",
-                        ".yaml",
-                        ".yml",
-                    )
+        truth_path = "truth" in normalized and (
+            "/" in value
+            or "\\" in value
+            or lower_value.endswith(
+                (
+                    ".json",
+                    ".jsonl",
+                    ".npy",
+                    ".npz",
+                    ".csv",
+                    ".yaml",
+                    ".yml",
                 )
             )
         )
@@ -264,11 +277,7 @@ def _canonical_isotope_names(
             f"{location} must be an array of nonempty JSON strings."
         )
     names = tuple(isotopes)
-    if (
-        not names
-        or len(set(names)) != len(names)
-        or names != tuple(sorted(names))
-    ):
+    if not names or len(set(names)) != len(names) or names != tuple(sorted(names)):
         raise MeasurementLogValidationError(
             f"{location} must be nonempty, unique, and canonically sorted."
         )
@@ -291,14 +300,10 @@ def _validate_run_identity(run_id: object, repository_commit: object) -> None:
 def _finite_real(value: object, *, location: str) -> float:
     """Return one exact finite real without accepting booleans or strings."""
     if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
-        raise MeasurementLogValidationError(
-            f"{location} must be a finite JSON number."
-        )
+        raise MeasurementLogValidationError(f"{location} must be a finite JSON number.")
     parsed = float(value)
     if not np.isfinite(parsed):
-        raise MeasurementLogValidationError(
-            f"{location} must be a finite JSON number."
-        )
+        raise MeasurementLogValidationError(f"{location} must be a finite JSON number.")
     return parsed
 
 
@@ -401,18 +406,12 @@ def _validate_environment_payload(payload: Mapping[str, Any]) -> None:
                             float(payload["size_y"]),
                             float(payload["size_z"]),
                         ),
-                        passage_width_m=float(
-                            raw_family["passage_width_m"]
-                        ),
+                        passage_width_m=float(raw_family["passage_width_m"]),
                         target_blocked_fraction=float(
                             raw_family["target_blocked_fraction"]
                         ),
                         obstacle_height_limit_m=(
-                            float(
-                                raw_family[
-                                    "obstacle_height_limit_fraction"
-                                ]
-                            )
+                            float(raw_family["obstacle_height_limit_fraction"])
                             * float(payload["size_z"])
                         ),
                     )
@@ -421,13 +420,9 @@ def _validate_environment_payload(payload: Mapping[str, Any]) -> None:
                             "geometry_family does not match obstacle components."
                         )
             elif payload.get("geometry_family") is not None:
-                raise ValueError(
-                    "geometry_family requires obstacle_instances."
-                )
+                raise ValueError("geometry_family requires obstacle_instances.")
         elif payload.get("obstacle_instances") not in (None, []):
-            raise ValueError(
-                "obstacle_instances require a non-null obstacle_grid."
-            )
+            raise ValueError("obstacle_instances require a non-null obstacle_grid.")
     except (TypeError, ValueError) as exc:
         raise MeasurementLogValidationError(
             f"environment is incompatible with runtime geometry: {exc}"
@@ -453,9 +448,7 @@ def _validate_runtime_observation_contract(
         key
         for key in runtime_config
         if key in {"estimator_profile", "pure_pf_schema_version"}
-        or key.startswith(
-            ("dss_", "effective_pf_", "joint_", "pf_", "structural_rj_")
-        )
+        or key.startswith(("dss_", "effective_pf_", "joint_", "pf_", "structural_rj_"))
     )
     if forbidden_estimator_fields:
         raise MeasurementLogValidationError(
@@ -510,9 +503,7 @@ def _required_json_integer(
     """Return one exact JSON integer from an external manifest."""
     value = payload.get(key)
     if isinstance(value, bool) or not isinstance(value, int):
-        raise MeasurementLogValidationError(
-            f"{location}.{key} must be a JSON integer."
-        )
+        raise MeasurementLogValidationError(f"{location}.{key} must be a JSON integer.")
     if minimum is not None and value < minimum:
         raise MeasurementLogValidationError(
             f"{location}.{key} must be at least {minimum}."
@@ -529,14 +520,10 @@ def _required_json_number(
     """Return one finite exact JSON number from an external manifest."""
     value = payload.get(key)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise MeasurementLogValidationError(
-            f"{location}.{key} must be a JSON number."
-        )
+        raise MeasurementLogValidationError(f"{location}.{key} must be a JSON number.")
     parsed = float(value)
     if not np.isfinite(parsed):
-        raise MeasurementLogValidationError(
-            f"{location}.{key} must be finite."
-        )
+        raise MeasurementLogValidationError(f"{location}.{key} must be finite.")
     return parsed
 
 
@@ -682,10 +669,7 @@ class MeasurementLogRecord:
             )
         _validate_sha256(
             self.metadata.get(FULL_SPECTRUM_CONTRACT_HASH_METADATA_KEY),
-            (
-                "record.metadata."
-                f"{FULL_SPECTRUM_CONTRACT_HASH_METADATA_KEY}"
-            ),
+            (f"record.metadata.{FULL_SPECTRUM_CONTRACT_HASH_METADATA_KEY}"),
         )
         _validate_truth_free_payload(self.metadata, location="record.metadata")
         try:
@@ -873,7 +857,9 @@ class MeasurementStation:
         ):
             raise TypeError("Station indices must be integers.")
         if self.start_index < 0 or self.stop_index <= self.start_index:
-            raise ValueError("Station indices must describe a nonempty half-open range.")
+            raise ValueError(
+                "Station indices must describe a nonempty half-open range."
+            )
         if len(self.records) != self.stop_index - self.start_index:
             raise ValueError("Station records must align with its half-open range.")
         if any(record.station_id != self.station_id for record in self.records):
@@ -1121,9 +1107,7 @@ class MeasurementLog:
         """Return the manifest run identifier."""
         value = self.run_manifest["run_id"]
         if not isinstance(value, str):
-            raise MeasurementLogValidationError(
-                "run_manifest.run_id must be a string."
-            )
+            raise MeasurementLogValidationError("run_manifest.run_id must be a string.")
         return value
 
     @property
@@ -1206,9 +1190,7 @@ class MeasurementLog:
     def prefix(self, record_count: int) -> "MeasurementLog":
         """Return an in-memory causal prefix without inspecting a future record."""
         if isinstance(record_count, bool) or not isinstance(record_count, int):
-            raise MeasurementLogValidationError(
-                "record_count must be a JSON integer."
-            )
+            raise MeasurementLogValidationError("record_count must be a JSON integer.")
         if record_count < 0 or record_count > len(self.records):
             raise MeasurementLogValidationError(
                 "record_count must lie within the available record range."
@@ -1327,9 +1309,7 @@ def write_deterministic_npz(
         raise ValueError(
             "Deterministic NPZ array names must be safe Python identifiers."
         )
-    normalized_arrays = {
-        name: np.asanyarray(value) for name, value in arrays.items()
-    }
+    normalized_arrays = {name: np.asanyarray(value) for name, value in arrays.items()}
     if any(array.dtype.hasobject for array in normalized_arrays.values()):
         raise TypeError("Deterministic NPZ arrays must not contain Python objects.")
     target = Path(path)
@@ -1495,9 +1475,7 @@ def _validate_record_sequence(
             "action_id must equal zero-based measurement-action order."
         )
     station_deltas = np.diff(station_ids)
-    if station_ids[0] != 0 or np.any(
-        (station_deltas < 0) | (station_deltas > 1)
-    ):
+    if station_ids[0] != 0 or np.any((station_deltas < 0) | (station_deltas > 1)):
         raise MeasurementLogValidationError(
             "station_id must form contiguous zero-based nondecreasing groups."
         )
@@ -1515,9 +1493,7 @@ def _validate_record_sequence(
                 )
         contract_hashes.add(
             _validate_sha256(
-                record.metadata.get(
-                    FULL_SPECTRUM_CONTRACT_HASH_METADATA_KEY
-                ),
+                record.metadata.get(FULL_SPECTRUM_CONTRACT_HASH_METADATA_KEY),
                 (
                     f"records[{index}].metadata."
                     f"{FULL_SPECTRUM_CONTRACT_HASH_METADATA_KEY}"
@@ -1526,8 +1502,7 @@ def _validate_record_sequence(
         )
     if len(contract_hashes) > 1:
         raise MeasurementLogValidationError(
-            "The full-spectrum generative contract changed within one "
-            "MeasurementLog."
+            "The full-spectrum generative contract changed within one MeasurementLog."
         )
     return isotope_names
 
@@ -1543,10 +1518,7 @@ def _validate_full_spectrum_contract_alignment(
     if (
         not isinstance(raw_isotopes, list)
         or not raw_isotopes
-        or any(
-            type(value) is not str or not value
-            for value in raw_isotopes
-        )
+        or any(type(value) is not str or not value for value in raw_isotopes)
         or len(set(raw_isotopes)) != len(raw_isotopes)
     ):
         raise MeasurementLogValidationError(
@@ -1578,16 +1550,11 @@ def _validate_full_spectrum_contract_alignment(
             "Full-spectrum model requires a nonempty line_identity."
         )
     raw_line_isotopes = [row.get("isotope") for row in line_rows]
-    if any(
-        type(value) is not str or not value
-        for value in raw_line_isotopes
-    ):
+    if any(type(value) is not str or not value for value in raw_line_isotopes):
         raise MeasurementLogValidationError(
             "Full-spectrum line isotopes must be nonempty JSON strings."
         )
-    line_isotopes = tuple(
-        sorted(set(raw_line_isotopes))
-    )
+    line_isotopes = tuple(sorted(set(raw_line_isotopes)))
     if not set(isotope_order).issubset(line_isotopes):
         raise MeasurementLogValidationError(
             "Full-spectrum line isotopes must cover the canonical "
@@ -1607,8 +1574,7 @@ def _validate_full_spectrum_contract_alignment(
     )
     if len({contract_hash, runtime_hash, manifest_hash}) != 1:
         raise MeasurementLogValidationError(
-            "Full-spectrum contract hashes differ across runtime and run "
-            "manifests."
+            "Full-spectrum contract hashes differ across runtime and run manifests."
         )
     manifest_contract_schema_version = _required_json_integer(
         run_manifest,
@@ -1700,17 +1666,13 @@ def _validate_full_spectrum_contract_alignment(
         raise MeasurementLogValidationError(
             "Full-spectrum axis bounds, width, and bin count are inconsistent."
         )
-    expected_edges = (
-        energy_min
-        + bin_width * np.arange(bin_counts[0] + 1, dtype=np.float64)
+    expected_edges = energy_min + bin_width * np.arange(
+        bin_counts[0] + 1, dtype=np.float64
     )
     for index, record in enumerate(records):
         record_hash = _validate_sha256(
             record.metadata.get(FULL_SPECTRUM_CONTRACT_HASH_METADATA_KEY),
-            (
-                f"records[{index}].metadata."
-                f"{FULL_SPECTRUM_CONTRACT_HASH_METADATA_KEY}"
-            ),
+            (f"records[{index}].metadata.{FULL_SPECTRUM_CONTRACT_HASH_METADATA_KEY}"),
         )
         if record_hash != contract_hash:
             raise MeasurementLogValidationError(
@@ -1742,9 +1704,7 @@ def _records_to_arrays(
     if validate_causal_sequence:
         _validate_record_sequence(records, isotopes)
     elif not records:
-        raise MeasurementLogValidationError(
-            "A MeasurementLog shard needs one record."
-        )
+        raise MeasurementLogValidationError("A MeasurementLog shard needs one record.")
     energy_edges = np.asarray(records[0].energy_bin_edges_keV, dtype=np.float64)
     spectrum_size = energy_edges.size - 1
     for record in records:
@@ -2000,9 +1960,7 @@ def _write_measurement_log_unpublished(
         runtime_config,
         isotopes=isotope_names,
     )
-    full_spectrum_contract = runtime_config.get(
-        "full_spectrum_generative_model"
-    )
+    full_spectrum_contract = runtime_config.get("full_spectrum_generative_model")
     if not isinstance(full_spectrum_contract, Mapping):
         raise MeasurementLogValidationError(
             "runtime_config.full_spectrum_generative_model must be an object."
@@ -2168,6 +2126,7 @@ def write_measurement_log(
 
 def _parse_json_value(text: str, *, location: str) -> Any:
     """Parse strict JSON while rejecting duplicate keys and non-finite constants."""
+
     def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         """Build one JSON object only when every member name is unique."""
         result: dict[str, Any] = {}
@@ -2212,8 +2171,7 @@ def _validate_run_manifest(payload: Mapping[str, Any]) -> dict[str, Any]:
         missing = sorted(_RUN_MANIFEST_FIELDS - set(payload))
         unknown = sorted(set(payload) - _RUN_MANIFEST_FIELDS)
         raise MeasurementLogValidationError(
-            "run_manifest schema mismatch; "
-            f"missing={missing}, unknown={unknown}."
+            f"run_manifest schema mismatch; missing={missing}, unknown={unknown}."
         )
     if "source_layout_path" not in payload:
         raise MeasurementLogValidationError(
@@ -2296,9 +2254,7 @@ def _validate_run_manifest(payload: Mapping[str, Any]) -> dict[str, Any]:
             "run_manifest.obstacle_layout_path must be a JSON string or null."
         )
     if not isinstance(payload.get("metadata"), Mapping):
-        raise MeasurementLogValidationError(
-            "run_manifest.metadata must be an object."
-        )
+        raise MeasurementLogValidationError("run_manifest.metadata must be an object.")
     sim_backend = payload.get("sim_backend")
     if not isinstance(sim_backend, str) or not sim_backend.strip():
         raise MeasurementLogValidationError(
@@ -2306,8 +2262,7 @@ def _validate_run_manifest(payload: Mapping[str, Any]) -> dict[str, Any]:
         )
     if payload.get("observation_model") != "joint_full_spectrum_generative":
         raise MeasurementLogValidationError(
-            "run_manifest.observation_model must be "
-            "'joint_full_spectrum_generative'."
+            "run_manifest.observation_model must be 'joint_full_spectrum_generative'."
         )
     _required_json_integer(
         payload,
@@ -2322,8 +2277,7 @@ def _validate_run_manifest(payload: Mapping[str, Any]) -> dict[str, Any]:
             location="run_manifest",
         )
     if (
-        float(payload["energy_max_keV"])
-        <= float(payload["energy_min_keV"])
+        float(payload["energy_max_keV"]) <= float(payload["energy_min_keV"])
         or float(payload["bin_width_keV"]) <= 0.0
     ):
         raise MeasurementLogValidationError(
@@ -2338,11 +2292,14 @@ def _validate_run_manifest(payload: Mapping[str, Any]) -> dict[str, Any]:
         raise MeasurementLogValidationError(
             "run_manifest full-spectrum contract hash is invalid."
         )
-    if _required_json_integer(
-        payload,
-        "full_spectrum_contract_schema_version",
-        location="run_manifest",
-    ) != FULL_SPECTRUM_MODEL_SCHEMA_VERSION:
+    if (
+        _required_json_integer(
+            payload,
+            "full_spectrum_contract_schema_version",
+            location="run_manifest",
+        )
+        != FULL_SPECTRUM_MODEL_SCHEMA_VERSION
+    ):
         raise MeasurementLogValidationError(
             "run_manifest requires full-spectrum contract schema "
             f"{FULL_SPECTRUM_MODEL_SCHEMA_VERSION}."
@@ -2452,16 +2409,12 @@ def _records_from_arrays(
         record_count,
         (int, np.integer),
     ):
-        raise MeasurementLogValidationError(
-            "record_count must be an integer."
-        )
+        raise MeasurementLogValidationError("record_count must be an integer.")
     if isinstance(energy_bin_count, bool) or not isinstance(
         energy_bin_count,
         (int, np.integer),
     ):
-        raise MeasurementLogValidationError(
-            "energy_bin_count must be an integer."
-        )
+        raise MeasurementLogValidationError("energy_bin_count must be an integer.")
     row_count = int(record_count)
     bin_count = int(energy_bin_count)
     if row_count <= 0 or bin_count <= 0:
@@ -2560,12 +2513,15 @@ def _records_from_arrays(
             )
         if not isinstance(metadata_row.get("metadata"), Mapping):
             raise MeasurementLogValidationError("Metadata payload must be an object.")
-        if _required_json_integer(
-            metadata_row,
-            "array_index",
-            location=f"metadata_rows[{row}]",
-            minimum=0,
-        ) != row:
+        if (
+            _required_json_integer(
+                metadata_row,
+                "array_index",
+                location=f"metadata_rows[{row}]",
+                minimum=0,
+            )
+            != row
+        ):
             raise MeasurementLogValidationError(
                 "metadata array_index must equal zero-based row order."
             )
@@ -2575,9 +2531,7 @@ def _records_from_arrays(
                 identifier,
                 location=f"metadata_rows[{row}]",
                 minimum=0,
-            ) != int(
-                np.asarray(arrays[identifier])[row]
-            ):
+            ) != int(np.asarray(arrays[identifier])[row]):
                 raise MeasurementLogValidationError(
                     f"metadata {identifier} disagrees with observations.npz."
                 )
@@ -2806,9 +2760,7 @@ class MeasurementLogStreamWriter:
                 "obstacle_layout_path must be a JSON string or null."
             )
         if metadata is not None and not isinstance(metadata, Mapping):
-            raise MeasurementLogValidationError(
-                "metadata must be an object or null."
-            )
+            raise MeasurementLogValidationError("metadata must be an object or null.")
         _validate_truth_free_payload(runtime_config, location="runtime_config")
         _validate_truth_free_payload(environment, location="environment")
         _validate_truth_free_payload(metadata or {}, location="run_manifest.metadata")
@@ -2900,9 +2852,7 @@ class MeasurementLogStreamWriter:
                 "obstacle_layout_path must be a JSON string or null."
             )
         if metadata is not None and not isinstance(metadata, Mapping):
-            raise MeasurementLogValidationError(
-                "metadata must be an object or null."
-            )
+            raise MeasurementLogValidationError("metadata must be an object or null.")
         if not isinstance(resume_compatibility, Mapping):
             raise MeasurementLogValidationError(
                 "resume_compatibility must be an object."
@@ -2926,9 +2876,10 @@ class MeasurementLogStreamWriter:
         expected_stage_pattern = re.compile(
             rf"^\.{re.escape(target.name)}\.stream-[0-9]+$"
         )
-        if stage.parent != target.parent or expected_stage_pattern.fullmatch(
-            stage.name
-        ) is None:
+        if (
+            stage.parent != target.parent
+            or expected_stage_pattern.fullmatch(stage.name) is None
+        ):
             raise MeasurementLogValidationError(
                 "The resume stage must be the hidden stream directory belonging "
                 "to the requested MeasurementLog output."
@@ -2982,13 +2933,9 @@ class MeasurementLogStreamWriter:
                 "A resumable MeasurementLog stage needs at least one record."
             )
 
-        staged_runtime = _load_json_object(
-            stage / "runtime_config.resolved.json"
-        )
+        staged_runtime = _load_json_object(stage / "runtime_config.resolved.json")
         staged_environment = _load_json_object(stage / "environment.json")
-        staged_forward = _load_json_object(
-            stage / "forward_model_manifest.input.json"
-        )
+        staged_forward = _load_json_object(stage / "forward_model_manifest.input.json")
         identity_pairs = (
             ("runtime configuration", staged_runtime, dict(runtime_config)),
             ("environment", staged_environment, dict(environment)),
@@ -3017,8 +2964,7 @@ class MeasurementLogStreamWriter:
             location="run_manifest.metadata.resume_compatibility",
         )
         if (
-            compatibility_payload.get("prefix_repository_commit")
-            != repository_commit
+            compatibility_payload.get("prefix_repository_commit") != repository_commit
             or compatibility_payload.get("resume_execution_commit")
             != resume_execution_commit
         ):
@@ -3063,9 +3009,7 @@ class MeasurementLogStreamWriter:
                 "staged runtime configuration."
             )
         line_table = staged_forward.get("line_mu_by_isotope")
-        if not isinstance(line_table, Mapping) or set(line_table) != set(
-            isotope_names
-        ):
+        if not isinstance(line_table, Mapping) or set(line_table) != set(isotope_names):
             raise MeasurementLogValidationError(
                 "Resume isotopes do not match the staged forward model."
             )
@@ -3093,8 +3037,7 @@ class MeasurementLogStreamWriter:
                     row = _parse_json_value(
                         line,
                         location=(
-                            "staged observation_metadata.jsonl line "
-                            f"{line_number}"
+                            f"staged observation_metadata.jsonl line {line_number}"
                         ),
                     )
                 except json.JSONDecodeError as exc:
@@ -3144,12 +3087,15 @@ class MeasurementLogStreamWriter:
                 raise MeasurementLogValidationError(
                     "Resume run_id does not match the staged acquisition."
                 )
-            if _required_json_integer(
-                metadata_row,
-                "array_index",
-                location=f"metadata_rows[{record_index}]",
-                minimum=0,
-            ) != record_index:
+            if (
+                _required_json_integer(
+                    metadata_row,
+                    "array_index",
+                    location=f"metadata_rows[{record_index}]",
+                    minimum=0,
+                )
+                != record_index
+            ):
                 raise MeasurementLogValidationError(
                     "Staged metadata array_index must match its record shard."
                 )
@@ -3160,8 +3106,7 @@ class MeasurementLogStreamWriter:
                             f"{shard_path.name} contains duplicate array names."
                         )
                     arrays = {
-                        name: np.array(loaded[name], copy=True)
-                        for name in loaded.files
+                        name: np.array(loaded[name], copy=True) for name in loaded.files
                     }
             except MeasurementLogValidationError:
                 raise
@@ -3254,9 +3199,7 @@ class MeasurementLogStreamWriter:
         if any(
             _station_complete_marker(
                 record.metadata,
-                location=(
-                    f"records[{prefix_record_count + index}].metadata"
-                ),
+                location=(f"records[{prefix_record_count + index}].metadata"),
             )
             for index, record in enumerate(tail_records)
         ):
@@ -3312,11 +3255,7 @@ class MeasurementLogStreamWriter:
 
         fork_stage: Path | None = None
         for attempt in range(1000):
-            suffix = (
-                str(os.getpid())
-                if attempt == 0
-                else f"{os.getpid()}{attempt:03d}"
-            )
+            suffix = str(os.getpid()) if attempt == 0 else f"{os.getpid()}{attempt:03d}"
             candidate = target.with_name(f".{target.name}.stream-{suffix}")
             if candidate == stage:
                 continue
@@ -3332,9 +3271,7 @@ class MeasurementLogStreamWriter:
             )
         fork_metadata_path = fork_stage / "observation_metadata.jsonl"
         try:
-            for filename in _STREAM_STATIC_FILES - {
-                "observation_metadata.jsonl"
-            }:
+            for filename in _STREAM_STATIC_FILES - {"observation_metadata.jsonl"}:
                 shutil.copyfile(stage / filename, fork_stage / filename)
             for _, shard_path in prefix_shard_entries:
                 shutil.copyfile(shard_path, fork_stage / shard_path.name)
@@ -3466,10 +3403,9 @@ class MeasurementLogStreamWriter:
             )
         if self.records:
             previous = self.records[-1]
-            if (
-                int(previous.station_id) != int(record.station_id)
-                and not _station_complete_marker(previous.metadata)
-            ):
+            if int(previous.station_id) != int(
+                record.station_id
+            ) and not _station_complete_marker(previous.metadata):
                 raise MeasurementLogValidationError(
                     "A station must be durably marked complete before staging "
                     "the next station."
@@ -3523,9 +3459,7 @@ class MeasurementLogStreamWriter:
             station_id,
             (int, np.integer),
         ):
-            raise MeasurementLogValidationError(
-                "station_id must be an integer."
-            )
+            raise MeasurementLogValidationError("station_id must be an integer.")
         parsed_station_id = int(station_id)
         if not self.records:
             raise MeasurementLogValidationError(

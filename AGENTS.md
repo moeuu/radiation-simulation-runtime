@@ -11,6 +11,9 @@ observation generation, and MeasurementLog publication.
 - Estimators connect through `SimulationCommand` and the typed adaptive-session
   protocol. The runtime persists immutable MeasurementLog artifacts for audit and
   recovery; estimators must not receive realized source truth.
+- Keep private scenarios, source profiles, scene seeds/RNG provenance, and private
+  truth manifests below ignored `private_runs/`; serve estimators through an opaque
+  owner-only socket and join truth to completed results only by exact `run_id`.
 - Keep Geant4 physics fidelity and the event-level observation distribution
   unchanged when optimizing runtime performance.
 - Use Python 3.12 and `uv`; run `uv run pytest` after changes.

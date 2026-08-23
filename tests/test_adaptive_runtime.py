@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from io import StringIO
 from pathlib import Path
+from threading import Thread
 from types import SimpleNamespace
 from typing import Any
 
@@ -21,6 +22,7 @@ from runtime.adaptive import (
     _pose_is_clear,
     _validate_private_scene_profile,
     serve_adaptive_session,
+    serve_adaptive_session_socket,
 )
 from runtime.adaptive_client import AdaptiveRuntimeClient
 from runtime.adaptive_client import parse_adaptive_resume_prefix
@@ -407,9 +409,7 @@ def test_shield_program_quote_equals_sequential_executed_record_times() -> None:
         provider,
     )
     program = (1, 9, 63)
-    quoted_time_s = session._candidate_snapshot.quote_shield_program_time_s(
-        program
-    )
+    quoted_time_s = session._candidate_snapshot.quote_shield_program_time_s(program)
 
     for index, pair_id in enumerate(program):
         fe_index, pb_index = divmod(pair_id, 8)
@@ -638,6 +638,15 @@ def test_public_resume_adopts_verified_stage_and_continues_step_ids(
     assert resumed_event["record"]["step_id"] == 1
     assert published["record_count"] == 2
     assert [record.step_id for record in log.records] == [0, 1]
+    public_metadata = dict(log.run_manifest["metadata"])
+    for forbidden in (
+        "private_source_profile",
+        "scenario_family",
+        "scene_seed",
+        "scene_rng_provenance",
+    ):
+        assert forbidden not in public_metadata
+        assert forbidden not in ready["context"]["metadata"]
     assert log.records[1].metadata["resume_prefix_record_count"] == 1
     assert source_stage.is_dir()
     assert len(runtimes) == 2
@@ -709,7 +718,7 @@ def test_adaptive_protocol_accepts_actions_incrementally(
     monkeypatch.setattr(
         AdaptiveRuntimeSession,
         "open",
-        classmethod(lambda cls, path, private_scene_profile=None: fake),
+        classmethod(lambda cls, path: fake),
     )
     step = {
         "type": "step",
@@ -750,7 +759,7 @@ def test_adaptive_protocol_supports_estimator_ranked_runtime_refinement(
     monkeypatch.setattr(
         AdaptiveRuntimeSession,
         "open",
-        classmethod(lambda cls, path, private_scene_profile=None: fake),
+        classmethod(lambda cls, path: fake),
     )
     refine = {"type": "refine", "candidate_indices": [0]}
     input_stream = StringIO(
@@ -773,6 +782,48 @@ def test_adaptive_protocol_supports_estimator_ranked_runtime_refinement(
     assert [event["type"] for event in events] == ["ready", "candidates", "aborted"]
 
 
+def test_adaptive_socket_hides_private_scenario_from_client_arguments(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """A socket client must receive events without a private scenario path."""
+    fake = _FakeAdaptiveSession()
+    monkeypatch.setattr(
+        AdaptiveRuntimeSession,
+        "open",
+        classmethod(lambda cls, path: fake),
+    )
+    endpoint = tmp_path / "adaptive.sock"
+    outcomes: list[int] = []
+    failures: list[BaseException] = []
+
+    def serve() -> None:
+        """Run the blocking socket server for one client interaction."""
+        try:
+            outcomes.append(
+                serve_adaptive_session_socket(
+                    tmp_path / "private-scenario.json",
+                    socket_path=endpoint,
+                )
+            )
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            failures.append(exc)
+
+    thread = Thread(target=serve)
+    thread.start()
+    client = AdaptiveRuntimeClient.connect(endpoint, connect_timeout_s=2.0)
+    ready = client.read_event()
+    client.abort()
+    thread.join(timeout=2.0)
+
+    assert ready["context"]["run_id"] == "test"
+    assert client.command == ["adaptive-session-socket", endpoint.as_posix()]
+    assert "private-scenario" not in " ".join(client.command)
+    assert outcomes == [0]
+    assert failures == []
+    assert not endpoint.exists()
+
+
 def test_adaptive_protocol_routes_resume_stage_through_public_session_api(
     monkeypatch: Any,
     tmp_path: Path,
@@ -787,7 +838,6 @@ def test_adaptive_protocol_routes_resume_stage_through_public_session_api(
         *,
         stage_dir: Path,
         resume_compatibility: dict[str, object] | None = None,
-        private_scene_profile: str | None = None,
     ) -> _FakeAdaptiveSession:
         """Capture public resume arguments and return a fake live session."""
         captured.update(
@@ -795,7 +845,6 @@ def test_adaptive_protocol_routes_resume_stage_through_public_session_api(
                 "path": path,
                 "stage_dir": stage_dir,
                 "resume_compatibility": resume_compatibility,
-                "private_scene_profile": private_scene_profile,
             }
         )
         return fake
@@ -806,7 +855,6 @@ def test_adaptive_protocol_routes_resume_stage_through_public_session_api(
         tmp_path / "private-scenario.json",
         input_stream=StringIO(json.dumps({"type": "abort"}) + "\n"),
         output_stream=output_stream,
-        private_scene_profile="ral-mix9",
         resume_stage_dir=tmp_path / ".measurement-log.stream-7",
         resume_compatibility={"review": "approved"},
     )
@@ -816,7 +864,6 @@ def test_adaptive_protocol_routes_resume_stage_through_public_session_api(
         "path": tmp_path / "private-scenario.json",
         "stage_dir": tmp_path / ".measurement-log.stream-7",
         "resume_compatibility": {"review": "approved"},
-        "private_scene_profile": "ral-mix9",
     }
 
 
@@ -829,7 +876,7 @@ def test_adaptive_protocol_uses_private_prefix_for_cui_overlay(
     monkeypatch.setattr(
         AdaptiveRuntimeSession,
         "open",
-        classmethod(lambda cls, path, private_scene_profile=None: fake),
+        classmethod(lambda cls, path: fake),
     )
     overlay = {"type": "cui_overlay", "include_truth": True}
     input_stream = StringIO(
@@ -858,9 +905,7 @@ def test_adaptive_protocol_uses_private_prefix_for_cui_overlay(
     assert fake.requests == [overlay]
     assert [event["type"] for event in normal_events] == ["ready", "aborted"]
     assert len(private_events) == 1
-    assert private_events[0]["truth"]["true_sources"]["Cs-137"] == [
-        [1.0, 1.0, 1.0]
-    ]
+    assert private_events[0]["truth"]["true_sources"]["Cs-137"] == [[1.0, 1.0, 1.0]]
 
 
 def test_adaptive_client_rejects_truth_before_writing_cui_request() -> None:
@@ -872,9 +917,7 @@ def test_adaptive_client_rejects_truth_before_writing_cui_request() -> None:
     }
     client = AdaptiveRuntimeClient.__new__(AdaptiveRuntimeClient)
     client.input = StringIO()
-    client.output = StringIO(
-        ADAPTIVE_CUI_OVERLAY_PREFIX + json.dumps(response) + "\n"
-    )
+    client.output = StringIO(ADAPTIVE_CUI_OVERLAY_PREFIX + json.dumps(response) + "\n")
     client.output_hook = lambda message: None
     client.process = SimpleNamespace(poll=lambda: None)
 
@@ -893,9 +936,7 @@ def test_adaptive_client_accepts_only_truth_free_cui_response() -> None:
     }
     client = AdaptiveRuntimeClient.__new__(AdaptiveRuntimeClient)
     client.input = StringIO()
-    client.output = StringIO(
-        ADAPTIVE_CUI_OVERLAY_PREFIX + json.dumps(response) + "\n"
-    )
+    client.output = StringIO(ADAPTIVE_CUI_OVERLAY_PREFIX + json.dumps(response) + "\n")
     client.output_hook = lambda message: None
     client.process = SimpleNamespace(poll=lambda: None)
 
@@ -922,9 +963,7 @@ def test_adaptive_client_rejects_unexpected_truth_cui_response() -> None:
     }
     client = AdaptiveRuntimeClient.__new__(AdaptiveRuntimeClient)
     client.input = StringIO()
-    client.output = StringIO(
-        ADAPTIVE_CUI_OVERLAY_PREFIX + json.dumps(response) + "\n"
-    )
+    client.output = StringIO(ADAPTIVE_CUI_OVERLAY_PREFIX + json.dumps(response) + "\n")
     client.output_hook = lambda message: None
     client.process = SimpleNamespace(poll=lambda: None)
 

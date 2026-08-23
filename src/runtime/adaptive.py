@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import socket
 from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -297,17 +299,13 @@ def _validate_private_scene_profile(scene: object, profile: str | None) -> None:
     for source in scene.sources:
         counts[source.isotope] = counts.get(source.isotope, 0) + 1
     expected = _PRIVATE_SCENE_PROFILE_COUNTS[profile]
-    normalized = {
-        isotope: int(counts.get(isotope, 0))
-        for isotope in expected
-    }
+    normalized = {isotope: int(counts.get(isotope, 0)) for isotope in expected}
     unknown = set(counts) - set(expected)
     if normalized != expected or unknown:
         raise ValueError(
             f"{profile} private scene must contain exactly "
             + ", ".join(
-                f"{isotope} x{count}"
-                for isotope, count in sorted(expected.items())
+                f"{isotope} x{count}" for isotope, count in sorted(expected.items())
             )
             + "."
         )
@@ -325,9 +323,7 @@ def _cui_truth_overlay(scene: object) -> dict[str, object]:
         true_sources.setdefault(isotope, []).append(
             [float(value) for value in position]
         )
-        true_strengths.setdefault(isotope, []).append(
-            float(source.intensity_cps_1m)
-        )
+        true_strengths.setdefault(isotope, []).append(float(source.intensity_cps_1m))
     return {
         "schema_version": 1,
         "semantics": "evaluation_cui_overlay_only_not_estimator_input",
@@ -760,9 +756,7 @@ class AdaptiveCandidateProvider:
             if (
                 deduplicated
                 and float(
-                    np.linalg.norm(
-                        arr - np.asarray(deduplicated[-1], dtype=float)
-                    )
+                    np.linalg.norm(arr - np.asarray(deduplicated[-1], dtype=float))
                 )
                 <= 1.0e-9
             ):
@@ -868,9 +862,7 @@ class AdaptiveCandidateProvider:
             travel_costs=tuple(costs),
             allowed_pair_ids=tuple(range(64)),
             current_pair_id=int(current_pair_id),
-            shield_angular_speed_rad_s=(
-                self.motion.shield_angular_speed_rad_s
-            ),
+            shield_angular_speed_rad_s=(self.motion.shield_angular_speed_rad_s),
         )
 
     def snapshot(
@@ -1015,13 +1007,10 @@ class AdaptiveRuntimeSession:
     def open(
         cls,
         scenario_path: str | Path,
-        *,
-        private_scene_profile: str | None = None,
     ) -> AdaptiveRuntimeSession:
         """Open a private scenario that contains no acquisition action list."""
         return cls._open(
             scenario_path,
-            private_scene_profile=private_scene_profile,
             resume_stage_dir=None,
             resume_compatibility=None,
         )
@@ -1033,12 +1022,10 @@ class AdaptiveRuntimeSession:
         *,
         stage_dir: str | Path,
         resume_compatibility: Mapping[str, object] | None = None,
-        private_scene_profile: str | None = None,
     ) -> AdaptiveRuntimeSession:
         """Resume after the last verified station boundary in a stream stage."""
         return cls._open(
             scenario_path,
-            private_scene_profile=private_scene_profile,
             resume_stage_dir=stage_dir,
             resume_compatibility=resume_compatibility,
         )
@@ -1048,7 +1035,6 @@ class AdaptiveRuntimeSession:
         cls,
         scenario_path: str | Path,
         *,
-        private_scene_profile: str | None,
         resume_stage_dir: str | Path | None,
         resume_compatibility: Mapping[str, object] | None,
     ) -> AdaptiveRuntimeSession:
@@ -1084,10 +1070,19 @@ class AdaptiveRuntimeSession:
             if resume_stage_dir is None
             else _resume_stage_repository_commit(resume_stage_dir)
         )
-        run_metadata = dict(scenario["metadata"])
-        run_metadata["repository_source_snapshot_sha256"] = (
-            repository_source_snapshot_sha256(runtime_root)
-        )
+        private_metadata = scenario["metadata"]
+        if not isinstance(private_metadata, Mapping):
+            raise TypeError("Private scenario metadata must be a JSON object.")
+        private_scene_profile = private_metadata.get("private_source_profile")
+        if not isinstance(private_scene_profile, str):
+            raise ValueError(
+                "Private scenario metadata must declare private_source_profile."
+            )
+        run_metadata = {
+            "repository_source_snapshot_sha256": (
+                repository_source_snapshot_sha256(runtime_root)
+            ),
+        }
         resolved_hash = sha256(canonical_json_bytes(logged_config)).hexdigest()
         forward = build_forward_model_manifest(
             runtime_config=logged_config,
@@ -1199,9 +1194,7 @@ class AdaptiveRuntimeSession:
             context=self.context,
             candidates=self._candidate_snapshot,
             bootstrap=AdaptiveBootstrap(
-                candidate_index=int(
-                    np.argmin(self._candidate_snapshot.travel_costs)
-                ),
+                candidate_index=int(np.argmin(self._candidate_snapshot.travel_costs)),
                 fe_orientation_index=0,
                 pb_orientation_index=0,
             ),
@@ -1222,8 +1215,7 @@ class AdaptiveRuntimeSession:
             target,
         )
         requested_pair_id = (
-            typed_request.fe_orientation_index * 8
-            + typed_request.pb_orientation_index
+            typed_request.fe_orientation_index * 8 + typed_request.pb_orientation_index
         )
         shield_actuation_time = self._shield_actuation_time_s(requested_pair_id)
         delta_x = target[0] - self.current_pose[0]
@@ -1350,26 +1342,21 @@ def serve_adaptive_session(
     *,
     input_stream: TextIO,
     output_stream: TextIO,
-    private_scene_profile: str | None = None,
     resume_stage_dir: str | Path | None = None,
     resume_compatibility: Mapping[str, object] | None = None,
 ) -> int:
     """Serve one fresh or verified-resume acquisition over JSON lines."""
     if resume_stage_dir is None:
         if resume_compatibility is not None:
-            raise ValueError(
-                "resume_compatibility requires a resume_stage_dir."
-            )
+            raise ValueError("resume_compatibility requires a resume_stage_dir.")
         session = AdaptiveRuntimeSession.open(
             scenario_path,
-            private_scene_profile=private_scene_profile,
         )
     else:
         session = AdaptiveRuntimeSession.resume(
             scenario_path,
             stage_dir=resume_stage_dir,
             resume_compatibility=resume_compatibility,
-            private_scene_profile=private_scene_profile,
         )
     try:
         _write_event(output_stream, session.ready_payload())
@@ -1407,6 +1394,46 @@ def serve_adaptive_session(
         raise
 
 
+def serve_adaptive_session_socket(
+    scenario_path: str | Path,
+    *,
+    socket_path: str | Path,
+    resume_stage_dir: str | Path | None = None,
+    resume_compatibility: Mapping[str, object] | None = None,
+) -> int:
+    """Serve one private adaptive session over a local estimator-neutral socket."""
+    endpoint = Path(socket_path).expanduser().resolve()
+    if endpoint.exists() or endpoint.is_symlink():
+        raise FileExistsError(f"Adaptive session socket already exists: {endpoint}")
+    endpoint.parent.mkdir(parents=True, exist_ok=True)
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        server.bind(endpoint.as_posix())
+        os.chmod(endpoint, 0o600)
+        server.listen(1)
+        connection, _ = server.accept()
+        with connection:
+            with connection.makefile("r", encoding="utf-8") as input_stream:
+                with connection.makefile(
+                    "w",
+                    encoding="utf-8",
+                    buffering=1,
+                ) as output_stream:
+                    return serve_adaptive_session(
+                        scenario_path,
+                        input_stream=input_stream,
+                        output_stream=output_stream,
+                        resume_stage_dir=resume_stage_dir,
+                        resume_compatibility=resume_compatibility,
+                    )
+    finally:
+        server.close()
+        try:
+            endpoint.unlink()
+        except FileNotFoundError:
+            pass
+
+
 __all__ = [
     "ADAPTIVE_CUI_OVERLAY_PREFIX",
     "ADAPTIVE_EVENT_PREFIX",
@@ -1416,4 +1443,5 @@ __all__ = [
     "AdaptiveRuntimeSession",
     "cui_truth_overlay_from_scene",
     "serve_adaptive_session",
+    "serve_adaptive_session_socket",
 ]

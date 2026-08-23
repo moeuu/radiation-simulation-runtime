@@ -26,11 +26,13 @@ uv sync --extra test
 uv run rotating-shield-sim validate-log PATH
 uv run rotating-shield-sim serve --config configs/geant4/variance_reduction_external_no_isaac_32threads.json
 uv run rotating-shield-sim run-plan PLAN.json
-uv run rotating-shield-sim run-adaptive-session PRIVATE_SCENARIO.json \
-  --private-scene-profile ral-mix9
+uv run rotating-shield-sim run-adaptive-session PRIVATE_SCENARIO.json
 uv run rotating-shield-sim run-adaptive-session PRIVATE_SCENARIO.json \
   --resume-stage /private/logs/.run-001.stream-1234
+uv run rotating-shield-sim serve-adaptive-session-socket PRIVATE_SCENARIO.json \
+  --socket-path /run/user/1000/rotating-shield/run-001.sock
 uv run rotating-shield-sim generate-ral-scenario PRIVATE_SCENARIO.json \
+  --truth-manifest-output /private/truth/run-001.json \
   --measurement-log-output /private/logs/run-001 \
   --run-id run-001 \
   --runtime-config configs/geant4/variance_reduction_external_no_isaac_32threads.json \
@@ -55,9 +57,11 @@ MeasurementLog destination, but no action array, station count, view count, rout
 or shield program. It publishes reachable truth-free candidates, accepts exactly one
 controller selection over JSON lines, durably stages that observation, and repeats
 until the controller requests finalization.
-The optional `ral-mix9` private-scene profile validates Cs-137 x4, Co-60 x3, and
-Eu-154 x2 entirely inside the runtime; the counts and realized source data are not
-included in estimator-visible events.
+The private source profile is read and validated from the scenario entirely inside
+the runtime; profile names, scene seeds/RNG provenance, counts, and realized source
+data are not included in estimator-visible events or MeasurementLog.
+`serve-adaptive-session-socket` exposes only an owner-accessible Unix socket, so an
+estimator process does not receive the private scenario path.
 
 An interrupted adaptive acquisition can resume from its hidden stream stage with
 `--resume-stage`. The runtime authenticates the static acquisition identity and
@@ -69,7 +73,9 @@ modified. Resume under a different runtime commit fails closed unless
 surface is available to Python callers through `AdaptiveRuntimeSession.resume(...)`
 and `AdaptiveRuntimeClient(..., resume_stage_path=...)`.
 
-`generate-ral-scenario` creates that private, action-free scenario. Omitting
+`generate-ral-scenario` creates that private, action-free scenario and a separate
+owner-readable truth manifest joined to completed estimator output by `run_id`.
+Omitting
 `--scene-seed` creates a fresh environment and source realization; an explicit seed
 is reserved for reproducing a previously declared validation scene. The command does
 not choose station count, view count, shield programs, estimator settings, or a
@@ -113,7 +119,7 @@ moving their algorithms into this package:
 - `ResolvedForwardContext.from_log(...)` and `.from_run_context(...)` authenticate
   and construct the environment, obstacles, spectrum model, and observation model
   once. PF particles and MLE surfaces remain in their own repositories.
-- `AdaptiveRuntimeClient` exposes typed `handshake()`, `acquire()`,
+- `AdaptiveRuntimeClient.connect(...)` exposes typed `handshake()`, `acquire()`,
   `refine_candidates()`, and `finalize_log()` calls. It is a context manager with
   bounded termination and an optional immutable protocol observer. This client is
   estimator-facing: it rejects `request_cui_overlay(include_truth=True)` and also

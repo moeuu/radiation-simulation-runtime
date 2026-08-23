@@ -12,9 +12,11 @@ from runtime.discrepancy_calibrator import calibrate_discrepancy
 from runtime.measurement_log import load_measurement_log
 from runtime.scenarios import (
     RAL_PRIVATE_SOURCE_PROFILES,
+    build_private_truth_manifest,
     build_random_ral_mix9_scenario,
     generate_fresh_scene_seed,
     write_private_scenario,
+    write_private_truth_manifest,
 )
 from runtime.session import run_acquisition_plan
 from sim.geant4_app.bridge_server import Geant4BridgeServerConfig, serve_forever
@@ -33,9 +35,13 @@ def _build_parser() -> argparse.ArgumentParser:
     run_plan.add_argument("plan", type=Path)
     run_adaptive = subparsers.add_parser("run-adaptive-session")
     run_adaptive.add_argument("scenario", type=Path)
-    run_adaptive.add_argument(
-        "--private-scene-profile",
-        choices=tuple(RAL_PRIVATE_SOURCE_PROFILES),
+    serve_adaptive_socket = subparsers.add_parser("serve-adaptive-session-socket")
+    serve_adaptive_socket.add_argument("scenario", type=Path)
+    serve_adaptive_socket.add_argument("--socket-path", type=Path, required=True)
+    serve_adaptive_socket.add_argument("--resume-stage", type=Path, default=None)
+    serve_adaptive_socket.add_argument(
+        "--resume-compatibility",
+        type=Path,
         default=None,
     )
     run_adaptive.add_argument(
@@ -55,6 +61,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     generate_scenario = subparsers.add_parser("generate-ral-scenario")
     generate_scenario.add_argument("output", type=Path)
+    generate_scenario.add_argument(
+        "--truth-manifest-output",
+        type=Path,
+        required=True,
+    )
     generate_scenario.add_argument(
         "--measurement-log-output",
         type=Path,
@@ -110,11 +121,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.scenario,
             input_stream=sys.stdin,
             output_stream=sys.stdout,
-            private_scene_profile=args.private_scene_profile,
             resume_stage_dir=args.resume_stage,
-            resume_compatibility=_load_resume_compatibility(
-                args.resume_compatibility
-            ),
+            resume_compatibility=_load_resume_compatibility(args.resume_compatibility),
+        )
+    if args.command == "serve-adaptive-session-socket":
+        from runtime.adaptive import serve_adaptive_session_socket
+
+        if args.resume_compatibility is not None and args.resume_stage is None:
+            raise ValueError("--resume-compatibility requires --resume-stage.")
+        return serve_adaptive_session_socket(
+            args.scenario,
+            socket_path=args.socket_path,
+            resume_stage_dir=args.resume_stage,
+            resume_compatibility=_load_resume_compatibility(args.resume_compatibility),
         )
     if args.command == "generate-ral-scenario":
         scene_seed = (
@@ -131,7 +150,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             source_profile=str(args.source_profile),
         )
         output = write_private_scenario(args.output, scenario)
-        print(f"published private scenario {output} scene_seed={scene_seed}")
+        truth_manifest = write_private_truth_manifest(
+            args.truth_manifest_output,
+            build_private_truth_manifest(scenario),
+        )
+        print(
+            "published private scenario "
+            f"{output} truth_manifest={truth_manifest} scene_seed={scene_seed}"
+        )
         return 0
     if args.command == "calibrate-discrepancy":
         calibration = calibrate_discrepancy(

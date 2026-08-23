@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import socket
 import subprocess
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -133,9 +135,7 @@ def candidate_index_for_pose(
     elif isinstance(candidates, Mapping):
         raw_poses = candidates["candidate_poses_xyz"]
     else:
-        raise TypeError(
-            "candidates must be a mapping or AdaptiveCandidateSnapshot."
-        )
+        raise TypeError("candidates must be a mapping or AdaptiveCandidateSnapshot.")
     poses = np.asarray(raw_poses, dtype=np.float64)
     if (
         poses.ndim != 2
@@ -143,9 +143,7 @@ def candidate_index_for_pose(
         or poses.shape[1] != 3
         or np.any(~np.isfinite(poses))
     ):
-        raise ValueError(
-            "candidate_poses_xyz must have finite nonempty shape (C, 3)."
-        )
+        raise ValueError("candidate_poses_xyz must have finite nonempty shape (C, 3).")
     target = np.asarray(pose_xyz, dtype=np.float64)
     if target.shape != (3,) or np.any(~np.isfinite(target)):
         raise ValueError("pose_xyz must contain exactly three finite coordinates.")
@@ -170,10 +168,7 @@ def _freeze_protocol_value(value: object) -> object:
     """Recursively freeze already strict JSON data for observer delivery."""
     if isinstance(value, dict):
         return MappingProxyType(
-            {
-                str(key): _freeze_protocol_value(nested)
-                for key, nested in value.items()
-            }
+            {str(key): _freeze_protocol_value(nested) for key, nested in value.items()}
         )
     if isinstance(value, list):
         return tuple(_freeze_protocol_value(nested) for nested in value)
@@ -183,10 +178,7 @@ def _freeze_protocol_value(value: object) -> object:
 def _thaw_protocol_value(value: object) -> object:
     """Return mutable JSON data from an immutable observer payload."""
     if isinstance(value, Mapping):
-        return {
-            str(key): _thaw_protocol_value(nested)
-            for key, nested in value.items()
-        }
+        return {str(key): _thaw_protocol_value(nested) for key, nested in value.items()}
     if isinstance(value, tuple):
         return [_thaw_protocol_value(nested) for nested in value]
     return value
@@ -242,7 +234,6 @@ class AdaptiveRuntimeClient:
         scenario_path: str | Path,
         *,
         runtime_root: str | Path,
-        private_scene_profile: str | None = None,
         resume_stage_path: str | Path | None = None,
         resume_compatibility_path: str | Path | None = None,
         output_hook: Callable[[str], None] = print,
@@ -263,12 +254,8 @@ class AdaptiveRuntimeClient:
             "run-adaptive-session",
             scenario.as_posix(),
         ]
-        if private_scene_profile is not None:
-            command.extend(("--private-scene-profile", private_scene_profile))
         if resume_compatibility_path is not None and resume_stage_path is None:
-            raise ValueError(
-                "resume_compatibility_path requires resume_stage_path."
-            )
+            raise ValueError("resume_compatibility_path requires resume_stage_path.")
         if resume_stage_path is not None:
             stage = Path(resume_stage_path).expanduser().resolve()
             if not stage.is_dir():
@@ -278,8 +265,7 @@ class AdaptiveRuntimeClient:
             compatibility = Path(resume_compatibility_path).expanduser().resolve()
             if not compatibility.is_file():
                 raise FileNotFoundError(
-                    "Adaptive resume compatibility file is missing: "
-                    f"{compatibility}"
+                    f"Adaptive resume compatibility file is missing: {compatibility}"
                 )
             command.extend(("--resume-compatibility", compatibility.as_posix()))
         self.command = command
@@ -298,6 +284,7 @@ class AdaptiveRuntimeClient:
         self._observation_sequence = 0
         self._closed = False
         self._finalized = False
+        self._socket: socket.socket | None = None
         self.process = subprocess.Popen(
             command,
             cwd=root,
@@ -312,6 +299,58 @@ class AdaptiveRuntimeClient:
         if self.input is None or self.output is None:
             self.process.kill()
             raise RuntimeError("Shared runtime did not expose adaptive pipes.")
+
+    @classmethod
+    def connect(
+        cls,
+        socket_path: str | Path,
+        *,
+        output_hook: Callable[[str], None] = print,
+        protocol_observer: Callable[[AdaptiveProtocolObservation], None] | None = None,
+        connect_timeout_s: float = 30.0,
+        terminate_timeout_s: float = 10.0,
+    ) -> "AdaptiveRuntimeClient":
+        """Connect to a runtime-owned private session through an opaque socket."""
+        endpoint = Path(socket_path).expanduser().resolve()
+        for name, value in (
+            ("connect_timeout_s", connect_timeout_s),
+            ("terminate_timeout_s", terminate_timeout_s),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not np.isfinite(float(value))
+                or float(value) <= 0.0
+            ):
+                raise ValueError(f"{name} must be finite and positive.")
+        if protocol_observer is not None and not callable(protocol_observer):
+            raise TypeError("protocol_observer must be callable or null.")
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        deadline = time.monotonic() + float(connect_timeout_s)
+        while True:
+            try:
+                connection.connect(endpoint.as_posix())
+                break
+            except (FileNotFoundError, ConnectionRefusedError):
+                if time.monotonic() >= deadline:
+                    connection.close()
+                    raise TimeoutError(
+                        f"Adaptive runtime socket was not ready: {endpoint}"
+                    ) from None
+                time.sleep(0.05)
+        instance = cls.__new__(cls)
+        instance.command = ["adaptive-session-socket", endpoint.as_posix()]
+        instance.output_hook = output_hook
+        instance.protocol_observer = protocol_observer
+        instance.terminate_timeout_s = float(terminate_timeout_s)
+        instance._observation_sequence = 0
+        instance._closed = False
+        instance._finalized = False
+        instance._socket = connection
+        instance.process = None
+        instance.input = connection.makefile("w", encoding="utf-8", buffering=1)
+        instance.output = connection.makefile("r", encoding="utf-8")
+        return instance
 
     def _observe(
         self,
@@ -356,7 +395,7 @@ class AdaptiveRuntimeClient:
             validate_truth_free_estimator_input(payload, path="adaptive.event")
             self._observe(AdaptiveProtocolDirection.EVENT, payload)
             return payload
-        return_code = self.process.poll()
+        return_code = None if self.process is None else self.process.poll()
         raise RuntimeError(
             "Shared adaptive runtime closed before its next event; "
             f"return_code={return_code}."
@@ -447,7 +486,7 @@ class AdaptiveRuntimeClient:
                     "overlay request."
                 )
             self.output_hook(line)
-        return_code = self.process.poll()
+        return_code = None if self.process is None else self.process.poll()
         raise RuntimeError(
             "Shared adaptive runtime closed before its CUI overlay event; "
             f"return_code={return_code}."
@@ -459,14 +498,19 @@ class AdaptiveRuntimeClient:
         if self.input is not None:
             self.input.close()
             self.input = None
-        return_code = self.process.wait()
-        if return_code != 0:
-            raise subprocess.CalledProcessError(return_code, self.command)
+        if self.process is not None:
+            return_code = self.process.wait()
+            if return_code != 0:
+                raise subprocess.CalledProcessError(return_code, self.command)
         self._finalized = True
         self._closed = True
         if self.output is not None:
             self.output.close()
             self.output = None
+        active_socket = getattr(self, "_socket", None)
+        if active_socket is not None:
+            active_socket.close()
+            self._socket = None
         return event
 
     def finalize_event(self) -> AdaptivePublishedEvent:
@@ -496,7 +540,16 @@ class AdaptiveRuntimeClient:
         ):
             raise ValueError("terminate timeout must be finite and positive.")
         timeout_value = float(timeout_s)
-        if self.process.poll() is None:
+        if self.process is None:
+            try:
+                event = self.request({"type": "abort"})
+                if event != {"type": "aborted"}:
+                    raise RuntimeError(
+                        "Adaptive socket did not acknowledge session abort."
+                    )
+            except (BrokenPipeError, OSError, RuntimeError, ValueError):
+                pass
+        elif self.process.poll() is None:
             try:
                 self._write_request({"type": "abort"})
             except (BrokenPipeError, OSError, RuntimeError, ValueError):
@@ -521,6 +574,10 @@ class AdaptiveRuntimeClient:
         if self.output is not None:
             self.output.close()
             self.output = None
+        active_socket = getattr(self, "_socket", None)
+        if active_socket is not None:
+            active_socket.close()
+            self._socket = None
         self._closed = True
 
     def close(self) -> None:
