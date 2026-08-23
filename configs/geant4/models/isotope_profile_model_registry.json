@@ -67,7 +67,7 @@
       "model_file_sha256": "3782f8a4c30a6178a87a138d1c54e50a0b4384e36ffd9b8347846f8c7dfcad81",
       "model_path": "configs/geant4/models/profiles/fukushima_sb125_physics_only.json"
     },
-    "ral_eu154": {
+    "unconditioned_eu154": {
       "calibration_status": "physics_only_no_scene_fit_runtime_unvalidated",
       "isotopes": [
         "Cs-137",
@@ -76,7 +76,7 @@
       ],
       "model_contract_hash_sha256": "15db0fe453b08a74292f39952bf6e579cc321a79b2922a78748b094c4d281792",
       "model_file_sha256": "048a786c734369b1c73a3943a9b7a920055c1944779481af98358b7c0e647f3f",
-      "model_path": "configs/geant4/models/profiles/ral_eu154_physics_only.json"
+      "model_path": "configs/geant4/models/profiles/unconditioned_eu154_physics_only.json"
     }
   },
   "schema_version": 1

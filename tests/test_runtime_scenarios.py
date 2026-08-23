@@ -12,37 +12,26 @@ import pytest
 
 from measurement.obstacles import ObstacleGrid
 from runtime.adaptive import AdaptiveCandidateProvider
+from runtime.cli import _build_parser
+from runtime.experiment_profiles import STANDARD_EXPERIMENT_PROFILE
 from runtime.scenarios import (
-    RAL_ENVIRONMENT_CONFIG,
     build_private_truth_manifest,
-    build_random_ral_mix9_scenario,
+    build_random_surface_scenario,
     write_private_scenario,
     write_private_truth_manifest,
 )
 
 
-def _runtime_config() -> Path:
-    """Return the production Geant4 configuration used by scenario tests."""
-    return (
-        Path(__file__).resolve().parents[1]
-        / "configs"
-        / "geant4"
-        / "variance_reduction_external_no_isaac_32threads.json"
-    )
-
-
 def _scenario(tmp_path: Path, *, seed: int = 123) -> dict[str, object]:
     """Build one deterministic action-free private scenario."""
-    return build_random_ral_mix9_scenario(
+    return build_random_surface_scenario(
         scene_seed=seed,
-        runtime_config_path=_runtime_config(),
         measurement_log_output_dir=tmp_path / "measurement-log",
         run_id=f"scenario-{seed}",
-        candidate_count=32,
     )
 
 
-def test_ral_scenario_contains_physics_but_no_estimator_plan(
+def test_scenario_contains_physics_and_runtime_contract_but_no_estimator_plan(
     tmp_path: Path,
 ) -> None:
     """A runtime scenario must not precompute estimator actions or budgets."""
@@ -74,7 +63,6 @@ def test_ral_scenario_contains_physics_but_no_estimator_plan(
         "station_count",
         "view_count",
         "shield_program",
-        "max_measurements",
         "stopping_rule",
         "num_particles",
         "dss_pp",
@@ -86,15 +74,15 @@ def test_ral_scenario_contains_physics_but_no_estimator_plan(
     assert scenario["metadata"]["measurement_actions_precomputed"] is False
 
 
-def test_ral_scenario_derives_every_room_payload_from_one_profile(
+def test_scenario_derives_every_room_payload_from_one_profile(
     tmp_path: Path,
 ) -> None:
-    """The runtime-owned RA-L profile must drive all published room bounds."""
+    """The runtime-owned profile must drive all published room bounds."""
     scenario = _scenario(tmp_path)
     expected = (
-        RAL_ENVIRONMENT_CONFIG.size_x,
-        RAL_ENVIRONMENT_CONFIG.size_y,
-        RAL_ENVIRONMENT_CONFIG.size_z,
+        STANDARD_EXPERIMENT_PROFILE.environment.size_x,
+        STANDARD_EXPERIMENT_PROFILE.environment.size_y,
+        STANDARD_EXPERIMENT_PROFILE.environment.size_z,
     )
     environment = scenario["environment"]
 
@@ -105,12 +93,15 @@ def test_ral_scenario_derives_every_room_payload_from_one_profile(
         environment["size_z"],
     ) == expected
     assert tuple(scenario["scene"]["room_size_xyz"]) == expected
+    assert environment["acquisition_contract"] == (
+        STANDARD_EXPERIMENT_PROFILE.acquisition.to_payload()
+    )
 
 
-def test_ral_scenario_has_exact_mix9_and_resolvable_same_isotope_spacing(
+def test_default_scenario_has_exact_mix9_and_same_isotope_spacing(
     tmp_path: Path,
 ) -> None:
-    """Runtime truth must satisfy the fixed RA-L counts and spacing contract."""
+    """Runtime truth must satisfy the private counts and spacing contract."""
     scenario = _scenario(tmp_path)
     sources = scenario["scene"]["sources"]
     counts = Counter(source["isotope"] for source in sources)
@@ -131,28 +122,30 @@ def test_ral_scenario_has_exact_mix9_and_resolvable_same_isotope_spacing(
         assert float(np.min(distances)) >= 3.0 - 1.0e-12
 
 
-def test_ral_cs4_co3_eu0_uses_cs_co_candidate_contract(
+def test_absent_eu_variant_keeps_the_public_candidate_contract(
     tmp_path: Path,
 ) -> None:
-    """The explicit Cs/Co experiment must not infer an excluded Eu isotope."""
-    scenario = build_random_ral_mix9_scenario(
+    """An absent Eu truth source must remain a candidate for false-positive tests."""
+    scenario = build_random_surface_scenario(
         scene_seed=321,
-        runtime_config_path=_runtime_config(),
         measurement_log_output_dir=tmp_path / "measurement-log",
         run_id="scenario-cs4-co3-eu0",
-        candidate_count=32,
-        source_profile="ral-cs4-co3-eu0",
+        scene_variant_id="cs4-co3-eu0",
     )
     sources = scenario["scene"]["sources"]
     counts = Counter(source["isotope"] for source in sources)
 
     assert counts == {"Co-60": 3, "Cs-137": 4}
-    assert set(scenario["isotopes"]) == {"Co-60", "Cs-137"}
-    assert set(scenario["scene"]["transport_mu_by_isotope"]) == {"Co-60", "Cs-137"}
-    assert scenario["metadata"]["private_source_profile"] == ("ral-cs4-co3-eu0")
+    assert set(scenario["isotopes"]) == {"Co-60", "Cs-137", "Eu-154"}
+    assert set(scenario["scene"]["transport_mu_by_isotope"]) == {
+        "Co-60",
+        "Cs-137",
+        "Eu-154",
+    }
+    assert scenario["metadata"]["private_scene_variant_id"] == "cs4-co3-eu0"
 
 
-def test_ral_scenario_seed_is_deterministic_and_candidates_are_reachable(
+def test_scenario_seed_is_deterministic_and_candidates_are_reachable(
     tmp_path: Path,
 ) -> None:
     """One scene seed must reproduce truth and a valid runtime workspace."""
@@ -166,7 +159,7 @@ def test_ral_scenario_seed_is_deterministic_and_candidates_are_reachable(
     provider = AdaptiveCandidateProvider(environment, grid)
     snapshot = provider.snapshot(provider.initial_pose, current_pair_id=0)
 
-    assert len(snapshot.candidate_poses_xyz) == 32
+    assert len(snapshot.candidate_poses_xyz) == 256
     assert snapshot.allowed_pair_ids == tuple(range(64))
     assert all(grid.is_free(pose) for pose in snapshot.candidate_poses_xyz)
 
@@ -185,6 +178,32 @@ def test_private_scenario_writer_refuses_overwrite(tmp_path: Path) -> None:
         raise AssertionError("Private scenario overwrite was not rejected.")
 
 
+def test_scenario_cli_selects_only_runtime_owned_profiles() -> None:
+    """The scenario CLI must not expose duplicated physical-value overrides."""
+    parser = _build_parser()
+    parsed = parser.parse_args(
+        [
+            "generate-scenario",
+            "/private/scenario.json",
+            "--truth-manifest-output",
+            "/private/truth.json",
+            "--measurement-log-output",
+            "/private/measurement-log",
+            "--run-id",
+            "run-001",
+            "--scene-variant",
+            "cs4-co3-eu0",
+        ]
+    )
+
+    assert parsed.experiment_profile == STANDARD_EXPERIMENT_PROFILE.profile_id
+    assert parsed.scene_variant == "cs4-co3-eu0"
+    assert not hasattr(parsed, "runtime_config")
+    assert not hasattr(parsed, "candidate_count")
+    with pytest.raises(SystemExit):
+        parser.parse_args(["generate-ral-scenario"])
+
+
 def test_private_truth_manifest_is_separate_and_joined_by_run_id(
     tmp_path: Path,
 ) -> None:
@@ -196,7 +215,10 @@ def test_private_truth_manifest_is_separate_and_joined_by_run_id(
     payload = json.loads(target.read_text(encoding="utf-8"))
     assert payload["run_id"] == scenario["run_id"]
     assert payload["sources"] == scenario["scene"]["sources"]
-    assert payload["source_profile"] == "ral-mix9"
+    assert payload["experiment_profile_id"] == (
+        STANDARD_EXPERIMENT_PROFILE.profile_id
+    )
+    assert payload["scene_variant_id"] == "mix9"
     assert stat.S_IMODE(target.stat().st_mode) == 0o600
     with pytest.raises(FileExistsError):
         write_private_truth_manifest(target, manifest)

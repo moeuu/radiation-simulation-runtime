@@ -20,15 +20,16 @@ from runtime.adaptive import (
     AdaptiveRuntimeSession,
     _adaptive_resume_compatibility,
     _pose_is_clear,
-    _validate_private_scene_profile,
+    _validate_private_scene_variant,
     serve_adaptive_session,
     serve_adaptive_session_socket,
 )
 from runtime.adaptive_client import AdaptiveRuntimeClient
 from runtime.adaptive_client import parse_adaptive_resume_prefix
+from runtime.experiment_profiles import DEFAULT_EXPERIMENT_PROFILE_ID
 from runtime.measurement_log import MeasurementLogRecord
 from runtime.records import RunContext
-from runtime.scenarios import build_random_ral_mix9_scenario, write_private_scenario
+from runtime.scenarios import build_random_surface_scenario, write_private_scenario
 from sim.protocol import SimulationCommand, SimulationObservation
 from sim.runtime import SimulationRuntime
 
@@ -214,31 +215,47 @@ def test_local_refinement_is_runtime_filtered_and_adds_candidates() -> None:
     assert set(coarse.candidate_poses_xyz).issubset(refined.candidate_poses_xyz)
 
 
-def test_ral_mix9_profile_is_checked_only_inside_private_runtime() -> None:
-    """RAL source cardinality should be enforced without entering estimator data."""
+def test_default_scene_variant_is_checked_only_inside_private_runtime() -> None:
+    """Source cardinality should be enforced without entering estimator data."""
     sources = [SimpleNamespace(isotope="Cs-137") for _ in range(4)]
     sources.extend(SimpleNamespace(isotope="Co-60") for _ in range(3))
     sources.extend(SimpleNamespace(isotope="Eu-154") for _ in range(2))
     scene = SimpleNamespace(sources=sources)
 
-    _validate_private_scene_profile(scene, "ral-mix9")
+    _validate_private_scene_variant(
+        scene,
+        DEFAULT_EXPERIMENT_PROFILE_ID,
+        "mix9",
+    )
 
     scene.sources.pop()
     with pytest.raises(ValueError, match="exactly"):
-        _validate_private_scene_profile(scene, "ral-mix9")
+        _validate_private_scene_variant(
+            scene,
+            DEFAULT_EXPERIMENT_PROFILE_ID,
+            "mix9",
+        )
 
 
-def test_ral_cs4_co3_eu0_profile_accepts_explicit_absence() -> None:
+def test_cs4_co3_eu0_variant_accepts_explicit_absence() -> None:
     """The Eu-zero profile must validate without exposing truth downstream."""
     sources = [SimpleNamespace(isotope="Cs-137") for _ in range(4)]
     sources.extend(SimpleNamespace(isotope="Co-60") for _ in range(3))
     scene = SimpleNamespace(sources=sources)
 
-    _validate_private_scene_profile(scene, "ral-cs4-co3-eu0")
+    _validate_private_scene_variant(
+        scene,
+        DEFAULT_EXPERIMENT_PROFILE_ID,
+        "cs4-co3-eu0",
+    )
 
     scene.sources.append(SimpleNamespace(isotope="Eu-154"))
     with pytest.raises(ValueError, match="exactly"):
-        _validate_private_scene_profile(scene, "ral-cs4-co3-eu0")
+        _validate_private_scene_variant(
+            scene,
+            DEFAULT_EXPERIMENT_PROFILE_ID,
+            "cs4-co3-eu0",
+        )
 
 
 def test_cross_commit_resume_requires_explicit_compatibility_provenance() -> None:
@@ -579,16 +596,10 @@ def test_public_resume_adopts_verified_stage_and_continues_step_ids(
     tmp_path: Path,
 ) -> None:
     """The public API must copy a completed prefix and publish its continuation."""
-    runtime_config = (
-        Path(__file__).resolve().parents[1]
-        / "configs/geant4/variance_reduction_external_no_isaac_32threads.json"
-    )
-    scenario = build_random_ral_mix9_scenario(
+    scenario = build_random_surface_scenario(
         scene_seed=31415,
-        runtime_config_path=runtime_config,
         measurement_log_output_dir=tmp_path / "measurement-log",
         run_id="adaptive-resume-integration",
-        candidate_count=16,
     )
     scenario_path = write_private_scenario(tmp_path / "scenario.json", scenario)
     runtimes: list[_DurableFakeRuntime] = []

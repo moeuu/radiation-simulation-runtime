@@ -31,12 +31,12 @@ uv run rotating-shield-sim run-adaptive-session PRIVATE_SCENARIO.json \
   --resume-stage /private/logs/.run-001.stream-1234
 uv run rotating-shield-sim serve-adaptive-session-socket PRIVATE_SCENARIO.json \
   --socket-path /run/user/1000/rotating-shield/run-001.sock
-uv run rotating-shield-sim generate-ral-scenario PRIVATE_SCENARIO.json \
+uv run rotating-shield-sim generate-scenario PRIVATE_SCENARIO.json \
   --truth-manifest-output /private/truth/run-001.json \
   --measurement-log-output /private/logs/run-001 \
   --run-id run-001 \
-  --runtime-config configs/geant4/variance_reduction_external_no_isaac_32threads.json \
-  --source-profile ral-mix9
+  --experiment-profile multi_isotope_surface_search_v1 \
+  --scene-variant mix9
 uv run rotating-shield-sim calibrate-discrepancy CALIBRATION_ROWS.npz \
   discrepancy-calibration.json --calibration-id ral-independent
 ```
@@ -57,9 +57,11 @@ MeasurementLog destination, but no action array, station count, view count, rout
 or shield program. It publishes reachable truth-free candidates, accepts exactly one
 controller selection over JSON lines, durably stages that observation, and repeats
 until the controller requests finalization.
-The private source profile is read and validated from the scenario entirely inside
-the runtime; profile names, scene seeds/RNG provenance, counts, and realized source
-data are not included in estimator-visible events or MeasurementLog.
+The private scene variant is read and validated entirely inside the runtime; variant
+IDs, scene seeds/RNG provenance, counts, and realized source data are not included in
+estimator-visible events or MeasurementLog. The public experiment profile and its
+truth-free acquisition contract are included so every controller uses identical
+station, view, dwell, separation, and coverage limits.
 `serve-adaptive-session-socket` exposes only an owner-accessible Unix socket, so an
 estimator process does not receive the private scenario path.
 
@@ -73,17 +75,16 @@ modified. Resume under a different runtime commit fails closed unless
 surface is available to Python callers through `AdaptiveRuntimeSession.resume(...)`
 and `AdaptiveRuntimeClient(..., resume_stage_path=...)`.
 
-`generate-ral-scenario` creates that private, action-free scenario and a separate
+`generate-scenario` creates that private, action-free scenario and a separate
 owner-readable truth manifest joined to completed estimator output by `run_id`.
 Omitting
 `--scene-seed` creates a fresh environment and source realization; an explicit seed
-is reserved for reproducing a previously declared validation scene. The command does
-not choose station count, view count, shield programs, estimator settings, or a
-stopping rule. Those remain private to the estimator or experiment harness controlling
-the session. `--source-profile ral-cs4-co3-eu0` defines both the private truth and the
-truth-free candidate contract as Cs-137 plus Co-60: it realizes exactly four
-Cs-137 and three Co-60 sources, and Eu-154 is not offered to the estimator. Use
-`ral-mix9` when Eu-154 must remain in the candidate set.
+is reserved for reproducing a previously declared validation scene. The command
+publishes the runtime-owned acquisition contract but does not choose a shield policy,
+estimator setting, or statistical stopping rule. `--scene-variant cs4-co3-eu0`
+realizes exactly four Cs-137 and three Co-60 sources while keeping Eu-154 in the
+truth-free candidate set for an absent-isotope test. The default `mix9` variant adds
+two Eu-154 sources.
 
 ## Common adaptive workspace
 

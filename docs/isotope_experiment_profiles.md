@@ -5,7 +5,7 @@ Random-source experiments may select one named isotope profile with the
 
 | Profile | Isotopes | Placement of the third isotope |
 | --- | --- | --- |
-| `ral_eu154` | Cs-137, Co-60, Eu-154 | legacy area-uniform RA-L support |
+| `unconditioned_eu154` | Cs-137, Co-60, Eu-154 | area-uniform support without material conditioning |
 | `fukushima_eu154` | Cs-137, Co-60, Eu-154 | Co-60/Eu-154 on compatible activated materials |
 | `fukushima_eu152` | Cs-137, Co-60, Eu-152 | concrete surfaces only |
 | `fukushima_nb94` | Cs-137, Co-60, Nb-94 | steel/iron surfaces only |

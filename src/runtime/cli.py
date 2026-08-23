@@ -9,11 +9,14 @@ from pathlib import Path
 
 from runtime.adaptive import serve_adaptive_session
 from runtime.discrepancy_calibrator import calibrate_discrepancy
+from runtime.experiment_profiles import (
+    DEFAULT_EXPERIMENT_PROFILE_ID,
+    available_experiment_profiles,
+)
 from runtime.measurement_log import load_measurement_log
 from runtime.scenarios import (
-    RAL_PRIVATE_SOURCE_PROFILES,
     build_private_truth_manifest,
-    build_random_ral_mix9_scenario,
+    build_random_surface_scenario,
     generate_fresh_scene_seed,
     write_private_scenario,
     write_private_truth_manifest,
@@ -59,7 +62,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "different runtime commit."
         ),
     )
-    generate_scenario = subparsers.add_parser("generate-ral-scenario")
+    generate_scenario = subparsers.add_parser("generate-scenario")
     generate_scenario.add_argument("output", type=Path)
     generate_scenario.add_argument(
         "--truth-manifest-output",
@@ -72,14 +75,13 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
     )
     generate_scenario.add_argument("--run-id", required=True)
-    generate_scenario.add_argument("--runtime-config", type=Path, required=True)
     generate_scenario.add_argument("--scene-seed", type=int, default=None)
-    generate_scenario.add_argument("--candidate-count", type=int, default=256)
     generate_scenario.add_argument(
-        "--source-profile",
-        choices=tuple(RAL_PRIVATE_SOURCE_PROFILES),
-        default="ral-mix9",
+        "--experiment-profile",
+        choices=available_experiment_profiles(),
+        default=DEFAULT_EXPERIMENT_PROFILE_ID,
     )
+    generate_scenario.add_argument("--scene-variant", default=None)
     calibrate = subparsers.add_parser("calibrate-discrepancy")
     calibrate.add_argument("input", type=Path)
     calibrate.add_argument("output", type=Path)
@@ -135,19 +137,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             resume_stage_dir=args.resume_stage,
             resume_compatibility=_load_resume_compatibility(args.resume_compatibility),
         )
-    if args.command == "generate-ral-scenario":
+    if args.command == "generate-scenario":
         scene_seed = (
             generate_fresh_scene_seed()
             if args.scene_seed is None
             else int(args.scene_seed)
         )
-        scenario = build_random_ral_mix9_scenario(
+        scenario = build_random_surface_scenario(
             scene_seed=scene_seed,
-            runtime_config_path=args.runtime_config,
             measurement_log_output_dir=args.measurement_log_output,
             run_id=str(args.run_id),
-            candidate_count=int(args.candidate_count),
-            source_profile=str(args.source_profile),
+            experiment_profile_id=str(args.experiment_profile),
+            scene_variant_id=args.scene_variant,
         )
         output = write_private_scenario(args.output, scenario)
         truth_manifest = write_private_truth_manifest(

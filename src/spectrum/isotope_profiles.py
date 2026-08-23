@@ -40,11 +40,11 @@ class IsotopeExperimentProfile:
 
 _PROFILES: Mapping[str, IsotopeExperimentProfile] = MappingProxyType(
     {
-        "ral_eu154": IsotopeExperimentProfile(
-            name="ral_eu154",
+        "unconditioned_eu154": IsotopeExperimentProfile(
+            name="unconditioned_eu154",
             isotopes=("Cs-137", "Co-60", "Eu-154"),
             material_conditioning="none",
-            description="Legacy RA-L isotope set; preserves published truth support.",
+            description="Area-uniform Cs/Co/Eu set without material conditioning.",
         ),
         "fukushima_eu154": IsotopeExperimentProfile(
             name="fukushima_eu154",

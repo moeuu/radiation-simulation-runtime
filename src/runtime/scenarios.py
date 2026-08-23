@@ -5,11 +5,10 @@ from __future__ import annotations
 import json
 import os
 import secrets
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from measurement.model import EnvironmentConfig
 from measurement.obstacle_assets import obstacle_instances_to_dicts
 from measurement.obstacles import build_obstacle_grid
 from measurement.source_surfaces import generate_surface_sources
@@ -19,44 +18,15 @@ from runtime.randomness import (
     named_stream_seed,
     normalize_random_seed,
 )
+from runtime.experiment_profiles import (
+    DEFAULT_EXPERIMENT_PROFILE_ID,
+    default_private_scene_variant_id,
+    require_experiment_profile,
+    require_private_scene_variant,
+)
 from runtime_environment import attach_random_manchester_transport_geometry
 from sim.runtime import load_runtime_config
 
-RAL_MIX9_ISOTOPE_SEQUENCE = (
-    "Cs-137",
-    "Cs-137",
-    "Cs-137",
-    "Cs-137",
-    "Co-60",
-    "Co-60",
-    "Co-60",
-    "Eu-154",
-    "Eu-154",
-)
-RAL_CS4_CO3_EU0_ISOTOPE_SEQUENCE = (
-    "Cs-137",
-    "Cs-137",
-    "Cs-137",
-    "Cs-137",
-    "Co-60",
-    "Co-60",
-    "Co-60",
-)
-RAL_MIX9_ISOTOPES = tuple(sorted(set(RAL_MIX9_ISOTOPE_SEQUENCE)))
-RAL_PRIVATE_SOURCE_PROFILES = {
-    "ral-mix9": RAL_MIX9_ISOTOPE_SEQUENCE,
-    "ral-cs4-co3-eu0": RAL_CS4_CO3_EU0_ISOTOPE_SEQUENCE,
-}
-RAL_PRIVATE_CANDIDATE_ISOTOPES = {
-    profile: tuple(sorted(set(isotope_sequence)))
-    for profile, isotope_sequence in RAL_PRIVATE_SOURCE_PROFILES.items()
-}
-RAL_ENVIRONMENT_CONFIG = EnvironmentConfig(
-    size_x=10.0,
-    size_y=15.0,
-    size_z=5.0,
-    detector_position=(1.0, 1.0, 0.5),
-)
 _MAX_FRESH_SEED = (1 << 48) - 18
 
 
@@ -79,34 +49,38 @@ def _source_payload(source: object) -> dict[str, object]:
     }
 
 
-def build_random_ral_mix9_scenario(
+def build_random_surface_scenario(
     *,
     scene_seed: int,
-    runtime_config_path: str | Path,
     measurement_log_output_dir: str | Path,
     run_id: str,
-    intensity_cps_1m: float | Sequence[float] = (300_000.0, 2_000_000.0),
-    candidate_count: int = 256,
-    passage_width_m: float = 2.0,
-    blocked_fraction: float = 0.4,
-    same_isotope_min_distance_m: float = 3.0,
-    source_profile: str = "ral-mix9",
+    experiment_profile_id: str = DEFAULT_EXPERIMENT_PROFILE_ID,
+    scene_variant_id: str | None = None,
     metadata: Mapping[str, object] | None = None,
 ) -> dict[str, Any]:
-    """Build one action-free RA-L private scenario from runtime physics.
+    """Build one action-free private scenario from a runtime experiment.
 
     The returned object contains realized physical truth and therefore belongs
     outside estimator repositories. It intentionally contains no station,
     route, view-count, shield-program, or stopping-policy field.
     """
     seed = normalize_random_seed(scene_seed)
-    if source_profile not in RAL_PRIVATE_SOURCE_PROFILES:
-        raise ValueError(f"Unknown RA-L source profile: {source_profile!r}.")
-    isotope_sequence = RAL_PRIVATE_SOURCE_PROFILES[source_profile]
-    candidate_isotopes = RAL_PRIVATE_CANDIDATE_ISOTOPES[source_profile]
+    profile = require_experiment_profile(experiment_profile_id)
+    selected_variant_id = (
+        default_private_scene_variant_id(profile.profile_id)
+        if scene_variant_id is None
+        else str(scene_variant_id)
+    )
+    scene_variant = require_private_scene_variant(
+        profile.profile_id,
+        selected_variant_id,
+    )
+    isotope_sequence = scene_variant.isotope_sequence
+    candidate_isotopes = profile.candidate_isotopes
     if not isinstance(run_id, str) or not run_id.strip():
         raise ValueError("run_id must be a nonempty string.")
-    config_path = Path(runtime_config_path).expanduser().resolve()
+    runtime_root = Path(__file__).resolve().parents[2]
+    config_path = (runtime_root / profile.runtime_config_relative_path).resolve()
     if not config_path.is_file():
         raise FileNotFoundError(f"Runtime configuration is missing: {config_path}")
     config = load_runtime_config(config_path)
@@ -120,7 +94,7 @@ def build_random_ral_mix9_scenario(
             "random_manchester_component_union_v1",
         )
     )
-    environment = RAL_ENVIRONMENT_CONFIG
+    environment = profile.environment
     obstacle_seed = named_stream_seed(seed, "physical_obstacle_environment")
     candidate_seed = named_stream_seed(seed, "adaptive_candidate_workspace")
     grid = build_obstacle_grid(
@@ -129,12 +103,12 @@ def build_random_ral_mix9_scenario(
         size_x=environment.size_x,
         size_y=environment.size_y,
         cell_size=1.0,
-        blocked_fraction=float(blocked_fraction),
+        blocked_fraction=float(profile.blocked_fraction),
         rng_seed=obstacle_seed,
         keep_free_points=[
             (environment.detector_position[0], environment.detector_position[1])
         ],
-        passage_width_m=float(passage_width_m),
+        passage_width_m=float(profile.passage_width_m),
     )
     grid, obstacle_instances = attach_random_manchester_transport_geometry(
         grid,
@@ -153,15 +127,16 @@ def build_random_ral_mix9_scenario(
         env=environment,
         obstacle_grid=grid,
         isotopes=isotope_sequence,
-        intensity_cps_1m=intensity_cps_1m,
+        intensity_cps_1m=profile.intensity_cps_1m,
         rng=named_random_generator(seed, "physical_surface_sources"),
         count=len(isotope_sequence),
         obstacle_height_m=obstacle_height_m,
         chart_max_edge_m=chart_max_edge_m,
-        same_isotope_min_distance_m=float(same_isotope_min_distance_m),
+        same_isotope_min_distance_m=float(profile.same_isotope_min_distance_m),
     )
     obstacle_payload = obstacle_instances_to_dicts(obstacle_instances)
     environment_payload: dict[str, object] = {
+        **profile.public_environment_fields(),
         "environment_model_id": environment_model_id,
         "size_x": float(environment.size_x),
         "size_y": float(environment.size_y),
@@ -170,7 +145,7 @@ def build_random_ral_mix9_scenario(
         "obstacle_grid": grid.to_dict(),
         "obstacle_instances": obstacle_payload,
         "adaptive_measurement": {
-            "candidate_count": int(candidate_count),
+            "candidate_count": int(profile.candidate_count),
             "candidate_seed": int(candidate_seed),
         },
     }
@@ -207,8 +182,12 @@ def build_random_ral_mix9_scenario(
     run_metadata = dict(metadata or {})
     run_metadata.update(
         {
-            "scenario_family": ("ral_random_physical_surface_v1:" + source_profile),
-            "private_source_profile": source_profile,
+            "scenario_family": (
+                "random_physical_surface_v1:"
+                f"{profile.profile_id}:{selected_variant_id}"
+            ),
+            "experiment_profile_id": profile.profile_id,
+            "private_scene_variant_id": selected_variant_id,
             "scene_seed": int(seed),
             "scene_rng_provenance": named_rng_provenance(
                 seed,
@@ -218,7 +197,9 @@ def build_random_ral_mix9_scenario(
                     "adaptive_candidate_workspace",
                 ),
             ),
-            "same_isotope_min_distance_m": float(same_isotope_min_distance_m),
+            "same_isotope_min_distance_m": float(
+                profile.same_isotope_min_distance_m
+            ),
             "measurement_actions_precomputed": False,
         }
     )
@@ -306,7 +287,8 @@ def build_private_truth_manifest(
     if not isinstance(metadata, Mapping):
         raise ValueError("scenario.metadata must be a JSON object.")
     required_metadata = (
-        "private_source_profile",
+        "experiment_profile_id",
+        "private_scene_variant_id",
         "scene_seed",
         "scene_rng_provenance",
     )
@@ -321,7 +303,8 @@ def build_private_truth_manifest(
             {
                 "schema_version": 1,
                 "run_id": run_id,
-                "source_profile": metadata["private_source_profile"],
+                "experiment_profile_id": metadata["experiment_profile_id"],
+                "scene_variant_id": metadata["private_scene_variant_id"],
                 "scene_seed": metadata["scene_seed"],
                 "scene_rng_provenance": metadata["scene_rng_provenance"],
                 "sources": scene["sources"],
@@ -346,14 +329,8 @@ def write_private_truth_manifest(
 
 
 __all__ = [
-    "RAL_CS4_CO3_EU0_ISOTOPE_SEQUENCE",
-    "RAL_ENVIRONMENT_CONFIG",
-    "RAL_MIX9_ISOTOPES",
-    "RAL_MIX9_ISOTOPE_SEQUENCE",
-    "RAL_PRIVATE_CANDIDATE_ISOTOPES",
-    "RAL_PRIVATE_SOURCE_PROFILES",
     "build_private_truth_manifest",
-    "build_random_ral_mix9_scenario",
+    "build_random_surface_scenario",
     "generate_fresh_scene_seed",
     "write_private_scenario",
     "write_private_truth_manifest",

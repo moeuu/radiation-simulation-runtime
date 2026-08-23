@@ -67,7 +67,7 @@ def test_profile_contract_hash_is_portable_across_cpu_kernels(
     repository_root = Path(__file__).resolve().parents[1]
     model_path = (
         repository_root
-        / "configs/geant4/models/profiles/ral_eu154_physics_only.json"
+        / "configs/geant4/models/profiles/unconditioned_eu154_physics_only.json"
     )
     expected_hash = json.loads(model_path.read_text(encoding="utf-8"))[
         "contract_hash_sha256"
@@ -348,7 +348,7 @@ def test_physics_only_hierarchical_marks_round_trip_and_match_torch() -> None:
     )
     model_path = (
         Path(__file__).resolve().parents[1]
-        / "configs/geant4/models/profiles/ral_eu154_physics_only.json"
+        / "configs/geant4/models/profiles/unconditioned_eu154_physics_only.json"
     )
     model = GeometryConditionedSpectralModel.from_manifest_payload(
         json.loads(model_path.read_text(encoding="utf-8"))

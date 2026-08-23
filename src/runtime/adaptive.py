@@ -41,6 +41,10 @@ from runtime.forward_model_manifest import (
     SOURCE_RATE_SEMANTICS,
     build_forward_model_manifest,
 )
+from runtime.experiment_profiles import (
+    experiment_profile_from_environment,
+    require_private_scene_variant,
+)
 from runtime.measurement_log import (
     MEASUREMENT_LOG_SCHEMA_VERSION,
     MeasurementLog,
@@ -78,10 +82,6 @@ _SCENARIO_FIELDS = frozenset(
     }
 )
 _CUI_OVERLAY_FIELDS = frozenset({"type", "include_truth"})
-_PRIVATE_SCENE_PROFILE_COUNTS = {
-    "ral-mix9": {"Co-60": 3, "Cs-137": 4, "Eu-154": 2},
-    "ral-cs4-co3-eu0": {"Co-60": 3, "Cs-137": 4, "Eu-154": 0},
-}
 _ADAPTIVE_MEASUREMENT_FIELDS = frozenset(
     {
         "candidate_count",
@@ -289,21 +289,25 @@ def _load_json_object(path: Path) -> dict[str, Any]:
     return value
 
 
-def _validate_private_scene_profile(scene: object, profile: str | None) -> None:
-    """Validate a named source-cardinality profile inside the private runtime."""
-    if profile is None:
-        return
-    if profile not in _PRIVATE_SCENE_PROFILE_COUNTS:
-        raise ValueError(f"Unknown adaptive private-scene profile: {profile!r}.")
+def _validate_private_scene_variant(
+    scene: object,
+    experiment_profile_id: str,
+    scene_variant_id: str,
+) -> None:
+    """Validate runtime-private source cardinality for one named variant."""
+    variant = require_private_scene_variant(
+        experiment_profile_id,
+        scene_variant_id,
+    )
     counts: dict[str, int] = {}
     for source in scene.sources:
         counts[source.isotope] = counts.get(source.isotope, 0) + 1
-    expected = _PRIVATE_SCENE_PROFILE_COUNTS[profile]
+    expected = dict(variant.source_counts)
     normalized = {isotope: int(counts.get(isotope, 0)) for isotope in expected}
     unknown = set(counts) - set(expected)
     if normalized != expected or unknown:
         raise ValueError(
-            f"{profile} private scene must contain exactly "
+            f"{scene_variant_id} private scene must contain exactly "
             + ", ".join(
                 f"{isotope} x{count}" for isotope, count in sorted(expected.items())
             )
@@ -1073,10 +1077,20 @@ class AdaptiveRuntimeSession:
         private_metadata = scenario["metadata"]
         if not isinstance(private_metadata, Mapping):
             raise TypeError("Private scenario metadata must be a JSON object.")
-        private_scene_profile = private_metadata.get("private_source_profile")
-        if not isinstance(private_scene_profile, str):
+        experiment_profile = experiment_profile_from_environment(environment)
+        metadata_profile_id = private_metadata.get("experiment_profile_id")
+        if metadata_profile_id != experiment_profile.profile_id:
             raise ValueError(
-                "Private scenario metadata must declare private_source_profile."
+                "Private scenario metadata and environment experiment profiles differ."
+            )
+        private_scene_variant = private_metadata.get("private_scene_variant_id")
+        if not isinstance(private_scene_variant, str):
+            raise ValueError(
+                "Private scenario metadata must declare private_scene_variant_id."
+            )
+        if isotopes != tuple(sorted(experiment_profile.candidate_isotopes)):
+            raise ValueError(
+                "Scenario candidate isotopes differ from its experiment profile."
             )
         run_metadata = {
             "repository_source_snapshot_sha256": (
@@ -1094,7 +1108,11 @@ class AdaptiveRuntimeSession:
             repository_root=runtime_root,
         )
         scene_description = build_scene_description(scene)
-        _validate_private_scene_profile(scene_description, private_scene_profile)
+        _validate_private_scene_variant(
+            scene_description,
+            experiment_profile.profile_id,
+            private_scene_variant,
+        )
         writer_arguments = {
             "run_id": str(scenario["run_id"]),
             "repository_commit": prefix_commit,
