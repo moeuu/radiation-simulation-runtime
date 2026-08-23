@@ -54,6 +54,7 @@ def build_random_surface_scenario(
     scene_seed: int,
     measurement_log_output_dir: str | Path,
     run_id: str,
+    runtime_config_path: str | Path | None = None,
     experiment_profile_id: str = DEFAULT_EXPERIMENT_PROFILE_ID,
     scene_variant_id: str | None = None,
     metadata: Mapping[str, object] | None = None,
@@ -80,7 +81,11 @@ def build_random_surface_scenario(
     if not isinstance(run_id, str) or not run_id.strip():
         raise ValueError("run_id must be a nonempty string.")
     runtime_root = Path(__file__).resolve().parents[2]
-    config_path = (runtime_root / profile.runtime_config_relative_path).resolve()
+    config_path = (
+        (runtime_root / profile.runtime_config_relative_path).resolve()
+        if runtime_config_path is None
+        else Path(runtime_config_path).expanduser().resolve()
+    )
     if not config_path.is_file():
         raise FileNotFoundError(f"Runtime configuration is missing: {config_path}")
     config = load_runtime_config(config_path)

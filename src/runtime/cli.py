@@ -75,6 +75,12 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
     )
     generate_scenario.add_argument("--run-id", required=True)
+    generate_scenario.add_argument(
+        "--runtime-config",
+        type=Path,
+        default=None,
+        help="Explicit runtime-physics override for a controlled experiment variant.",
+    )
     generate_scenario.add_argument("--scene-seed", type=int, default=None)
     generate_scenario.add_argument(
         "--experiment-profile",
@@ -147,6 +153,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             scene_seed=scene_seed,
             measurement_log_output_dir=args.measurement_log_output,
             run_id=str(args.run_id),
+            runtime_config_path=args.runtime_config,
             experiment_profile_id=str(args.experiment_profile),
             scene_variant_id=args.scene_variant,
         )

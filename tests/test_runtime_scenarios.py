@@ -198,7 +198,6 @@ def test_scenario_cli_selects_only_runtime_owned_profiles() -> None:
 
     assert parsed.experiment_profile == STANDARD_EXPERIMENT_PROFILE.profile_id
     assert parsed.scene_variant == "cs4-co3-eu0"
-    assert not hasattr(parsed, "runtime_config")
     assert not hasattr(parsed, "candidate_count")
     with pytest.raises(SystemExit):
         parser.parse_args(["generate-ral-scenario"])
