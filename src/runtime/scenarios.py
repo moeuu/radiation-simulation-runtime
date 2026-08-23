@@ -51,6 +51,12 @@ RAL_PRIVATE_CANDIDATE_ISOTOPES = {
     profile: tuple(sorted(set(isotope_sequence)))
     for profile, isotope_sequence in RAL_PRIVATE_SOURCE_PROFILES.items()
 }
+RAL_ENVIRONMENT_CONFIG = EnvironmentConfig(
+    size_x=10.0,
+    size_y=15.0,
+    size_z=5.0,
+    detector_position=(1.0, 1.0, 0.5),
+)
 _MAX_FRESH_SEED = (1 << 48) - 18
 
 
@@ -114,12 +120,7 @@ def build_random_ral_mix9_scenario(
             "random_manchester_component_union_v1",
         )
     )
-    environment = EnvironmentConfig(
-        size_x=10.0,
-        size_y=20.0,
-        size_z=10.0,
-        detector_position=(1.0, 1.0, 0.5),
-    )
+    environment = RAL_ENVIRONMENT_CONFIG
     obstacle_seed = named_stream_seed(seed, "physical_obstacle_environment")
     candidate_seed = named_stream_seed(seed, "adaptive_candidate_workspace")
     grid = build_obstacle_grid(
@@ -346,6 +347,7 @@ def write_private_truth_manifest(
 
 __all__ = [
     "RAL_CS4_CO3_EU0_ISOTOPE_SEQUENCE",
+    "RAL_ENVIRONMENT_CONFIG",
     "RAL_MIX9_ISOTOPES",
     "RAL_MIX9_ISOTOPE_SEQUENCE",
     "RAL_PRIVATE_CANDIDATE_ISOTOPES",

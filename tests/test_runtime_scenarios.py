@@ -13,6 +13,7 @@ import pytest
 from measurement.obstacles import ObstacleGrid
 from runtime.adaptive import AdaptiveCandidateProvider
 from runtime.scenarios import (
+    RAL_ENVIRONMENT_CONFIG,
     build_private_truth_manifest,
     build_random_ral_mix9_scenario,
     write_private_scenario,
@@ -83,6 +84,27 @@ def test_ral_scenario_contains_physics_but_no_estimator_plan(
     ):
         assert forbidden not in fields
     assert scenario["metadata"]["measurement_actions_precomputed"] is False
+
+
+def test_ral_scenario_derives_every_room_payload_from_one_profile(
+    tmp_path: Path,
+) -> None:
+    """The runtime-owned RA-L profile must drive all published room bounds."""
+    scenario = _scenario(tmp_path)
+    expected = (
+        RAL_ENVIRONMENT_CONFIG.size_x,
+        RAL_ENVIRONMENT_CONFIG.size_y,
+        RAL_ENVIRONMENT_CONFIG.size_z,
+    )
+    environment = scenario["environment"]
+
+    assert expected == (10.0, 15.0, 5.0)
+    assert (
+        environment["size_x"],
+        environment["size_y"],
+        environment["size_z"],
+    ) == expected
+    assert tuple(scenario["scene"]["room_size_xyz"]) == expected
 
 
 def test_ral_scenario_has_exact_mix9_and_resolvable_same_isotope_spacing(
