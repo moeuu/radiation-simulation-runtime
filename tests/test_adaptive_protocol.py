@@ -158,6 +158,39 @@ def test_candidate_snapshot_accepts_legacy_payload_with_historical_speed() -> No
     assert snapshot.to_payload()["shield_angular_speed_rad_s"] == pytest.approx(
         math.pi / 4.0
     )
+    assert snapshot.has_motion_time_components is False
+
+
+def test_candidate_snapshot_round_trips_explicit_motion_time_components() -> None:
+    """Motion components must remain explicit and exactly sum to total costs."""
+    payload = _candidate_payload()
+    payload.update(
+        {
+            "horizontal_travel_times_s": [0.0, 0.2],
+            "mast_vertical_times_s": [0.0, 0.2],
+            "settling_times_s": [0.0, 0.1],
+        }
+    )
+
+    snapshot = AdaptiveCandidateSnapshot.from_payload(payload)
+
+    assert snapshot.has_motion_time_components is True
+    assert snapshot.to_payload() == payload
+
+
+def test_candidate_snapshot_rejects_inconsistent_motion_time_components() -> None:
+    """Published motion components must reproduce every legacy total exactly."""
+    payload = _candidate_payload()
+    payload.update(
+        {
+            "horizontal_travel_times_s": [0.0, 0.2],
+            "mast_vertical_times_s": [0.0, 0.2],
+            "settling_times_s": [0.0, 0.2],
+        }
+    )
+
+    with pytest.raises(ValueError, match="sum to travel_costs"):
+        AdaptiveCandidateSnapshot.from_payload(payload)
 
 
 @pytest.mark.parametrize("pair_ids", [(), (True,), (64,), ("1",)])

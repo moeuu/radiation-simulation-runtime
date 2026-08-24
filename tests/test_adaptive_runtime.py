@@ -173,10 +173,36 @@ def test_motion_time_separates_vertical_horizontal_and_settling_costs() -> None:
 
     same_xy = provider.motion_time_s(start, (start[0], start[1], 1.0))
     translated = provider.motion_time_s(start, (1.25, start[1], 1.0))
+    translated_components = provider.motion_time_components_s(
+        start,
+        (1.25, start[1], 1.0),
+    )
 
     assert same_xy == pytest.approx(0.5 / 0.25 + 2.0)
     expected_vertical = abs(0.5 - 0.4) + abs(1.0 - 0.4)
     assert translated == pytest.approx(1.0 / 0.5 + expected_vertical / 0.25 + 2.0)
+    assert translated_components == pytest.approx(
+        (1.0 / 0.5, expected_vertical / 0.25, 2.0)
+    )
+
+
+def test_candidate_snapshot_publishes_motion_time_components() -> None:
+    """Runtime snapshots must publish components that sum to every total cost."""
+    provider = AdaptiveCandidateProvider(_environment(), None)
+
+    snapshot = provider.snapshot(provider.initial_pose, current_pair_id=0)
+
+    assert snapshot.has_motion_time_components is True
+    totals = (
+        np.asarray(snapshot.horizontal_travel_times_s)
+        + np.asarray(snapshot.mast_vertical_times_s)
+        + np.asarray(snapshot.settling_times_s)
+    )
+    np.testing.assert_allclose(totals, np.asarray(snapshot.travel_costs))
+    payload = snapshot.to_payload()
+    assert "horizontal_travel_times_s" in payload
+    assert "mast_vertical_times_s" in payload
+    assert "settling_times_s" in payload
 
 
 def test_travel_waypoints_follow_runtime_motion_model() -> None:

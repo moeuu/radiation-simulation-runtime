@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from numbers import Real
 
 import numpy as np
@@ -77,6 +77,14 @@ class AdaptiveCandidateSnapshot:
     allowed_pair_ids: tuple[int, ...]
     current_pair_id: int
     shield_angular_speed_rad_s: float = DEFAULT_SHIELD_ANGULAR_SPEED_RAD_S
+    horizontal_travel_times_s: tuple[float, ...] | None = None
+    mast_vertical_times_s: tuple[float, ...] | None = None
+    settling_times_s: tuple[float, ...] | None = None
+    _motion_time_components_explicit: bool = field(
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         """Validate and normalize every candidate snapshot field."""
@@ -108,6 +116,63 @@ class AdaptiveCandidateSnapshot:
             _finite_nonnegative_number(value, name="travel_costs item")
             for value in raw_costs
         )
+        raw_components = (
+            self.horizontal_travel_times_s,
+            self.mast_vertical_times_s,
+            self.settling_times_s,
+        )
+        components_explicit = not all(
+            component is None for component in raw_components
+        )
+        if all(component is None for component in raw_components):
+            horizontal_times = costs
+            mast_times = tuple(0.0 for _ in poses)
+            settling_times = tuple(0.0 for _ in poses)
+        elif any(component is None for component in raw_components):
+            raise ValueError(
+                "Runtime motion-time components must be supplied together."
+            )
+        else:
+            component_names = (
+                "horizontal_travel_times_s",
+                "mast_vertical_times_s",
+                "settling_times_s",
+            )
+            normalized_components: list[tuple[float, ...]] = []
+            for component_name, raw_component in zip(
+                component_names,
+                raw_components,
+                strict=True,
+            ):
+                if (
+                    not isinstance(raw_component, (list, tuple))
+                    or len(raw_component) != len(poses)
+                ):
+                    raise ValueError(
+                        f"Runtime {component_name} must align with candidate poses."
+                    )
+                normalized_components.append(
+                    tuple(
+                        _finite_nonnegative_number(
+                            value,
+                            name=f"{component_name} item",
+                        )
+                        for value in raw_component
+                    )
+                )
+            horizontal_times, mast_times, settling_times = normalized_components
+            component_totals = np.asarray(horizontal_times, dtype=np.float64)
+            component_totals += np.asarray(mast_times, dtype=np.float64)
+            component_totals += np.asarray(settling_times, dtype=np.float64)
+            if not np.allclose(
+                component_totals,
+                np.asarray(costs, dtype=np.float64),
+                rtol=1.0e-12,
+                atol=1.0e-12,
+            ):
+                raise ValueError(
+                    "Runtime motion-time components must sum to travel_costs."
+                )
         raw_pair_ids = self.allowed_pair_ids
         if not isinstance(raw_pair_ids, (list, tuple)) or len(raw_pair_ids) != 64:
             raise ValueError("Adaptive runtime must expose every Fe/Pb pair 0..63.")
@@ -138,6 +203,22 @@ class AdaptiveCandidateSnapshot:
             )
         object.__setattr__(self, "candidate_poses_xyz", tuple(poses))
         object.__setattr__(self, "travel_costs", costs)
+        object.__setattr__(
+            self,
+            "horizontal_travel_times_s",
+            tuple(horizontal_times),
+        )
+        object.__setattr__(
+            self,
+            "mast_vertical_times_s",
+            tuple(mast_times),
+        )
+        object.__setattr__(self, "settling_times_s", tuple(settling_times))
+        object.__setattr__(
+            self,
+            "_motion_time_components_explicit",
+            components_explicit,
+        )
         object.__setattr__(self, "allowed_pair_ids", pair_ids)
         object.__setattr__(self, "current_pair_id", current_pair_id)
         object.__setattr__(
@@ -154,15 +235,33 @@ class AdaptiveCandidateSnapshot:
             shield_angular_speed_rad_s=self.shield_angular_speed_rad_s,
         )
 
+    @property
+    def has_motion_time_components(self) -> bool:
+        """Return whether the wire snapshot supplied explicit motion components."""
+        return bool(self._motion_time_components_explicit)
+
     def to_payload(self) -> dict[str, object]:
         """Serialize this snapshot to its existing wire representation."""
-        return {
+        payload: dict[str, object] = {
             "candidate_poses_xyz": [list(pose) for pose in self.candidate_poses_xyz],
             "travel_costs": list(self.travel_costs),
             "allowed_pair_ids": list(self.allowed_pair_ids),
             "current_pair_id": self.current_pair_id,
             "shield_angular_speed_rad_s": self.shield_angular_speed_rad_s,
         }
+        if self.has_motion_time_components:
+            payload.update(
+                {
+                    "horizontal_travel_times_s": list(
+                        self.horizontal_travel_times_s or ()
+                    ),
+                    "mast_vertical_times_s": list(
+                        self.mast_vertical_times_s or ()
+                    ),
+                    "settling_times_s": list(self.settling_times_s or ()),
+                }
+            )
+        return payload
 
     def to_dict(self) -> dict[str, object]:
         """Return the legacy dictionary representation of this snapshot."""
@@ -184,12 +283,17 @@ class AdaptiveCandidateSnapshot:
             "current_pair_id",
         }
         current_fields = legacy_fields | {"shield_angular_speed_rad_s"}
+        component_fields = current_fields | {
+            "horizontal_travel_times_s",
+            "mast_vertical_times_s",
+            "settling_times_s",
+        }
         actual_fields = set(payload)
-        if actual_fields not in (legacy_fields, current_fields):
+        if actual_fields not in (legacy_fields, current_fields, component_fields):
             raise ValueError(
                 "adaptive candidates fields disagree with the adaptive protocol: "
-                f"missing={sorted(current_fields - actual_fields)}, "
-                f"unknown={sorted(actual_fields - current_fields)}."
+                f"missing={sorted(component_fields - actual_fields)}, "
+                f"unknown={sorted(actual_fields - component_fields)}."
             )
         return cls(
             candidate_poses_xyz=payload["candidate_poses_xyz"],
@@ -200,6 +304,11 @@ class AdaptiveCandidateSnapshot:
                 "shield_angular_speed_rad_s",
                 DEFAULT_SHIELD_ANGULAR_SPEED_RAD_S,
             ),
+            horizontal_travel_times_s=payload.get(
+                "horizontal_travel_times_s"
+            ),
+            mast_vertical_times_s=payload.get("mast_vertical_times_s"),
+            settling_times_s=payload.get("settling_times_s"),
         )
 
 

@@ -642,6 +642,23 @@ class AdaptiveCandidateProvider:
         distances: Mapping[tuple[int, int], int] | None = None,
     ) -> float | None:
         """Return retract-translate-extend and settling time for one target."""
+        components = self.motion_time_components_s(
+            current_pose,
+            target_pose,
+            distances=distances,
+        )
+        if components is None:
+            return None
+        return float(sum(components))
+
+    def motion_time_components_s(
+        self,
+        current_pose: tuple[float, float, float],
+        target_pose: tuple[float, float, float],
+        *,
+        distances: Mapping[tuple[int, int], int] | None = None,
+    ) -> tuple[float, float, float] | None:
+        """Return horizontal, mast-vertical, and settling times for one target."""
         horizontal = self._horizontal_distance_m(
             current_pose,
             target_pose,
@@ -657,10 +674,10 @@ class AdaptiveCandidateProvider:
                 float(target_pose[2]) - transport
             )
         changed = horizontal > 1.0e-12 or vertical > 1.0e-12
-        return float(
-            horizontal / float(self.motion.horizontal_speed_m_s)
-            + vertical / float(self.motion.vertical_speed_m_s)
-            + (float(self.motion.settling_time_s) if changed else 0.0)
+        return (
+            float(horizontal / float(self.motion.horizontal_speed_m_s)),
+            float(vertical / float(self.motion.vertical_speed_m_s)),
+            float(self.motion.settling_time_s) if changed else 0.0,
         )
 
     def _shortest_cell_path(
@@ -849,16 +866,23 @@ class AdaptiveCandidateProvider:
         """Build one reachable candidate snapshot with time-valued costs."""
         selected: list[tuple[float, float, float]] = []
         costs: list[float] = []
+        horizontal_times: list[float] = []
+        mast_times: list[float] = []
+        settling_times: list[float] = []
         for pose in candidates:
-            cost = self.motion_time_s(
+            components = self.motion_time_components_s(
                 current_pose,
                 pose,
                 distances=distances,
             )
-            if cost is None:
+            if components is None:
                 continue
+            horizontal_time, mast_time, settling_time = components
             selected.append(pose)
-            costs.append(cost)
+            horizontal_times.append(horizontal_time)
+            mast_times.append(mast_time)
+            settling_times.append(settling_time)
+            costs.append(horizontal_time + mast_time + settling_time)
         if not selected:
             raise RuntimeError("No reachable adaptive measurement pose remains.")
         return AdaptiveCandidateSnapshot(
@@ -867,6 +891,9 @@ class AdaptiveCandidateProvider:
             allowed_pair_ids=tuple(range(64)),
             current_pair_id=int(current_pair_id),
             shield_angular_speed_rad_s=(self.motion.shield_angular_speed_rad_s),
+            horizontal_travel_times_s=tuple(horizontal_times),
+            mast_vertical_times_s=tuple(mast_times),
+            settling_times_s=tuple(settling_times),
         )
 
     def snapshot(
