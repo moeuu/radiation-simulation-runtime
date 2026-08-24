@@ -680,8 +680,16 @@ class _SafeQuietHTTPRequestHandler(SimpleHTTPRequestHandler):
             handle.close()
             raise
 
+    def log_request(
+        self,
+        code: int | str = "-",
+        size: int | str = "-",
+    ) -> None:
+        """Suppress unbounded per-request access logging for the CUI poller."""
+        del code, size
+
     def log_message(self, format: str, *args: Any) -> None:
-        """Suppress per-request HTTP server logging."""
+        """Suppress request-error messages emitted by the HTTP base class."""
         del format, args
 
 

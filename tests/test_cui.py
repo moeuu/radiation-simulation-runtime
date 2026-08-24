@@ -299,6 +299,36 @@ def test_managed_server_supports_nested_index_and_closes(
     assert _wait_until_closed("127.0.0.1", int(handle.port))
 
 
+def test_server_suppresses_all_per_request_access_logs(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Successful and failed polling must not create unbounded access logs."""
+    root = tmp_path / "static"
+    root.mkdir()
+    (root / "index.html").write_text("dashboard", encoding="utf-8")
+    handle = start_cui_server(
+        root,
+        config=CUIDashboardConfig(
+            host="127.0.0.1",
+            port=0,
+            public_host="127.0.0.1",
+        ),
+    )
+    try:
+        assert handle.url is not None
+        assert _fetch_text(handle.url) == "dashboard"
+        assert capsys.readouterr().err == ""
+
+        missing_url = urljoin(handle.url, "missing.png")
+        with pytest.raises(HTTPError) as error:
+            _fetch_text(missing_url)
+        assert error.value.code == 404
+        assert capsys.readouterr().err == ""
+    finally:
+        handle.close()
+
+
 def test_managed_server_supports_ipv6_loopback_when_available(
     tmp_path: Path,
 ) -> None:
