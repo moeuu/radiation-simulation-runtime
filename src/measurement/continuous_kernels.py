@@ -58,6 +58,8 @@ _CUDA_CHUNK_FREE_MEMORY_FRACTION = 0.20
 _CUDA_CHUNK_LOW_MEMORY_FRACTION = 0.05
 _CUDA_CHUNK_MIN_RESERVE_BYTES = 512 * 1024**2
 _CUDA_CHUNK_RESERVE_FRACTION = 0.10
+_EXPLICIT_TRANSPORT_BUDGET_NUMERATOR = 3
+_EXPLICIT_TRANSPORT_BUDGET_DENOMINATOR = 4
 _LINE_RESPONSE_CACHE_MAX_ENTRIES = 8
 _LINE_RESPONSE_CACHE_MAX_BYTES = 256 * 1024**2
 
@@ -1576,6 +1578,7 @@ class ContinuousKernel:
         device: "torch.device | str | None" = None,
         dtype: "torch.dtype | None" = None,
         all_orientation_pairs: bool = False,
+        working_memory_budget_bytes: int | None = None,
     ) -> int:
         """
         Return a memory-aware torch chunk size without changing kernel math.
@@ -1585,8 +1588,10 @@ class ContinuousKernel:
         intersections. The CUDA path budgets a conservative working set from
         currently free VRAM, while leaving headroom for the PF and driver. The
         estimate uses the requested isotope's actual line count and requested
-        shield-pair count. CPU and unavailable-memory-query paths retain the
-        fixed conservative budget used before adaptive CUDA sizing.
+        shield-pair count. When ``working_memory_budget_bytes`` is supplied,
+        the public response-memory contract applies an additional conservative
+        source-row cap. CPU and unavailable-memory-query paths retain the fixed
+        conservative budget used before adaptive CUDA sizing.
         """
         chunk = max(1, int(requested))
         aperture_sample_count = (
@@ -1611,6 +1616,14 @@ class ContinuousKernel:
             if isotope is not None
             else self._max_line_count()
         )
+        if working_memory_budget_bytes is not None and (
+            isinstance(working_memory_budget_bytes, bool)
+            or not isinstance(working_memory_budget_bytes, (int, np.integer))
+            or int(working_memory_budget_bytes) <= 0
+        ):
+            raise ValueError(
+                "working_memory_budget_bytes must be a positive integer."
+            )
 
         dtype_name = str(dtype if dtype is not None else self.gpu_dtype).lower()
         bytes_per_element = 8 if "64" in dtype_name else 4
@@ -1628,13 +1641,36 @@ class ContinuousKernel:
             sample_count * pair_count * line_count,
         )
         legacy_safe_chunk = max(1, int(legacy_element_budget // legacy_denom))
+        explicit_safe_chunk: int | None = None
+        if working_memory_budget_bytes is not None:
+            explicit_safe_chunk = self._explicit_line_transport_source_chunk_size(
+                requested=chunk,
+                isotope=isotope,
+                orientation_pair_count=pair_count,
+                dtype_bytes=bytes_per_element,
+                working_memory_budget_bytes=int(working_memory_budget_bytes),
+            )
 
         device_name = str(device if device is not None else self.gpu_device)
         if not device_name.startswith("cuda"):
-            return max(1, min(chunk, legacy_safe_chunk))
+            return max(
+                1,
+                min(
+                    chunk,
+                    legacy_safe_chunk,
+                    chunk if explicit_safe_chunk is None else explicit_safe_chunk,
+                ),
+            )
         memory_info = self._torch_cuda_memory_info(device_name)
         if memory_info is None:
-            return max(1, min(chunk, legacy_safe_chunk))
+            return max(
+                1,
+                min(
+                    chunk,
+                    legacy_safe_chunk,
+                    chunk if explicit_safe_chunk is None else explicit_safe_chunk,
+                ),
+            )
         free_bytes, total_bytes = memory_info
         reserve_bytes = max(
             _CUDA_CHUNK_MIN_RESERVE_BYTES,
@@ -1670,7 +1706,136 @@ class ContinuousKernel:
                 // max(1, bytes_per_element * working_elements_per_source)
             ),
         )
+        if explicit_safe_chunk is not None:
+            cuda_safe_chunk = min(cuda_safe_chunk, explicit_safe_chunk)
         return max(1, min(chunk, cuda_safe_chunk))
+
+    def estimate_line_transport_working_set_bytes(
+        self,
+        *,
+        isotope: str | None,
+        orientation_pair_count: int,
+        source_row_count: int,
+        dtype_bytes: int = 8,
+    ) -> int:
+        """Return a conservative GPU response scratch estimate.
+
+        One source row expands over finite-aperture rays, obstacle boxes,
+        shield pairs, and positive gamma lines. The coefficients account for
+        the simultaneously live interval, quadrature, optical-depth, buildup,
+        and output tensors in the exact Torch response. This estimate changes
+        only scheduling; all rays, boxes, pairs, and lines remain evaluated.
+        """
+        counts = {
+            "orientation_pair_count": orientation_pair_count,
+            "source_row_count": source_row_count,
+            "dtype_bytes": dtype_bytes,
+        }
+        if isotope is not None and (
+            not isinstance(isotope, str) or not isotope
+        ):
+            raise ValueError("isotope must be None or a nonempty string.")
+        for name, value in counts.items():
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, np.integer))
+                or int(value) <= 0
+            ):
+                raise ValueError(f"{name} must be a positive integer.")
+        aperture_count = (
+            max(int(self.detector_aperture_samples), 1)
+            if float(self.detector_aperture_radius_m or 0.0) > 0.0
+            else 1
+        )
+        source_extent_count = (
+            max(int(self.source_extent_samples), 1)
+            if float(self.source_extent_radius_m or 0.0) > 0.0
+            else 1
+        )
+        ray_count = aperture_count * source_extent_count
+        obstacle_count = int(self.obstacle_boxes_m().shape[0])
+        line_count = (
+            self._max_line_count()
+            if isotope is None
+            else max(1, len(self._line_mu_values(isotope)))
+        )
+        pair_count = int(orientation_pair_count)
+        # Obstacle quadrature dominates dense material scenes. The exact
+        # implementation holds compacted intersection indices, interval
+        # endpoints, quadrature coordinates, material coefficients, survival,
+        # scatter and reduction tensors concurrently.
+        obstacle_elements = 160 * ray_count * obstacle_count
+        # Exact spherical-octant intersection and line-resolved attenuation
+        # retain several pair/ray and pair/ray/line arrays simultaneously.
+        pair_elements = 32 * ray_count * pair_count
+        line_elements = 24 * ray_count * pair_count * line_count
+        ray_elements = 64 * ray_count
+        elements_per_source = max(
+            1,
+            obstacle_elements + pair_elements + line_elements + ray_elements,
+        )
+        return int(
+            int(source_row_count) * elements_per_source * int(dtype_bytes)
+        )
+
+    def minimum_line_transport_working_memory_budget_bytes(
+        self,
+        *,
+        isotope: str | None,
+        orientation_pair_count: int,
+        dtype_bytes: int = 8,
+    ) -> int:
+        """Return the smallest explicit budget that fits one source row."""
+        per_source_bytes = self.estimate_line_transport_working_set_bytes(
+            isotope=isotope,
+            orientation_pair_count=orientation_pair_count,
+            source_row_count=1,
+            dtype_bytes=dtype_bytes,
+        )
+        return int(
+            (
+                per_source_bytes * _EXPLICIT_TRANSPORT_BUDGET_DENOMINATOR
+                + _EXPLICIT_TRANSPORT_BUDGET_NUMERATOR
+                - 1
+            )
+            // _EXPLICIT_TRANSPORT_BUDGET_NUMERATOR
+        )
+
+    def _explicit_line_transport_source_chunk_size(
+        self,
+        *,
+        requested: int,
+        isotope: str | None,
+        orientation_pair_count: int,
+        dtype_bytes: int,
+        working_memory_budget_bytes: int,
+    ) -> int:
+        """Return a fail-closed source chunk under one explicit phase budget."""
+        minimum_budget = self.minimum_line_transport_working_memory_budget_bytes(
+            isotope=isotope,
+            orientation_pair_count=orientation_pair_count,
+            dtype_bytes=dtype_bytes,
+        )
+        if int(working_memory_budget_bytes) < minimum_budget:
+            raise MemoryError(
+                "working_memory_budget_bytes cannot hold one exact "
+                "line-transport source row."
+            )
+        per_source_bytes = self.estimate_line_transport_working_set_bytes(
+            isotope=isotope,
+            orientation_pair_count=orientation_pair_count,
+            source_row_count=1,
+            dtype_bytes=dtype_bytes,
+        )
+        working_bytes = (
+            int(working_memory_budget_bytes)
+            * _EXPLICIT_TRANSPORT_BUDGET_NUMERATOR
+            // _EXPLICIT_TRANSPORT_BUDGET_DENOMINATOR
+        )
+        return max(
+            1,
+            min(int(requested), int(working_bytes // per_source_bytes)),
+        )
 
     def _torch_cuda_memory_info(
         self,
@@ -6290,6 +6455,8 @@ class ContinuousKernel:
         sources: NDArray[np.float64],
         positive_line_indices: object,
         chunk_size: int = 262144,
+        *,
+        working_memory_budget_bytes: int | None = None,
     ) -> LineTransportComponents:
         """Return transport components for every detector and shield pair.
 
@@ -6301,6 +6468,14 @@ class ContinuousKernel:
         shield geometry across all pairs.  The CPU path remains a batched
         selected-pair equivalence implementation.
         """
+        if working_memory_budget_bytes is not None and (
+            isinstance(working_memory_budget_bytes, bool)
+            or not isinstance(working_memory_budget_bytes, (int, np.integer))
+            or int(working_memory_budget_bytes) <= 0
+        ):
+            raise ValueError(
+                "working_memory_budget_bytes must be a positive integer."
+            )
         line_selection = self._validated_positive_line_indices(
             isotope,
             positive_line_indices,
@@ -6347,6 +6522,17 @@ class ContinuousKernel:
                 distance_m=empty.copy(),
             )
         if not self.use_gpu:
+            cpu_chunk_size = int(chunk_size)
+            if working_memory_budget_bytes is not None:
+                cpu_chunk_size = self._explicit_line_transport_source_chunk_size(
+                    requested=cpu_chunk_size,
+                    isotope=isotope,
+                    orientation_pair_count=pair_count,
+                    dtype_bytes=np.dtype(np.float64).itemsize,
+                    working_memory_budget_bytes=int(
+                        working_memory_budget_bytes
+                    ),
+                )
             pair_ids = np.arange(pair_count, dtype=np.int64)
             repeated_detectors = np.repeat(
                 detectors_arr,
@@ -6368,7 +6554,7 @@ class ContinuousKernel:
                 fe_indices=fe_indices,
                 pb_indices=pb_indices,
                 positive_line_indices=line_selection,
-                chunk_size=chunk_size,
+                chunk_size=cpu_chunk_size,
             )
 
             def _cpu_field(field_name: str) -> NDArray[np.float64]:
@@ -6407,6 +6593,7 @@ class ContinuousKernel:
             device=device,
             dtype=dtype,
             all_orientation_pairs=True,
+            working_memory_budget_bytes=working_memory_budget_bytes,
         )
 
         def _evaluate_component_chunk(
@@ -6487,6 +6674,7 @@ class ContinuousKernel:
         chunk_size: int = 262144,
         *,
         device_resident: bool = False,
+        working_memory_budget_bytes: int | None = None,
     ) -> LineTransportComponents | DeviceLineTransportComponents:
         """Return components for one shield program at every detector.
 
@@ -6498,6 +6686,14 @@ class ContinuousKernel:
         ordering. When ``device_resident`` is true, the CUDA implementation
         returns the same tensors without a device-to-host copy.
         """
+        if working_memory_budget_bytes is not None and (
+            isinstance(working_memory_budget_bytes, bool)
+            or not isinstance(working_memory_budget_bytes, (int, np.integer))
+            or int(working_memory_budget_bytes) <= 0
+        ):
+            raise ValueError(
+                "working_memory_budget_bytes must be a positive integer."
+            )
         line_selection = self._validated_positive_line_indices(
             isotope,
             positive_line_indices,
@@ -6590,6 +6786,17 @@ class ContinuousKernel:
                 raise ValueError(
                     "Device-resident components require the GPU path."
                 )
+            cpu_chunk_size = int(chunk_size)
+            if working_memory_budget_bytes is not None:
+                cpu_chunk_size = self._explicit_line_transport_source_chunk_size(
+                    requested=cpu_chunk_size,
+                    isotope=isotope,
+                    orientation_pair_count=view_count,
+                    dtype_bytes=np.dtype(np.float64).itemsize,
+                    working_memory_budget_bytes=int(
+                        working_memory_budget_bytes
+                    ),
+                )
             repeated_detectors = np.repeat(
                 detectors_arr,
                 view_count,
@@ -6603,7 +6810,7 @@ class ContinuousKernel:
                     fe_indices=fe_program.reshape(-1),
                     pb_indices=pb_program.reshape(-1),
                     positive_line_indices=line_selection,
-                    chunk_size=chunk_size,
+                    chunk_size=cpu_chunk_size,
                 )
             )
 
@@ -6653,6 +6860,7 @@ class ContinuousKernel:
             device=device,
             dtype=dtype,
             all_orientation_pairs=False,
+            working_memory_budget_bytes=working_memory_budget_bytes,
         )
 
         def _evaluate_component_chunk(
@@ -6683,28 +6891,79 @@ class ContinuousKernel:
                 )
             return result
 
-        parts, _ = self._evaluate_torch_chunks_with_oom_retry(
-            total_size=int(sources_flat.shape[0]),
-            initial_chunk=chunk,
-            device=device,
-            evaluator=_evaluate_component_chunk,
-        )
-        expected_type = (
-            DeviceLineTransportComponents
-            if device_resident
-            else LineTransportComponents
-        )
-        if any(not isinstance(part, expected_type) for part in parts):
-            raise RuntimeError(
-                "Pair-program component chunks returned scalar kernels."
-            )
-
         if device_resident:
+            field_names = (
+                "total_kernel",
+                "unattenuated_kernel",
+                "uncollided_kernel",
+                "tau_fe",
+                "tau_pb",
+                "tau_obstacle",
+                "tau_obstacle_compton",
+                "distance_m",
+            )
+            flat_shape = (
+                int(sources_flat.shape[0]),
+                view_count,
+                line_count,
+            )
+            buffers = {
+                field_name: torch.empty(
+                    flat_shape,
+                    device=device,
+                    dtype=dtype,
+                )
+                for field_name in field_names
+            }
+            active_chunk = max(
+                1,
+                min(int(chunk), int(sources_flat.shape[0])),
+            )
+            start = 0
+            while start < int(sources_flat.shape[0]):
+                stop = min(
+                    start + active_chunk,
+                    int(sources_flat.shape[0]),
+                )
+                part = None
+                retry_after_oom = False
+                try:
+                    part = _evaluate_component_chunk(start, stop)
+                    if not isinstance(part, DeviceLineTransportComponents):
+                        raise RuntimeError(
+                            "Pair-program component chunks returned host arrays."
+                        )
+                    expected_chunk_shape = (
+                        stop - start,
+                        view_count,
+                        line_count,
+                    )
+                    for field_name in field_names:
+                        values = getattr(part, field_name)
+                        if tuple(values.shape) != expected_chunk_shape:
+                            raise RuntimeError(
+                                "Pair-program component chunk has an invalid "
+                                "shape."
+                            )
+                        buffers[field_name][start:stop].copy_(values)
+                except RuntimeError as error:
+                    part = None
+                    if (
+                        not self._is_cuda_out_of_memory(error)
+                        or active_chunk <= 1
+                    ):
+                        raise
+                    active_chunk = max(1, active_chunk // 2)
+                    retry_after_oom = True
+                if retry_after_oom:
+                    self._clear_cuda_cache_after_oom(device)
+                    continue
+                part = None
+                start = stop
+
             def _device_field(field_name: str) -> "torch.Tensor":
-                """Concatenate one selected-program component on the GPU."""
-                rows = [getattr(part, field_name) for part in parts]
-                flat = torch.cat(rows, dim=0)
-                return flat.reshape(
+                """Return one preallocated component in public layout."""
+                return buffers[field_name].reshape(
                     detector_count,
                     source_count,
                     view_count,
@@ -6722,6 +6981,17 @@ class ContinuousKernel:
                     "tau_obstacle_compton"
                 ),
                 distance_m=_device_field("distance_m"),
+            )
+
+        parts, _ = self._evaluate_torch_chunks_with_oom_retry(
+            total_size=int(sources_flat.shape[0]),
+            initial_chunk=chunk,
+            device=device,
+            evaluator=_evaluate_component_chunk,
+        )
+        if any(not isinstance(part, LineTransportComponents) for part in parts):
+            raise RuntimeError(
+                "Pair-program component chunks returned device arrays."
             )
 
         def _gpu_field(field_name: str) -> NDArray[np.float64]:

@@ -77,6 +77,7 @@ CROSS_LIKELIHOOD_SAMPLE_CHUNK_SIZE = 64
 CROSS_LIKELIHOOD_STATE_CHUNK_SIZE = 256
 CROSS_LIKELIHOOD_STATE_AUTOTUNE_MAX_CHUNK_SIZE = 1024
 CROSS_LIKELIHOOD_BIN_CHUNK_SIZE = 128
+SUBSET_LIKELIHOOD_VIEW_CHUNK_SIZE = 8
 CONTINUUM_NUISANCE_BAND_WIDTH_KEV = 50.0
 RENEWAL_LOG_GAMMA_MAX_ITERATIONS = 2_048
 RENEWAL_GAMMA_INTERVAL_QUADRATURE_ORDER = 32
@@ -131,14 +132,21 @@ class PreparedTorchCrossObservation:
         action_stop: int,
         sample_start: int,
         sample_stop: int,
+        view_start: int = 0,
+        view_stop: int | None = None,
     ) -> "PreparedTorchCrossObservation":
-        """Return a view of one action/sample slab without recomputation."""
+        """Return one action/sample/view slab without recomputation."""
+
+        resolved_view_stop = (
+            int(self.observed_asvb.shape[2]) if view_stop is None else int(view_stop)
+        )
 
         def _slice(values: object) -> object:
-            """Slice a prepared tensor on its action and sample axes."""
+            """Slice a prepared tensor on action, sample, and view axes."""
             return values[
                 int(action_start) : int(action_stop),
                 int(sample_start) : int(sample_stop),
+                int(view_start) : resolved_view_stop,
             ]
 
         return PreparedTorchCrossObservation(
@@ -150,22 +158,511 @@ class PreparedTorchCrossObservation:
             continuum_observed_asvc=_slice(self.continuum_observed_asvc),
             peak_count_asv=_slice(self.peak_count_asv),
             continuum_count_asv=_slice(self.continuum_count_asv),
-            beta_binomial_constant_asv=_slice(
-                self.beta_binomial_constant_asv
-            ),
-            peak_multinomial_constant_asv=_slice(
-                self.peak_multinomial_constant_asv
-            ),
-            continuum_group_observed_asvg=_slice(
-                self.continuum_group_observed_asvg
-            ),
-            continuum_group_constant_asv=_slice(
-                self.continuum_group_constant_asv
-            ),
-            continuum_within_constant_asv=_slice(
-                self.continuum_within_constant_asv
-            ),
+            beta_binomial_constant_asv=_slice(self.beta_binomial_constant_asv),
+            peak_multinomial_constant_asv=_slice(self.peak_multinomial_constant_asv),
+            continuum_group_observed_asvg=_slice(self.continuum_group_observed_asvg),
+            continuum_group_constant_asv=_slice(self.continuum_group_constant_asv),
+            continuum_within_constant_asv=_slice(self.continuum_within_constant_asv),
         )
+
+
+@dataclass(frozen=True)
+class PreparedNumpySubsetCrossLikelihood:
+    """Cache exact view-resolved NumPy terms for arbitrary view subsets.
+
+    The cached axes are action, predictive sample, hypothesis state,
+    station-shared rate node, station-shared physical-mark node, and view.
+    A subset evaluation gathers only selected views, combines their sufficient
+    statistics, and marginalizes station-shared nuisance nodes exactly once.
+    """
+
+    leading_shape: tuple[int, ...]
+    view_node_log_aqnjrv: NDArray[np.float64]
+    latent_log_weights_jr: NDArray[np.float64]
+    shared_gamma_concentration: float | None = None
+    shared_observed_counts_aqv: NDArray[np.float64] | None = None
+    shared_expected_counts_anjv: NDArray[np.float64] | None = None
+
+    @property
+    def action_count(self) -> int:
+        """Return the flattened number of action or pose candidates."""
+        return int(self.view_node_log_aqnjrv.shape[0])
+
+    @property
+    def sample_count(self) -> int:
+        """Return the number of predictive observation samples."""
+        return int(self.view_node_log_aqnjrv.shape[1])
+
+    @property
+    def state_count(self) -> int:
+        """Return the number of likelihood hypothesis states."""
+        return int(self.view_node_log_aqnjrv.shape[2])
+
+    @property
+    def view_count(self) -> int:
+        """Return the number of cached views or shield pairs."""
+        return int(self.view_node_log_aqnjrv.shape[-1])
+
+    @property
+    def pair_count(self) -> int:
+        """Return the cached view count under the shield-pair terminology."""
+        return self.view_count
+
+    @property
+    def dtype(self) -> np.dtype[np.float64]:
+        """Return the floating-point dtype used by cached likelihood terms."""
+        return self.view_node_log_aqnjrv.dtype
+
+    def _normalized_indices(
+        self,
+        subset_indices: object,
+    ) -> NDArray[np.int64]:
+        """Validate and broadcast subset indices to action/candidate/view."""
+        raw = np.asarray(subset_indices)
+        if raw.dtype == np.bool_ or not np.issubdtype(raw.dtype, np.integer):
+            raise ValueError("Subset view indices must be integer-valued.")
+        if raw.ndim == 2:
+            indices = np.broadcast_to(
+                raw[np.newaxis, ...],
+                (self.action_count,) + tuple(raw.shape),
+            )
+        elif raw.ndim == 3 and int(raw.shape[0]) == self.action_count:
+            indices = raw
+        else:
+            raise ValueError(
+                "Subset view indices must be shaped candidate/view or "
+                "action/candidate/view."
+            )
+        if int(indices.shape[1]) <= 0:
+            raise ValueError("At least one subset candidate is required.")
+        normalized = np.asarray(indices, dtype=np.int64)
+        if normalized.size and (
+            np.any(normalized < 0) or np.any(normalized >= self.view_count)
+        ):
+            raise ValueError("Subset view indices are outside the cache range.")
+        if int(normalized.shape[-1]) > 1 and np.any(
+            np.diff(np.sort(normalized, axis=-1), axis=-1) == 0
+        ):
+            raise ValueError("One subset cannot contain duplicate views.")
+        return normalized
+
+    def _shared_gamma_adjustment(
+        self,
+        selection_acv: NDArray[np.float64],
+    ) -> NDArray[np.float64] | None:
+        """Return exact negative-multinomial subset normalization terms."""
+        if self.shared_gamma_concentration is None:
+            return None
+        if (
+            self.shared_observed_counts_aqv is None
+            or self.shared_expected_counts_anjv is None
+        ):
+            raise RuntimeError("Shared-Gamma subset statistics are incomplete.")
+        observed_by_view = np.moveaxis(
+            self.shared_observed_counts_aqv,
+            -1,
+            1,
+        )
+        total_observed = np.matmul(selection_acv, observed_by_view)
+        expected_by_view = np.moveaxis(
+            self.shared_expected_counts_anjv,
+            -1,
+            1,
+        )
+        expected_shape = tuple(int(value) for value in expected_by_view.shape)
+        total_expected = np.matmul(
+            selection_acv,
+            expected_by_view.reshape((self.action_count, self.view_count, -1)),
+        ).reshape(
+            (
+                self.action_count,
+                int(selection_acv.shape[1]),
+            )
+            + expected_shape[2:]
+        )
+        concentration = float(self.shared_gamma_concentration)
+        counts = total_observed[:, :, :, np.newaxis, np.newaxis]
+        means = total_expected[:, :, np.newaxis, :, :]
+        return (
+            special.gammaln(concentration + counts)
+            - special.gammaln(concentration)
+            + concentration * np.log(concentration)
+            - (concentration + counts) * np.log(concentration + means)
+        )
+
+    def _marginalize_nodes(
+        self,
+        node_log_acqnjr: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Integrate the shared rate and physical-mark quadrature nodes."""
+        weights = self.latent_log_weights_jr.reshape(
+            (1,) * (node_log_acqnjr.ndim - 2) + tuple(self.latent_log_weights_jr.shape)
+        )
+        return special.logsumexp(
+            node_log_acqnjr + weights,
+            axis=(-2, -1),
+        )
+
+    def evaluate(
+        self,
+        subset_indices: object,
+    ) -> NDArray[np.float64]:
+        """Return exact likelihoods for batched arbitrary view subsets.
+
+        ``subset_indices`` may be shaped ``(C, K)`` and shared by all actions,
+        or ``(A, C, K)`` for action-specific candidates.  The result is shaped
+        ``(A, C, Q, N)``.  View order has no statistical effect and unselected
+        views do not enter any sufficient statistic.
+        """
+        indices = self._normalized_indices(subset_indices)
+        candidate_count = int(indices.shape[1])
+        selection = np.zeros(
+            (self.action_count, candidate_count, self.view_count),
+            dtype=np.float64,
+        )
+        np.put_along_axis(selection, indices, 1.0, axis=-1)
+        view_first = np.moveaxis(self.view_node_log_aqnjrv, -1, 1)
+        trailing_shape = tuple(int(value) for value in view_first.shape[2:])
+        node_log = np.matmul(
+            selection,
+            view_first.reshape((self.action_count, self.view_count, -1)),
+        ).reshape((self.action_count, candidate_count) + trailing_shape)
+        shared_adjustment = self._shared_gamma_adjustment(selection)
+        if shared_adjustment is not None:
+            node_log = node_log + shared_adjustment[..., np.newaxis]
+        return np.asarray(self._marginalize_nodes(node_log), dtype=np.float64)
+
+    def full(self) -> NDArray[np.float64]:
+        """Return the exact likelihood using every cached view."""
+        node_log = np.sum(self.view_node_log_aqnjrv, axis=-1)
+        if self.shared_gamma_concentration is not None:
+            if (
+                self.shared_observed_counts_aqv is None
+                or self.shared_expected_counts_anjv is None
+            ):
+                raise RuntimeError("Shared-Gamma full statistics are incomplete.")
+            counts = np.sum(
+                self.shared_observed_counts_aqv,
+                axis=-1,
+            )[:, :, np.newaxis, np.newaxis]
+            means = np.sum(
+                self.shared_expected_counts_anjv,
+                axis=-1,
+            )[:, np.newaxis, :, :]
+            concentration = float(self.shared_gamma_concentration)
+            node_log = (
+                node_log
+                + (
+                    special.gammaln(concentration + counts)
+                    - special.gammaln(concentration)
+                    + concentration * np.log(concentration)
+                    - (concentration + counts) * np.log(concentration + means)
+                )[..., np.newaxis]
+            )
+        flat = self._marginalize_nodes(node_log)
+        return flat.reshape(self.leading_shape + (self.sample_count, self.state_count))
+
+    def prefixes(self) -> NDArray[np.float64]:
+        """Return exact likelihoods for ordered prefixes zero through V."""
+        cumulative = np.cumsum(self.view_node_log_aqnjrv, axis=-1)
+        if self.shared_gamma_concentration is not None:
+            if (
+                self.shared_observed_counts_aqv is None
+                or self.shared_expected_counts_anjv is None
+            ):
+                raise RuntimeError("Shared-Gamma prefix statistics are incomplete.")
+            counts = np.cumsum(
+                self.shared_observed_counts_aqv,
+                axis=-1,
+            )[:, :, np.newaxis, np.newaxis, :]
+            means = np.cumsum(
+                self.shared_expected_counts_anjv,
+                axis=-1,
+            )[:, np.newaxis, :, :, :]
+            concentration = float(self.shared_gamma_concentration)
+            cumulative = (
+                cumulative
+                + (
+                    special.gammaln(concentration + counts)
+                    - special.gammaln(concentration)
+                    + concentration * np.log(concentration)
+                    - (concentration + counts) * np.log(concentration + means)
+                )[..., np.newaxis, :]
+            )
+        nonempty = self._marginalize_nodes(np.moveaxis(cumulative, -1, 1))
+        zero = np.zeros(
+            (self.action_count, 1, self.sample_count, self.state_count),
+            dtype=np.float64,
+        )
+        result = np.concatenate((zero, nonempty), axis=1)
+        result = np.moveaxis(result, 1, -1)
+        return result.reshape(
+            self.leading_shape
+            + (self.sample_count, self.state_count, self.view_count + 1)
+        )
+
+
+@dataclass(frozen=True)
+class PreparedTorchSubsetCrossLikelihood:
+    """Cache device-resident exact Torch terms for arbitrary view subsets."""
+
+    leading_shape: tuple[int, ...]
+    view_node_log_aqnjrv: object
+    latent_log_weights_jr: object
+    shared_gamma_concentration: float | None = None
+    shared_observed_counts_aqv: object | None = None
+    shared_expected_counts_anjv: object | None = None
+
+    @property
+    def action_count(self) -> int:
+        """Return the flattened number of action or pose candidates."""
+        return int(self.view_node_log_aqnjrv.shape[0])
+
+    @property
+    def sample_count(self) -> int:
+        """Return the number of predictive observation samples."""
+        return int(self.view_node_log_aqnjrv.shape[1])
+
+    @property
+    def state_count(self) -> int:
+        """Return the number of likelihood hypothesis states."""
+        return int(self.view_node_log_aqnjrv.shape[2])
+
+    @property
+    def view_count(self) -> int:
+        """Return the number of cached views or shield pairs."""
+        return int(self.view_node_log_aqnjrv.shape[-1])
+
+    @property
+    def pair_count(self) -> int:
+        """Return the cached view count under the shield-pair terminology."""
+        return self.view_count
+
+    @property
+    def device(self) -> object:
+        """Return the device holding all cached likelihood terms."""
+        return self.view_node_log_aqnjrv.device
+
+    @property
+    def dtype(self) -> object:
+        """Return the floating-point dtype used by cached likelihood terms."""
+        return self.view_node_log_aqnjrv.dtype
+
+    def _normalized_indices(self, subset_indices: object) -> object:
+        """Validate and broadcast subset indices on the cache device."""
+        import torch
+
+        raw = torch.as_tensor(subset_indices, device=self.device)
+        if raw.dtype == torch.bool or raw.dtype not in (
+            torch.int8,
+            torch.int16,
+            torch.int32,
+            torch.int64,
+            torch.uint8,
+        ):
+            raise ValueError("Subset view indices must be integer-valued.")
+        if raw.ndim == 2:
+            indices = raw.unsqueeze(0).expand(self.action_count, -1, -1)
+        elif raw.ndim == 3 and int(raw.shape[0]) == self.action_count:
+            indices = raw
+        else:
+            raise ValueError(
+                "Subset view indices must be shaped candidate/view or "
+                "action/candidate/view."
+            )
+        if int(indices.shape[1]) <= 0:
+            raise ValueError("At least one subset candidate is required.")
+        indices = indices.to(dtype=torch.int64)
+        if int(indices.numel()) > 0:
+            invalid_range = torch.any((indices < 0) | (indices >= self.view_count))
+            if bool(invalid_range.item()):
+                raise ValueError("Subset view indices are outside the cache range.")
+        if int(indices.shape[-1]) > 1:
+            ordered = torch.sort(indices, dim=-1).values
+            if bool(torch.any(torch.diff(ordered, dim=-1) == 0).item()):
+                raise ValueError("One subset cannot contain duplicate views.")
+        return indices
+
+    def _shared_gamma_adjustment(self, selection_acv: object) -> object | None:
+        """Return exact negative-multinomial subset normalization terms."""
+        import torch
+
+        if self.shared_gamma_concentration is None:
+            return None
+        if (
+            self.shared_observed_counts_aqv is None
+            or self.shared_expected_counts_anjv is None
+        ):
+            raise RuntimeError("Shared-Gamma subset statistics are incomplete.")
+        candidate_count = int(selection_acv.shape[1])
+        observed_by_view = torch.movedim(
+            self.shared_observed_counts_aqv,
+            -1,
+            1,
+        )
+        total_observed = torch.bmm(selection_acv, observed_by_view)
+        node_count = int(self.shared_expected_counts_anjv.shape[-2])
+        expected_by_view = torch.movedim(
+            self.shared_expected_counts_anjv,
+            -1,
+            1,
+        )
+        total_expected = torch.bmm(
+            selection_acv,
+            expected_by_view.reshape(
+                self.action_count,
+                self.view_count,
+                self.state_count * node_count,
+            ),
+        ).reshape(
+            self.action_count,
+            candidate_count,
+            self.state_count,
+            node_count,
+        )
+        concentration = torch.as_tensor(
+            float(self.shared_gamma_concentration),
+            device=self.device,
+            dtype=self.dtype,
+        )
+        counts = total_observed[:, :, :, None, None]
+        means = total_expected[:, :, None, :, :]
+        return (
+            torch.lgamma(concentration + counts)
+            - torch.lgamma(concentration)
+            + concentration * torch.log(concentration)
+            - (concentration + counts) * torch.log(concentration + means)
+        )
+
+    def _marginalize_nodes(self, node_log_acqnjr: object) -> object:
+        """Integrate the shared rate and physical-mark quadrature nodes."""
+        import torch
+
+        weights = self.latent_log_weights_jr.reshape(
+            (1,) * (node_log_acqnjr.ndim - 2) + tuple(self.latent_log_weights_jr.shape)
+        )
+        return torch.logsumexp(
+            node_log_acqnjr + weights,
+            dim=(-2, -1),
+        )
+
+    def evaluate(self, subset_indices: object) -> object:
+        """Return device-resident exact likelihoods for arbitrary subsets.
+
+        Input shapes are ``(C, K)`` or ``(A, C, K)`` and output shape is
+        ``(A, C, Q, N)``.  All arithmetic stays on the prepared response
+        device and uses its floating-point dtype.
+        """
+        import torch
+
+        indices = self._normalized_indices(subset_indices)
+        candidate_count = int(indices.shape[1])
+        node_count = int(self.view_node_log_aqnjrv.shape[-3])
+        mark_node_count = int(self.view_node_log_aqnjrv.shape[-2])
+        selection = torch.zeros(
+            (self.action_count, candidate_count, self.view_count),
+            device=self.device,
+            dtype=self.dtype,
+        )
+        selection.scatter_(-1, indices, 1.0)
+        view_first = torch.movedim(self.view_node_log_aqnjrv, -1, 1)
+        node_log = torch.bmm(
+            selection,
+            view_first.reshape(
+                self.action_count,
+                self.view_count,
+                self.sample_count * self.state_count * node_count * mark_node_count,
+            ),
+        ).reshape(
+            self.action_count,
+            candidate_count,
+            self.sample_count,
+            self.state_count,
+            node_count,
+            mark_node_count,
+        )
+        shared_adjustment = self._shared_gamma_adjustment(selection)
+        if shared_adjustment is not None:
+            node_log = node_log + shared_adjustment.unsqueeze(-1)
+        return self._marginalize_nodes(node_log)
+
+    def full(self) -> object:
+        """Return the exact likelihood using every cached view."""
+        import torch
+
+        node_log = torch.sum(self.view_node_log_aqnjrv, dim=-1)
+        if self.shared_gamma_concentration is not None:
+            if (
+                self.shared_observed_counts_aqv is None
+                or self.shared_expected_counts_anjv is None
+            ):
+                raise RuntimeError("Shared-Gamma full statistics are incomplete.")
+            counts = torch.sum(
+                self.shared_observed_counts_aqv,
+                dim=-1,
+            )[:, :, None, None]
+            means = torch.sum(
+                self.shared_expected_counts_anjv,
+                dim=-1,
+            )[:, None, :, :]
+            concentration = torch.as_tensor(
+                float(self.shared_gamma_concentration),
+                device=self.device,
+                dtype=self.dtype,
+            )
+            node_log = node_log + (
+                torch.lgamma(concentration + counts)
+                - torch.lgamma(concentration)
+                + concentration * torch.log(concentration)
+                - (concentration + counts) * torch.log(concentration + means)
+            ).unsqueeze(-1)
+        flat = self._marginalize_nodes(node_log)
+        return flat.reshape(self.leading_shape + (self.sample_count, self.state_count))
+
+    def prefixes(self) -> object:
+        """Return exact likelihoods for ordered prefixes zero through V."""
+        import torch
+
+        cumulative = torch.cumsum(self.view_node_log_aqnjrv, dim=-1)
+        if self.shared_gamma_concentration is not None:
+            if (
+                self.shared_observed_counts_aqv is None
+                or self.shared_expected_counts_anjv is None
+            ):
+                raise RuntimeError("Shared-Gamma prefix statistics are incomplete.")
+            counts = torch.cumsum(
+                self.shared_observed_counts_aqv,
+                dim=-1,
+            )[:, :, None, None, :]
+            means = torch.cumsum(
+                self.shared_expected_counts_anjv,
+                dim=-1,
+            )[:, None, :, :, :]
+            concentration = torch.as_tensor(
+                float(self.shared_gamma_concentration),
+                device=self.device,
+                dtype=self.dtype,
+            )
+            cumulative = cumulative + (
+                torch.lgamma(concentration + counts)
+                - torch.lgamma(concentration)
+                + concentration * torch.log(concentration)
+                - (concentration + counts) * torch.log(concentration + means)
+            ).unsqueeze(-2)
+        nonempty = self._marginalize_nodes(torch.movedim(cumulative, -1, 1))
+        zero = torch.zeros(
+            (self.action_count, 1, self.sample_count, self.state_count),
+            device=self.device,
+            dtype=self.dtype,
+        )
+        result = torch.cat((zero, nonempty), dim=1)
+        result = torch.movedim(result, 1, -1)
+        return result.reshape(
+            self.leading_shape
+            + (self.sample_count, self.state_count, self.view_count + 1)
+        )
+
+
 VALIDATION_SCENARIO_IDS = (
     "background_only",
     "single_line_source_resolved",
@@ -5309,17 +5806,15 @@ class GeometryConditionedSpectralModel:
             torch.full_like(total_rate, 1.0e15),
         )
 
-    def _cross_log_likelihood_numpy_unchunked(
+    def _prepare_subset_cross_likelihood_numpy_unchunked(
         self,
         observed_spectra_xqvb: NDArray[np.float64],
         total_line_contributions_xnvsl: NDArray[np.float64],
         uncollided_line_contributions_xnvsl: NDArray[np.float64],
         transport_features_xnvslf: NDArray[np.float64],
         live_times_s_v: NDArray[np.float64],
-        *,
-        return_view_prefixes: bool = False,
-    ) -> NDArray[np.float64]:
-        """Return vectorized sample-by-state renewal/multinomial likelihoods."""
+    ) -> PreparedNumpySubsetCrossLikelihood:
+        """Prepare exact view-resolved NumPy likelihood sufficient terms."""
         observed = np.asarray(observed_spectra_xqvb, dtype=np.float64)
         component_discrepancy = self.physical_component_discrepancy
         component_scale_marks = bool(
@@ -5375,6 +5870,9 @@ class GeometryConditionedSpectralModel:
         observed_total = np.sum(observed, axis=-1)
         pre_total = np.sum(pre_mean, axis=-1)
         live = np.asarray(live_times_s_v, dtype=np.float64)
+        shared_gamma_concentration: float | None = None
+        shared_observed_counts = None
+        shared_expected_counts = None
         if (
             self.count_discrepancy_concentration is None
             and component_discrepancy is None
@@ -5401,21 +5899,26 @@ class GeometryConditionedSpectralModel:
                         uncollided_line_contributions_xnvsl,
                     )[..., np.newaxis, :]
                 )
-            count_function = (
-                view_independent_gamma_poisson_count_log_increments_numpy
-                if component_discrepancy is not None
-                or self.count_discrepancy_scope == "view_independent"
-                else station_shared_gamma_poisson_count_log_increments_numpy
-            )
-            count_log = count_function(
-                observed_total,
-                recorded_total_mean,
-                concentration=(
-                    component_count_concentration
-                    if component_count_concentration is not None
-                    else float(self.count_discrepancy_concentration)
-                ),
-            )
+            if (
+                component_discrepancy is None
+                and self.count_discrepancy_scope != "view_independent"
+            ):
+                shared_gamma_concentration = float(self.count_discrepancy_concentration)
+                shared_observed_counts = observed_total
+                shared_expected_counts = recorded_total_mean
+                counts = observed_total[..., :, np.newaxis, np.newaxis, :]
+                means = recorded_total_mean[..., np.newaxis, :, :, :]
+                count_log = special.xlogy(counts, means) - special.gammaln(counts + 1.0)
+            else:
+                count_log = view_independent_gamma_poisson_count_log_increments_numpy(
+                    observed_total,
+                    recorded_total_mean,
+                    concentration=(
+                        component_count_concentration
+                        if component_count_concentration is not None
+                        else float(self.count_discrepancy_concentration)
+                    ),
+                )
         probabilities = np.divide(
             pre_mean,
             pre_total[..., np.newaxis],
@@ -5636,87 +6139,88 @@ class GeometryConditionedSpectralModel:
             if component_scale_marks
             else count_log + mark_log
         )
-        if return_view_prefixes:
-            cumulative_node_log = np.cumsum(view_node_log, axis=-1)
-            if component_scale_marks:
-                if component_mark_weights is None:
-                    raise RuntimeError("Physical mark weights are unavailable.")
-                rate_weight_shape = (
-                    (1,) * (cumulative_node_log.ndim - 3)
-                    + (int(self._rate_scale_weights_j.size), 1, 1)
-                )
-                mark_weight_shape = (
-                    (1,) * (cumulative_node_log.ndim - 2)
-                    + (int(component_mark_weights.size), 1)
-                )
-                nonempty_prefixes = special.logsumexp(
-                    cumulative_node_log
-                    + np.log(self._rate_scale_weights_j).reshape(
-                        rate_weight_shape
-                    )
-                    + np.log(component_mark_weights).reshape(
-                        mark_weight_shape
-                    ),
-                    axis=(-3, -2),
-                )
-                return np.concatenate(
-                    (
-                        np.zeros(
-                            nonempty_prefixes.shape[:-1] + (1,),
-                            dtype=np.float64,
-                        ),
-                        nonempty_prefixes,
-                    ),
-                    axis=-1,
-                )
-            weight_shape = (
-                (1,) * (cumulative_node_log.ndim - 2)
-                + (int(self._rate_scale_weights_j.size), 1)
-            )
-            nonempty_prefixes = special.logsumexp(
-                cumulative_node_log
-                + np.log(self._rate_scale_weights_j).reshape(weight_shape),
-                axis=-2,
-            )
-            return np.concatenate(
-                (
-                    np.zeros(
-                        nonempty_prefixes.shape[:-1] + (1,),
-                        dtype=np.float64,
-                    ),
-                    nonempty_prefixes,
-                ),
-                axis=-1,
-            )
-        node_log = np.sum(view_node_log, axis=-1)
         if component_scale_marks:
             if component_mark_weights is None:
                 raise RuntimeError("Physical mark weights are unavailable.")
-            rate_weight_shape = (
-                (1,) * (node_log.ndim - 2)
-                + (int(self._rate_scale_weights_j.size), 1)
+            latent_log_weights = (
+                np.log(self._rate_scale_weights_j)[:, np.newaxis]
+                + np.log(component_mark_weights)[np.newaxis, :]
             )
-            mark_weight_shape = (
-                (1,) * (node_log.ndim - 1)
-                + (int(component_mark_weights.size),)
-            )
-            return special.logsumexp(
-                node_log
-                + np.log(self._rate_scale_weights_j).reshape(
-                    rate_weight_shape
-                )
-                + np.log(component_mark_weights).reshape(mark_weight_shape),
-                axis=(-2, -1),
-            )
-        return special.logsumexp(
-            node_log
-            + np.log(self._rate_scale_weights_j).reshape(
-                (1,) * (node_log.ndim - 1) + (-1,)
+        else:
+            view_node_log = view_node_log[..., np.newaxis, :]
+            latent_log_weights = np.log(self._rate_scale_weights_j)[:, np.newaxis]
+        leading_shape = tuple(int(value) for value in observed.shape[:-3])
+        action_count = int(np.prod(leading_shape, dtype=np.int64))
+        if not leading_shape:
+            action_count = 1
+        sample_count = int(observed.shape[-3])
+        state_count = int(total_line_contributions_xnvsl.shape[-4])
+        return PreparedNumpySubsetCrossLikelihood(
+            leading_shape=leading_shape,
+            view_node_log_aqnjrv=np.ascontiguousarray(
+                view_node_log.reshape(
+                    (
+                        action_count,
+                        sample_count,
+                        state_count,
+                    )
+                    + tuple(view_node_log.shape[-3:])
+                ),
+                dtype=np.float64,
             ),
-            axis=-1,
+            latent_log_weights_jr=np.ascontiguousarray(
+                latent_log_weights,
+                dtype=np.float64,
+            ),
+            shared_gamma_concentration=shared_gamma_concentration,
+            shared_observed_counts_aqv=(
+                None
+                if shared_observed_counts is None
+                else np.ascontiguousarray(
+                    shared_observed_counts.reshape(
+                        (action_count, sample_count, int(observed.shape[-2]))
+                    ),
+                    dtype=np.float64,
+                )
+            ),
+            shared_expected_counts_anjv=(
+                None
+                if shared_expected_counts is None
+                else np.ascontiguousarray(
+                    shared_expected_counts.reshape(
+                        (
+                            action_count,
+                            state_count,
+                            int(self._rate_scale_nodes_j.size),
+                            int(observed.shape[-2]),
+                        )
+                    ),
+                    dtype=np.float64,
+                )
+            ),
         )
 
-    def _cross_log_likelihood_torch_unchunked(
+    def _cross_log_likelihood_numpy_unchunked(
+        self,
+        observed_spectra_xqvb: NDArray[np.float64],
+        total_line_contributions_xnvsl: NDArray[np.float64],
+        uncollided_line_contributions_xnvsl: NDArray[np.float64],
+        transport_features_xnvslf: NDArray[np.float64],
+        live_times_s_v: NDArray[np.float64],
+        *,
+        return_view_prefixes: bool = False,
+    ) -> NDArray[np.float64]:
+        """Return exact likelihoods by reducing prepared view terms."""
+        prepared = self._prepare_subset_cross_likelihood_numpy_unchunked(
+            observed_spectra_xqvb,
+            total_line_contributions_xnvsl,
+            uncollided_line_contributions_xnvsl,
+            transport_features_xnvslf,
+            live_times_s_v,
+        )
+        return prepared.prefixes() if return_view_prefixes else prepared.full()
+
+    def _prepare_subset_cross_likelihood_torch_unchunked(
         self,
         observed_spectra_xqvb: object,
         total_line_contributions_xnvsl: object,
@@ -5724,10 +6228,9 @@ class GeometryConditionedSpectralModel:
         transport_features_xnvslf: object,
         live_times_s_v: object,
         *,
-        return_view_prefixes: bool = False,
         prepared_observation: PreparedTorchCrossObservation | None = None,
-    ) -> object:
-        """Return the Torch vectorized sample-by-state likelihood matrix."""
+    ) -> PreparedTorchSubsetCrossLikelihood:
+        """Prepare exact device-resident Torch view sufficient terms."""
         import torch
 
         total = torch.as_tensor(total_line_contributions_xnvsl)
@@ -5794,6 +6297,9 @@ class GeometryConditionedSpectralModel:
             device=total.device,
             dtype=total.dtype,
         )
+        shared_gamma_concentration: float | None = None
+        shared_observed_counts = None
+        shared_expected_counts = None
         if (
             self.count_discrepancy_concentration is None
             and component_discrepancy is None
@@ -5821,22 +6327,27 @@ class GeometryConditionedSpectralModel:
                         uncollided_line_contributions_xnvsl,
                     ).unsqueeze(-2)
                 )
-            count_function = (
-                view_independent_gamma_poisson_count_log_increments_torch
-                if component_discrepancy is not None
-                or self.count_discrepancy_scope == "view_independent"
-                else station_shared_gamma_poisson_count_log_increments_torch
-            )
-            count_log = count_function(
-                observed_total,
-                recorded_total_mean,
-                concentration=(
-                    component_count_concentration
-                    if component_count_concentration is not None
-                    else float(self.count_discrepancy_concentration)
-                ),
-                validate_inputs=False,
-            )
+            if (
+                component_discrepancy is None
+                and self.count_discrepancy_scope != "view_independent"
+            ):
+                shared_gamma_concentration = float(self.count_discrepancy_concentration)
+                shared_observed_counts = observed_total
+                shared_expected_counts = recorded_total_mean
+                counts = observed_total.unsqueeze(-2).unsqueeze(-2)
+                means = recorded_total_mean.unsqueeze(-4)
+                count_log = torch.xlogy(counts, means) - torch.lgamma(counts + 1.0)
+            else:
+                count_log = view_independent_gamma_poisson_count_log_increments_torch(
+                    observed_total,
+                    recorded_total_mean,
+                    concentration=(
+                        component_count_concentration
+                        if component_count_concentration is not None
+                        else float(self.count_discrepancy_concentration)
+                    ),
+                    validate_inputs=False,
+                )
         tiny = torch.finfo(total.dtype).tiny
         probabilities = torch.where(
             pre_total.unsqueeze(-1) > 0.0,
@@ -6037,83 +6548,71 @@ class GeometryConditionedSpectralModel:
             if component_scale_marks
             else count_log + mark_log
         )
-        if return_view_prefixes:
-            cumulative_node_log = torch.cumsum(view_node_log, dim=-1)
-            if component_scale_marks:
-                if component_mark_weights is None:
-                    raise RuntimeError("Physical mark weights are unavailable.")
-                rate_weight_shape = (
-                    (1,) * (cumulative_node_log.ndim - 3)
-                    + (int(node_weights.numel()), 1, 1)
-                )
-                mark_weight_shape = (
-                    (1,) * (cumulative_node_log.ndim - 2)
-                    + (int(component_mark_weights.numel()), 1)
-                )
-                nonempty_prefixes = torch.logsumexp(
-                    cumulative_node_log
-                    + torch.log(node_weights).reshape(rate_weight_shape)
-                    + torch.log(component_mark_weights).reshape(
-                        mark_weight_shape
-                    ),
-                    dim=(-3, -2),
-                )
-                return torch.cat(
-                    (
-                        torch.zeros(
-                            nonempty_prefixes.shape[:-1] + (1,),
-                            device=total.device,
-                            dtype=total.dtype,
-                        ),
-                        nonempty_prefixes,
-                    ),
-                    dim=-1,
-                )
-            weight_shape = (
-                (1,) * (cumulative_node_log.ndim - 2)
-                + (int(node_weights.numel()), 1)
-            )
-            nonempty_prefixes = torch.logsumexp(
-                cumulative_node_log
-                + torch.log(node_weights).reshape(weight_shape),
-                dim=-2,
-            )
-            return torch.cat(
-                (
-                    torch.zeros(
-                        nonempty_prefixes.shape[:-1] + (1,),
-                        device=total.device,
-                        dtype=total.dtype,
-                    ),
-                    nonempty_prefixes,
-                ),
-                dim=-1,
-            )
-        node_log = torch.sum(view_node_log, dim=-1)
         if component_scale_marks:
             if component_mark_weights is None:
                 raise RuntimeError("Physical mark weights are unavailable.")
-            rate_weight_shape = (
-                (1,) * (node_log.ndim - 2)
-                + (int(node_weights.numel()), 1)
-            )
-            mark_weight_shape = (
-                (1,) * (node_log.ndim - 1)
-                + (int(component_mark_weights.numel()),)
-            )
-            return torch.logsumexp(
-                node_log
-                + torch.log(node_weights).reshape(rate_weight_shape)
-                + torch.log(component_mark_weights).reshape(mark_weight_shape),
-                dim=(-2, -1),
-            )
-        weight_shape = (1,) * (node_log.ndim - 1) + (
-            int(node_weights.numel()),
+            latent_log_weights = torch.log(node_weights).unsqueeze(-1) + torch.log(
+                component_mark_weights
+            ).unsqueeze(0)
+        else:
+            view_node_log = view_node_log.unsqueeze(-2)
+            latent_log_weights = torch.log(node_weights).unsqueeze(-1)
+        leading_shape = tuple(int(value) for value in observed.shape[:-3])
+        action_count = int(np.prod(leading_shape, dtype=np.int64))
+        if not leading_shape:
+            action_count = 1
+        sample_count = int(observed.shape[-3])
+        state_count = int(total.shape[-4])
+        return PreparedTorchSubsetCrossLikelihood(
+            leading_shape=leading_shape,
+            view_node_log_aqnjrv=view_node_log.reshape(
+                (action_count, sample_count, state_count)
+                + tuple(view_node_log.shape[-3:])
+            ).contiguous(),
+            latent_log_weights_jr=latent_log_weights.contiguous(),
+            shared_gamma_concentration=shared_gamma_concentration,
+            shared_observed_counts_aqv=(
+                None
+                if shared_observed_counts is None
+                else shared_observed_counts.reshape(
+                    (action_count, sample_count, int(observed.shape[-2]))
+                ).contiguous()
+            ),
+            shared_expected_counts_anjv=(
+                None
+                if shared_expected_counts is None
+                else shared_expected_counts.reshape(
+                    (
+                        action_count,
+                        state_count,
+                        int(node_weights.numel()),
+                        int(observed.shape[-2]),
+                    )
+                ).contiguous()
+            ),
         )
-        return torch.logsumexp(
-            node_log + torch.log(node_weights).reshape(weight_shape),
-            dim=-1,
+
+    def _cross_log_likelihood_torch_unchunked(
+        self,
+        observed_spectra_xqvb: object,
+        total_line_contributions_xnvsl: object,
+        uncollided_line_contributions_xnvsl: object,
+        transport_features_xnvslf: object,
+        live_times_s_v: object,
+        *,
+        return_view_prefixes: bool = False,
+        prepared_observation: PreparedTorchCrossObservation | None = None,
+    ) -> object:
+        """Return exact Torch likelihoods by reducing prepared view terms."""
+        prepared = self._prepare_subset_cross_likelihood_torch_unchunked(
+            observed_spectra_xqvb,
+            total_line_contributions_xnvsl,
+            uncollided_line_contributions_xnvsl,
+            transport_features_xnvslf,
+            live_times_s_v,
+            prepared_observation=prepared_observation,
         )
+        return prepared.prefixes() if return_view_prefixes else prepared.full()
 
     @staticmethod
     def _resolved_cross_chunk_size(
@@ -6236,6 +6735,182 @@ class GeometryConditionedSpectralModel:
         )
         return int(total_elements * int(dtype_bytes))
 
+    def estimate_subset_cross_likelihood_working_set_bytes(
+        self,
+        *,
+        num_actions: int,
+        num_samples: int,
+        num_particles: int,
+        num_source_slots: int,
+        num_views: int,
+        num_candidates: int,
+        subset_size: int,
+        action_chunk_size: int | None = None,
+        sample_chunk_size: int | None = None,
+        state_chunk_size: int | None = None,
+        view_chunk_size: int | None = None,
+        dtype_bytes: int = 8,
+    ) -> int:
+        """Estimate resident cache plus peak arbitrary-subset workspace.
+
+        The estimate includes source-resolved inputs, predictive observations,
+        the reusable view/node cache, one bounded cache-preparation slab, and
+        one fully batched candidate contraction. It is intentionally suitable
+        for planner scheduling and never changes nuisance integration or the
+        set of evaluated candidates.
+        """
+        counts = {
+            "num_actions": num_actions,
+            "num_samples": num_samples,
+            "num_particles": num_particles,
+            "num_source_slots": num_source_slots,
+            "num_views": num_views,
+            "num_candidates": num_candidates,
+            "subset_size": subset_size,
+            "dtype_bytes": dtype_bytes,
+        }
+        for label, raw_value in counts.items():
+            if (
+                isinstance(raw_value, bool)
+                or not isinstance(raw_value, (int, np.integer))
+                or int(raw_value) <= 0
+            ):
+                raise ValueError(f"{label} must be a positive integer.")
+        if int(subset_size) > int(num_views):
+            raise ValueError("subset_size cannot exceed num_views.")
+        action_chunk = self._resolved_cross_chunk_size(
+            action_chunk_size,
+            total=int(num_actions),
+            default=CROSS_LIKELIHOOD_ACTION_CHUNK_SIZE,
+            label="action",
+        )
+        sample_chunk = self._resolved_cross_chunk_size(
+            sample_chunk_size,
+            total=int(num_samples),
+            default=CROSS_LIKELIHOOD_SAMPLE_CHUNK_SIZE,
+            label="sample",
+        )
+        state_chunk = self._resolved_cross_chunk_size(
+            state_chunk_size,
+            total=int(num_particles),
+            default=CROSS_LIKELIHOOD_STATE_CHUNK_SIZE,
+            label="state",
+        )
+        view_chunk = self._resolved_cross_chunk_size(
+            view_chunk_size,
+            total=int(num_views),
+            default=SUBSET_LIKELIHOOD_VIEW_CHUNK_SIZE,
+            label="view",
+        )
+        action_count = int(num_actions)
+        sample_count = int(num_samples)
+        particle_count = int(num_particles)
+        view_count = int(num_views)
+        candidate_count = int(num_candidates)
+        node_count = int(self._rate_scale_nodes_j.size)
+        component = self.physical_component_discrepancy
+        mark_node_count = (
+            4
+            if component is not None
+            and component.mark_latent_model
+            == "station_shared_two_point_component_scale"
+            else 1
+        )
+        line_count = len(self._line_identity)
+        bin_count = int(np.asarray(self.energy_axis_keV).size)
+        cache_elements = (
+            action_count
+            * sample_count
+            * particle_count
+            * node_count
+            * mark_node_count
+            * view_count
+        )
+        shared_gamma = bool(
+            self.count_discrepancy_concentration is not None
+            and component is None
+            and self.count_discrepancy_scope != "view_independent"
+        )
+        if shared_gamma:
+            cache_elements += (
+                action_count * sample_count * view_count
+                + action_count * particle_count * node_count * view_count
+            )
+        transport_elements = (
+            action_count
+            * particle_count
+            * view_count
+            * int(num_source_slots)
+            * line_count
+            * (2 + len(TRANSPORT_FEATURE_ORDER))
+        )
+        predictive_transport_elements = (
+            action_count
+            * sample_count
+            * view_count
+            * int(num_source_slots)
+            * line_count
+            * (2 + len(TRANSPORT_FEATURE_ORDER))
+        )
+        # Predictive integer spectra coexist briefly with their float64 cache
+        # input and prepared observation statistics.
+        predictive_elements = (
+            3 * action_count * sample_count * view_count * bin_count
+        )
+        preparation_workspace = self.estimate_cross_likelihood_working_set_bytes(
+            num_actions=action_count,
+            num_samples=sample_count,
+            num_particles=particle_count,
+            num_isotopes=int(num_source_slots),
+            num_views=view_chunk,
+            action_chunk_size=action_chunk,
+            sample_chunk_size=sample_chunk,
+            state_chunk_size=state_chunk,
+            dtype_bytes=int(dtype_bytes),
+        )
+        candidate_node_elements = (
+            action_count
+            * candidate_count
+            * sample_count
+            * particle_count
+            * node_count
+            * mark_node_count
+        )
+        selection_elements = action_count * candidate_count * view_count
+        eig_reduction_elements = (
+            8
+            * action_count
+            * candidate_count
+            * sample_count
+            * particle_count
+        )
+        gamma_elements = (
+            4
+            * action_count
+            * candidate_count
+            * sample_count
+            * particle_count
+            * node_count
+            if shared_gamma
+            else 0
+        )
+        candidate_workspace = int(dtype_bytes) * (
+            2 * candidate_node_elements
+            + selection_elements
+            + eig_reduction_elements
+            + gamma_elements
+        )
+        resident_bytes = int(dtype_bytes) * (
+            cache_elements
+            + transport_elements
+            + predictive_transport_elements
+            + predictive_elements
+        )
+        return int(
+            resident_bytes
+            + max(int(preparation_workspace), int(candidate_workspace))
+        )
+
     @staticmethod
     def _torch_cross_state_autotune_candidates(
         *,
@@ -6285,6 +6960,387 @@ class GeometryConditionedSpectralModel:
             int(tensor.shape[-2]),
             int(tensor.shape[-1]),
             None if component is None else str(component.mark_latent_model),
+        )
+
+    def prepare_subset_cross_likelihood_numpy(
+        self,
+        observed_spectra_xqvb: NDArray[np.float64],
+        total_line_contributions_xnvsl: NDArray[np.float64],
+        uncollided_line_contributions_xnvsl: NDArray[np.float64],
+        transport_features_xnvslf: NDArray[np.float64],
+        live_times_s_v: NDArray[np.float64],
+        *,
+        action_chunk_size: int | None = None,
+        sample_chunk_size: int | None = None,
+        state_chunk_size: int | None = None,
+        view_chunk_size: int | None = None,
+    ) -> PreparedNumpySubsetCrossLikelihood:
+        """Prepare reusable exact NumPy likelihood terms for view subsets.
+
+        Preparation is chunked over actions, samples, states, and views.
+        Subsequent candidates use one bounded selection-matrix contraction
+        without recomputing full-spectrum response marking.
+        """
+        observed = np.asarray(observed_spectra_xqvb, dtype=np.float64)
+        total = np.asarray(total_line_contributions_xnvsl, dtype=np.float64)
+        uncollided = np.asarray(
+            uncollided_line_contributions_xnvsl,
+            dtype=np.float64,
+        )
+        features = np.asarray(
+            transport_features_xnvslf,
+            dtype=np.float64,
+        )
+        if observed.ndim < 3 or total.ndim < 4:
+            raise ValueError("Subset likelihood inputs have too few dimensions.")
+        leading_shape = tuple(int(value) for value in observed.shape[:-3])
+        if tuple(int(value) for value in total.shape[:-4]) != leading_shape:
+            raise ValueError("Subset spectra and states require identical action axes.")
+        if (
+            uncollided.shape != total.shape
+            or features.shape != total.shape + (len(TRANSPORT_FEATURE_ORDER),)
+            or int(observed.shape[-2]) != int(total.shape[-3])
+            or int(observed.shape[-1]) != int(np.asarray(self.energy_axis_keV).size)
+        ):
+            raise ValueError("Subset likelihood tensor shapes are inconsistent.")
+        action_count = int(np.prod(leading_shape, dtype=np.int64))
+        if not leading_shape:
+            action_count = 1
+        sample_count = int(observed.shape[-3])
+        state_count = int(total.shape[-4])
+        view_count = int(total.shape[-3])
+        action_chunk = self._resolved_cross_chunk_size(
+            action_chunk_size,
+            total=action_count,
+            default=CROSS_LIKELIHOOD_ACTION_CHUNK_SIZE,
+            label="action",
+        )
+        sample_chunk = self._resolved_cross_chunk_size(
+            sample_chunk_size,
+            total=sample_count,
+            default=CROSS_LIKELIHOOD_SAMPLE_CHUNK_SIZE,
+            label="sample",
+        )
+        state_chunk = self._resolved_cross_chunk_size(
+            state_chunk_size,
+            total=state_count,
+            default=CROSS_LIKELIHOOD_STATE_CHUNK_SIZE,
+            label="state",
+        )
+        view_chunk = self._resolved_cross_chunk_size(
+            view_chunk_size,
+            total=view_count,
+            default=SUBSET_LIKELIHOOD_VIEW_CHUNK_SIZE,
+            label="view",
+        )
+        live = np.asarray(live_times_s_v, dtype=np.float64)
+        observed_flat = observed.reshape((action_count,) + tuple(observed.shape[-3:]))
+        total_flat = total.reshape((action_count,) + tuple(total.shape[-4:]))
+        uncollided_flat = uncollided.reshape(total_flat.shape)
+        features_flat = features.reshape((action_count,) + tuple(features.shape[-5:]))
+        component = self.physical_component_discrepancy
+        component_scale_marks = bool(
+            component is not None
+            and component.mark_latent_model
+            == "station_shared_two_point_component_scale"
+        )
+        mark_node_count = 4 if component_scale_marks else 1
+        node_count = int(self._rate_scale_nodes_j.size)
+        view_node_log = np.empty(
+            (
+                action_count,
+                sample_count,
+                state_count,
+                node_count,
+                mark_node_count,
+                view_count,
+            ),
+            dtype=np.float64,
+        )
+        shared_gamma = bool(
+            self.count_discrepancy_concentration is not None
+            and component is None
+            and self.count_discrepancy_scope != "view_independent"
+        )
+        shared_observed = np.sum(observed_flat, axis=-1) if shared_gamma else None
+        shared_expected = (
+            np.empty(
+                (action_count, state_count, node_count, view_count),
+                dtype=np.float64,
+            )
+            if shared_gamma
+            else None
+        )
+        latent_log_weights = None
+        for action_start in range(0, action_count, action_chunk):
+            action_stop = min(action_start + action_chunk, action_count)
+            for state_start in range(0, state_count, state_chunk):
+                state_stop = min(state_start + state_chunk, state_count)
+                for sample_start in range(0, sample_count, sample_chunk):
+                    sample_stop = min(sample_start + sample_chunk, sample_count)
+                    for view_start in range(0, view_count, view_chunk):
+                        view_stop = min(view_start + view_chunk, view_count)
+                        block = self._prepare_subset_cross_likelihood_numpy_unchunked(
+                            observed_flat[
+                                action_start:action_stop,
+                                sample_start:sample_stop,
+                                view_start:view_stop,
+                            ],
+                            total_flat[
+                                action_start:action_stop,
+                                state_start:state_stop,
+                                view_start:view_stop,
+                            ],
+                            uncollided_flat[
+                                action_start:action_stop,
+                                state_start:state_stop,
+                                view_start:view_stop,
+                            ],
+                            features_flat[
+                                action_start:action_stop,
+                                state_start:state_stop,
+                                view_start:view_stop,
+                            ],
+                            live[view_start:view_stop],
+                        )
+                        view_node_log[
+                            action_start:action_stop,
+                            sample_start:sample_stop,
+                            state_start:state_stop,
+                            ...,
+                            view_start:view_stop,
+                        ] = block.view_node_log_aqnjrv
+                        if latent_log_weights is None:
+                            latent_log_weights = block.latent_log_weights_jr
+                        if (
+                            shared_expected is not None
+                            and sample_start == 0
+                            and block.shared_expected_counts_anjv is not None
+                        ):
+                            shared_expected[
+                                action_start:action_stop,
+                                state_start:state_stop,
+                                ...,
+                                view_start:view_stop,
+                            ] = block.shared_expected_counts_anjv
+        if latent_log_weights is None:
+            raise RuntimeError("Subset likelihood preparation produced no blocks.")
+        return PreparedNumpySubsetCrossLikelihood(
+            leading_shape=leading_shape,
+            view_node_log_aqnjrv=view_node_log,
+            latent_log_weights_jr=np.ascontiguousarray(latent_log_weights),
+            shared_gamma_concentration=(
+                float(self.count_discrepancy_concentration) if shared_gamma else None
+            ),
+            shared_observed_counts_aqv=shared_observed,
+            shared_expected_counts_anjv=shared_expected,
+        )
+
+    def prepare_subset_cross_likelihood_torch(
+        self,
+        observed_spectra_xqvb: object,
+        total_line_contributions_xnvsl: object,
+        uncollided_line_contributions_xnvsl: object,
+        transport_features_xnvslf: object,
+        live_times_s_v: object,
+        *,
+        action_chunk_size: int | None = None,
+        sample_chunk_size: int | None = None,
+        state_chunk_size: int | None = None,
+        view_chunk_size: int | None = None,
+        prepared_observation: PreparedTorchCrossObservation | None = None,
+    ) -> PreparedTorchSubsetCrossLikelihood:
+        """Prepare reusable device-resident Torch terms for view subsets.
+
+        Full-spectrum marking is evaluated in bounded GPU slabs once.  Every
+        candidate subset thereafter uses bounded matrix contractions and
+        retains the exact station-shared nuisance integration.
+        """
+        import torch
+
+        total = torch.as_tensor(total_line_contributions_xnvsl)
+        observation_terms = prepared_observation
+        if observation_terms is None:
+            observation_terms = self.prepare_cross_observation_torch(
+                observed_spectra_xqvb,
+                reference=total,
+            )
+        observed = torch.as_tensor(
+            observation_terms.restored(observation_terms.observed_asvb),
+            device=total.device,
+            dtype=total.dtype,
+        )
+        uncollided = torch.as_tensor(
+            uncollided_line_contributions_xnvsl,
+            device=total.device,
+            dtype=total.dtype,
+        )
+        features = torch.as_tensor(
+            transport_features_xnvslf,
+            device=total.device,
+            dtype=total.dtype,
+        )
+        if observed.ndim < 3 or total.ndim < 4:
+            raise ValueError("Torch subset likelihood inputs have too few dimensions.")
+        leading_shape = tuple(int(value) for value in observation_terms.leading_shape)
+        if tuple(int(value) for value in total.shape[:-4]) != leading_shape:
+            raise ValueError(
+                "Torch subset spectra and states require identical action axes."
+            )
+        if (
+            tuple(uncollided.shape) != tuple(total.shape)
+            or tuple(features.shape)
+            != tuple(total.shape) + (len(TRANSPORT_FEATURE_ORDER),)
+            or int(observed.shape[-2]) != int(total.shape[-3])
+            or int(observed.shape[-1]) != int(np.asarray(self.energy_axis_keV).size)
+        ):
+            raise ValueError("Torch subset likelihood tensor shapes are inconsistent.")
+        action_count = int(np.prod(leading_shape, dtype=np.int64))
+        if not leading_shape:
+            action_count = 1
+        sample_count = int(observed.shape[-3])
+        state_count = int(total.shape[-4])
+        view_count = int(total.shape[-3])
+        action_chunk = self._resolved_cross_chunk_size(
+            action_chunk_size,
+            total=action_count,
+            default=CROSS_LIKELIHOOD_ACTION_CHUNK_SIZE,
+            label="action",
+        )
+        sample_chunk = self._resolved_cross_chunk_size(
+            sample_chunk_size,
+            total=sample_count,
+            default=CROSS_LIKELIHOOD_SAMPLE_CHUNK_SIZE,
+            label="sample",
+        )
+        state_chunk = self._resolved_cross_chunk_size(
+            state_chunk_size,
+            total=state_count,
+            default=CROSS_LIKELIHOOD_STATE_CHUNK_SIZE,
+            label="state",
+        )
+        view_chunk = self._resolved_cross_chunk_size(
+            view_chunk_size,
+            total=view_count,
+            default=SUBSET_LIKELIHOOD_VIEW_CHUNK_SIZE,
+            label="view",
+        )
+        live = torch.as_tensor(
+            live_times_s_v,
+            device=total.device,
+            dtype=total.dtype,
+        )
+        observed_flat = observed.reshape((action_count,) + tuple(observed.shape[-3:]))
+        total_flat = total.reshape((action_count,) + tuple(total.shape[-4:]))
+        uncollided_flat = uncollided.reshape(total_flat.shape)
+        features_flat = features.reshape((action_count,) + tuple(features.shape[-5:]))
+        component = self.physical_component_discrepancy
+        component_scale_marks = bool(
+            component is not None
+            and component.mark_latent_model
+            == "station_shared_two_point_component_scale"
+        )
+        mark_node_count = 4 if component_scale_marks else 1
+        node_count = int(self._rate_scale_nodes_j.size)
+        view_node_log = torch.empty(
+            (
+                action_count,
+                sample_count,
+                state_count,
+                node_count,
+                mark_node_count,
+                view_count,
+            ),
+            device=total.device,
+            dtype=total.dtype,
+        )
+        shared_gamma = bool(
+            self.count_discrepancy_concentration is not None
+            and component is None
+            and self.count_discrepancy_scope != "view_independent"
+        )
+        shared_observed = torch.sum(observed_flat, dim=-1) if shared_gamma else None
+        shared_expected = (
+            torch.empty(
+                (action_count, state_count, node_count, view_count),
+                device=total.device,
+                dtype=total.dtype,
+            )
+            if shared_gamma
+            else None
+        )
+        latent_log_weights = None
+        for action_start in range(0, action_count, action_chunk):
+            action_stop = min(action_start + action_chunk, action_count)
+            for state_start in range(0, state_count, state_chunk):
+                state_stop = min(state_start + state_chunk, state_count)
+                for sample_start in range(0, sample_count, sample_chunk):
+                    sample_stop = min(sample_start + sample_chunk, sample_count)
+                    for view_start in range(0, view_count, view_chunk):
+                        view_stop = min(view_start + view_chunk, view_count)
+                        observation_block = observation_terms.block(
+                            action_start=action_start,
+                            action_stop=action_stop,
+                            sample_start=sample_start,
+                            sample_stop=sample_stop,
+                            view_start=view_start,
+                            view_stop=view_stop,
+                        )
+                        block = self._prepare_subset_cross_likelihood_torch_unchunked(
+                            observed_flat[
+                                action_start:action_stop,
+                                sample_start:sample_stop,
+                                view_start:view_stop,
+                            ],
+                            total_flat[
+                                action_start:action_stop,
+                                state_start:state_stop,
+                                view_start:view_stop,
+                            ],
+                            uncollided_flat[
+                                action_start:action_stop,
+                                state_start:state_stop,
+                                view_start:view_stop,
+                            ],
+                            features_flat[
+                                action_start:action_stop,
+                                state_start:state_stop,
+                                view_start:view_stop,
+                            ],
+                            live[view_start:view_stop],
+                            prepared_observation=observation_block,
+                        )
+                        view_node_log[
+                            action_start:action_stop,
+                            sample_start:sample_stop,
+                            state_start:state_stop,
+                            ...,
+                            view_start:view_stop,
+                        ] = block.view_node_log_aqnjrv
+                        if latent_log_weights is None:
+                            latent_log_weights = block.latent_log_weights_jr
+                        if (
+                            shared_expected is not None
+                            and sample_start == 0
+                            and block.shared_expected_counts_anjv is not None
+                        ):
+                            shared_expected[
+                                action_start:action_stop,
+                                state_start:state_stop,
+                                ...,
+                                view_start:view_stop,
+                            ] = block.shared_expected_counts_anjv
+        if latent_log_weights is None:
+            raise RuntimeError("Torch subset preparation produced no blocks.")
+        return PreparedTorchSubsetCrossLikelihood(
+            leading_shape=leading_shape,
+            view_node_log_aqnjrv=view_node_log,
+            latent_log_weights_jr=latent_log_weights,
+            shared_gamma_concentration=(
+                float(self.count_discrepancy_concentration) if shared_gamma else None
+            ),
+            shared_observed_counts_aqv=shared_observed,
+            shared_expected_counts_anjv=shared_expected,
         )
 
     def cross_log_likelihood_numpy(

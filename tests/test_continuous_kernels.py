@@ -995,7 +995,105 @@ def test_line_transport_pair_program_torch_matches_selected_pair_oracle() -> Non
         )
 
 
-def test_pair_program_device_components_match_host_components() -> None:
+def test_pair_program_explicit_memory_budget_preserves_exact_response() -> None:
+    """Source-row memory slabs must preserve every full-physics component."""
+    pytest.importorskip("torch")
+    kernel = _line_resolved_full_physics_kernel(use_gpu=True)
+    detectors, sources, _, _ = _line_resolved_inputs()
+    indices = np.asarray([0, 2], dtype=np.int64)
+    fe_program = np.asarray([[0, 2, 7], [1, 5, 3]], dtype=np.int64)
+    pb_program = np.asarray([[7, 4, 0], [6, 2, 3]], dtype=np.int64)
+    unrestricted = kernel.line_transport_components_pair_program_for_detectors(
+        "TestIso",
+        detectors,
+        sources,
+        fe_program,
+        pb_program,
+        indices,
+        chunk_size=64,
+    )
+    per_source = kernel.estimate_line_transport_working_set_bytes(
+        isotope="TestIso",
+        orientation_pair_count=int(fe_program.shape[1]),
+        source_row_count=1,
+    )
+    budgeted = kernel.line_transport_components_pair_program_for_detectors(
+        "TestIso",
+        detectors,
+        sources,
+        fe_program,
+        pb_program,
+        indices,
+        chunk_size=64,
+        working_memory_budget_bytes=2 * per_source,
+    )
+
+    for field_name in (
+        "total_kernel",
+        "unattenuated_kernel",
+        "uncollided_kernel",
+        "tau_fe",
+        "tau_pb",
+        "tau_obstacle",
+        "tau_obstacle_compton",
+        "distance_m",
+    ):
+        np.testing.assert_array_equal(
+            getattr(budgeted, field_name),
+            getattr(unrestricted, field_name),
+        )
+
+
+def test_numpy_pair_program_enforces_budget_without_changing_response() -> None:
+    """The non-GPU response path must honor the same exact source-row cap."""
+    kernel = _line_resolved_full_physics_kernel(use_gpu=False)
+    detectors, sources, _, _ = _line_resolved_inputs()
+    indices = np.asarray([0, 2], dtype=np.int64)
+    fe_program = np.asarray([[0, 2, 7], [1, 5, 3]], dtype=np.int64)
+    pb_program = np.asarray([[7, 4, 0], [6, 2, 3]], dtype=np.int64)
+    unrestricted = kernel.line_transport_components_pair_program_for_detectors(
+        "TestIso",
+        detectors,
+        sources,
+        fe_program,
+        pb_program,
+        indices,
+        chunk_size=64,
+    )
+    minimum = kernel.minimum_line_transport_working_memory_budget_bytes(
+        isotope="TestIso",
+        orientation_pair_count=int(fe_program.shape[1]),
+    )
+    budgeted = kernel.line_transport_components_pair_program_for_detectors(
+        "TestIso",
+        detectors,
+        sources,
+        fe_program,
+        pb_program,
+        indices,
+        chunk_size=64,
+        working_memory_budget_bytes=2 * minimum,
+    )
+
+    for field_name in (
+        "total_kernel",
+        "unattenuated_kernel",
+        "uncollided_kernel",
+        "tau_fe",
+        "tau_pb",
+        "tau_obstacle",
+        "tau_obstacle_compton",
+        "distance_m",
+    ):
+        np.testing.assert_array_equal(
+            getattr(budgeted, field_name),
+            getattr(unrestricted, field_name),
+        )
+
+
+def test_pair_program_device_components_match_host_components(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Device-resident output must preserve every exact component value."""
     torch = pytest.importorskip("torch")
     kernel = _line_resolved_full_physics_kernel(use_gpu=True)
@@ -1012,6 +1110,16 @@ def test_pair_program_device_components_match_host_components() -> None:
         pb_program,
         indices,
         chunk_size=5,
+    )
+
+    def _reject_accumulating_chunks(**_kwargs: object) -> object:
+        """Reject the former list-and-concatenate device implementation."""
+        raise AssertionError("device response chunks must stream into buffers")
+
+    monkeypatch.setattr(
+        kernel,
+        "_evaluate_torch_chunks_with_oom_retry",
+        _reject_accumulating_chunks,
     )
     device = kernel.line_transport_components_pair_program_for_detectors(
         "TestIso",

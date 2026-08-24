@@ -118,6 +118,96 @@ def test_low_vram_shrinks_chunk_and_cpu_uses_fixed_fallback(
     assert cuda_chunk < cpu_chunk
 
 
+def test_explicit_transport_budget_caps_source_rows_conservatively(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A planner budget must cap exact response scratch by physical axes."""
+    torch = pytest.importorskip("torch")
+    kernel = _ral_shape_kernel()
+    gib = 1024**3
+
+    def _memory_info(_device: object) -> tuple[int, int]:
+        """Return enough free VRAM that the explicit budget is limiting."""
+        return 32 * gib, 32 * gib
+
+    monkeypatch.setattr(kernel, "_torch_cuda_memory_info", _memory_info)
+    per_source = kernel.estimate_line_transport_working_set_bytes(
+        isotope="Eu-154",
+        orientation_pair_count=64,
+        source_row_count=1,
+        dtype_bytes=8,
+    )
+    four_gib_chunk = kernel._adaptive_torch_chunk_size(
+        262144,
+        isotope="Eu-154",
+        orientation_pair_count=64,
+        device=torch.device("cuda"),
+        dtype=torch.float64,
+        working_memory_budget_bytes=4 * gib,
+    )
+    two_gib_chunk = kernel._adaptive_torch_chunk_size(
+        262144,
+        isotope="Eu-154",
+        orientation_pair_count=64,
+        device=torch.device("cuda"),
+        dtype=torch.float64,
+        working_memory_budget_bytes=2 * gib,
+    )
+
+    assert four_gib_chunk <= int(0.75 * 4 * gib) // per_source
+    assert two_gib_chunk <= int(0.75 * 2 * gib) // per_source
+    assert 1 <= two_gib_chunk < four_gib_chunk <= 64
+
+
+def test_transport_working_set_estimate_tracks_physical_dimensions() -> None:
+    """More lines, pairs, sources, and obstacles must never lower memory."""
+    kernel = _ral_shape_kernel()
+    base = kernel.estimate_line_transport_working_set_bytes(
+        isotope="Cs-137",
+        orientation_pair_count=8,
+        source_row_count=1,
+    )
+    more_pairs = kernel.estimate_line_transport_working_set_bytes(
+        isotope="Cs-137",
+        orientation_pair_count=64,
+        source_row_count=1,
+    )
+    more_lines = kernel.estimate_line_transport_working_set_bytes(
+        isotope="Eu-154",
+        orientation_pair_count=64,
+        source_row_count=1,
+    )
+    more_sources = kernel.estimate_line_transport_working_set_bytes(
+        isotope="Eu-154",
+        orientation_pair_count=64,
+        source_row_count=3,
+    )
+
+    assert base < more_pairs < more_lines
+    assert more_sources == 3 * more_lines
+
+
+def test_explicit_transport_budget_fails_when_one_row_cannot_fit() -> None:
+    """An explicit budget must not silently force an impossible one-row slab."""
+    torch = pytest.importorskip("torch")
+    kernel = _ral_shape_kernel()
+    minimum = kernel.minimum_line_transport_working_memory_budget_bytes(
+        isotope="Eu-154",
+        orientation_pair_count=64,
+        dtype_bytes=8,
+    )
+
+    with pytest.raises(MemoryError, match="cannot hold one exact"):
+        kernel._adaptive_torch_chunk_size(
+            262144,
+            isotope="Eu-154",
+            orientation_pair_count=64,
+            device=torch.device("cpu"),
+            dtype=torch.float64,
+            working_memory_budget_bytes=minimum - 1,
+        )
+
+
 def test_cuda_oom_retry_halves_chunk_and_restarts_in_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -208,6 +208,89 @@ def _model(
     )
 
 
+def _subset_likelihood_branch_model(
+    branch: str,
+) -> GeometryConditionedSpectralModel:
+    """Return a compact model exercising one subset-likelihood branch."""
+    keywords: dict[str, object] = {}
+    if branch == "rate_nodes":
+        keywords.update(
+            rate_scale_nodes_j=(0.8, 1.0, 1.2),
+            rate_scale_weights_j=(0.25, 0.5, 0.25),
+        )
+    elif branch in ("station_shared_count", "view_independent_count"):
+        keywords.update(
+            count_discrepancy_concentration=40.0,
+            count_discrepancy_scope=(
+                "station_shared"
+                if branch == "station_shared_count"
+                else "view_independent"
+            ),
+            mark_concentration_source=80.0,
+        )
+    elif branch in (
+        "component_fraction",
+        "component_scale",
+        "component_hierarchical",
+    ):
+        mark_model = {
+            "component_fraction": "fraction_dirichlet_multinomial",
+            "component_scale": "station_shared_two_point_component_scale",
+            "component_hierarchical": "photopeak_continuum_hierarchical",
+        }[branch]
+        keywords["physical_component_discrepancy"] = PhysicalComponentDiscrepancy(
+            count_uncollided_concentration=60.0,
+            count_scatter_concentration=12.0,
+            mark_uncollided_concentration=90.0,
+            mark_scatter_concentration=15.0,
+            mark_latent_model=mark_model,
+            mark_continuum_group_concentration=(
+                25.0 if branch == "component_hierarchical" else None
+            ),
+        )
+    elif branch != "fixed_renewal":
+        raise ValueError(f"Unknown subset likelihood branch: {branch!r}.")
+    return GeometryConditionedSpectralModel.standard_native(
+        ("Cs-137",),
+        dead_time_tau_s=1.0e-5,
+        background_rate_cps=1.0,
+        **keywords,
+    )
+
+
+def _subset_likelihood_inputs(
+    model: GeometryConditionedSpectralModel,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return deterministic action/sample/state/view subset test tensors."""
+    rng = np.random.default_rng(20260824)
+    action_count = 2
+    sample_count = 2
+    state_count = 3
+    view_count = 5
+    line_count = len(model.line_identity)
+    total = rng.uniform(
+        0.1,
+        4.0,
+        (action_count, state_count, view_count, 1, line_count),
+    )
+    uncollided = total * rng.uniform(0.2, 1.0, total.shape)
+    features = rng.uniform(0.0, 1.0, total.shape + (4,))
+    live = np.linspace(1.0, 3.0, view_count, dtype=np.float64)
+    predictive_mean = model.predict_mean_numpy(
+        total[:, 0],
+        uncollided[:, 0],
+        features[:, 0],
+        live,
+    )
+    observed = np.repeat(
+        np.rint(predictive_mean)[:, np.newaxis, :, :],
+        sample_count,
+        axis=1,
+    ).astype(np.float64)
+    observed[:, 1, :, 0] += 1.0
+    return observed, total, uncollided, features, live
+
+
 def _runtime_ready_candidate() -> GeometryConditionedSpectralModel:
     """Return a training-ready model without independent holdout approval."""
     approved = approved_full_spectrum_model()
@@ -650,6 +733,198 @@ def test_spectrum_mean_and_cross_likelihood_match_torch() -> None:
     )
     assert log_numpy.shape == (2, particle_count)
     assert np.allclose(log_numpy, log_torch, rtol=1e-10, atol=1e-7)
+
+
+@pytest.mark.parametrize(
+    "branch",
+    (
+        "fixed_renewal",
+        "rate_nodes",
+        "station_shared_count",
+        "view_independent_count",
+        "component_fraction",
+        "component_scale",
+        "component_hierarchical",
+    ),
+)
+def test_numpy_subset_cache_matches_direct_arbitrary_view_likelihood(
+    branch: str,
+) -> None:
+    """Every likelihood branch must match direct non-prefix subset calls."""
+    model = _subset_likelihood_branch_model(branch)
+    observed, total, uncollided, features, live = _subset_likelihood_inputs(model)
+    prepared = model.prepare_subset_cross_likelihood_numpy(
+        observed,
+        total,
+        uncollided,
+        features,
+        live,
+        action_chunk_size=1,
+        sample_chunk_size=1,
+        state_chunk_size=2,
+        view_chunk_size=2,
+    )
+    subsets = np.asarray(
+        (
+            ((4, 1, 3), (2, 0, 4)),
+            ((3, 0, 1), (1, 4, 2)),
+        ),
+        dtype=np.int64,
+    )
+
+    cached = prepared.evaluate(subsets)
+
+    assert prepared.action_count == 2
+    assert prepared.sample_count == 2
+    assert prepared.state_count == 3
+    assert prepared.view_count == prepared.pair_count == 5
+    assert cached.shape == (2, 2, 2, 3)
+    for action_index in range(2):
+        for candidate_index in range(2):
+            selected = subsets[action_index, candidate_index]
+            direct = model.cross_log_likelihood_numpy(
+                np.take(observed[action_index], selected, axis=1),
+                np.take(total[action_index], selected, axis=1),
+                np.take(uncollided[action_index], selected, axis=1),
+                np.take(features[action_index], selected, axis=1),
+                live[selected],
+            )
+            assert np.allclose(
+                cached[action_index, candidate_index],
+                direct,
+                rtol=2.0e-12,
+                atol=2.0e-9,
+            )
+    reversed_subsets = subsets[..., ::-1]
+    assert np.allclose(
+        cached,
+        prepared.evaluate(reversed_subsets),
+        rtol=2.0e-12,
+        atol=2.0e-9,
+    )
+    full = model.cross_log_likelihood_numpy(
+        observed,
+        total,
+        uncollided,
+        features,
+        live,
+    )
+    assert np.allclose(prepared.full(), full, rtol=2.0e-12, atol=2.0e-9)
+
+
+def test_shared_gamma_subset_cache_ignores_every_unselected_view() -> None:
+    """Unselected views must not alter shared-Gamma sufficient statistics."""
+    model = _subset_likelihood_branch_model("station_shared_count")
+    observed, total, uncollided, features, live = _subset_likelihood_inputs(model)
+    selected = np.asarray(((4, 1, 3),), dtype=np.int64)
+    baseline = model.prepare_subset_cross_likelihood_numpy(
+        observed,
+        total,
+        uncollided,
+        features,
+        live,
+    ).evaluate(selected)
+    changed_observed = observed.copy()
+    changed_total = total.copy()
+    changed_uncollided = uncollided.copy()
+    changed_features = features.copy()
+    changed_observed[:, :, (0, 2), 0] += 10_000.0
+    changed_total[:, :, (0, 2)] *= 9.0
+    changed_uncollided[:, :, (0, 2)] *= 0.1
+    changed_features[:, :, (0, 2)] += 7.0
+    changed = model.prepare_subset_cross_likelihood_numpy(
+        changed_observed,
+        changed_total,
+        changed_uncollided,
+        changed_features,
+        live,
+    ).evaluate(selected)
+
+    assert np.array_equal(baseline, changed)
+
+
+def test_subset_cache_rejects_invalid_or_duplicate_view_indices() -> None:
+    """Subset caches must reject noninteger, duplicate, and invalid views."""
+    model = _subset_likelihood_branch_model("fixed_renewal")
+    observed, total, uncollided, features, live = _subset_likelihood_inputs(model)
+    prepared = model.prepare_subset_cross_likelihood_numpy(
+        observed,
+        total,
+        uncollided,
+        features,
+        live,
+    )
+
+    with pytest.raises(ValueError, match="integer"):
+        prepared.evaluate(np.asarray(((0.0, 1.0),)))
+    with pytest.raises(ValueError, match="duplicate"):
+        prepared.evaluate(np.asarray(((0, 0),), dtype=np.int64))
+    with pytest.raises(ValueError, match="range"):
+        prepared.evaluate(np.asarray(((0, 5),), dtype=np.int64))
+    with pytest.raises(ValueError, match="shaped"):
+        prepared.evaluate(np.asarray((0, 1), dtype=np.int64))
+
+
+@pytest.mark.parametrize(
+    "branch",
+    (
+        "fixed_renewal",
+        "rate_nodes",
+        "station_shared_count",
+        "view_independent_count",
+        "component_fraction",
+        "component_scale",
+        "component_hierarchical",
+    ),
+)
+def test_torch_subset_cache_matches_numpy_and_stays_device_resident(
+    branch: str,
+) -> None:
+    """The standard batched Torch cache must equal NumPy on every branch."""
+    torch = pytest.importorskip("torch")
+    model = _subset_likelihood_branch_model(branch)
+    observed, total, uncollided, features, live = _subset_likelihood_inputs(model)
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    prepared_numpy = model.prepare_subset_cross_likelihood_numpy(
+        observed,
+        total,
+        uncollided,
+        features,
+        live,
+    )
+    prepared_torch = model.prepare_subset_cross_likelihood_torch(
+        torch.as_tensor(observed, device=device, dtype=torch.float64),
+        torch.as_tensor(total, device=device, dtype=torch.float64),
+        torch.as_tensor(uncollided, device=device, dtype=torch.float64),
+        torch.as_tensor(features, device=device, dtype=torch.float64),
+        torch.as_tensor(live, device=device, dtype=torch.float64),
+        action_chunk_size=1,
+        sample_chunk_size=1,
+        state_chunk_size=2,
+        view_chunk_size=2,
+    )
+    subsets = np.asarray(
+        (
+            ((4, 1, 3), (2, 0, 4)),
+            ((3, 0, 1), (1, 4, 2)),
+        ),
+        dtype=np.int64,
+    )
+
+    expected = prepared_numpy.evaluate(subsets)
+    actual = prepared_torch.evaluate(
+        torch.as_tensor(subsets, device=device, dtype=torch.int64)
+    )
+
+    assert tuple(actual.shape) == (2, 2, 2, 3)
+    assert actual.device == device
+    assert actual.dtype == torch.float64
+    assert np.allclose(
+        actual.detach().cpu().numpy(),
+        expected,
+        rtol=1.0e-10,
+        atol=1.0e-7,
+    )
 
 
 @pytest.mark.parametrize("scope", ["station_shared", "view_independent"])
@@ -1107,6 +1382,66 @@ def test_cross_likelihood_working_set_estimate_tracks_chunk_sizes() -> None:
     )
     assert bounded < unchunked
     assert bounded > 0
+
+
+def test_subset_working_set_estimate_tracks_poses_and_candidates() -> None:
+    """The arbitrary-subset estimate must cover both resident and search axes."""
+    model = _model()
+    base = model.estimate_subset_cross_likelihood_working_set_bytes(
+        num_actions=1,
+        num_samples=50,
+        num_particles=512,
+        num_source_slots=15,
+        num_views=64,
+        num_candidates=64,
+        subset_size=8,
+        action_chunk_size=1,
+        sample_chunk_size=10,
+        state_chunk_size=128,
+        view_chunk_size=8,
+    )
+    more_candidates = model.estimate_subset_cross_likelihood_working_set_bytes(
+        num_actions=1,
+        num_samples=50,
+        num_particles=512,
+        num_source_slots=15,
+        num_views=64,
+        num_candidates=448,
+        subset_size=8,
+        action_chunk_size=1,
+        sample_chunk_size=10,
+        state_chunk_size=128,
+        view_chunk_size=8,
+    )
+    more_source_slots = model.estimate_subset_cross_likelihood_working_set_bytes(
+        num_actions=1,
+        num_samples=50,
+        num_particles=512,
+        num_source_slots=30,
+        num_views=64,
+        num_candidates=64,
+        subset_size=8,
+        action_chunk_size=1,
+        sample_chunk_size=10,
+        state_chunk_size=128,
+        view_chunk_size=8,
+    )
+    more_poses = model.estimate_subset_cross_likelihood_working_set_bytes(
+        num_actions=4,
+        num_samples=50,
+        num_particles=512,
+        num_source_slots=15,
+        num_views=64,
+        num_candidates=448,
+        subset_size=8,
+        action_chunk_size=1,
+        sample_chunk_size=10,
+        state_chunk_size=128,
+        view_chunk_size=8,
+    )
+
+    assert 0 < base < more_candidates < more_poses
+    assert base < more_source_slots
 
 
 def test_birth_proposal_score_is_finite_target_only_and_matches_torch() -> None:
