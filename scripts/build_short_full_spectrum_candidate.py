@@ -9,6 +9,7 @@ from collections.abc import Mapping, Sequence
 
 import numpy as np
 
+from runtime.experiment_profiles import STANDARD_ACQUISITION_LIVE_TIME_S
 from spectrum.additive_scatter import scatter_basis_from_stored_geometry_numpy
 from spectrum.full_spectrum_acceptance_runner import (
     ACCEPTANCE_ISOTOPES,
@@ -31,7 +32,12 @@ from spectrum.transport_spectral import (
 
 
 _ROOT = Path(__file__).resolve().parents[1]
-_DEFAULT_TRAINING_ROOT = _ROOT / "results" / "full_spectrum_all64_acceptance"
+_DEFAULT_TRAINING_ROOT = (
+    _ROOT
+    / "results"
+    / "full_spectrum_all64_acceptance"
+    / FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256
+)
 _DEFAULT_BASE_MODEL = (
     _ROOT
     / "configs"
@@ -439,7 +445,11 @@ def build_short_candidate(
                 total[np.newaxis, ...],
                 uncollided[np.newaxis, ...],
                 features[np.newaxis, ...],
-                np.full(observed.shape[0], 30.0, dtype=np.float64),
+                np.full(
+                    observed.shape[0],
+                    STANDARD_ACQUISITION_LIVE_TIME_S,
+                    dtype=np.float64,
+                ),
             )
             score += float(value[0])
         candidate_scores[

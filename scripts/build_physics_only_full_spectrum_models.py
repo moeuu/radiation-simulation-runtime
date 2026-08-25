@@ -27,6 +27,14 @@ from spectrum.transport_spectral import (
 )
 
 
+_REGISTRY_CONSUMER_CONFIG_NAMES = (
+    "diagnostic_external_no_isaac_1thread.json",
+    "variance_reduction_external_gui_32threads.json",
+    "variance_reduction_external_no_isaac_32threads.json",
+    "variance_reduction_external_no_isaac_32threads_cpu_guarded.json",
+)
+
+
 def _canonical_bytes(payload: object) -> bytes:
     """Return stable pretty-printed JSON bytes for one asset."""
     return (
@@ -97,15 +105,14 @@ def build_assets(repository_root: Path) -> dict[str, object]:
     registry_path.parent.mkdir(parents=True, exist_ok=True)
     registry_path.write_bytes(registry_bytes)
     registry_hash = hashlib.sha256(registry_bytes).hexdigest()
-    standard_config_path = (
-        repository_root
-        / "configs/geant4/variance_reduction_external_no_isaac_32threads.json"
-    )
-    standard_config = json.loads(
-        standard_config_path.read_text(encoding="utf-8")
-    )
-    standard_config["full_spectrum_model_registry_file_sha256"] = registry_hash
-    standard_config_path.write_bytes(_canonical_bytes(standard_config))
+    config_directory = repository_root / "configs/geant4"
+    for config_name in _REGISTRY_CONSUMER_CONFIG_NAMES:
+        config_path = config_directory / config_name
+        if not config_path.is_file():
+            continue
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["full_spectrum_model_registry_file_sha256"] = registry_hash
+        config_path.write_bytes(_canonical_bytes(config))
     return registry
 
 

@@ -8,8 +8,8 @@
         "Co-60",
         "Am-241"
       ],
-      "model_contract_hash_sha256": "24ce7cc05ac2e80b3bba8d81062b9e247c6638607eb8c317933f25e1e9dfac67",
-      "model_file_sha256": "39fb763a5c62f0b1242b91dc3964a39405500c0cd9e4a15a611a7b4c4f7449d9",
+      "model_contract_hash_sha256": "ca66d531916cbf5ff96f034c891fbb4e1c6ca36d482779eac94c829b61316832",
+      "model_file_sha256": "642802ef29ad22ae61ba7d8a0c8f52fa3da377f4341f2d970d3fcdb8a6325edb",
       "model_path": "configs/geant4/models/profiles/fukushima_am241_physics_only.json"
     },
     "fukushima_cs134": {
@@ -19,8 +19,8 @@
         "Co-60",
         "Cs-134"
       ],
-      "model_contract_hash_sha256": "54787a67b8388c3bc35de4951f3db49bd3183c44b9a189787165388bd57319ef",
-      "model_file_sha256": "30307bd2913299db6e4f496c88d9bf1b7b7e4611dbd4c02187d55147a46b7f9b",
+      "model_contract_hash_sha256": "19f134a923bd7f8cb73ea1225f2e2b585926d2ce118895a75c64b03300b40a93",
+      "model_file_sha256": "2b6f9e18b42c216e72aad87f3085e32b4a506648e9377423c2aff4476e1989f3",
       "model_path": "configs/geant4/models/profiles/fukushima_cs134_physics_only.json"
     },
     "fukushima_eu152": {
@@ -30,8 +30,8 @@
         "Co-60",
         "Eu-152"
       ],
-      "model_contract_hash_sha256": "57c9744ad56ece46e6c5a250149ba196e9cef6daf9945d3a9f54d320d311c074",
-      "model_file_sha256": "a9d31a00e5aefd88b6c7bf5a88c06a32caeb7cd708cc7a214940f42c542cbe7d",
+      "model_contract_hash_sha256": "bfc04b42b20afa70640ff79c9fcd3f8ea92160dbc7642238c712727f624043de",
+      "model_file_sha256": "54463b908191524ea0398433f43101b8567c892e50bb9d5ae319042d0e31f83a",
       "model_path": "configs/geant4/models/profiles/fukushima_eu152_physics_only.json"
     },
     "fukushima_eu154": {
@@ -41,8 +41,8 @@
         "Co-60",
         "Eu-154"
       ],
-      "model_contract_hash_sha256": "bb43a61a7a8cb7b034eacaf8b5ada3d6a79db06748cf91089c49ccb48f9d34e8",
-      "model_file_sha256": "570d17e4d7d8d09a40a8575833052288d39cffed521ae446bfd33ccc091b1764",
+      "model_contract_hash_sha256": "2bf0980138fa16c12b0658b16c477a2e1d0877af8b67ccbbdecc8b0c8cc34d06",
+      "model_file_sha256": "b8629c3c9598557d7d5ecf069557732e60e7de6ce01d860f35686a3d204d72a6",
       "model_path": "configs/geant4/models/profiles/fukushima_eu154_physics_only.json"
     },
     "fukushima_nb94": {
@@ -52,8 +52,8 @@
         "Co-60",
         "Nb-94"
       ],
-      "model_contract_hash_sha256": "4cb570b4e41666c2d66d0eb0e4849fc072d659f41741d06acb51165da8b7b706",
-      "model_file_sha256": "72164dc0eedcd47be8605530c34b97e39d590253c438362db7536d18976ea222",
+      "model_contract_hash_sha256": "cc0043aefdd797bef17709a70bfdf6b27237b8804f26644be1af28a707d92c86",
+      "model_file_sha256": "e7576d8de886ee08ca656117a8068649c5341bfa0ddf0380eb5bb35b34bc5632",
       "model_path": "configs/geant4/models/profiles/fukushima_nb94_physics_only.json"
     },
     "fukushima_sb125": {
@@ -63,8 +63,8 @@
         "Co-60",
         "Sb-125"
       ],
-      "model_contract_hash_sha256": "94a88ad070c603384b7fa21ce89119f77403c8786f7e445c0ed8ef84492387b7",
-      "model_file_sha256": "411d463d1aa04e5f0d630aeed08ac79096b0e7451b2c1a68bba81ae9737aa54c",
+      "model_contract_hash_sha256": "9f21d47cf404874eef1bbebf16116b7cbb11441e1885726e7a999bfe6d778b16",
+      "model_file_sha256": "1823c5bfc3300141e1156eeba6e8b35cdc9e19925989df120dd9fef8373ae337",
       "model_path": "configs/geant4/models/profiles/fukushima_sb125_physics_only.json"
     },
     "unconditioned_eu154": {
@@ -74,8 +74,8 @@
         "Co-60",
         "Eu-154"
       ],
-      "model_contract_hash_sha256": "bb43a61a7a8cb7b034eacaf8b5ada3d6a79db06748cf91089c49ccb48f9d34e8",
-      "model_file_sha256": "570d17e4d7d8d09a40a8575833052288d39cffed521ae446bfd33ccc091b1764",
+      "model_contract_hash_sha256": "2bf0980138fa16c12b0658b16c477a2e1d0877af8b67ccbbdecc8b0c8cc34d06",
+      "model_file_sha256": "b8629c3c9598557d7d5ecf069557732e60e7de6ce01d860f35686a3d204d72a6",
       "model_path": "configs/geant4/models/profiles/unconditioned_eu154_physics_only.json"
     }
   },

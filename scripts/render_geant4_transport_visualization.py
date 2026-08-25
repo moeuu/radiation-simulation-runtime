@@ -29,6 +29,9 @@ if str(SRC) not in sys.path:
 from sim.isaacsim_app.app import IsaacSimApplication  # noqa: E402
 from sim.isaacsim_app.scene_builder import SceneDescription, SourceDescription  # noqa: E402
 from sim.protocol import SimulationCommand  # noqa: E402
+from runtime.experiment_profiles import (  # noqa: E402
+    STANDARD_ACQUISITION_LIVE_TIME_S,
+)
 
 
 SOURCE = (1.2, 3.3, 0.85)
@@ -154,7 +157,7 @@ def _command(step_id: int) -> SimulationCommand:
         target_base_yaw_rad=math.pi,
         fe_orientation_index=0,
         pb_orientation_index=6,
-        dwell_time_s=30.0,
+        dwell_time_s=STANDARD_ACQUISITION_LIVE_TIME_S,
     )
 
 

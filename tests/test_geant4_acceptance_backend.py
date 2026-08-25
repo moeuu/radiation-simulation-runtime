@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import spectrum.geant4_acceptance_backend as acceptance_backend
 
 from measurement.model import PointSource
 from measurement.obstacles import ObstacleGrid
@@ -29,7 +30,12 @@ from spectrum.native_metadata import (
     sanitize_native_metadata_token,
 )
 from spectrum.response_matrix import NATIVE_GEANT4_BIN_COUNT
-from spectrum.transport_spectral import GeometryConditionedSpectralModel
+from spectrum.transport_spectral import (
+    ACCEPTANCE_GEOMETRY_DEVICE,
+    ACCEPTANCE_GEOMETRY_DTYPE,
+    ACCEPTANCE_GEOMETRY_USE_GPU,
+    GeometryConditionedSpectralModel,
+)
 
 
 class _FakeKernel:
@@ -91,22 +97,60 @@ class _Source:
         return self._position.copy()
 
 
-@pytest.mark.parametrize("use_gpu", (0, 1, "false", "true", None))
-def test_acceptance_kernel_rejects_coerced_gpu_switch(
-    use_gpu: object,
+def test_acceptance_kernel_uses_predeclared_cpu_float64_contract(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Acceptance must not reinterpret an invalid backend switch."""
+    """Runtime config must not select acceptance geometry compute semantics."""
     backend = object.__new__(ExternalGeant4AcceptanceBackend)
-    backend.runtime_config = {"use_gpu": use_gpu}
+    backend.runtime_config = {}
     grid = ObstacleGrid(
         origin=(0.0, 0.0),
         cell_size=1.0,
         grid_shape=(1, 1),
         blocked_cells=(),
     )
+    observation = SimpleNamespace(additive_scatter_response=None)
+    captured: dict[str, object] = {}
 
-    with pytest.raises(TypeError, match="Acceptance use_gpu"):
-        backend._kernel(grid)
+    def _build_observation(
+        payload: object,
+        *,
+        isotopes: object,
+    ) -> SimpleNamespace:
+        """Return one model-free observation and record its exact inputs."""
+        captured["payload"] = payload
+        captured["isotopes"] = isotopes
+        return observation
+
+    def _build_kernel(
+        actual_observation: object,
+        *,
+        obstacle_grid: object,
+        use_gpu: object,
+    ) -> SimpleNamespace:
+        """Return one mutable fake kernel and record compute selection."""
+        captured["observation"] = actual_observation
+        captured["grid"] = obstacle_grid
+        captured["use_gpu"] = use_gpu
+        return SimpleNamespace()
+
+    monkeypatch.setattr(
+        acceptance_backend,
+        "build_nonproduction_observation_model",
+        _build_observation,
+    )
+    monkeypatch.setattr(
+        acceptance_backend,
+        "continuous_kernel_from_observation_model",
+        _build_kernel,
+    )
+
+    kernel = backend._kernel(grid)
+
+    assert captured["payload"] == {}
+    assert captured["use_gpu"] is ACCEPTANCE_GEOMETRY_USE_GPU
+    assert kernel.gpu_device == ACCEPTANCE_GEOMETRY_DEVICE
+    assert kernel.gpu_dtype == ACCEPTANCE_GEOMETRY_DTYPE
 
 
 def _config() -> SimpleNamespace:

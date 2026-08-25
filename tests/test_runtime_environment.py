@@ -18,6 +18,10 @@ from measurement.geometry_family import (
     validate_geometry_family_descriptor,
 )
 from measurement.obstacles import ObstacleGrid
+from spectrum.transport_spectral import (
+    DESIGNATED_HOLDOUT_SCENE_SEEDS,
+    DESIGNATED_TRAINING_SCENE_SEEDS,
+)
 
 
 def test_random_runtime_obstacle_environment_is_in_memory(tmp_path: Path) -> None:
@@ -164,7 +168,7 @@ def test_randomized_geometry_family_is_deterministic_and_in_domain(
 
 @pytest.mark.parametrize(
     "scene_seed",
-    (2026072701, 2026072702, 2026072703, 2026072791, 2026072792),
+    DESIGNATED_TRAINING_SCENE_SEEDS + DESIGNATED_HOLDOUT_SCENE_SEEDS,
 )
 def test_randomized_geometry_family_retains_obstacles_and_xy_access(
     tmp_path: Path,

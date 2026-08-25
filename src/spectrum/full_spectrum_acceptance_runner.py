@@ -30,6 +30,7 @@ from collections.abc import Callable, Mapping, Sequence
 import numpy as np
 from numpy.typing import NDArray
 
+from measurement.geometry_family import validate_geometry_family_descriptor
 from measurement.source_boundary import (
     SURFACE_EMISSION_EPSILON_M,
     canonical_surface_source_runtime_payload,
@@ -43,6 +44,12 @@ from measurement.shielding import (
     DEFAULT_PB_SHIELD_INNER_RADIUS_CM,
     DEFAULT_PB_SHIELD_THICKNESS_CM,
     SHIELD_POSE_CONTRACT_SHA256,
+)
+from runtime.experiment_profiles import (
+    DEFAULT_EXPERIMENT_PROFILE_ID,
+    STANDARD_ACQUISITION_LIVE_TIME_S,
+    STANDARD_OBSTACLE_MATERIAL,
+    STANDARD_ROOM_BOUNDARY_THICKNESS_M,
 )
 from spectrum.additive_scatter import (
     ADDITIVE_SCATTER_FEATURE_ORDER,
@@ -63,6 +70,14 @@ from spectrum.response_matrix import (
     NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256,
 )
 from spectrum.transport_spectral import (
+    ACCEPTANCE_DETECTOR_POSE_XYZ,
+    ACCEPTANCE_GEOMETRY_DEVICE,
+    ACCEPTANCE_GEOMETRY_DTYPE,
+    ACCEPTANCE_GEOMETRY_USE_GPU,
+    ACCEPTANCE_OBSTACLE_BLOCKED_FRACTION,
+    ACCEPTANCE_PASSAGE_WIDTH_M,
+    ACCEPTANCE_ROOM_SIZE_XYZ,
+    ACCEPTANCE_SURFACE_CHART_MAX_EDGE_M,
     DESIGNATED_HOLDOUT_SCENE_SEEDS,
     DESIGNATED_TRAINING_SCENE_SEEDS,
     FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256,
@@ -76,11 +91,10 @@ from spectrum.transport_spectral import (
 )
 
 
-ACCEPTANCE_RUN_CONTRACT_SCHEMA_VERSION = 3
+ACCEPTANCE_RUN_CONTRACT_SCHEMA_VERSION = 4
 ACCEPTANCE_PAIR_SCHEMA_VERSION = 2
 ACCEPTANCE_SCENE_CORPUS_SCHEMA_VERSION = 1
 DISCREPANCY_SELECTION_ARTIFACT_SCHEMA_VERSION = 1
-ACCEPTANCE_DWELL_TIME_S = 30.0
 ACCEPTANCE_ISOTOPES = ("Co-60", "Cs-137", "Eu-154")
 ACCEPTANCE_PAIR_IDS = tuple(range(64))
 ACCEPTANCE_SCENARIO_SOURCE_SPEC = {
@@ -158,13 +172,6 @@ _PAIR_KEYS = frozenset(
         "transport_physics_table_contract_sha256",
     }
 )
-_LEGACY_PAIR_KEYS = _PAIR_KEYS - {
-    "geometry_family",
-    "detector_response_contract_sha256",
-    "shield_pose_contract_sha256",
-    "obstacle_material_contract_sha256",
-    "transport_physics_table_contract_sha256",
-}
 _GEOMETRY_KEYS = frozenset(
     {
         "unattenuated_source_line_rate_vsl",
@@ -399,6 +406,7 @@ def build_acceptance_run_contract(
         "acceptance_contract_sha256": (
             FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256
         ),
+        "experiment_profile_id": DEFAULT_EXPERIMENT_PROFILE_ID,
         "runtime_config_sha256": _require_sha256(
             runtime_config_sha256,
             field_name="runtime_config_sha256",
@@ -431,7 +439,27 @@ def build_acceptance_run_contract(
             for scenario in VALIDATION_SCENARIO_IDS
         },
         "shield_pair_ids": list(ACCEPTANCE_PAIR_IDS),
-        "dwell_time_s": ACCEPTANCE_DWELL_TIME_S,
+        "dwell_time_s": STANDARD_ACQUISITION_LIVE_TIME_S,
+        "environment": {
+            "room_size_xyz_m": list(ACCEPTANCE_ROOM_SIZE_XYZ),
+            "detector_pose_xyz_m": list(ACCEPTANCE_DETECTOR_POSE_XYZ),
+            "target_blocked_fraction": (
+                ACCEPTANCE_OBSTACLE_BLOCKED_FRACTION
+            ),
+            "passage_width_m": ACCEPTANCE_PASSAGE_WIDTH_M,
+            "surface_chart_max_edge_m": (
+                ACCEPTANCE_SURFACE_CHART_MAX_EDGE_M
+            ),
+            "obstacle_material": STANDARD_OBSTACLE_MATERIAL,
+            "room_boundary_thickness_m": (
+                STANDARD_ROOM_BOUNDARY_THICKNESS_M
+            ),
+        },
+        "geometry_compute": {
+            "use_gpu": ACCEPTANCE_GEOMETRY_USE_GPU,
+            "device": ACCEPTANCE_GEOMETRY_DEVICE,
+            "dtype": ACCEPTANCE_GEOMETRY_DTYPE,
+        },
         "native_fidelity": dict(NATIVE_ACCEPTANCE_FIDELITY),
         "surface_emission_policy_sha256": (
             surface_emission_policy_sha256()
@@ -636,7 +664,7 @@ class AcceptancePairRecord:
     perturbed_features_vslf: NDArray[np.float64]
     perturbed_scatter_basis_vslf: NDArray[np.float64]
     labels: Mapping[str, object]
-    geometry_family: Mapping[str, object] | None = None
+    geometry_family: Mapping[str, object]
 
 
 def load_acceptance_pair(
@@ -661,13 +689,7 @@ def load_acceptance_pair(
         )
     if not isinstance(payload, Mapping):
         raise ValueError("Pair artifact has an incompatible exact schema.")
-    schema_version = payload.get("schema_version")
-    expected_keys = (
-        _PAIR_KEYS
-        if schema_version == ACCEPTANCE_PAIR_SCHEMA_VERSION
-        else _LEGACY_PAIR_KEYS
-    )
-    if set(payload) != expected_keys:
+    if set(payload) != _PAIR_KEYS:
         raise ValueError("Pair artifact has an incompatible exact schema.")
     seed = payload["scene_seed"]
     pair_id = payload["shield_pair_id"]
@@ -691,7 +713,7 @@ def load_acceptance_pair(
         raise ValueError("Pair seed or shield-pair identity is invalid.")
     if (
         type(payload["schema_version"]) is not int
-        or payload["schema_version"] not in (1, ACCEPTANCE_PAIR_SCHEMA_VERSION)
+        or payload["schema_version"] != ACCEPTANCE_PAIR_SCHEMA_VERSION
         or payload["acceptance_contract_sha256"]
         != FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256
         or type(payload["split"]) is not str
@@ -709,7 +731,7 @@ def load_acceptance_pair(
         payload["dwell_time_s"],
         field_name="dwell_time_s",
     )
-    if dwell != ACCEPTANCE_DWELL_TIME_S:
+    if dwell != STANDARD_ACQUISITION_LIVE_TIME_S:
         raise ValueError("Acceptance dwell time differs from its fixed contract.")
     scene_hash = _require_sha256(
         payload["scene_hash"],
@@ -721,32 +743,27 @@ def load_acceptance_pair(
     )
     validate_surface_boundary_gate(payload["surface_boundary_gate"])
     validate_native_fidelity(payload["native_fidelity"])
-    if payload["schema_version"] == ACCEPTANCE_PAIR_SCHEMA_VERSION:
-        from measurement.geometry_family import (
-            validate_geometry_family_descriptor,
-        )
-
-        validate_geometry_family_descriptor(
-            payload["geometry_family"],
-            require_in_domain=True,
-        )
-        expected_physics_contracts = {
-            "detector_response_contract_sha256": (
-                NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
-            ),
-            "shield_pose_contract_sha256": SHIELD_POSE_CONTRACT_SHA256,
-            "obstacle_material_contract_sha256": (
-                OBSTACLE_MATERIAL_CONTRACT_SHA256
-            ),
-            "transport_physics_table_contract_sha256": (
-                TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256
-            ),
-        }
-        for field_name, expected_value in expected_physics_contracts.items():
-            if payload.get(field_name) != expected_value:
-                raise ValueError(
-                    f"Pair physics contract {field_name!r} is incompatible."
-                )
+    validate_geometry_family_descriptor(
+        payload["geometry_family"],
+        require_in_domain=True,
+    )
+    expected_physics_contracts = {
+        "detector_response_contract_sha256": (
+            NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
+        ),
+        "shield_pose_contract_sha256": SHIELD_POSE_CONTRACT_SHA256,
+        "obstacle_material_contract_sha256": (
+            OBSTACLE_MATERIAL_CONTRACT_SHA256
+        ),
+        "transport_physics_table_contract_sha256": (
+            TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256
+        ),
+    }
+    for field_name, expected_value in expected_physics_contracts.items():
+        if payload[field_name] != expected_value:
+            raise ValueError(
+                f"Pair physics contract {field_name!r} is incompatible."
+            )
     detector = _validate_vector_payload(
         payload["detector_pose_xyz"],
         shape=(3,),
@@ -988,14 +1005,10 @@ def load_acceptance_pair(
         perturbed_features_vslf=perturbed_features,
         perturbed_scatter_basis_vslf=perturbed_scatter,
         labels=json.loads(json.dumps(dict(labels), allow_nan=False)),
-        geometry_family=(
-            None
-            if payload["schema_version"] == 1
-            else json.loads(
-                json.dumps(
-                    dict(payload["geometry_family"]),
-                    allow_nan=False,
-                )
+        geometry_family=json.loads(
+            json.dumps(
+                dict(payload["geometry_family"]),
+                allow_nan=False,
             )
         ),
     )
@@ -1773,7 +1786,7 @@ def select_training_discrepancy(
                     total[np.newaxis, ...],
                     uncollided[np.newaxis, ...],
                     features[np.newaxis, ...],
-                    np.full(64, ACCEPTANCE_DWELL_TIME_S),
+                    np.full(64, STANDARD_ACQUISITION_LIVE_TIME_S),
                 )
                 score += float(value[0])
             candidate_scores[
@@ -2022,7 +2035,6 @@ def acquire_designated_split(
 
 
 __all__ = [
-    "ACCEPTANCE_DWELL_TIME_S",
     "ACCEPTANCE_ISOTOPES",
     "ACCEPTANCE_PAIR_IDS",
     "ACCEPTANCE_SCENARIO_SOURCE_SPEC",

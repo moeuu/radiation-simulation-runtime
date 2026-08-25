@@ -29,6 +29,7 @@ from spectrum.air_attenuation import (
     dry_air_total_linear_attenuation_torch,
 )
 from spectrum.transport_spectral import (
+    DESIGNATED_HOLDOUT_SCENE_SEEDS,
     DESIGNATED_TRAINING_SCENE_SEEDS,
     FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256,
     VALIDATION_SCENARIO_IDS,
@@ -713,7 +714,9 @@ def test_training_provenance_rejects_leakage_and_schema_tampering(
     """Only the designated training all-64 LOSO fit may enter production."""
     manifest = copy.deepcopy(dict(_response().training_manifest))
     if tamper == "holdout_seed":
-        manifest["training_scene_seeds"][-1] = 2026072791
+        manifest["training_scene_seeds"][-1] = (
+            DESIGNATED_HOLDOUT_SCENE_SEEDS[0]
+        )
     elif tamper == "missing_pair":
         manifest["pair_ids_by_scene"]["2026072701"] = list(range(63))
     else:

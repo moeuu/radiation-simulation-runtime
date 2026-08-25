@@ -9,6 +9,8 @@ from pathlib import Path
 from collections.abc import Mapping, Sequence
 
 import numpy as np
+
+from runtime.experiment_profiles import STANDARD_ACQUISITION_LIVE_TIME_S
 from scipy import stats
 
 from measurement.geometry_family import (
@@ -330,7 +332,11 @@ def _candidate_score(
             total[np.newaxis, ...],
             uncollided[np.newaxis, ...],
             features[np.newaxis, ...],
-            np.full(observed.shape[0], 30.0, dtype=np.float64),
+            np.full(
+                observed.shape[0],
+                STANDARD_ACQUISITION_LIVE_TIME_S,
+                dtype=np.float64,
+            ),
         )
         score += float(likelihood[0])
         observation_count += int(observed.shape[0])
@@ -380,7 +386,11 @@ def _candidate_pairwise_mark_coverage(
                 fold_model.low_rank_spectral_mean_correction
             ),
         )
-        live_times = np.full(observed.shape[0], 30.0, dtype=np.float64)
+        live_times = np.full(
+            observed.shape[0],
+            STANDARD_ACQUISITION_LIVE_TIME_S,
+            dtype=np.float64,
+        )
         source_mean, background_mean = candidate.pre_dead_time_components_numpy(
             total,
             uncollided,
@@ -540,7 +550,6 @@ def build_candidate(
             record.scene_seed != seed
             or record.split != "training"
             or record.scenario_id != scenario
-            or record.geometry_family is None
             for record in records
         ):
             raise RuntimeError("Randomized training pair identity is invalid.")

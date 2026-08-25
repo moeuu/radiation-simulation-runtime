@@ -43,6 +43,11 @@ from measurement.source_boundary import (
 from measurement.source_surfaces import generate_surface_sources
 from measurement.shielding import SHIELD_POSE_CONTRACT_SHA256
 from measurement.surface_charts import build_surface_chart_geometry
+from runtime.experiment_profiles import (
+    STANDARD_ACQUISITION_LIVE_TIME_S,
+    STANDARD_OBSTACLE_MATERIAL,
+    STANDARD_ROOM_BOUNDARY_THICKNESS_M,
+)
 from runtime.randomness import named_random_generator
 from measurement.surface_atlas import ContinuousSurfaceAtlas
 from runtime_environment import attach_random_manchester_transport_geometry
@@ -69,7 +74,6 @@ from spectrum.additive_scatter import (
     physical_scatter_basis_numpy,
 )
 from spectrum.full_spectrum_acceptance_runner import (
-    ACCEPTANCE_DWELL_TIME_S,
     ACCEPTANCE_ISOTOPES,
     ACCEPTANCE_PAIR_SCHEMA_VERSION,
     ACCEPTANCE_PAIR_IDS,
@@ -94,6 +98,14 @@ from spectrum.response_matrix import (
     NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256,
 )
 from spectrum.transport_spectral import (
+    ACCEPTANCE_DETECTOR_POSE_XYZ,
+    ACCEPTANCE_GEOMETRY_DEVICE,
+    ACCEPTANCE_GEOMETRY_DTYPE,
+    ACCEPTANCE_GEOMETRY_USE_GPU,
+    ACCEPTANCE_OBSTACLE_BLOCKED_FRACTION,
+    ACCEPTANCE_PASSAGE_WIDTH_M,
+    ACCEPTANCE_ROOM_SIZE_XYZ,
+    ACCEPTANCE_SURFACE_CHART_MAX_EDGE_M,
     FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256,
     TRANSPORT_FEATURE_ORDER,
     VALIDATION_SCENARIO_IDS,
@@ -101,11 +113,6 @@ from spectrum.transport_spectral import (
 )
 
 
-ACCEPTANCE_ROOM_SIZE_XYZ = (10.0, 20.0, 10.0)
-ACCEPTANCE_DETECTOR_POSE_XYZ = (1.0, 1.0, 0.5)
-ACCEPTANCE_OBSTACLE_BLOCKED_FRACTION = 0.4
-ACCEPTANCE_PASSAGE_WIDTH_M = 1.0
-ACCEPTANCE_SURFACE_CHART_MAX_EDGE_M = 1.0
 _SOURCE_RNG_DOMAIN = "full_spectrum_acceptance_surface_truth_v1"
 _BOUNDARY_RNG_DOMAIN = "full_spectrum_acceptance_boundary_probe_v1"
 _BOUNDARY_ERROR_MARKER = "surface-anchor epsilon contract"
@@ -814,7 +821,7 @@ def _command_for_pair(pair_id: int) -> SimulationCommand:
         target_base_yaw_rad=0.0,
         fe_orientation_index=int(pair_id // 8),
         pb_orientation_index=int(pair_id % 8),
-        dwell_time_s=ACCEPTANCE_DWELL_TIME_S,
+        dwell_time_s=STANDARD_ACQUISITION_LIVE_TIME_S,
     )
 
 
@@ -1136,7 +1143,7 @@ class _NativeScenarioSession(AcceptanceScenarioSession):
             self.app,
             command,
             seed=seed,
-            dwell_time_s=ACCEPTANCE_DWELL_TIME_S,
+            dwell_time_s=STANDARD_ACQUISITION_LIVE_TIME_S,
         )
         spectrum, raw_metadata = self.app.engine.simulate(request)
         metadata = dict(raw_metadata)
@@ -1223,7 +1230,7 @@ class _NativeScenarioSession(AcceptanceScenarioSession):
             "scenario_id": self.scenario_id,
             "shield_pair_id": shield_pair_id,
             "transport_seed": seed,
-            "dwell_time_s": ACCEPTANCE_DWELL_TIME_S,
+            "dwell_time_s": STANDARD_ACQUISITION_LIVE_TIME_S,
             "scene_hash": self.scene_hash,
             "surface_source_contract_sha256": self.source_hash,
             "surface_boundary_gate": dict(self.boundary_gate),
@@ -1274,7 +1281,7 @@ class _ScenarioContext(AbstractContextManager[AcceptanceScenarioSession]):
 class ExternalGeant4AcceptanceBackend(AcceptanceTransportBackend):
     """Build deterministic random scenes and run real external Geant4."""
 
-    backend_id = "external_geant4_all64_v1"
+    backend_id = "external_geant4_all64_v2"
 
     def __init__(
         self,
@@ -1290,10 +1297,7 @@ class ExternalGeant4AcceptanceBackend(AcceptanceTransportBackend):
         )
         app_payload = dict(self.runtime_config)
         app_payload["validation_entry_class_spectra"] = True
-        executable_raw = app_payload.get(
-            "executable_path",
-            "build/geant4_sidecar",
-        )
+        executable_raw = app_payload["executable_path"]
         if not isinstance(executable_raw, str) or not executable_raw:
             raise ValueError("Native executable_path must be a nonempty string.")
         executable = Path(executable_raw)
@@ -1339,25 +1343,6 @@ class ExternalGeant4AcceptanceBackend(AcceptanceTransportBackend):
         )
         self._boundary_gate_by_seed: dict[int, Mapping[str, object]] = {}
 
-    def _room_boundary_thickness_m(self) -> float:
-        """Return the strict configured room-boundary thickness."""
-        raw = self.runtime_config.get("room_boundary_thickness_m", 0.1)
-        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
-            raise TypeError("room_boundary_thickness_m must be a JSON number.")
-        value = float(raw)
-        if not math.isfinite(value) or value <= 0.0:
-            raise ValueError(
-                "room_boundary_thickness_m must be finite and positive."
-            )
-        return value
-
-    def _obstacle_material(self) -> str:
-        """Return the strict material used by the authored obstacle prims."""
-        raw = self.runtime_config.get("obstacle_material", "concrete")
-        if not isinstance(raw, str) or not raw:
-            raise TypeError("obstacle_material must be a nonempty string.")
-        return raw
-
     def _kernel(
         self,
         grid: ObstacleGrid,
@@ -1368,9 +1353,6 @@ class ExternalGeant4AcceptanceBackend(AcceptanceTransportBackend):
             for key, value in self.runtime_config.items()
             if key not in _FULL_SPECTRUM_RUNTIME_KEYS
         }
-        use_gpu = observation_payload.get("use_gpu", False)
-        if not isinstance(use_gpu, bool):
-            raise TypeError("Acceptance use_gpu must be a JSON boolean.")
         observation = build_nonproduction_observation_model(
             observation_payload,
             isotopes=ACCEPTANCE_ISOTOPES,
@@ -1382,19 +1364,10 @@ class ExternalGeant4AcceptanceBackend(AcceptanceTransportBackend):
         kernel = continuous_kernel_from_observation_model(
             observation,
             obstacle_grid=grid,
-            use_gpu=use_gpu,
+            use_gpu=ACCEPTANCE_GEOMETRY_USE_GPU,
         )
-        gpu_device = observation_payload.get("gpu_device", "cuda")
-        gpu_dtype = observation_payload.get("gpu_dtype", "float64")
-        if (
-            not isinstance(gpu_device, str)
-            or not gpu_device
-            or not isinstance(gpu_dtype, str)
-            or not gpu_dtype
-        ):
-            raise ValueError("Acceptance GPU device/dtype must be strings.")
-        kernel.gpu_device = gpu_device
-        kernel.gpu_dtype = gpu_dtype
+        kernel.gpu_device = ACCEPTANCE_GEOMETRY_DEVICE
+        kernel.gpu_dtype = ACCEPTANCE_GEOMETRY_DTYPE
         return kernel
 
     def _app_for_scene(
@@ -1426,7 +1399,7 @@ class ExternalGeant4AcceptanceBackend(AcceptanceTransportBackend):
                     author_room_boundaries=bool(
                         self.app_config.author_room_boundary_prims
                     ),
-                    obstacle_material=self._obstacle_material(),
+                    obstacle_material=STANDARD_OBSTACLE_MATERIAL,
                 )
             )
         )
@@ -1492,8 +1465,8 @@ class ExternalGeant4AcceptanceBackend(AcceptanceTransportBackend):
             author_room_boundaries=bool(
                 self.app_config.author_room_boundary_prims
             ),
-            room_boundary_thickness_m=float(
-                self._room_boundary_thickness_m()
+            room_boundary_thickness_m=(
+                STANDARD_ROOM_BOUNDARY_THICKNESS_M
             ),
         )
         family_parameters = randomized_training_geometry_parameters(

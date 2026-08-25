@@ -19,6 +19,7 @@ from build_physical_component_full_spectrum_candidate import (
     COMPONENT_TRAINING_PAIR_IDS,
     _group_arrays,
 )
+from runtime.experiment_profiles import STANDARD_ACQUISITION_LIVE_TIME_S
 from spectrum.full_spectrum_acceptance_runner import (
     ACCEPTANCE_ISOTOPES,
     AcceptanceScenarioSession,
@@ -130,8 +131,6 @@ def _evaluate(
             for path in paths
         )
         for record in records:
-            if record.geometry_family is None:
-                raise RuntimeError("Holdout record lacks geometry-family identity.")
             model.require_environment_applicable(
                 {"geometry_family": record.geometry_family}
             )
@@ -139,7 +138,11 @@ def _evaluate(
             records,
             model=model,
         )
-        live_times = np.full(observed.shape[0], 30.0, dtype=np.float64)
+        live_times = np.full(
+            observed.shape[0],
+            STANDARD_ACQUISITION_LIVE_TIME_S,
+            dtype=np.float64,
+        )
         total_x = total[np.newaxis, ...]
         uncollided_x = uncollided[np.newaxis, ...]
         features_x = features[np.newaxis, ...]

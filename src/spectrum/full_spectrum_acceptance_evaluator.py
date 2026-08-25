@@ -36,12 +36,12 @@ from measurement.shielding import (
     DEFAULT_PB_SHIELD_INNER_RADIUS_CM,
     DEFAULT_PB_SHIELD_THICKNESS_CM,
 )
+from runtime.experiment_profiles import STANDARD_ACQUISITION_LIVE_TIME_S
 from spectrum.additive_scatter import scatter_basis_from_stored_geometry_numpy
 from spectrum.full_spectrum_acceptance import (
     build_independent_validation_manifest,
 )
 from spectrum.full_spectrum_acceptance_runner import (
-    ACCEPTANCE_DWELL_TIME_S,
     ACCEPTANCE_ISOTOPES,
     ACCEPTANCE_PAIR_IDS,
     AcceptancePairRecord,
@@ -325,7 +325,7 @@ def _total_diagnostics(
     """Return exact-mixture renewal moments and randomized PIT values."""
     live = np.full(
         len(ACCEPTANCE_PAIR_IDS),
-        ACCEPTANCE_DWELL_TIME_S,
+        STANDARD_ACQUISITION_LIVE_TIME_S,
         dtype=np.float64,
     )
     source_pre_total = (
@@ -401,7 +401,7 @@ def _mark_diagnostics(
     """Return batched conditional-mark posterior-predictive rank values."""
     live = np.full(
         len(ACCEPTANCE_PAIR_IDS),
-        ACCEPTANCE_DWELL_TIME_S,
+        STANDARD_ACQUISITION_LIVE_TIME_S,
         dtype=np.float64,
     )
     mean = model.predict_mean_numpy(
@@ -611,7 +611,10 @@ def _pair_log_likelihoods(
         total[:, :, np.newaxis, :, :],
         uncollided[:, :, np.newaxis, :, :],
         features[:, :, np.newaxis, :, :, :],
-        np.asarray([ACCEPTANCE_DWELL_TIME_S], dtype=np.float64),
+        np.asarray(
+            [STANDARD_ACQUISITION_LIVE_TIME_S],
+            dtype=np.float64,
+        ),
         action_chunk_size=len(ACCEPTANCE_PAIR_IDS),
         sample_chunk_size=1,
         state_chunk_size=len(candidates),
@@ -699,7 +702,7 @@ def _cpu_torch_errors(
     maximum_likelihood = 0.0
     live = np.full(
         len(ACCEPTANCE_PAIR_IDS),
-        ACCEPTANCE_DWELL_TIME_S,
+        STANDARD_ACQUISITION_LIVE_TIME_S,
         dtype=np.float64,
     )
     for scenario in VALIDATION_SCENARIO_IDS:
@@ -769,7 +772,7 @@ def _line_conservation_error(
     """Return marked-source versus transport-line pre-dead-time total error."""
     live = np.full(
         len(ACCEPTANCE_PAIR_IDS),
-        ACCEPTANCE_DWELL_TIME_S,
+        STANDARD_ACQUISITION_LIVE_TIME_S,
         dtype=np.float64,
     )
     maximum = 0.0

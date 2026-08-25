@@ -13,6 +13,9 @@ from measurement.model import EnvironmentConfig
 DEFAULT_EXPERIMENT_PROFILE_ID = "multi_isotope_surface_search_v1"
 ACQUISITION_CONTRACT_FIELD = "acquisition_contract"
 EXPERIMENT_PROFILE_ID_FIELD = "experiment_profile_id"
+STANDARD_ACQUISITION_LIVE_TIME_S = 20.0
+STANDARD_OBSTACLE_MATERIAL = "concrete"
+STANDARD_ROOM_BOUNDARY_THICKNESS_M = 0.1
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,7 +192,7 @@ STANDARD_EXPERIMENT_PROFILE = ExperimentProfile(
     acquisition=AcquisitionContract(
         max_stations=16,
         views_per_station=8,
-        live_time_s=20.0,
+        live_time_s=STANDARD_ACQUISITION_LIVE_TIME_S,
         max_measurements=128,
         min_station_separation_m=3.0,
         coverage_radius_m=3.0,
@@ -205,8 +208,8 @@ STANDARD_EXPERIMENT_PROFILE = ExperimentProfile(
     same_isotope_min_distance_m=3.0,
     intensity_cps_1m=(300_000.0, 2_000_000.0),
     environment_model_id="random_manchester_component_union_v1",
-    obstacle_material="concrete",
-    room_boundary_thickness_m=0.1,
+    obstacle_material=STANDARD_OBSTACLE_MATERIAL,
+    room_boundary_thickness_m=STANDARD_ROOM_BOUNDARY_THICKNESS_M,
     surface_chart_max_edge_m=1.0,
 )
 
@@ -329,7 +332,10 @@ __all__ = [
     "DEFAULT_EXPERIMENT_PROFILE_ID",
     "EXPERIMENT_PROFILE_ID_FIELD",
     "ExperimentProfile",
+    "STANDARD_ACQUISITION_LIVE_TIME_S",
     "STANDARD_EXPERIMENT_PROFILE",
+    "STANDARD_OBSTACLE_MATERIAL",
+    "STANDARD_ROOM_BOUNDARY_THICKNESS_M",
     "acquisition_contract_from_environment",
     "available_experiment_profiles",
     "experiment_profile_from_environment",

@@ -9,18 +9,25 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from measurement.geometry_family import (
+    GEOMETRY_FAMILY_APPLICABILITY_SHA256,
+    GEOMETRY_FAMILY_ID,
+    GEOMETRY_FAMILY_SCHEMA_VERSION,
+    GEOMETRY_GENERATOR_ALGORITHM_ID,
+)
 from measurement.source_boundary import (
     SURFACE_EMISSION_EPSILON_M,
     surface_emission_policy_sha256,
     surface_source_runtime_contract_sha256,
 )
+from measurement.shielding import SHIELD_POSE_CONTRACT_SHA256
+from runtime.experiment_profiles import STANDARD_ACQUISITION_LIVE_TIME_S
 from spectrum.additive_scatter import (
     ADDITIVE_SCATTER_FEATURE_ORDER,
     ADDITIVE_SCATTER_INCIDENT_LABEL_SEMANTICS,
     ADDITIVE_SCATTER_TARGET_SEMANTICS,
 )
 from spectrum.full_spectrum_acceptance_runner import (
-    ACCEPTANCE_DWELL_TIME_S,
     NATIVE_ACCEPTANCE_FIDELITY,
     acceptance_transport_seed,
     build_acceptance_run_contract,
@@ -30,7 +37,14 @@ from spectrum.full_spectrum_acceptance_runner import (
     load_acceptance_run_contract,
 )
 from spectrum.native_metadata import native_source_line_token
-from spectrum.response_matrix import NATIVE_GEANT4_BIN_COUNT
+from spectrum.physics_contracts import (
+    OBSTACLE_MATERIAL_CONTRACT_SHA256,
+    TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256,
+)
+from spectrum.response_matrix import (
+    NATIVE_GEANT4_BIN_COUNT,
+    NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256,
+)
 from spectrum.transport_spectral import (
     FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256,
     TRANSPORT_FEATURE_ORDER,
@@ -56,7 +70,8 @@ def test_acceptance_run_contract_authenticates_python_implementation() -> None:
         implementation_bundle_sha256="c" * 64,
     )
 
-    assert contract["schema_version"] == 3
+    assert contract["schema_version"] == 4
+    assert contract["dwell_time_s"] == STANDARD_ACQUISITION_LIVE_TIME_S
     assert contract["native_execution_environment_sha256"] == "d" * 64
     assert contract["implementation_bundle_sha256"] == "c" * 64
 
@@ -216,7 +231,7 @@ def _pair_payload(*, background_only: bool) -> dict[str, object]:
         else "single_line_source_resolved"
     )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "acceptance_contract_sha256": (
             FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256
         ),
@@ -229,7 +244,7 @@ def _pair_payload(*, background_only: bool) -> dict[str, object]:
             scenario_id=scenario,
             shield_pair_id=0,
         ),
-        "dwell_time_s": ACCEPTANCE_DWELL_TIME_S,
+        "dwell_time_s": STANDARD_ACQUISITION_LIVE_TIME_S,
         "scene_hash": "7" * 64,
         "surface_source_contract_sha256": (
             surface_source_runtime_contract_sha256(sources)
@@ -251,6 +266,37 @@ def _pair_payload(*, background_only: bool) -> dict[str, object]:
             "background_entry_spectrum_sha256": "8" * 64,
         },
         "native_fidelity": dict(NATIVE_ACCEPTANCE_FIDELITY),
+        "geometry_family": {
+            "schema_version": GEOMETRY_FAMILY_SCHEMA_VERSION,
+            "geometry_family_id": GEOMETRY_FAMILY_ID,
+            "generator_algorithm_id": GEOMETRY_GENERATOR_ALGORITHM_ID,
+            "transport_representation": "explicit_material_component_boxes",
+            "room_size_xyz_m": [10.0, 20.0, 10.0],
+            "cell_size_m": 1.0,
+            "target_blocked_fraction": 0.4,
+            "realized_blocked_fraction": 0.3,
+            "passage_width_m": 2.0,
+            "obstacle_height_limit_fraction": 0.5,
+            "realized_max_component_height_fraction": 0.1,
+            "instance_count": 1,
+            "transport_component_count": 1,
+            "template_names": ["fake_hollow_obstacle"],
+            "component_materials": ["concrete"],
+            "component_geometry_sha256": "9" * 64,
+            "applicability_contract_sha256": (
+                GEOMETRY_FAMILY_APPLICABILITY_SHA256
+            ),
+        },
+        "detector_response_contract_sha256": (
+            NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
+        ),
+        "shield_pose_contract_sha256": SHIELD_POSE_CONTRACT_SHA256,
+        "obstacle_material_contract_sha256": (
+            OBSTACLE_MATERIAL_CONTRACT_SHA256
+        ),
+        "transport_physics_table_contract_sha256": (
+            TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256
+        ),
     }
 
 
@@ -281,6 +327,20 @@ def test_pair_loader_accepts_exact_background_and_source_contracts(
         record.source_count,
         len(model.line_identity),
     )
+
+
+def test_pair_loader_rejects_retired_schema_one_artifacts(tmp_path: Path) -> None:
+    """The current acceptance command must have no legacy pair adapter."""
+    payload = _pair_payload(background_only=True)
+    payload["schema_version"] = 1
+
+    with pytest.raises(ValueError, match="contract identity"):
+        load_acceptance_pair(
+            _write_pair(tmp_path / "legacy_pair.json", payload),
+            expected_line_identity_sha256=(
+                line_identity_contract_sha256(_base_model())
+            ),
+        )
 
 
 def test_pair_loader_rejects_numeric_string_geometry(tmp_path: Path) -> None:
@@ -383,7 +443,7 @@ def test_pair_loader_rejects_noncanonical_duplicate_keys(
     payload = _pair_payload(background_only=False)
     canonical = canonical_json_bytes(payload).decode("utf-8")
     raw = (
-        '{"schema_version":1,' + canonical.removeprefix("{")
+        '{"schema_version":2,' + canonical.removeprefix("{")
     ).encode("utf-8")
     path = tmp_path / "duplicate.json"
     path.write_bytes(raw)

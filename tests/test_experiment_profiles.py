@@ -7,6 +7,7 @@ import pytest
 from runtime.experiment_profiles import (
     AcquisitionContract,
     DEFAULT_EXPERIMENT_PROFILE_ID,
+    STANDARD_ACQUISITION_LIVE_TIME_S,
     STANDARD_EXPERIMENT_PROFILE,
     acquisition_contract_from_environment,
     experiment_profile_from_environment,
@@ -42,6 +43,7 @@ def test_standard_profile_owns_every_shared_acquisition_value() -> None:
     profile = STANDARD_EXPERIMENT_PROFILE
 
     assert profile.profile_id == DEFAULT_EXPERIMENT_PROFILE_ID
+    assert STANDARD_ACQUISITION_LIVE_TIME_S == 20.0
     assert (
         profile.environment.size_x,
         profile.environment.size_y,
@@ -51,7 +53,7 @@ def test_standard_profile_owns_every_shared_acquisition_value() -> None:
         "schema_version": 1,
         "max_stations": 16,
         "views_per_station": 8,
-        "live_time_s": 20.0,
+        "live_time_s": STANDARD_ACQUISITION_LIVE_TIME_S,
         "max_measurements": 128,
         "min_station_separation_m": 3.0,
         "coverage_radius_m": 3.0,

@@ -23,6 +23,7 @@ from measurement.geometry_family import (
 )
 from measurement.shielding import SHIELD_POSE_CONTRACT_SHA256
 import scripts.run_full_spectrum_all64_acceptance as acceptance_cli
+from runtime.experiment_profiles import STANDARD_ACQUISITION_LIVE_TIME_S
 from spectrum.additive_scatter import (
     ADDITIVE_SCATTER_FEATURE_ORDER,
     ADDITIVE_SCATTER_INCIDENT_LABEL_SEMANTICS,
@@ -50,6 +51,7 @@ from spectrum.response_matrix import (
 )
 from spectrum.transport_spectral import (
     ACCEPTANCE_METRIC_CONTRACT,
+    FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256,
     GeometryConditionedSpectralModel,
 )
 
@@ -287,7 +289,7 @@ class _FakeSession:
                 scenario_id=self.scenario_id,
                 shield_pair_id=shield_pair_id,
             ),
-            "dwell_time_s": 30.0,
+            "dwell_time_s": STANDARD_ACQUISITION_LIVE_TIME_S,
             "scene_hash": canonical_json_sha256(
                 [self.scene_seed, self.scenario_id, "scene"]
             ),
@@ -393,6 +395,16 @@ def _passing_metrics(
         metric: 0.0 if comparison == "le" else 1.0
         for metric, (comparison, _) in ACCEPTANCE_METRIC_CONTRACT.items()
     }
+
+
+def test_default_output_root_is_scoped_to_the_current_contract() -> None:
+    """The CLI must never resume the stale unversioned acceptance root."""
+    assert acceptance_cli._DEFAULT_OUTPUT.name == (
+        FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256
+    )
+    assert acceptance_cli._DEFAULT_OUTPUT.parent.name == (
+        "full_spectrum_all64_acceptance"
+    )
 
 
 def test_mark_diagnostic_uses_physical_component_concentration() -> None:

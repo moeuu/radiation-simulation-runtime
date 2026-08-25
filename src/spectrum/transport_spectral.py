@@ -32,6 +32,12 @@ from measurement.shielding import (
     SHIELD_POSE_CONTRACT_SHA256,
     line_resolved_shield_mu_by_isotope,
 )
+from runtime.experiment_profiles import (
+    DEFAULT_EXPERIMENT_PROFILE_ID,
+    STANDARD_ACQUISITION_LIVE_TIME_S,
+    STANDARD_OBSTACLE_MATERIAL,
+    STANDARD_ROOM_BOUNDARY_THICKNESS_M,
+)
 from runtime.forward_model_manifest import resolve_file_backed_model_asset
 from spectrum.additive_scatter import (
     ADDITIVE_SCATTER_INCIDENT_LABEL_SEMANTICS,
@@ -89,7 +95,15 @@ RENEWAL_GAMMA_INTERVAL_QUADRATURE_ORDER = 32
     RENEWAL_GAMMA_INTERVAL_QUADRATURE_ORDER
 )
 DESIGNATED_TRAINING_SCENE_SEEDS = (2026072701, 2026072702, 2026072703)
-DESIGNATED_HOLDOUT_SCENE_SEEDS = (2026072791, 2026072792)
+DESIGNATED_HOLDOUT_SCENE_SEEDS = (3721907945, 9459185298)
+ACCEPTANCE_ROOM_SIZE_XYZ = (10.0, 20.0, 10.0)
+ACCEPTANCE_DETECTOR_POSE_XYZ = (1.0, 1.0, 0.5)
+ACCEPTANCE_OBSTACLE_BLOCKED_FRACTION = 0.4
+ACCEPTANCE_PASSAGE_WIDTH_M = 1.0
+ACCEPTANCE_SURFACE_CHART_MAX_EDGE_M = 1.0
+ACCEPTANCE_GEOMETRY_USE_GPU = False
+ACCEPTANCE_GEOMETRY_DEVICE = "cpu"
+ACCEPTANCE_GEOMETRY_DTYPE = "float64"
 RATE_SCALE_HALF_WIDTH_GRID = (0.0, 0.02, 0.05, 0.10, 0.20)
 RATE_SCALE_MIXTURE_WEIGHTS = (0.25, 0.50, 0.25)
 RATE_SCALE_UNIFORM_QUADRATURE_ORDER = 9
@@ -696,12 +710,40 @@ ACCEPTANCE_METRIC_CONTRACT = MappingProxyType(
 
 
 def full_spectrum_acceptance_contract_payload() -> Mapping[str, object]:
-    """Return the predeclared validation split, scenarios, and thresholds."""
+    """Return the complete predeclared acceptance execution contract."""
     return {
-        "schema_version": 1,
-        "contract_id": "geometry_conditioned_full_spectrum_acceptance_v1",
+        "schema_version": 2,
+        "contract_id": "geometry_conditioned_full_spectrum_acceptance_v2",
+        "experiment_profile_id": DEFAULT_EXPERIMENT_PROFILE_ID,
+        "dwell_time_s": STANDARD_ACQUISITION_LIVE_TIME_S,
         "training_scene_seeds": list(DESIGNATED_TRAINING_SCENE_SEEDS),
         "holdout_scene_seeds": list(DESIGNATED_HOLDOUT_SCENE_SEEDS),
+        "holdout_seed_set": {
+            "seed_set_id": "independent_holdout_20260826_v1",
+            "generation_method": "os_csprng_uniform_10_digit",
+            "generated_utc_date": "2026-08-26",
+            "predeclared_before_acquisition": True,
+        },
+        "environment": {
+            "room_size_xyz_m": list(ACCEPTANCE_ROOM_SIZE_XYZ),
+            "detector_pose_xyz_m": list(ACCEPTANCE_DETECTOR_POSE_XYZ),
+            "target_blocked_fraction": (
+                ACCEPTANCE_OBSTACLE_BLOCKED_FRACTION
+            ),
+            "passage_width_m": ACCEPTANCE_PASSAGE_WIDTH_M,
+            "surface_chart_max_edge_m": (
+                ACCEPTANCE_SURFACE_CHART_MAX_EDGE_M
+            ),
+            "obstacle_material": STANDARD_OBSTACLE_MATERIAL,
+            "room_boundary_thickness_m": (
+                STANDARD_ROOM_BOUNDARY_THICKNESS_M
+            ),
+        },
+        "geometry_compute": {
+            "use_gpu": ACCEPTANCE_GEOMETRY_USE_GPU,
+            "device": ACCEPTANCE_GEOMETRY_DEVICE,
+            "dtype": ACCEPTANCE_GEOMETRY_DTYPE,
+        },
         "shield_pair_ids": list(range(64)),
         "scenario_ids": list(VALIDATION_SCENARIO_IDS),
         "metrics": {

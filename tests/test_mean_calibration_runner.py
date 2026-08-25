@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from runtime.experiment_profiles import STANDARD_ACQUISITION_LIVE_TIME_S
 from scripts.run_mean_calibration import (
     _design as cli_design,
     _parser as calibration_cli_parser,
@@ -150,6 +151,15 @@ def test_calibration_payload_isolated_from_standard_runtime() -> None:
     assert payload["mean_calibration_histories_per_source_line"] == 256
     assert payload["mean_calibration_angle_strata_mu"] == 8
     assert payload["mean_calibration_angle_strata_phi"] == 2
+
+    missing_executable = dict(standard)
+    del missing_executable["executable_path"]
+    with pytest.raises(ValueError, match="explicit executable_path"):
+        build_mean_calibration_app_payload(
+            missing_executable,
+            repository_root=repository_root,
+            design=_design(),
+        )
 
 
 def test_forced_collision_is_selected_only_by_calibration_design() -> None:
@@ -299,7 +309,7 @@ def test_pair_artifact_saves_rao_blackwell_moments_and_covariance(
             "scene_seed": DESIGNATED_TRAINING_SCENE_SEEDS[0],
             "scenario_id": "single_line_source_resolved",
             "shield_pair_id": 0,
-            "dwell_time_s": 30.0,
+            "dwell_time_s": STANDARD_ACQUISITION_LIVE_TIME_S,
             "sources": [],
         },
         calibration=calibration,
@@ -345,7 +355,7 @@ def test_pair_artifact_rejects_laundered_shield_contract(
             "scene_seed": DESIGNATED_TRAINING_SCENE_SEEDS[0],
             "scenario_id": "single_line_source_resolved",
             "shield_pair_id": 0,
-            "dwell_time_s": 30.0,
+            "dwell_time_s": STANDARD_ACQUISITION_LIVE_TIME_S,
             "sources": [],
         },
         calibration=calibration,

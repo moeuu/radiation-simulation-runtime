@@ -1,5 +1,5 @@
 {
-  "acceptance_contract_sha256": "0d55c31536052b27dc79e189239df10c52fcee033dbaf572dfc24192ea35d650",
+  "acceptance_contract_sha256": "7077c0fc82d4a8f35dc839c45a7d69f2bc62f1fe31fc10d6173989120e1229c1",
   "additive_noncollided_transport_response": {
     "angular_quadrature_order": 16,
     "contract_hash_sha256": "e601ac34cf073c6633d3daef381ef3446b59d0c19cada27a6ed1bfcb210f639c",
@@ -33,7 +33,7 @@
   "background_rate_cps": 12.0,
   "background_semantics": "independent_pre_dead_time_pulse_rate_added_once",
   "bin_width_keV": 2.0,
-  "contract_hash_sha256": "24ce7cc05ac2e80b3bba8d81062b9e247c6638607eb8c317933f25e1e9dfac67",
+  "contract_hash_sha256": "ca66d531916cbf5ff96f034c891fbb4e1c6ca36d482779eac94c829b61316832",
   "dead_time_application_count": 1,
   "dead_time_model": "nonparalyzable_mean_then_component_gamma_poisson_total",
   "dead_time_tau_s": 5.813e-09,

@@ -10,6 +10,7 @@ from collections.abc import Mapping, Sequence
 
 import numpy as np
 
+from runtime.experiment_profiles import STANDARD_ACQUISITION_LIVE_TIME_S
 from spectrum.full_spectrum_acceptance import (
     write_independent_validation_manifest,
 )
@@ -37,6 +38,7 @@ from spectrum.geant4_acceptance_backend import (
 from spectrum.transport_spectral import (
     DESIGNATED_HOLDOUT_SCENE_SEEDS,
     DESIGNATED_TRAINING_SCENE_SEEDS,
+    FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256,
     GeometryConditionedSpectralModel,
 )
 
@@ -49,8 +51,13 @@ _DEFAULT_CONFIG = (
     / "variance_reduction_external_no_isaac_32threads.json"
 )
 _DEFAULT_OUTPUT = (
-    _REPOSITORY_ROOT / "results" / "full_spectrum_all64_acceptance"
+    _REPOSITORY_ROOT
+    / "results"
+    / "full_spectrum_all64_acceptance"
+    / FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256
 )
+
+
 def _common_parser(parser: argparse.ArgumentParser) -> None:
     """Add the shared native acquisition arguments to one subparser."""
     parser.add_argument(
@@ -93,7 +100,8 @@ def _parser() -> argparse.ArgumentParser:
     smoke = subparsers.add_parser(
         "smoke",
         help=(
-            "Acquire one real 30 s background pair plus the native signed-"
+            f"Acquire one real {STANDARD_ACQUISITION_LIVE_TIME_S:g} s "
+            "background pair plus the native signed-"
             "epsilon gate; the checkpoint is reusable by the training phase."
         ),
     )

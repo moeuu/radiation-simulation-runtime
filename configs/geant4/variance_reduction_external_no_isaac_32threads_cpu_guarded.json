@@ -28,7 +28,7 @@
   "energy_min_keV": 0.0,
   "engine_mode": "external",
   "executable_path": "build/geant4_sidecar",
-  "full_spectrum_model_registry_file_sha256": "6a511c48f37e1a54e43880eb86868bf77cf93b64424b1194d66531a91d7b3cb2",
+  "full_spectrum_model_registry_file_sha256": "9c8d55ad07902f52eaae97141af0fa6fa2d3d05ce785f05dfb64b6225d17b93b",
   "full_spectrum_model_registry_path": "configs/geant4/models/isotope_profile_model_registry.json",
   "headless": true,
   "host": "127.0.0.1",

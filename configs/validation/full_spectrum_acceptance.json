@@ -1,15 +1,45 @@
 {
-  "schema_version": 1,
-  "contract_id": "geometry_conditioned_full_spectrum_acceptance_v1",
+  "schema_version": 2,
+  "contract_id": "geometry_conditioned_full_spectrum_acceptance_v2",
+  "experiment_profile_id": "multi_isotope_surface_search_v1",
+  "dwell_time_s": 20.0,
   "training_scene_seeds": [
     2026072701,
     2026072702,
     2026072703
   ],
   "holdout_scene_seeds": [
-    2026072791,
-    2026072792
+    3721907945,
+    9459185298
   ],
+  "holdout_seed_set": {
+    "seed_set_id": "independent_holdout_20260826_v1",
+    "generation_method": "os_csprng_uniform_10_digit",
+    "generated_utc_date": "2026-08-26",
+    "predeclared_before_acquisition": true
+  },
+  "environment": {
+    "room_size_xyz_m": [
+      10.0,
+      20.0,
+      10.0
+    ],
+    "detector_pose_xyz_m": [
+      1.0,
+      1.0,
+      0.5
+    ],
+    "target_blocked_fraction": 0.4,
+    "passage_width_m": 1.0,
+    "surface_chart_max_edge_m": 1.0,
+    "obstacle_material": "concrete",
+    "room_boundary_thickness_m": 0.1
+  },
+  "geometry_compute": {
+    "use_gpu": false,
+    "device": "cpu",
+    "dtype": "float64"
+  },
   "shield_pair_ids": [
     0,
     1,

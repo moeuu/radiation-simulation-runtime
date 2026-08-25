@@ -24,8 +24,21 @@ from spectrum.response_matrix import (
     NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256,
     build_native_geant4_detector_response_matrix,
 )
+from runtime.experiment_profiles import (
+    STANDARD_ACQUISITION_LIVE_TIME_S,
+    STANDARD_EXPERIMENT_PROFILE,
+)
 from spectrum.transport_spectral import (
+    ACCEPTANCE_DETECTOR_POSE_XYZ,
+    ACCEPTANCE_GEOMETRY_DEVICE,
+    ACCEPTANCE_GEOMETRY_DTYPE,
+    ACCEPTANCE_GEOMETRY_USE_GPU,
+    ACCEPTANCE_OBSTACLE_BLOCKED_FRACTION,
+    ACCEPTANCE_PASSAGE_WIDTH_M,
+    ACCEPTANCE_ROOM_SIZE_XYZ,
+    ACCEPTANCE_SURFACE_CHART_MAX_EDGE_M,
     continuous_rate_scale_quadrature_for_half_width,
+    DESIGNATED_HOLDOUT_SCENE_SEEDS,
     DESIGNATED_TRAINING_SCENE_SEEDS,
     FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256,
     GeometryConditionedSpectralModel,
@@ -2118,8 +2131,8 @@ def test_exact_physical_statistics_need_only_trained_additive_mean() -> None:
     assert reconstructed.runtime_ready is True
 
 
-def test_legacy_component_candidate_without_physics_contract_is_rejected() -> None:
-    """A learned asset cannot be laundered without source-artifact contracts."""
+def test_retired_component_candidate_is_rejected_before_runtime() -> None:
+    """A stale learned asset cannot cross the current training boundary."""
     path = (
         Path(__file__).resolve().parents[1]
         / "configs"
@@ -2127,7 +2140,7 @@ def test_legacy_component_candidate_without_physics_contract_is_rejected() -> No
         / "models"
         / "geometry_conditioned_full_spectrum_ral_eu154_component.json"
     )
-    with pytest.raises(ValueError, match="does not exactly reconstruct"):
+    with pytest.raises(ValueError, match="training provenance"):
         GeometryConditionedSpectralModel.from_manifest_payload(
             json.loads(path.read_text(encoding="utf-8"))
         )
@@ -2144,6 +2157,40 @@ def test_acceptance_contract_file_is_predeclared_and_hash_stable() -> None:
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload == full_spectrum_acceptance_contract_payload()
     assert len(FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256) == 64
+
+
+def test_acceptance_contract_owns_fresh_environment_and_compute_inputs() -> None:
+    """Acceptance must share dwell and explicitly freeze every backend input."""
+    payload = full_spectrum_acceptance_contract_payload()
+
+    assert payload["schema_version"] == 2
+    assert payload["dwell_time_s"] == STANDARD_ACQUISITION_LIVE_TIME_S
+    assert payload["dwell_time_s"] == (
+        STANDARD_EXPERIMENT_PROFILE.acquisition.live_time_s
+    )
+    assert DESIGNATED_HOLDOUT_SCENE_SEEDS == (3721907945, 9459185298)
+    assert set(DESIGNATED_HOLDOUT_SCENE_SEEDS).isdisjoint(
+        DESIGNATED_TRAINING_SCENE_SEEDS
+    )
+    assert set(DESIGNATED_HOLDOUT_SCENE_SEEDS).isdisjoint(
+        {2026072791, 2026072792}
+    )
+    assert payload["environment"] == {
+        "room_size_xyz_m": list(ACCEPTANCE_ROOM_SIZE_XYZ),
+        "detector_pose_xyz_m": list(ACCEPTANCE_DETECTOR_POSE_XYZ),
+        "target_blocked_fraction": ACCEPTANCE_OBSTACLE_BLOCKED_FRACTION,
+        "passage_width_m": ACCEPTANCE_PASSAGE_WIDTH_M,
+        "surface_chart_max_edge_m": ACCEPTANCE_SURFACE_CHART_MAX_EDGE_M,
+        "obstacle_material": STANDARD_EXPERIMENT_PROFILE.obstacle_material,
+        "room_boundary_thickness_m": (
+            STANDARD_EXPERIMENT_PROFILE.room_boundary_thickness_m
+        ),
+    }
+    assert payload["geometry_compute"] == {
+        "use_gpu": ACCEPTANCE_GEOMETRY_USE_GPU,
+        "device": ACCEPTANCE_GEOMETRY_DEVICE,
+        "dtype": ACCEPTANCE_GEOMETRY_DTYPE,
+    }
 
 
 def test_validation_manifest_and_line_identity_are_immutable_snapshots() -> None:

@@ -38,6 +38,11 @@ from measurement.source_boundary import (
     surface_source_runtime_contract_sha256,
 )
 from measurement.shielding import SHIELD_POSE_CONTRACT_SHA256
+from runtime.experiment_profiles import (
+    STANDARD_ACQUISITION_LIVE_TIME_S,
+    STANDARD_OBSTACLE_MATERIAL,
+    STANDARD_ROOM_BOUNDARY_THICKNESS_M,
+)
 from sim.geant4_app.app import (
     Geant4AppConfig,
     Geant4Application,
@@ -54,14 +59,11 @@ from spectrum.additive_scatter import (
     scatter_basis_from_stored_geometry_numpy,
 )
 from spectrum.full_spectrum_acceptance_runner import (
-    ACCEPTANCE_DWELL_TIME_S,
     ACCEPTANCE_ISOTOPES,
     ACCEPTANCE_PAIR_IDS,
     acceptance_transport_seed,
 )
 from spectrum.geant4_acceptance_backend import (
-    ACCEPTANCE_DETECTOR_POSE_XYZ,
-    ACCEPTANCE_ROOM_SIZE_XYZ,
     _FULL_SPECTRUM_RUNTIME_KEYS,
     _build_environment,
     _command_for_pair,
@@ -85,6 +87,11 @@ from spectrum.physics_contracts import (
     TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256,
 )
 from spectrum.transport_spectral import (
+    ACCEPTANCE_DETECTOR_POSE_XYZ,
+    ACCEPTANCE_GEOMETRY_DEVICE,
+    ACCEPTANCE_GEOMETRY_DTYPE,
+    ACCEPTANCE_GEOMETRY_USE_GPU,
+    ACCEPTANCE_ROOM_SIZE_XYZ,
     DESIGNATED_TRAINING_SCENE_SEEDS,
     FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256,
     VALIDATION_SCENARIO_IDS,
@@ -367,7 +374,9 @@ def build_mean_calibration_app_payload(
         for key, value in dict(runtime_config).items()
         if key not in _FULL_SPECTRUM_RUNTIME_KEYS
     }
-    executable_raw = payload.get("executable_path", "build/geant4_sidecar")
+    if "executable_path" not in payload:
+        raise ValueError("Mean calibration requires explicit executable_path.")
+    executable_raw = payload["executable_path"]
     if not isinstance(executable_raw, str) or not executable_raw:
         raise ValueError("executable_path must be a nonempty string.")
     executable = Path(executable_raw)
@@ -728,14 +737,10 @@ class ExternalGeant4MeanCalibrationBackend:
         kernel = continuous_kernel_from_observation_model(
             observation,
             obstacle_grid=grid,
-            use_gpu=bool(observation_payload.get("use_gpu", False)),
+            use_gpu=ACCEPTANCE_GEOMETRY_USE_GPU,
         )
-        kernel.gpu_device = str(
-            observation_payload.get("gpu_device", "cuda")
-        )
-        kernel.gpu_dtype = str(
-            observation_payload.get("gpu_dtype", "float64")
-        )
+        kernel.gpu_device = ACCEPTANCE_GEOMETRY_DEVICE
+        kernel.gpu_dtype = ACCEPTANCE_GEOMETRY_DTYPE
         return kernel
 
     def acquire_scenario(
@@ -769,8 +774,8 @@ class ExternalGeant4MeanCalibrationBackend:
             author_room_boundaries=bool(
                 self.app_config.author_room_boundary_prims
             ),
-            room_boundary_thickness_m=float(
-                self.runtime_config.get("room_boundary_thickness_m", 0.1)
+            room_boundary_thickness_m=(
+                STANDARD_ROOM_BOUNDARY_THICKNESS_M
             ),
         )
         family_parameters = randomized_training_geometry_parameters(
@@ -832,12 +837,7 @@ class ExternalGeant4MeanCalibrationBackend:
                     author_room_boundaries=bool(
                         self.app_config.author_room_boundary_prims
                     ),
-                    obstacle_material=str(
-                        self.runtime_config.get(
-                            "obstacle_material",
-                            "concrete",
-                        )
-                    ),
+                    obstacle_material=STANDARD_OBSTACLE_MATERIAL,
                 )
             )
         )
@@ -860,7 +860,7 @@ class ExternalGeant4MeanCalibrationBackend:
                     app,
                     command,
                     seed=transport_seed,
-                    dwell_time_s=ACCEPTANCE_DWELL_TIME_S,
+                    dwell_time_s=STANDARD_ACQUISITION_LIVE_TIME_S,
                 )
                 spectrum, raw_metadata = app.engine.simulate(request)
                 metadata = dict(raw_metadata)
@@ -975,7 +975,7 @@ class ExternalGeant4MeanCalibrationBackend:
             "scenario_id": str(scenario_id),
             "shield_pair_id": int(shield_pair_id),
             "transport_seed": int(transport_seed),
-            "dwell_time_s": ACCEPTANCE_DWELL_TIME_S,
+            "dwell_time_s": STANDARD_ACQUISITION_LIVE_TIME_S,
             "scene_hash": str(scene_hash),
             "surface_source_contract_sha256": str(source_hash),
             "sources": [dict(value) for value in source_payloads],
@@ -1036,7 +1036,7 @@ class ExternalGeant4MeanCalibrationBackend:
                 "scenario_id": str(scenario_id),
                 "shield_pair_id": int(shield_pair_id),
                 "transport_seed": None,
-                "dwell_time_s": ACCEPTANCE_DWELL_TIME_S,
+                "dwell_time_s": STANDARD_ACQUISITION_LIVE_TIME_S,
                 "scene_hash": None,
                 "surface_source_contract_sha256": None,
                 "sources": [],
