@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from numbers import Real
 
 import numpy as np
@@ -17,7 +17,6 @@ from runtime.records import (
     validate_truth_free_estimator_input,
 )
 from runtime.shield_timing import (
-    DEFAULT_SHIELD_ANGULAR_SPEED_RAD_S,
     shield_program_actuation_time_s,
 )
 
@@ -72,22 +71,37 @@ def _finite_nonnegative_number(value: object, *, name: str) -> float:
 class AdaptiveCandidateSnapshot:
     """Expose reachable truth-free poses and runtime-owned motion costs."""
 
+    current_pose_xyz: tuple[float, float, float]
     candidate_poses_xyz: tuple[tuple[float, float, float], ...]
     travel_costs: tuple[float, ...]
     allowed_pair_ids: tuple[int, ...]
     current_pair_id: int
-    shield_angular_speed_rad_s: float = DEFAULT_SHIELD_ANGULAR_SPEED_RAD_S
-    horizontal_travel_times_s: tuple[float, ...] | None = None
-    mast_vertical_times_s: tuple[float, ...] | None = None
-    settling_times_s: tuple[float, ...] | None = None
-    _motion_time_components_explicit: bool = field(
-        init=False,
-        repr=False,
-        compare=False,
-    )
+    shield_angular_speed_rad_s: float
+    horizontal_travel_times_s: tuple[float, ...]
+    mast_vertical_times_s: tuple[float, ...]
+    settling_times_s: tuple[float, ...]
 
     def __post_init__(self) -> None:
         """Validate and normalize every candidate snapshot field."""
+        raw_current_pose = self.current_pose_xyz
+        if (
+            not isinstance(raw_current_pose, (list, tuple))
+            or len(raw_current_pose) != 3
+        ):
+            raise ValueError("Runtime current pose must contain exactly three values.")
+        current_pose: list[float] = []
+        for value in raw_current_pose:
+            if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
+                raise TypeError("Runtime current pose must contain numbers.")
+            parsed = float(value)
+            if not np.isfinite(parsed):
+                raise ValueError("Runtime current pose must be finite.")
+            current_pose.append(parsed)
+        normalized_current_pose = (
+            current_pose[0],
+            current_pose[1],
+            current_pose[2],
+        )
         raw_poses = self.candidate_poses_xyz
         if not isinstance(raw_poses, (list, tuple)) or not raw_poses:
             raise ValueError(
@@ -109,6 +123,8 @@ class AdaptiveCandidateSnapshot:
                     raise ValueError("Runtime candidate poses must be finite.")
                 pose.append(parsed)
             poses.append((pose[0], pose[1], pose[2]))
+        if len(set(poses)) != len(poses):
+            raise ValueError("Runtime candidate poses must be unique.")
         raw_costs = self.travel_costs
         if not isinstance(raw_costs, (list, tuple)) or len(raw_costs) != len(poses):
             raise ValueError("Runtime travel costs must align with candidate poses.")
@@ -121,58 +137,73 @@ class AdaptiveCandidateSnapshot:
             self.mast_vertical_times_s,
             self.settling_times_s,
         )
-        components_explicit = not all(
-            component is None for component in raw_components
+        component_names = (
+            "horizontal_travel_times_s",
+            "mast_vertical_times_s",
+            "settling_times_s",
         )
-        if all(component is None for component in raw_components):
-            horizontal_times = costs
-            mast_times = tuple(0.0 for _ in poses)
-            settling_times = tuple(0.0 for _ in poses)
-        elif any(component is None for component in raw_components):
-            raise ValueError(
-                "Runtime motion-time components must be supplied together."
-            )
-        else:
-            component_names = (
-                "horizontal_travel_times_s",
-                "mast_vertical_times_s",
-                "settling_times_s",
-            )
-            normalized_components: list[tuple[float, ...]] = []
-            for component_name, raw_component in zip(
-                component_names,
-                raw_components,
-                strict=True,
-            ):
-                if (
-                    not isinstance(raw_component, (list, tuple))
-                    or len(raw_component) != len(poses)
-                ):
-                    raise ValueError(
-                        f"Runtime {component_name} must align with candidate poses."
-                    )
-                normalized_components.append(
-                    tuple(
-                        _finite_nonnegative_number(
-                            value,
-                            name=f"{component_name} item",
-                        )
-                        for value in raw_component
-                    )
-                )
-            horizontal_times, mast_times, settling_times = normalized_components
-            component_totals = np.asarray(horizontal_times, dtype=np.float64)
-            component_totals += np.asarray(mast_times, dtype=np.float64)
-            component_totals += np.asarray(settling_times, dtype=np.float64)
-            if not np.allclose(
-                component_totals,
-                np.asarray(costs, dtype=np.float64),
-                rtol=1.0e-12,
-                atol=1.0e-12,
+        normalized_components: list[tuple[float, ...]] = []
+        for component_name, raw_component in zip(
+            component_names,
+            raw_components,
+            strict=True,
+        ):
+            if (
+                not isinstance(raw_component, (list, tuple))
+                or len(raw_component) != len(poses)
             ):
                 raise ValueError(
-                    "Runtime motion-time components must sum to travel_costs."
+                    f"Runtime {component_name} must align with candidate poses."
                 )
+            normalized_components.append(
+                tuple(
+                    _finite_nonnegative_number(
+                        value,
+                        name=f"{component_name} item",
+                    )
+                    for value in raw_component
+                )
+            )
+        horizontal_times, mast_times, settling_times = normalized_components
+        component_totals = np.asarray(horizontal_times, dtype=np.float64)
+        component_totals += np.asarray(mast_times, dtype=np.float64)
+        component_totals += np.asarray(settling_times, dtype=np.float64)
+        if not np.array_equal(
+            component_totals,
+            np.asarray(costs, dtype=np.float64),
+        ):
+            raise ValueError(
+                "Runtime motion-time components must sum to travel_costs."
+            )
+        current_rows = [
+            index
+            for index, pose in enumerate(poses)
+            if pose == normalized_current_pose
+        ]
+        if len(current_rows) != 1:
+            raise ValueError(
+                "Runtime candidates must contain current_pose_xyz exactly once."
+            )
+        current_index = current_rows[0]
+        if any(
+            value != 0.0
+            for value in (
+                costs[current_index],
+                horizontal_times[current_index],
+                mast_times[current_index],
+                settling_times[current_index],
+            )
+        ):
+            raise ValueError(
+                "Runtime current_pose_xyz candidate must be the exact zero-motion row."
+            )
+        if any(
+            index != current_index and costs[index] == 0.0
+            for index in range(len(costs))
+        ):
+            raise ValueError(
+                "Runtime candidates must contain only one zero-motion row."
+            )
         raw_pair_ids = self.allowed_pair_ids
         if not isinstance(raw_pair_ids, (list, tuple)) or len(raw_pair_ids) != 64:
             raise ValueError("Adaptive runtime must expose every Fe/Pb pair 0..63.")
@@ -201,6 +232,7 @@ class AdaptiveCandidateSnapshot:
             raise ValueError(
                 "shield_angular_speed_rad_s must be finite and positive."
             )
+        object.__setattr__(self, "current_pose_xyz", normalized_current_pose)
         object.__setattr__(self, "candidate_poses_xyz", tuple(poses))
         object.__setattr__(self, "travel_costs", costs)
         object.__setattr__(
@@ -214,11 +246,6 @@ class AdaptiveCandidateSnapshot:
             tuple(mast_times),
         )
         object.__setattr__(self, "settling_times_s", tuple(settling_times))
-        object.__setattr__(
-            self,
-            "_motion_time_components_explicit",
-            components_explicit,
-        )
         object.__setattr__(self, "allowed_pair_ids", pair_ids)
         object.__setattr__(self, "current_pair_id", current_pair_id)
         object.__setattr__(
@@ -235,37 +262,21 @@ class AdaptiveCandidateSnapshot:
             shield_angular_speed_rad_s=self.shield_angular_speed_rad_s,
         )
 
-    @property
-    def has_motion_time_components(self) -> bool:
-        """Return whether the wire snapshot supplied explicit motion components."""
-        return bool(self._motion_time_components_explicit)
-
     def to_payload(self) -> dict[str, object]:
-        """Serialize this snapshot to its existing wire representation."""
-        payload: dict[str, object] = {
+        """Serialize this snapshot to the current strict wire schema."""
+        return {
+            "current_pose_xyz": list(self.current_pose_xyz),
             "candidate_poses_xyz": [list(pose) for pose in self.candidate_poses_xyz],
             "travel_costs": list(self.travel_costs),
             "allowed_pair_ids": list(self.allowed_pair_ids),
             "current_pair_id": self.current_pair_id,
             "shield_angular_speed_rad_s": self.shield_angular_speed_rad_s,
+            "horizontal_travel_times_s": list(
+                self.horizontal_travel_times_s
+            ),
+            "mast_vertical_times_s": list(self.mast_vertical_times_s),
+            "settling_times_s": list(self.settling_times_s),
         }
-        if self.has_motion_time_components:
-            payload.update(
-                {
-                    "horizontal_travel_times_s": list(
-                        self.horizontal_travel_times_s or ()
-                    ),
-                    "mast_vertical_times_s": list(
-                        self.mast_vertical_times_s or ()
-                    ),
-                    "settling_times_s": list(self.settling_times_s or ()),
-                }
-            )
-        return payload
-
-    def to_dict(self) -> dict[str, object]:
-        """Return the legacy dictionary representation of this snapshot."""
-        return self.to_payload()
 
     @classmethod
     def from_payload(
@@ -276,39 +287,32 @@ class AdaptiveCandidateSnapshot:
         if not isinstance(payload, Mapping):
             raise TypeError("Adaptive candidates must be an object.")
         validate_truth_free_estimator_input(payload, path="adaptive.candidates")
-        legacy_fields = {
+        component_fields = {
+            "current_pose_xyz",
             "candidate_poses_xyz",
             "travel_costs",
             "allowed_pair_ids",
             "current_pair_id",
-        }
-        current_fields = legacy_fields | {"shield_angular_speed_rad_s"}
-        component_fields = current_fields | {
+            "shield_angular_speed_rad_s",
             "horizontal_travel_times_s",
             "mast_vertical_times_s",
             "settling_times_s",
         }
-        actual_fields = set(payload)
-        if actual_fields not in (legacy_fields, current_fields, component_fields):
-            raise ValueError(
-                "adaptive candidates fields disagree with the adaptive protocol: "
-                f"missing={sorted(component_fields - actual_fields)}, "
-                f"unknown={sorted(actual_fields - component_fields)}."
-            )
+        _strict_fields(
+            payload,
+            component_fields,
+            name="adaptive candidates",
+        )
         return cls(
+            current_pose_xyz=payload["current_pose_xyz"],
             candidate_poses_xyz=payload["candidate_poses_xyz"],
             travel_costs=payload["travel_costs"],
             allowed_pair_ids=payload["allowed_pair_ids"],
             current_pair_id=payload["current_pair_id"],
-            shield_angular_speed_rad_s=payload.get(
-                "shield_angular_speed_rad_s",
-                DEFAULT_SHIELD_ANGULAR_SPEED_RAD_S,
-            ),
-            horizontal_travel_times_s=payload.get(
-                "horizontal_travel_times_s"
-            ),
-            mast_vertical_times_s=payload.get("mast_vertical_times_s"),
-            settling_times_s=payload.get("settling_times_s"),
+            shield_angular_speed_rad_s=payload["shield_angular_speed_rad_s"],
+            horizontal_travel_times_s=payload["horizontal_travel_times_s"],
+            mast_vertical_times_s=payload["mast_vertical_times_s"],
+            settling_times_s=payload["settling_times_s"],
         )
 
 
@@ -370,89 +374,10 @@ class AdaptiveBootstrap:
 
 
 @dataclass(frozen=True, slots=True)
-class AdaptiveResumePrefix:
-    """Store the verified completed-station prefix returned during resume."""
-
-    records: tuple[MeasurementLogRecord, ...]
-    next_station_id: int
-
-    def __post_init__(self) -> None:
-        """Validate and normalize one completed causal resume prefix."""
-        if not isinstance(self.records, (list, tuple)) or not self.records:
-            raise TypeError("Adaptive resume records must be a nonempty sequence.")
-        records = tuple(self.records)
-        if any(not isinstance(record, MeasurementLogRecord) for record in records):
-            raise TypeError(
-                "Adaptive resume records must contain MeasurementLogRecord values."
-            )
-        station_ids = [int(record.station_id) for record in records]
-        if [int(record.step_id) for record in records] != list(range(len(records))):
-            raise ValueError("Adaptive resume step_id must equal causal record order.")
-        if [int(record.action_id) for record in records] != list(range(len(records))):
-            raise ValueError("Adaptive resume action_id must equal causal record order.")
-        if sorted(set(station_ids)) != list(range(station_ids[-1] + 1)):
-            raise ValueError(
-                "Adaptive resume stations must be contiguous and zero based."
-            )
-        for index, record in enumerate(records):
-            station_end = index + 1 == len(records) or (
-                station_ids[index + 1] != station_ids[index]
-            )
-            if (record.metadata.get("station_complete") is True) is not station_end:
-                raise ValueError(
-                    "Adaptive resume records must end every station exactly once."
-                )
-        next_station_id = _exact_nonnegative_integer(
-            self.next_station_id,
-            name="Adaptive resume next_station_id",
-        )
-        if next_station_id != station_ids[-1] + 1:
-            raise ValueError(
-                "Adaptive resume next_station_id disagrees with the durable prefix."
-            )
-        object.__setattr__(self, "records", records)
-        object.__setattr__(self, "next_station_id", next_station_id)
-
-    def to_payload(self) -> dict[str, object]:
-        """Serialize this durable prefix to the existing resume wire schema."""
-        return {
-            "record_count": len(self.records),
-            "records": [
-                measurement_record_to_payload(record) for record in self.records
-            ],
-            "next_station_id": self.next_station_id,
-        }
-
-    @classmethod
-    def from_payload(cls, payload: Mapping[str, object]) -> "AdaptiveResumePrefix":
-        """Parse and validate one truth-free adaptive resume prefix."""
-        if not isinstance(payload, Mapping):
-            raise TypeError("Adaptive resume prefix must be an object.")
-        validate_truth_free_estimator_input(payload, path="adaptive.resume")
-        _strict_fields(
-            payload,
-            {"record_count", "records", "next_station_id"},
-            name="adaptive resume prefix",
-        )
-        raw_count = _exact_nonnegative_integer(
-            payload["record_count"],
-            name="Adaptive resume record_count",
-        )
-        raw_records = payload["records"]
-        if not isinstance(raw_records, list) or not raw_records:
-            raise TypeError("Adaptive resume records must be a nonempty list.")
-        records = tuple(
-            measurement_record_from_payload(record) for record in raw_records
-        )
-        if raw_count != len(records):
-            raise ValueError("Adaptive resume record_count disagrees with records.")
-        return cls(records=records, next_station_id=payload["next_station_id"])
-
-
-@dataclass(frozen=True, slots=True)
 class AdaptiveStepRequest:
     """Represent one typed adaptive observation request."""
 
+    action_id: int
     candidate_index: int
     fe_orientation_index: int
     pb_orientation_index: int
@@ -462,6 +387,10 @@ class AdaptiveStepRequest:
 
     def __post_init__(self) -> None:
         """Validate and normalize every typed step request field."""
+        action_id = _exact_nonnegative_integer(
+            self.action_id,
+            name="action_id",
+        )
         candidate_index = _exact_nonnegative_integer(
             self.candidate_index,
             name="candidate_index",
@@ -485,6 +414,7 @@ class AdaptiveStepRequest:
         station_id = _exact_nonnegative_integer(self.station_id, name="station_id")
         if not isinstance(self.station_complete, bool):
             raise TypeError("station_complete must be a boolean.")
+        object.__setattr__(self, "action_id", action_id)
         object.__setattr__(self, "candidate_index", candidate_index)
         object.__setattr__(self, "fe_orientation_index", fe_index)
         object.__setattr__(self, "pb_orientation_index", pb_index)
@@ -492,9 +422,10 @@ class AdaptiveStepRequest:
         object.__setattr__(self, "station_id", station_id)
 
     def to_payload(self) -> dict[str, object]:
-        """Serialize this request without changing the schema-v1 wire fields."""
+        """Serialize this request to the current strict wire fields."""
         return {
             "type": "step",
+            "action_id": self.action_id,
             "candidate_index": self.candidate_index,
             "fe_orientation_index": self.fe_orientation_index,
             "pb_orientation_index": self.pb_orientation_index,
@@ -505,13 +436,14 @@ class AdaptiveStepRequest:
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, object]) -> "AdaptiveStepRequest":
-        """Parse one exact schema-v1 adaptive observation request."""
+        """Parse one exact current adaptive observation request."""
         if not isinstance(payload, Mapping):
             raise TypeError("Adaptive step request must be an object.")
         _strict_fields(
             payload,
             {
                 "type",
+                "action_id",
                 "candidate_index",
                 "fe_orientation_index",
                 "pb_orientation_index",
@@ -524,6 +456,7 @@ class AdaptiveStepRequest:
         if payload["type"] != "step":
             raise ValueError("Adaptive step request type must be 'step'.")
         return cls(
+            action_id=payload["action_id"],
             candidate_index=payload["candidate_index"],
             fe_orientation_index=payload["fe_orientation_index"],
             pb_orientation_index=payload["pb_orientation_index"],
@@ -586,91 +519,81 @@ class AdaptiveRefineRequest:
 
 @dataclass(frozen=True, slots=True)
 class AdaptiveReadyEvent:
-    """Represent a fresh or resumed adaptive-session handshake."""
+    """Represent the sole fresh adaptive-session handshake."""
 
     schema_version: int
     context: RunContext
     candidates: AdaptiveCandidateSnapshot
-    bootstrap: AdaptiveBootstrap | None = None
-    resume: AdaptiveResumePrefix | None = None
+    bootstrap: AdaptiveBootstrap
 
     def __post_init__(self) -> None:
-        """Require one internally consistent fresh or resumed handshake."""
+        """Require one internally consistent fresh-run handshake."""
         schema_version = _exact_nonnegative_integer(
             self.schema_version,
             name="schema_version",
         )
+        if schema_version != 1:
+            raise ValueError("Adaptive ready events support fresh schema version 1 only.")
         if not isinstance(self.context, RunContext):
             raise TypeError("context must be a RunContext.")
         if not isinstance(self.candidates, AdaptiveCandidateSnapshot):
             raise TypeError("candidates must be an AdaptiveCandidateSnapshot.")
-        if schema_version == 1:
-            if not isinstance(self.bootstrap, AdaptiveBootstrap) or self.resume is not None:
-                raise ValueError(
-                    "Schema-v1 ready events require only a bootstrap selection."
-                )
-        elif schema_version == 2:
-            if not isinstance(self.resume, AdaptiveResumePrefix) or self.bootstrap is not None:
-                raise ValueError(
-                    "Schema-v2 ready events require only a resume prefix."
-                )
-        else:
-            raise ValueError("Adaptive ready event schema is incompatible.")
+        if not isinstance(self.bootstrap, AdaptiveBootstrap):
+            raise TypeError("bootstrap must be an AdaptiveBootstrap.")
+        if self.bootstrap.candidate_index >= len(
+            self.candidates.candidate_poses_xyz
+        ):
+            raise ValueError(
+                "Adaptive bootstrap candidate_index lies outside candidates."
+            )
+        bootstrap_pair_id = (
+            self.bootstrap.fe_orientation_index * 8
+            + self.bootstrap.pb_orientation_index
+        )
+        if (
+            self.candidates.current_pair_id != bootstrap_pair_id
+            or self.candidates.candidate_poses_xyz[
+                self.bootstrap.candidate_index
+            ]
+            != self.candidates.current_pose_xyz
+        ):
+            raise ValueError(
+                "Adaptive bootstrap must identify the candidate snapshot's "
+                "current pose and shield pair."
+            )
         object.__setattr__(self, "schema_version", schema_version)
 
     def to_payload(self) -> dict[str, object]:
-        """Serialize this handshake without changing its versioned wire schema."""
-        payload: dict[str, object] = {
+        """Serialize the sole fresh-run handshake schema."""
+        return {
             "type": "ready",
             "schema_version": self.schema_version,
             "context": self.context.to_payload(),
             "candidates": self.candidates.to_payload(),
+            "bootstrap": self.bootstrap.to_payload(),
         }
-        if self.schema_version == 1 and self.bootstrap is not None:
-            payload["bootstrap"] = self.bootstrap.to_payload()
-        elif self.schema_version == 2 and self.resume is not None:
-            payload["resume"] = self.resume.to_payload()
-        else:
-            raise AssertionError("Validated ready event state became inconsistent.")
-        return payload
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, object]) -> "AdaptiveReadyEvent":
-        """Parse one exact versioned adaptive-session handshake."""
+        """Parse the sole fresh-run adaptive-session handshake."""
         if not isinstance(payload, Mapping):
             raise TypeError("Adaptive ready event must be an object.")
+        _strict_fields(
+            payload,
+            {"type", "schema_version", "context", "candidates", "bootstrap"},
+            name="adaptive ready event",
+        )
         if payload.get("type") != "ready":
             raise ValueError("Adaptive ready event type must be 'ready'.")
-        schema_version = payload.get("schema_version")
-        if schema_version == 1:
-            _strict_fields(
-                payload,
-                {"type", "schema_version", "context", "candidates", "bootstrap"},
-                name="adaptive ready event",
-            )
-            return cls(
-                schema_version=1,
-                context=RunContext.from_payload(payload["context"]),
-                candidates=AdaptiveCandidateSnapshot.from_payload(
-                    payload["candidates"]
-                ),
-                bootstrap=AdaptiveBootstrap.from_payload(payload["bootstrap"]),
-            )
-        if schema_version == 2:
-            _strict_fields(
-                payload,
-                {"type", "schema_version", "context", "candidates", "resume"},
-                name="adaptive ready event",
-            )
-            return cls(
-                schema_version=2,
-                context=RunContext.from_payload(payload["context"]),
-                candidates=AdaptiveCandidateSnapshot.from_payload(
-                    payload["candidates"]
-                ),
-                resume=AdaptiveResumePrefix.from_payload(payload["resume"]),
-            )
-        raise ValueError("Adaptive ready event schema is incompatible.")
+        schema_version = payload["schema_version"]
+        if type(schema_version) is not int or schema_version != 1:
+            raise ValueError("Adaptive ready events support fresh schema version 1 only.")
+        return cls(
+            schema_version=schema_version,
+            context=RunContext.from_payload(payload["context"]),
+            candidates=AdaptiveCandidateSnapshot.from_payload(payload["candidates"]),
+            bootstrap=AdaptiveBootstrap.from_payload(payload["bootstrap"]),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -686,6 +609,19 @@ class AdaptiveRecordEvent:
             raise TypeError("record must be a MeasurementLogRecord.")
         if not isinstance(self.candidates, AdaptiveCandidateSnapshot):
             raise TypeError("candidates must be an AdaptiveCandidateSnapshot.")
+        record_pair_id = (
+            int(self.record.fe_orientation_index) * 8
+            + int(self.record.pb_orientation_index)
+        )
+        if (
+            self.candidates.current_pair_id != record_pair_id
+            or self.candidates.current_pose_xyz
+            != tuple(self.record.detector_pose_xyz)
+        ):
+            raise ValueError(
+                "Adaptive record candidates disagree with the durable current "
+                "pose or shield pair."
+            )
 
     def to_payload(self) -> dict[str, object]:
         """Serialize this record event to the existing wire schema."""
@@ -850,7 +786,6 @@ __all__ = [
     "AdaptiveReadyEvent",
     "AdaptiveRecordEvent",
     "AdaptiveRefineRequest",
-    "AdaptiveResumePrefix",
     "AdaptiveSessionEvent",
     "AdaptiveStepRequest",
     "parse_adaptive_event",

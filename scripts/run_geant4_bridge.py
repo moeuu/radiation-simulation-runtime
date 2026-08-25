@@ -15,7 +15,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from sim.geant4_app.bridge_server import Geant4BridgeServerConfig, serve_forever
-from sim.runtime import load_runtime_config
+from runtime.session import require_production_runtime_preflight
+from sim.runtime import (
+    load_production_runtime_config,
+    production_runtime_config_sha256,
+)
 
 
 def main() -> None:
@@ -24,34 +28,27 @@ def main() -> None:
     parser.add_argument(
         "--config",
         type=str,
-        default=(
-            ROOT
-            / "configs"
-            / "geant4"
-            / "variance_reduction_external_no_isaac_32threads.json"
-        ).as_posix(),
+        required=True,
         help="Path to the bridge configuration JSON file.",
-    )
-    parser.add_argument(
-        "--mock-stage",
-        action="store_true",
-        help="Force the sidecar to use the fake stage backend.",
     )
     args = parser.parse_args()
     config_path = Path(args.config).expanduser().resolve()
-    config = load_runtime_config(config_path)
-    usd_path = config.get("usd_path")
-    if usd_path:
-        resolved_usd_path = Path(str(usd_path)).expanduser()
-        if not resolved_usd_path.is_absolute():
-            resolved_usd_path = (config_path.parent / resolved_usd_path).resolve()
-        config["usd_path"] = resolved_usd_path.as_posix()
-    if args.mock_stage:
-        config["use_mock_stage"] = True
+    config = load_production_runtime_config(config_path)
+    require_production_runtime_preflight(
+        config,
+        requested_backend=config["backend"],
+    )
+    if not Path(config["usd_path"]).is_absolute():
+        raise RuntimeError(
+            "Production config loader did not canonicalize usd_path."
+        )
     server_config = Geant4BridgeServerConfig(
-        host=str(config.get("host", "127.0.0.1")),
-        port=int(config.get("port", 5556)),
+        host=config["host"],
+        port=config["port"],
         app_config=config,
+        production_runtime_config_sha256=(
+            production_runtime_config_sha256(config)
+        ),
     )
     serve_forever(server_config)
 

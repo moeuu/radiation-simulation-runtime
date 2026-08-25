@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 import platform
 import subprocess
@@ -16,6 +17,9 @@ import pytest
 from scipy import stats
 
 import spectrum.transport_spectral as transport_spectral
+from spectrum.additive_scatter import (
+    DETECTOR_CONE_SINGLE_SCATTER_BASIS_SEMANTICS,
+)
 from spectrum.response_matrix import (
     NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256,
     build_native_geant4_detector_response_matrix,
@@ -2571,6 +2575,51 @@ def test_validation_metrics_reject_numeric_strings(field_name: str) -> None:
         discrepancy_training_manifest=approved.discrepancy_training_manifest,
         validation_manifest=validation,
         additive_scatter_response=approved.additive_scatter_response,
+    )
+
+    assert candidate.runtime_ready is True
+    assert candidate.production_ready is False
+
+
+def test_legacy_scatter_semantics_cannot_become_production_ready() -> None:
+    """Otherwise valid validation cannot approve retired scatter semantics."""
+    approved = approved_full_spectrum_model()
+    assert approved.additive_scatter_response is not None
+    legacy_response = replace(
+        approved.additive_scatter_response,
+        feature_basis_semantics=(
+            DETECTOR_CONE_SINGLE_SCATTER_BASIS_SEMANTICS
+        ),
+    )
+    unvalidated = GeometryConditionedSpectralModel.standard_native(
+        ("Co-60", "Cs-137", "Eu-154"),
+        dead_time_tau_s=approved.dead_time_tau_s,
+        background_rate_cps=approved.background_rate_cps,
+        rate_scale_nodes_j=approved.rate_scale_nodes_j,
+        rate_scale_weights_j=approved.rate_scale_weights_j,
+        mark_concentration_source=approved.mark_concentration_source,
+        discrepancy_training_manifest=approved.discrepancy_training_manifest,
+        additive_scatter_response=legacy_response,
+    )
+    validation = json.loads(
+        json.dumps(approved.manifest_payload()["validation"])
+    )
+    validation["approved_model_contract_sha256"] = (
+        unvalidated.contract_hash_sha256
+    )
+    validation["additive_scatter_contract_sha256"] = (
+        legacy_response.contract_hash_sha256
+    )
+    candidate = GeometryConditionedSpectralModel.standard_native(
+        ("Co-60", "Cs-137", "Eu-154"),
+        dead_time_tau_s=approved.dead_time_tau_s,
+        background_rate_cps=approved.background_rate_cps,
+        rate_scale_nodes_j=approved.rate_scale_nodes_j,
+        rate_scale_weights_j=approved.rate_scale_weights_j,
+        mark_concentration_source=approved.mark_concentration_source,
+        discrepancy_training_manifest=approved.discrepancy_training_manifest,
+        validation_manifest=validation,
+        additive_scatter_response=legacy_response,
     )
 
     assert candidate.runtime_ready is True

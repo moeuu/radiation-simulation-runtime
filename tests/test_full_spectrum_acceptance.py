@@ -67,10 +67,15 @@ def _write_artifact(
         else "holdout"
     )
     payload = {
-        "schema_version": 1,
+        "schema_version": 3,
         "acceptance_contract_sha256": (
             FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256
         ),
+        "acceptance_run_contract_sha256": "c" * 64,
+        "runtime_config_sha256": "d" * 64,
+        "native_executable_sha256": "e" * 64,
+        "native_execution_environment_sha256": "1" * 64,
+        "implementation_bundle_sha256": "f" * 64,
         "scene_seed": scene_seed,
         "split": split,
         "scenario_ids": list(VALIDATION_SCENARIO_IDS),
@@ -173,6 +178,12 @@ def test_validation_metrics_use_holdout_scenes_only(tmp_path: Path) -> None:
     assert manifest["metric_aggregation"] == (
         "holdout_scene_conservative_worst_case"
     )
+    assert manifest["schema_version"] == 3
+    assert manifest["acceptance_run_contract_sha256"] == "c" * 64
+    assert manifest["runtime_config_sha256"] == "d" * 64
+    assert manifest["native_executable_sha256"] == "e" * 64
+    assert manifest["native_execution_environment_sha256"] == "1" * 64
+    assert manifest["implementation_bundle_sha256"] == "f" * 64
     assert manifest["all_passed"] is True
     for metric_id, (_, threshold) in ACCEPTANCE_METRIC_CONTRACT.items():
         assert manifest["metrics"][metric_id]["value"] == float(threshold)
@@ -268,4 +279,28 @@ def test_native_signed_epsilon_gate_is_mandatory(tmp_path: Path) -> None:
     _write_payload(paths[-1], payload)
 
     with pytest.raises(ValueError, match="signed-epsilon"):
+        build_independent_validation_manifest(paths)
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    (
+        "acceptance_run_contract_sha256",
+        "runtime_config_sha256",
+        "native_executable_sha256",
+        "native_execution_environment_sha256",
+        "implementation_bundle_sha256",
+    ),
+)
+def test_all_scenes_require_one_exact_native_execution_contract(
+    tmp_path: Path,
+    field_name: str,
+) -> None:
+    """One scene from another runtime build cannot enter model approval."""
+    paths = _all_artifacts(tmp_path)
+    payload = json.loads(paths[-1].read_text(encoding="utf-8"))
+    payload[field_name] = "0" * 64
+    _write_payload(paths[-1], payload)
+
+    with pytest.raises(ValueError, match="native execution contracts"):
         build_independent_validation_manifest(paths)

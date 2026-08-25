@@ -18,6 +18,7 @@ from measurement.observation_model import (
     RuntimeObservationModel,
     build_runtime_observation_model,
     continuous_kernel_from_observation_model,
+    require_production_model_approval,
 )
 from measurement.obstacles import ObstacleGrid
 from runtime.forward_model_manifest import (
@@ -36,7 +37,7 @@ from runtime.measurement_log import (
     _validate_runtime_observation_contract,
     validate_forward_model_manifest,
 )
-from runtime.provenance import sha256_json, strict_canonical_json_bytes
+from runtime.provenance import strict_canonical_json_bytes, strict_sha256_json
 from runtime.records import RunContext, validate_truth_free_estimator_input
 from spectrum.transport_spectral import (
     GeometryConditionedSpectralModel,
@@ -263,7 +264,7 @@ def _resolve_context(
         raise MeasurementLogValidationError(
             "RunContext sim_backend differs from runtime_config."
         )
-    if sha256_json(runtime_config) != context.runtime_config_sha256:
+    if strict_sha256_json(runtime_config) != context.runtime_config_sha256:
         raise MeasurementLogValidationError(
             "RunContext runtime_config_sha256 does not authenticate runtime_config."
         )
@@ -290,7 +291,7 @@ def _resolve_context(
         runtime_config,
         run_root=run_root,
     )
-    spectral_model.require_runtime_ready()
+    require_production_model_approval(spectral_model)
     spectral_model.require_environment_applicable(environment_payload)
     model_isotopes = {
         str(row["isotope"])

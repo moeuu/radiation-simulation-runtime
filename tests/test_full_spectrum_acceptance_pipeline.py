@@ -357,6 +357,8 @@ class _FakeBackend:
         """Expose the hashes and rates required by the production CLI."""
         self.runtime_config_sha256 = "a" * 64
         self.native_executable_sha256 = "b" * 64
+        self.native_execution_environment_sha256 = "c" * 64
+        self.implementation_bundle_sha256 = "d" * 64
         self.app_config = SimpleNamespace(
             dead_time_tau_s=0.0,
             background_cps=0.0,

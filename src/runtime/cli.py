@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Sequence
-import json
 from pathlib import Path
 
 from runtime.adaptive import serve_adaptive_session
@@ -21,9 +20,12 @@ from runtime.scenarios import (
     write_private_scenario,
     write_private_truth_manifest,
 )
-from runtime.session import run_acquisition_plan
+from runtime.session import require_production_runtime_preflight
 from sim.geant4_app.bridge_server import Geant4BridgeServerConfig, serve_forever
-from sim.runtime import load_runtime_config
+from sim.runtime import (
+    load_production_runtime_config,
+    production_runtime_config_sha256,
+)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -34,34 +36,11 @@ def _build_parser() -> argparse.ArgumentParser:
     validate.add_argument("path", type=Path)
     serve = subparsers.add_parser("serve")
     serve.add_argument("--config", type=Path, required=True)
-    run_plan = subparsers.add_parser("run-plan")
-    run_plan.add_argument("plan", type=Path)
     run_adaptive = subparsers.add_parser("run-adaptive-session")
     run_adaptive.add_argument("scenario", type=Path)
     serve_adaptive_socket = subparsers.add_parser("serve-adaptive-session-socket")
     serve_adaptive_socket.add_argument("scenario", type=Path)
     serve_adaptive_socket.add_argument("--socket-path", type=Path, required=True)
-    serve_adaptive_socket.add_argument("--resume-stage", type=Path, default=None)
-    serve_adaptive_socket.add_argument(
-        "--resume-compatibility",
-        type=Path,
-        default=None,
-    )
-    run_adaptive.add_argument(
-        "--resume-stage",
-        type=Path,
-        default=None,
-        help="Resume from a verified adaptive MeasurementLog stream stage.",
-    )
-    run_adaptive.add_argument(
-        "--resume-compatibility",
-        type=Path,
-        default=None,
-        help=(
-            "Explicit compatibility provenance required when resuming under a "
-            "different runtime commit."
-        ),
-    )
     generate_scenario = subparsers.add_parser("generate-scenario")
     generate_scenario.add_argument("output", type=Path)
     generate_scenario.add_argument(
@@ -96,16 +75,6 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _load_resume_compatibility(path: Path | None) -> dict[str, object] | None:
-    """Load one JSON compatibility object supplied for adaptive resume."""
-    if path is None:
-        return None
-    payload = json.loads(path.expanduser().resolve().read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise TypeError("Adaptive resume compatibility must be a JSON object.")
-    return payload
-
-
 def main(argv: Sequence[str] | None = None) -> int:
     """Run one simulation-runtime command."""
     args = _build_parser().parse_args(argv)
@@ -116,32 +85,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"run_id={log.run_id} records={len(log.records)}"
         )
         return 0
-    if args.command == "run-plan":
-        log = run_acquisition_plan(args.plan)
-        print(f"published {log.path} records={len(log.records)}")
-        return 0
     if args.command == "run-adaptive-session":
         import sys
 
-        if args.resume_compatibility is not None and args.resume_stage is None:
-            raise ValueError("--resume-compatibility requires --resume-stage.")
         return serve_adaptive_session(
             args.scenario,
             input_stream=sys.stdin,
             output_stream=sys.stdout,
-            resume_stage_dir=args.resume_stage,
-            resume_compatibility=_load_resume_compatibility(args.resume_compatibility),
         )
     if args.command == "serve-adaptive-session-socket":
         from runtime.adaptive import serve_adaptive_session_socket
 
-        if args.resume_compatibility is not None and args.resume_stage is None:
-            raise ValueError("--resume-compatibility requires --resume-stage.")
         return serve_adaptive_session_socket(
             args.scenario,
             socket_path=args.socket_path,
-            resume_stage_dir=args.resume_stage,
-            resume_compatibility=_load_resume_compatibility(args.resume_compatibility),
         )
     if args.command == "generate-scenario":
         scene_seed = (
@@ -179,12 +136,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"environments={len(calibration.independent_environment_ids)}"
         )
         return 0
-    config = load_runtime_config(args.config)
+    config = load_production_runtime_config(args.config)
+    require_production_runtime_preflight(
+        config,
+        requested_backend=config["backend"],
+    )
     serve_forever(
         Geant4BridgeServerConfig(
-            host=str(config.get("host", "127.0.0.1")),
-            port=int(config.get("port", 5556)),
+            host=config["host"],
+            port=config["port"],
             app_config=config,
+            production_runtime_config_sha256=(
+                production_runtime_config_sha256(config)
+            ),
         )
     )
     return 0

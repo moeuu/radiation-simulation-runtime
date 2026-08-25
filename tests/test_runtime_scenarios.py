@@ -12,7 +12,7 @@ import pytest
 
 from measurement.obstacles import ObstacleGrid
 from runtime.adaptive import AdaptiveCandidateProvider
-from runtime.cli import _build_parser
+from runtime.cli import _build_parser, main as runtime_cli_main
 from runtime.experiment_profiles import STANDARD_EXPERIMENT_PROFILE
 from runtime.scenarios import (
     build_private_truth_manifest,
@@ -72,6 +72,11 @@ def test_scenario_contains_physics_and_runtime_contract_but_no_estimator_plan(
     ):
         assert forbidden not in fields
     assert scenario["metadata"]["measurement_actions_precomputed"] is False
+    assert scenario["scene"]["obstacle_material"] == (
+        STANDARD_EXPERIMENT_PROFILE.obstacle_material
+    )
+    assert scenario["scene"]["use_config_usd_fallback"] is False
+    assert scenario["scene"]["usd_path"]
 
 
 def test_scenario_derives_every_room_payload_from_one_profile(
@@ -93,9 +98,29 @@ def test_scenario_derives_every_room_payload_from_one_profile(
         environment["size_z"],
     ) == expected
     assert tuple(scenario["scene"]["room_size_xyz"]) == expected
+    assert environment["environment_model_id"] == (
+        STANDARD_EXPERIMENT_PROFILE.environment_model_id
+    )
     assert environment["acquisition_contract"] == (
         STANDARD_EXPERIMENT_PROFILE.acquisition.to_payload()
     )
+    assert set(environment["adaptive_measurement"]) == {
+        "candidate_count",
+        "candidate_seed",
+        "detector_height_min_m",
+        "detector_height_max_m",
+        "local_refinement_count",
+        "local_refinement_radius_m",
+        "base_radius_m",
+        "base_height_m",
+        "mast_radius_m",
+        "head_radius_m",
+        "transport_height_m",
+        "horizontal_speed_m_s",
+        "vertical_speed_m_s",
+        "settling_time_s",
+        "shield_angular_speed_rad_s",
+    }
 
 
 def test_default_scenario_has_exact_mix9_and_same_isotope_spacing(
@@ -203,6 +228,95 @@ def test_scenario_cli_selects_only_runtime_owned_profiles() -> None:
         parser.parse_args(["generate-ral-scenario"])
 
 
+def test_adaptive_cli_rejects_retired_resume_flags() -> None:
+    """Production adaptive commands must provide no resume entrypoint."""
+    parser = _build_parser()
+    for command in ("run-adaptive-session", "serve-adaptive-session-socket"):
+        arguments = [command, "/private/scenario.json"]
+        if command == "serve-adaptive-session-socket":
+            arguments.extend(["--socket-path", "/private/session.sock"])
+        arguments.extend(["--resume-stage", "/private/.measurement-log.stream-7"])
+        with pytest.raises(SystemExit):
+            parser.parse_args(arguments)
+
+
+def test_production_cli_rejects_retired_fixed_run_plan() -> None:
+    """No predeclared batch plan may publish a production MeasurementLog."""
+    parser = _build_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["run-plan", "/private/plan.json"])
+
+
+def test_serve_cli_rejects_unknown_runtime_config_before_binding(
+    tmp_path: Path,
+) -> None:
+    """The public bridge server must use the exact production loader."""
+    runtime_root = Path(__file__).resolve().parents[1]
+    config_path = (
+        runtime_root / STANDARD_EXPERIMENT_PROFILE.runtime_config_relative_path
+    )
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    payload["thred_count"] = payload["thread_count"]
+    invalid_path = tmp_path / "invalid-runtime.json"
+    invalid_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="unknown_or_retired.*thred_count"):
+        runtime_cli_main(["serve", "--config", str(invalid_path)])
+
+
+def test_serve_cli_rejects_invalid_model_registry_before_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The public server must resolve registry identity before binding a port."""
+    runtime_root = Path(__file__).resolve().parents[1]
+    config_path = (
+        runtime_root / STANDARD_EXPERIMENT_PROFILE.runtime_config_relative_path
+    )
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    payload["full_spectrum_model_registry_path"] = "missing-registry.json"
+    payload["full_spectrum_model_registry_file_sha256"] = "0" * 64
+    invalid_path = tmp_path / "invalid-registry.json"
+    invalid_path.write_text(json.dumps(payload), encoding="utf-8")
+    bound = False
+
+    def bind_server(*args: object, **kwargs: object) -> None:
+        """Record any forbidden server bind after failed model preflight."""
+        nonlocal bound
+        bound = True
+
+    monkeypatch.setattr("runtime.cli.serve_forever", bind_server)
+
+    with pytest.raises(FileNotFoundError, match="missing-registry"):
+        runtime_cli_main(["serve", "--config", str(invalid_path)])
+
+    assert bound is False
+
+
+def test_serve_cli_rejects_unapproved_model_before_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runtime-ready model without holdout approval cannot start a server."""
+    runtime_root = Path(__file__).resolve().parents[1]
+    config_path = (
+        runtime_root / STANDARD_EXPERIMENT_PROFILE.runtime_config_relative_path
+    )
+    bound = False
+
+    def bind_server(*args: object, **kwargs: object) -> None:
+        """Record any forbidden server bind after failed model approval."""
+        nonlocal bound
+        bound = True
+
+    monkeypatch.setattr("runtime.cli.serve_forever", bind_server)
+
+    with pytest.raises(RuntimeError, match="independent all-64 holdout"):
+        runtime_cli_main(["serve", "--config", str(config_path)])
+
+    assert bound is False
+
+
 def test_private_truth_manifest_is_separate_and_joined_by_run_id(
     tmp_path: Path,
 ) -> None:
@@ -214,9 +328,7 @@ def test_private_truth_manifest_is_separate_and_joined_by_run_id(
     payload = json.loads(target.read_text(encoding="utf-8"))
     assert payload["run_id"] == scenario["run_id"]
     assert payload["sources"] == scenario["scene"]["sources"]
-    assert payload["experiment_profile_id"] == (
-        STANDARD_EXPERIMENT_PROFILE.profile_id
-    )
+    assert payload["experiment_profile_id"] == (STANDARD_EXPERIMENT_PROFILE.profile_id)
     assert payload["scene_variant_id"] == "mix9"
     assert stat.S_IMODE(target.stat().st_mode) == 0o600
     with pytest.raises(FileExistsError):

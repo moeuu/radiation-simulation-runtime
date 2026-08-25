@@ -12,12 +12,10 @@ import numpy as np
 
 from measurement.obstacles import ObstacleGrid
 from sim.isaacsim_app.materials import (
-    composition_mass_attenuation,
-    composition_mass_attenuation_at_energy,
     normalize_material_name,
+    require_composition_mass_attenuation_at_energy,
     resolve_material_preset,
 )
-from sim.transport import DEFAULT_MATERIAL_MU_CM_INV
 from spectrum.additive_scatter import material_compton_mu_cm_inv_numpy
 from spectrum.library import default_library
 
@@ -517,7 +515,7 @@ def line_transport_model_from_components(
     for isotope in isotopes:
         nuclide = _lookup_nuclide(library, str(isotope))
         if nuclide is None:
-            continue
+            raise ValueError(f"Unknown production isotope {isotope!r}.")
         rows: list[tuple[float, ...]] = []
         for line in nuclide.lines:
             if max(float(line.intensity), 0.0) <= 0.0:
@@ -549,6 +547,10 @@ def line_compton_transport_model_from_components(
     material_presets = []
     for component in component_tuple:
         normalized = normalize_material_name(component.material)
+        if normalized != component.material:
+            raise ValueError(
+                f"Obstacle material {component.material!r} is not canonical."
+            )
         preset = resolve_material_preset(normalized)
         if (
             preset is None
@@ -565,7 +567,7 @@ def line_compton_transport_model_from_components(
     for isotope in isotopes:
         nuclide = _lookup_nuclide(library, str(isotope))
         if nuclide is None:
-            continue
+            raise ValueError(f"Unknown production isotope {isotope!r}.")
         rows: list[tuple[float, ...]] = []
         for line in nuclide.lines:
             if max(float(line.intensity), 0.0) <= 0.0:
@@ -794,20 +796,29 @@ def validate_nominal_obstacle_transmission(
 
 
 def material_mu_cm_inv(material: str, isotope: str) -> float:
-    """Return an effective linear attenuation coefficient for a material."""
-    normalized = normalize_material_name(str(material))
+    """Return an exact line-weighted coefficient for a known material/isotope."""
+    if not isinstance(material, str) or not material.strip():
+        raise ValueError("material must be a nonempty string.")
+    if not isinstance(isotope, str) or not isotope:
+        raise ValueError("isotope must be a nonempty string.")
+    normalized = normalize_material_name(material)
+    if normalized != material:
+        raise ValueError(
+            f"Material {material!r} is not a canonical production material ID."
+        )
     preset = resolve_material_preset(normalized)
-    if preset is not None and preset.density_g_cm3 is not None:
-        mass_att = _line_weighted_mass_attenuation(preset.composition_by_mass, isotope)
-        if mass_att is None:
-            mass_att = composition_mass_attenuation(preset.composition_by_mass, isotope)
-        if mass_att is not None:
-            return float(preset.density_g_cm3) * float(mass_att)
-    fallback = DEFAULT_MATERIAL_MU_CM_INV.get(normalized, {})
-    if isotope in fallback:
-        return float(fallback[isotope])
-    concrete = DEFAULT_MATERIAL_MU_CM_INV.get("concrete", {})
-    return float(concrete.get(isotope, 0.0))
+    if preset is None or preset.density_g_cm3 is None:
+        raise ValueError(f"Unknown or incomplete material preset {material!r}.")
+    mass_att = _line_weighted_mass_attenuation(
+        preset.composition_by_mass,
+        isotope,
+    )
+    if mass_att is None:
+        raise ValueError(
+            f"No exact XCOM line attenuation exists for material {material!r} "
+            f"and isotope {isotope!r}."
+        )
+    return float(preset.density_g_cm3) * mass_att
 
 
 def material_mu_cm_inv_at_energy(
@@ -817,29 +828,30 @@ def material_mu_cm_inv_at_energy(
     isotope: str,
 ) -> float:
     """Return material linear attenuation at a gamma-line energy in 1/cm."""
-    normalized = normalize_material_name(str(material))
-    preset = resolve_material_preset(normalized)
-    if preset is not None and preset.density_g_cm3 is not None:
-        mass_att = composition_mass_attenuation_at_energy(
-            preset.composition_by_mass,
-            float(energy_keV),
+    if not isinstance(material, str) or not material.strip():
+        raise ValueError("material must be a nonempty string.")
+    if not isinstance(isotope, str) or not isotope:
+        raise ValueError("isotope must be a nonempty string.")
+    if _lookup_nuclide(default_library(), isotope) is None:
+        raise ValueError(f"Unknown production isotope {isotope!r}.")
+    normalized = normalize_material_name(material)
+    if normalized != material:
+        raise ValueError(
+            f"Material {material!r} is not a canonical production material ID."
         )
-        if mass_att is not None:
-            return float(preset.density_g_cm3) * float(mass_att)
-    return material_mu_cm_inv(normalized, isotope)
+    preset = resolve_material_preset(normalized)
+    if preset is None or preset.density_g_cm3 is None:
+        raise ValueError(f"Unknown or incomplete material preset {material!r}.")
+    mass_att = require_composition_mass_attenuation_at_energy(
+        preset.composition_by_mass,
+        energy_keV,
+    )
+    return float(preset.density_g_cm3) * mass_att
 
 
 def _lookup_nuclide(library: dict[str, object], isotope: str) -> object | None:
-    """Return a nuclide entry using tolerant isotope-name matching."""
-    nuclide = library.get(str(isotope))
-    if nuclide is not None:
-        return nuclide
-    normalized = "".join(ch for ch in str(isotope).upper() if ch.isalnum())
-    for name, candidate in library.items():
-        candidate_key = "".join(ch for ch in str(name).upper() if ch.isalnum())
-        if candidate_key == normalized:
-            return candidate
-    return None
+    """Return only an exact canonical nuclide entry."""
+    return library.get(isotope)
 
 
 def _line_weighted_mass_attenuation(
@@ -851,20 +863,16 @@ def _line_weighted_mass_attenuation(
     nuclide = _lookup_nuclide(library, str(isotope))
     if nuclide is None:
         return None
-    if len(nuclide.lines) < 2:
-        return None
     total_weight = 0.0
     weighted_mu = 0.0
     for line in nuclide.lines:
         weight = max(float(line.intensity), 0.0)
         if weight <= 0.0:
             continue
-        mass_att = composition_mass_attenuation_at_energy(
+        mass_att = require_composition_mass_attenuation_at_energy(
             composition_by_mass,
             float(line.energy_keV),
         )
-        if mass_att is None:
-            continue
         total_weight += weight
         weighted_mu += weight * float(mass_att)
     if total_weight <= 0.0:

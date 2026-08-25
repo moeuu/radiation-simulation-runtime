@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
+import math
 from types import MappingProxyType
 
 from measurement.model import EnvironmentConfig
@@ -29,7 +30,9 @@ class AcquisitionContract:
         """Validate one internally consistent acquisition contract."""
         for name in ("max_stations", "views_per_station", "max_measurements"):
             value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            if type(value) is not int:
+                raise TypeError(f"{name} must be an exact JSON integer.")
+            if value < 1:
                 raise ValueError(f"{name} must be a positive integer.")
         if self.max_measurements != self.max_stations * self.views_per_station:
             raise ValueError(
@@ -40,8 +43,11 @@ class AcquisitionContract:
             "min_station_separation_m",
             "coverage_radius_m",
         ):
-            value = float(getattr(self, name))
-            if value <= 0.0:
+            raw_value = getattr(self, name)
+            if type(raw_value) not in (int, float):
+                raise TypeError(f"{name} must be an exact JSON number.")
+            value = float(raw_value)
+            if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{name} must be positive.")
             object.__setattr__(self, name, value)
 
@@ -71,8 +77,13 @@ class AcquisitionContract:
             "min_station_separation_m",
             "coverage_radius_m",
         }
-        if set(payload) != expected or payload.get("schema_version") != 1:
+        if set(payload) != expected:
             raise ValueError("acquisition_contract must match schema version 1.")
+        schema_version = payload["schema_version"]
+        if type(schema_version) is not int or schema_version != 1:
+            raise ValueError(
+                "acquisition_contract schema_version must be exact integer 1."
+            )
         return cls(
             max_stations=payload["max_stations"],
             views_per_station=payload["views_per_station"],
@@ -116,11 +127,22 @@ class ExperimentProfile:
     blocked_fraction: float
     same_isotope_min_distance_m: float
     intensity_cps_1m: tuple[float, float]
+    environment_model_id: str
+    obstacle_material: str
+    room_boundary_thickness_m: float
+    surface_chart_max_edge_m: float
 
     def __post_init__(self) -> None:
         """Validate the public physical and acquisition profile."""
-        if not self.profile_id:
-            raise ValueError("profile_id must be nonempty.")
+        if (
+            not self.profile_id
+            or not self.environment_model_id
+            or not self.obstacle_material
+        ):
+            raise ValueError(
+                "profile_id, environment_model_id, and obstacle_material must "
+                "be nonempty."
+            )
         if not self.candidate_isotopes or len(set(self.candidate_isotopes)) != len(
             self.candidate_isotopes
         ):
@@ -133,7 +155,9 @@ class ExperimentProfile:
             raise ValueError("candidate_count must be an integer of at least 8.")
         for name in (
             "passage_width_m",
+            "room_boundary_thickness_m",
             "same_isotope_min_distance_m",
+            "surface_chart_max_edge_m",
         ):
             if float(getattr(self, name)) <= 0.0:
                 raise ValueError(f"{name} must be positive.")
@@ -180,46 +204,50 @@ STANDARD_EXPERIMENT_PROFILE = ExperimentProfile(
     blocked_fraction=0.4,
     same_isotope_min_distance_m=3.0,
     intensity_cps_1m=(300_000.0, 2_000_000.0),
+    environment_model_id="random_manchester_component_union_v1",
+    obstacle_material="concrete",
+    room_boundary_thickness_m=0.1,
+    surface_chart_max_edge_m=1.0,
 )
 
 _DEFAULT_PRIVATE_SCENE_VARIANT_BY_PROFILE = MappingProxyType(
     {DEFAULT_EXPERIMENT_PROFILE_ID: "mix9"}
 )
-_PRIVATE_SCENE_VARIANTS_BY_PROFILE: Mapping[
-    str, Mapping[str, _PrivateSceneVariant]
-] = MappingProxyType(
-    {
-        DEFAULT_EXPERIMENT_PROFILE_ID: MappingProxyType(
-            {
-                "mix9": _PrivateSceneVariant(
-                    variant_id="mix9",
-                    isotope_sequence=(
-                        "Cs-137",
-                        "Cs-137",
-                        "Cs-137",
-                        "Cs-137",
-                        "Co-60",
-                        "Co-60",
-                        "Co-60",
-                        "Eu-154",
-                        "Eu-154",
+_PRIVATE_SCENE_VARIANTS_BY_PROFILE: Mapping[str, Mapping[str, _PrivateSceneVariant]] = (
+    MappingProxyType(
+        {
+            DEFAULT_EXPERIMENT_PROFILE_ID: MappingProxyType(
+                {
+                    "mix9": _PrivateSceneVariant(
+                        variant_id="mix9",
+                        isotope_sequence=(
+                            "Cs-137",
+                            "Cs-137",
+                            "Cs-137",
+                            "Cs-137",
+                            "Co-60",
+                            "Co-60",
+                            "Co-60",
+                            "Eu-154",
+                            "Eu-154",
+                        ),
                     ),
-                ),
-                "cs4-co3-eu0": _PrivateSceneVariant(
-                    variant_id="cs4-co3-eu0",
-                    isotope_sequence=(
-                        "Cs-137",
-                        "Cs-137",
-                        "Cs-137",
-                        "Cs-137",
-                        "Co-60",
-                        "Co-60",
-                        "Co-60",
+                    "cs4-co3-eu0": _PrivateSceneVariant(
+                        variant_id="cs4-co3-eu0",
+                        isotope_sequence=(
+                            "Cs-137",
+                            "Cs-137",
+                            "Cs-137",
+                            "Cs-137",
+                            "Co-60",
+                            "Co-60",
+                            "Co-60",
+                        ),
                     ),
-                ),
-            }
-        )
-    }
+                }
+            )
+        }
+    )
 )
 
 _EXPERIMENT_PROFILES: Mapping[str, ExperimentProfile] = MappingProxyType(

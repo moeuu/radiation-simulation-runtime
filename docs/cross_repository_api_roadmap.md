@@ -26,13 +26,13 @@ The current worktree implements the estimator-neutral portions of phases 1–3:
 
 - `runtime.artifacts` owns strict atomic bytes, text, JSON, and file-copy
   publication;
-- legacy `canonical_json_bytes` remains byte-compatible for existing digests,
-  while new schemas use fail-closed `strict_canonical_json_bytes` and
-  `strict_sha256_json`;
+- every runtime artifact uses the same fail-closed canonical JSON contract;
+  the public serializer names reject non-string keys, NumPy scalars, paths,
+  arbitrary objects, and non-finite values instead of stringifying them;
 - `runtime.measurement_log.write_deterministic_npz` is a public, atomic,
   byte-stable NPZ API;
-- `runtime.defaults` is packaged, including the legacy `runtime_defaults`
-  wheel shim and shared PF-style CUI host/port/path values;
+- `runtime.defaults` is the sole packaged defaults namespace and owns shared
+  PF-style CUI host/port/path values;
 - `runtime.cui` owns strict configuration, browser URLs, managed safe static
   serving, the immutable truth-free `CUIRoute`, correctly ordered `CUIScene`
   geometry, and the responsive panel HTML shell. Estimator repositories own the
@@ -43,8 +43,8 @@ The current worktree implements the estimator-neutral portions of phases 1–3:
   are frozen DTOs, and the client owns bounded lifecycle plus transcript observing;
 - `MeasurementLogView.from_records` owns live array/station conversion, while
   file-backed logs expose generic inventories and pathless prefix views;
-- digest identities and golden fixtures distinguish the runtime v2 record digest
-  from the orchestrator's historical compatibility normalization;
+- digest identities and golden fixtures bind each current algorithm explicitly;
+  historical normalization is not reachable from live artifact authoring;
 - bundle publication, durable JSONL append, strict JSON/config identity, forward
   fixture parsing, and prefixed CLI JSON framing are shared mechanical APIs.
 
@@ -133,7 +133,7 @@ estimator access to realized truth.
 
 ### Phase 2: typed adaptive session
 
-- Replace raw ready, candidate, record, refine, resume, and finalized dictionaries
+- Replace raw ready, candidate, record, refine, and finalized dictionaries
   with frozen, versioned DTOs.
 - Add high-level `handshake`, `acquire_station`, `refine_candidates`, and
   `finalize_log` client operations.
@@ -146,12 +146,15 @@ estimator access to realized truth.
 - Delegate orchestrator MeasurementLog v2 validation, read-only views, and record
   prefix digests to runtime APIs.
 - Retain orchestrator-local schema-v1 readers only for historical artifacts.
-- Freeze byte-level conformance fixtures before replacing legacy digest code.
+- Keep byte-level conformance fixtures for JSON-native historical artifacts;
+  lossy historical authoring is intentionally unsupported.
 
 ## Compatibility and acceptance gates
 
-- Existing CLI commands and result filenames remain readable during migration.
-- Contract changes are backward-compatible or increment a schema version.
+- Current CLI commands and result filenames remain readable when their schemas
+  are exact; retired aliases and lossy authoring paths fail immediately.
+- Semantic contract changes use an explicit schema version or a deliberate
+  clean break rather than a compatibility fallback.
 - Canonical JSON, deterministic NPZ, MeasurementLog, and prefix digests have
   byte-level conformance tests.
 - CUI tests cover IPv4, IPv6, explicit and discovered public hosts, occupied

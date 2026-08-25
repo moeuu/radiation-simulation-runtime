@@ -2,7 +2,8 @@
 
 ``decay_lines`` are evaluated marginal photon probabilities per parent decay.
 ``lines`` are the detector-count-rate transport basis. The two are kept
-separate because an authenticated legacy PF model may fix a coarser line basis.
+separate because an authenticated detector-response model may fix a coarser
+line basis.
 Prompt cascades are sampled by Geant4 RadioactiveDecay and are never
 reconstructed by treating marginal photon probabilities as exclusive branches.
 """

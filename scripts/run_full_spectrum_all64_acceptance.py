@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -52,14 +51,6 @@ _DEFAULT_CONFIG = (
 _DEFAULT_OUTPUT = (
     _REPOSITORY_ROOT / "results" / "full_spectrum_all64_acceptance"
 )
-_IMPLEMENTATION_STATIC_PATHS = (
-    Path("pyproject.toml"),
-    Path("uv.lock"),
-    Path("configs/validation/full_spectrum_acceptance.json"),
-    Path("scripts/run_full_spectrum_all64_acceptance.py"),
-)
-
-
 def _common_parser(parser: argparse.ArgumentParser) -> None:
     """Add the shared native acquisition arguments to one subparser."""
     parser.add_argument(
@@ -221,34 +212,6 @@ def _progress(message: str) -> None:
     print(message, flush=True)
 
 
-def _implementation_bundle_sha256(repository_root: Path) -> str:
-    """Hash every Python implementation input shared by acceptance phases."""
-    root = repository_root.resolve()
-    relative_paths = set(_IMPLEMENTATION_STATIC_PATHS)
-    relative_paths.update(
-        path.relative_to(root)
-        for path in (root / "src").rglob("*.py")
-        if path.is_file()
-    )
-    digest = hashlib.sha256()
-    for relative_path in sorted(
-        relative_paths,
-        key=lambda value: value.as_posix(),
-    ):
-        source = root / relative_path
-        if not source.is_file():
-            raise FileNotFoundError(
-                f"Acceptance implementation input is missing: {source}."
-            )
-        encoded_path = relative_path.as_posix().encode("utf-8")
-        raw = source.read_bytes()
-        digest.update(len(encoded_path).to_bytes(8, "big"))
-        digest.update(encoded_path)
-        digest.update(len(raw).to_bytes(8, "big"))
-        digest.update(raw)
-    return digest.hexdigest()
-
-
 def _native_context(
     arguments: argparse.Namespace,
 ) -> tuple[
@@ -266,9 +229,10 @@ def _native_context(
     run_contract = build_acceptance_run_contract(
         runtime_config_sha256=backend.runtime_config_sha256,
         native_executable_sha256=backend.native_executable_sha256,
-        implementation_bundle_sha256=_implementation_bundle_sha256(
-            _REPOSITORY_ROOT
+        native_execution_environment_sha256=(
+            backend.native_execution_environment_sha256
         ),
+        implementation_bundle_sha256=backend.implementation_bundle_sha256,
     )
     _write_immutable_json(layout.run_contract_path, run_contract)
     base_model = GeometryConditionedSpectralModel.standard_native(

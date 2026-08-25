@@ -1,4 +1,4 @@
-"""バックスキャターピークの挙動を確認するテスト。"""
+"""Test the canonical detector backscatter response."""
 
 import numpy as np
 
@@ -6,13 +6,13 @@ from spectrum.library import Nuclide, NuclideLine
 from spectrum.response_matrix import (
     backscatter_energy,
     build_response_matrix,
-    energy_dependent_efficiency,
+    cebr3_efficiency,
     default_resolution,
 )
 
 
 def test_backscatter_energy_values():
-    """代表的なエネルギーでのバックスキャター位置を確認する。"""
+    """Backscatter peak locations must match representative energies."""
     assert abs(backscatter_energy(352.0) - 148.0) < 10.0
     assert abs(backscatter_energy(662.0) - 184.0) < 10.0
     assert abs(backscatter_energy(1332.0) - 214.0) < 10.0
@@ -20,7 +20,7 @@ def test_backscatter_energy_values():
 
 
 def test_backscatter_peak_creates_bump():
-    """応答行列にバックスキャターピークが反映されることを確認する。"""
+    """The response matrix must contain a resolved backscatter bump."""
     energy_axis = np.arange(0.0, 1501.0, 1.0)
     library = {
         "Test": Nuclide(
@@ -33,7 +33,7 @@ def test_backscatter_peak_creates_bump():
         energy_axis,
         library,
         resolution_fn=default_resolution(),
-        efficiency_fn=energy_dependent_efficiency,
+        efficiency_fn=cebr3_efficiency,
         bin_width_keV=1.0,
     )[:, 0]
     idx_back = np.argmin(np.abs(energy_axis - backscatter_energy(662.0)))

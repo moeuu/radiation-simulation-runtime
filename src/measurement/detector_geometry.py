@@ -11,8 +11,6 @@ from typing import Any
 DEFAULT_CRYSTAL_RADIUS_M = 0.038
 DEFAULT_HOUSING_THICKNESS_M = 0.0015
 DEFAULT_DETECTOR_APERTURE_SAMPLES = 121
-# Compatibility for estimator code that has not yet renamed its local constant.
-DEFAULT_PF_DETECTOR_APERTURE_SAMPLES = DEFAULT_DETECTOR_APERTURE_SAMPLES
 
 
 @dataclass(frozen=True)

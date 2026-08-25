@@ -263,86 +263,28 @@ def sample_standard_gamma_torch(
     concentration: object,
     *,
     generator: object,
-    maximum_rejection_rounds: int = 1024,
 ) -> object:
-    """Draw unit-scale Gamma variates with an explicit action generator.
-
-    Current Torch exposes its generator-aware device Gamma kernel as
-    ``_standard_gamma``.  The guarded batched Marsaglia-Tsang implementation
-    remains an exact fallback for Torch builds without that entry point.
-    """
+    """Draw unit-scale Gamma variates through the required Torch kernel."""
     torch = _torch_module()
     alpha = _require_float64_tensor(concentration, name="concentration")
     _validate_generator_device(generator, alpha)
-    resolved_rounds = _positive_integer(
-        maximum_rejection_rounds,
-        name="maximum_rejection_rounds",
-    )
     invalid = torch.any(~torch.isfinite(alpha)) | torch.any(alpha <= 0.0)
     if bool(invalid.item()):
         raise ValueError("Gamma concentrations must be finite and positive.")
     if alpha.numel() == 0:
         return torch.empty_like(alpha)
     standard_gamma = getattr(torch, "_standard_gamma", None)
-    if callable(standard_gamma):
-        try:
-            return standard_gamma(alpha, generator=generator)
-        except TypeError:  # pragma: no cover - older Torch generator API
-            pass
-
-    boosted = alpha < 1.0
-    working_alpha = torch.where(boosted, alpha + 1.0, alpha)
-    d_value = working_alpha - (1.0 / 3.0)
-    c_value = torch.rsqrt(9.0 * d_value)
-    accepted = torch.zeros_like(alpha, dtype=torch.bool)
-    samples = torch.zeros_like(alpha)
-    tiny = torch.finfo(torch.float64).tiny
-    for _ in range(resolved_rounds):
-        normal = torch.randn(
-            alpha.shape,
-            device=alpha.device,
-            dtype=torch.float64,
-            generator=generator,
+    if not callable(standard_gamma):
+        raise RuntimeError(
+            "Production predictive sampling requires torch._standard_gamma."
         )
-        uniform = torch.rand(
-            alpha.shape,
-            device=alpha.device,
-            dtype=torch.float64,
-            generator=generator,
-        )
-        base = 1.0 + c_value * normal
-        positive = base > 0.0
-        candidate_scale = torch.clamp(base, min=tiny) ** 3
-        squeeze_accept = uniform < 1.0 - 0.0331 * normal**4
-        log_accept = torch.log(torch.clamp(uniform, min=tiny)) < (
-            0.5 * normal**2
-            + d_value
-            * (
-                1.0
-                - candidate_scale
-                + torch.log(torch.clamp(candidate_scale, min=tiny))
-            )
-        )
-        newly_accepted = (~accepted) & positive & (squeeze_accept | log_accept)
-        samples = torch.where(
-            newly_accepted,
-            d_value * candidate_scale,
-            samples,
-        )
-        accepted = accepted | newly_accepted
-        if bool(torch.all(accepted).item()):
-            break
-    else:  # pragma: no cover - acceptance is high for all valid shapes
-        raise RuntimeError("Batched Gamma rejection sampling did not converge.")
-
-    boost_uniform = torch.rand(
-        alpha.shape,
-        device=alpha.device,
-        dtype=torch.float64,
-        generator=generator,
-    )
-    boost_factor = torch.exp(torch.log(torch.clamp(boost_uniform, min=tiny)) / alpha)
-    return torch.where(boosted, samples * boost_factor, samples)
+    try:
+        return standard_gamma(alpha, generator=generator)
+    except TypeError as exc:
+        raise RuntimeError(
+            "Production predictive sampling requires generator-aware "
+            "torch._standard_gamma."
+        ) from exc
 
 
 def sample_mean_one_gamma_torch(
@@ -753,7 +695,7 @@ def sample_predictive_action_torch(
     Any leading axes are retained and one predictive-sample axis is inserted
     immediately before the view axis.  Rate-scale draws are shared across all
     views of one station, while view-independent count discrepancy is sampled
-    separately per view.  ``mark_model`` is mandatory so unsupported legacy
+    separately per view.  ``mark_model`` is mandatory so unsupported retired
     marking branches cannot silently fall back to another distribution.
     """
     torch = _torch_module()
@@ -1038,11 +980,11 @@ def sample_predictive_action_torch(
         torch.zeros_like(mark_pre_mean),
     )
     zero_rate = pre_total <= 0.0
-    fallback = torch.zeros_like(probabilities)
-    fallback[..., 0] = 1.0
+    zero_count_sentinel = torch.zeros_like(probabilities)
+    zero_count_sentinel[..., 0] = 1.0
     probabilities = torch.where(
         zero_rate.unsqueeze(-1),
-        fallback,
+        zero_count_sentinel,
         probabilities,
     )
     if mark_model == "fraction_dirichlet_multinomial":

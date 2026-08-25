@@ -2,7 +2,7 @@
   "acceptance_contract_sha256": "0d55c31536052b27dc79e189239df10c52fcee033dbaf572dfc24192ea35d650",
   "additive_noncollided_transport_response": {
     "angular_quadrature_order": 16,
-    "contract_hash_sha256": "af6f66b5701edc0a3e65b7bd0777e0cd69776946b80c24eab72a9b13b96626ed",
+    "contract_hash_sha256": "e601ac34cf073c6633d3daef381ef3446b59d0c19cada27a6ed1bfcb210f639c",
     "detector_radius_m": 0.038,
     "dry_air_total_attenuation_contract_id": "nist_xcom_dry_air_total_v1",
     "dry_air_total_attenuation_contract_sha256": "f353deb7ba298f7419e4b1f8aeadaaa8f5e5805e7e10e98f1c52273c8a824fef",
@@ -23,17 +23,17 @@
     "mean_model": "beer_lambert_uncollided_with_nist_xcom_dry_air_plus_detector_cone_single_compton",
     "model": "physics_only_detector_cone_transport_response_v2",
     "obstacle_material_contract_id": "known_composite_materials_xcom_v1",
-    "obstacle_material_contract_sha256": "a89258ca5b5d31973852c0b1b7ea16b278131b1637abdcdae9298d3d2ff1798d",
+    "obstacle_material_contract_sha256": "07d133b231f65daa92ea698fce1c24b859510d1c38e622927a9009ee8751f480",
     "pb_scatter_distance_m": 0.08213717026449714,
     "schema_version": 2,
     "transport_physics_table_contract_id": "klein_nishina_xcom_single_scatter_quadrature_v1",
-    "transport_physics_table_contract_sha256": "ad6afe5b05a91059db3e38192c1e9d3b9aad6bc86513c6dc0cfd04ab3406d814"
+    "transport_physics_table_contract_sha256": "c12ccfdc6e2eee3b5db4506b0c6e99fd1dfeb9584756bc2550b741303868617a"
   },
   "background_model": "native_geant4_background_shape_v1_bin_centres",
   "background_rate_cps": 12.0,
   "background_semantics": "independent_pre_dead_time_pulse_rate_added_once",
   "bin_width_keV": 2.0,
-  "contract_hash_sha256": "a1bf37084cc2aceb8134ea5c0362ca7f21a76d48b9ab04edb725de5070845c95",
+  "contract_hash_sha256": "24ce7cc05ac2e80b3bba8d81062b9e247c6638607eb8c317933f25e1e9dfac67",
   "dead_time_application_count": 1,
   "dead_time_model": "nonparalyzable_mean_then_component_gamma_poisson_total",
   "dead_time_tau_s": 5.813e-09,
@@ -51,8 +51,8 @@
       "branching_weight": 0.062306913471273914,
       "energy_keV": 26.345,
       "isotope": "Am-241",
-      "mu_fe_cm_inv": 0.6621818,
-      "mu_pb_cm_inv": 1.8302759999999998,
+      "mu_fe_cm_inv": 114.69511344000003,
+      "mu_pb_cm_inv": 576.1017108000001,
       "raw_bin_energy_keV": 26.0,
       "raw_bin_index": 13,
       "transport_line_index": 0
@@ -61,8 +61,8 @@
       "branching_weight": 0.0032711129572418804,
       "energy_keV": 33.196,
       "isotope": "Am-241",
-      "mu_fe_cm_inv": 0.6621818,
-      "mu_pb_cm_inv": 1.8302759999999998,
+      "mu_fe_cm_inv": 52.908269156,
+      "mu_pb_cm_inv": 285.98554656000005,
       "raw_bin_energy_keV": 32.0,
       "raw_bin_index": 16,
       "transport_line_index": 1
@@ -71,8 +71,8 @@
       "branching_weight": 0.0018951686180845814,
       "energy_keV": 43.423,
       "isotope": "Am-241",
-      "mu_fe_cm_inv": 0.6621818,
-      "mu_pb_cm_inv": 1.8302759999999998,
+      "mu_fe_cm_inv": 24.058721429,
+      "mu_pb_cm_inv": 138.31405144199996,
       "raw_bin_energy_keV": 42.0,
       "raw_bin_index": 21,
       "transport_line_index": 2
@@ -81,8 +81,8 @@
       "branching_weight": 0.9325268049533996,
       "energy_keV": 59.541,
       "isotope": "Am-241",
-      "mu_fe_cm_inv": 0.6621818,
-      "mu_pb_cm_inv": 1.8302759999999998,
+      "mu_fe_cm_inv": 9.755358449000003,
+      "mu_pb_cm_inv": 58.51006812000001,
       "raw_bin_energy_keV": 58.0,
       "raw_bin_index": 29,
       "transport_line_index": 3
@@ -123,7 +123,7 @@
   "maximum_scatter_order": 5,
   "model": "geometry_conditioned_full_spectrum",
   "obstacle_material_contract_id": "known_composite_materials_xcom_v1",
-  "obstacle_material_contract_sha256": "a89258ca5b5d31973852c0b1b7ea16b278131b1637abdcdae9298d3d2ff1798d",
+  "obstacle_material_contract_sha256": "07d133b231f65daa92ea698fce1c24b859510d1c38e622927a9009ee8751f480",
   "physical_component_discrepancy": {
     "continuum_partition_contract": "fixed_50kev_detector_resolution_bands_v1",
     "count_scatter_concentration": 4.0,
@@ -143,11 +143,11 @@
     "mark_uncollided_concentration": 9999.0,
     "mark_uncollided_probability_standard_uncertainty": 0.01,
     "model": "uncollided_scatter_component_latents_v1",
-    "obstacle_material_contract_sha256": "a89258ca5b5d31973852c0b1b7ea16b278131b1637abdcdae9298d3d2ff1798d",
+    "obstacle_material_contract_sha256": "07d133b231f65daa92ea698fce1c24b859510d1c38e622927a9009ee8751f480",
     "photopeak_partition_contract": "detector_response_contiguous_three_sigma_support_v1",
     "provenance": "physics_only_uncertainty_budget_v1",
     "schema_version": 4,
-    "transport_physics_table_contract_sha256": "ad6afe5b05a91059db3e38192c1e9d3b9aad6bc86513c6dc0cfd04ab3406d814"
+    "transport_physics_table_contract_sha256": "c12ccfdc6e2eee3b5db4506b0c6e99fd1dfeb9584756bc2550b741303868617a"
   },
   "production_ready": false,
   "rate_scale_mixture": {
@@ -174,7 +174,7 @@
     "distance_m"
   ],
   "transport_physics_table_contract_id": "klein_nishina_xcom_single_scatter_quadrature_v1",
-  "transport_physics_table_contract_sha256": "ad6afe5b05a91059db3e38192c1e9d3b9aad6bc86513c6dc0cfd04ab3406d814",
+  "transport_physics_table_contract_sha256": "c12ccfdc6e2eee3b5db4506b0c6e99fd1dfeb9584756bc2550b741303868617a",
   "validation": null,
   "validation_manifest_sha256": null
 }

@@ -25,10 +25,7 @@ configuration to every live session.
 uv sync --extra test
 uv run rotating-shield-sim validate-log PATH
 uv run rotating-shield-sim serve --config configs/geant4/variance_reduction_external_no_isaac_32threads.json
-uv run rotating-shield-sim run-plan PLAN.json
 uv run rotating-shield-sim run-adaptive-session PRIVATE_SCENARIO.json
-uv run rotating-shield-sim run-adaptive-session PRIVATE_SCENARIO.json \
-  --resume-stage /private/logs/.run-001.stream-1234
 uv run rotating-shield-sim serve-adaptive-session-socket PRIVATE_SCENARIO.json \
   --socket-path /run/user/1000/rotating-shield/run-001.sock
 uv run rotating-shield-sim generate-scenario PRIVATE_SCENARIO.json \
@@ -40,10 +37,6 @@ uv run rotating-shield-sim generate-scenario PRIVATE_SCENARIO.json \
 uv run rotating-shield-sim calibrate-discrepancy CALIBRATION_ROWS.npz \
   discrepancy-calibration.json --calibration-id ral-independent
 ```
-
-`run-plan` reads source truth only from the private plan, durably records each raw
-observation before returning it to a controller, and never writes source truth into
-MeasurementLog.
 
 The shared geometry-conditioned spectrum model exposes exact NumPy and Torch
 predictive samplers. Its Torch path keeps renewal/Gamma-Poisson totals, calibrated
@@ -61,19 +54,18 @@ The private scene variant is read and validated entirely inside the runtime; var
 IDs, scene seeds/RNG provenance, counts, and realized source data are not included in
 estimator-visible events or MeasurementLog. The public experiment profile and its
 truth-free acquisition contract are included so every controller uses identical
-station, view, dwell, separation, and coverage limits.
+station, view, dwell, separation, and coverage limits. The runtime rejects dwell,
+station-order, view-boundary, and measurement-limit drift before transport and
+publishes only nonempty logs ending at a complete station boundary.
 `serve-adaptive-session-socket` exposes only an owner-accessible Unix socket, so an
 estimator process does not receive the private scenario path.
 
-An interrupted adaptive acquisition can resume from its hidden stream stage with
-`--resume-stage`. The runtime authenticates the static acquisition identity and
-every durable record shard, discards an incomplete station tail, copies through the
-last `station_complete` boundary, restores pose/yaw/Fe/Pb state, and returns the
-adopted truth-free prefix in a canonical ready event. The original stage is never
-modified. Resume under a different runtime commit fails closed unless
-`--resume-compatibility COMPATIBILITY.json` supplies explicit provenance. The same
-surface is available to Python callers through `AdaptiveRuntimeSession.resume(...)`
-and `AdaptiveRuntimeClient(..., resume_stage_path=...)`.
+Adaptive acquisition is fresh-run only. Any controller disconnect, simulator error,
+or explicit abort closes transport, removes the private write-ahead stage, and
+publishes no partial MeasurementLog. There is no production resume or prefix-replay
+entrypoint; a failed acquisition must start again with a new output destination.
+Estimator clients attach only to the opaque socket with
+`AdaptiveRuntimeClient.connect(...)`.
 
 `generate-scenario` creates that private, action-free scenario and a separate
 owner-readable truth manifest joined to completed estimator output by `run_id`.
@@ -125,9 +117,8 @@ moving their algorithms into this package:
   bounded termination and an optional immutable protocol observer. This client is
   estimator-facing: it rejects `request_cui_overlay(include_truth=True)` and also
   rejects any unexpected truth-bearing overlay response.
-- `candidate_index_for_pose(...)` accepts either the legacy candidate mapping or
-  an `AdaptiveCandidateSnapshot`, so typed controllers do not serialize a DTO back
-  to a dictionary just to retain a selected pose.
+- `candidate_index_for_pose(...)` requires an `AdaptiveCandidateSnapshot`, so raw
+  unvalidated candidate mappings cannot enter controller decisions.
 - `AdaptiveCandidateSnapshot.quote_shield_program_time_s(...)` quotes the exact
   sequential Fe/Pb actuation time from the current shield state before a station is
   executed, using the same parallel-actuator timing function as acquisition.

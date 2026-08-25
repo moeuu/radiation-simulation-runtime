@@ -12,7 +12,7 @@ from measurement.shielding import (
     line_resolved_shield_mu_by_isotope,
     shield_pose_contract_payload,
 )
-from runtime.provenance import sha256_json
+from runtime.provenance import strict_sha256_json
 from spectrum.physics_contracts import (
     OBSTACLE_MATERIAL_CONTRACT_ID,
     OBSTACLE_MATERIAL_CONTRACT_SHA256,
@@ -61,6 +61,37 @@ REQUIRED_MODEL_NAMES = (
     "transport",
     "spectrum",
 )
+_FIXED_MODEL_IDENTIFIERS = {
+    "detector": "local_detector_observation_geometry.v1",
+    "shield": "rotating_nested_octant_shield.v1",
+    "obstacle": "embedded_or_file_backed_obstacle_geometry.v1",
+    "transport": "continuous_geometry_additive_noncollided_transport.v1",
+    "spectrum": "geometry_conditioned_joint_full_spectrum.v1",
+}
+_RETIRED_RUNTIME_IDENTIFIER_FIELDS = frozenset(
+    {
+        "detector_model_id",
+        "detector_model_identifier",
+        "environment_id",
+        "environment_mode",
+        "environment_model_id",
+        "obstacle_layout_id",
+        "obstacle_model_id",
+        "shield_model_id",
+        "shield_model_identifier",
+        "spectrum_model_id",
+        "spectrum_response_model_id",
+        "transport_model_id",
+    }
+)
+_RETIRED_ENVIRONMENT_IDENTIFIER_FIELDS = frozenset(
+    {
+        "environment_id",
+        "environment_mode",
+        "obstacle_layout_id",
+        "obstacle_model_id",
+    }
+)
 
 _NATIVE_FIELDS = {
     "schema_version",
@@ -87,9 +118,15 @@ def production_line_mu_by_isotope(
     isotopes: Sequence[str],
 ) -> dict[str, list[dict[str, float]]]:
     """Project the exact production ``ContinuousKernel`` spectral line table."""
-    isotope_order = tuple(str(value) for value in isotopes)
-    if not isotope_order or len(set(isotope_order)) != len(isotope_order):
-        raise ValueError("Forward-model isotopes must be non-empty and unique.")
+    if isinstance(isotopes, (str, bytes)):
+        raise TypeError("Forward-model isotopes must be a sequence of strings.")
+    isotope_order = tuple(isotopes)
+    if not isotope_order or any(
+        not isinstance(value, str) or not value for value in isotope_order
+    ):
+        raise TypeError("Forward-model isotopes must be exact nonempty strings.")
+    if len(set(isotope_order)) != len(isotope_order):
+        raise ValueError("Forward-model isotopes must be unique.")
     raw = line_resolved_shield_mu_by_isotope(
         isotopes=isotope_order,
         normalize_line_intensities=True,
@@ -113,8 +150,10 @@ def line_energy_weight_by_isotope(
     line_table: Mapping[str, object],
 ) -> dict[str, list[dict[str, float]]]:
     """Return the spectral-identity subset of a full attenuation line table."""
+    if any(not isinstance(isotope, str) or not isotope for isotope in line_table):
+        raise TypeError("Spectral line-table isotope keys must be nonempty strings.")
     return {
-        str(isotope): [
+        isotope: [
             {
                 "energy_keV": float(entry["energy_keV"]),
                 "weight": float(entry["weight"]),
@@ -127,32 +166,58 @@ def line_energy_weight_by_isotope(
 
 def _selected(payload: Mapping[str, object], *tokens: str) -> dict[str, object]:
     """Return a deterministic copy of keys related to any supplied token."""
+    if any(not isinstance(key, str) for key in payload):
+        raise TypeError("Forward-model component payload keys must be strings.")
     lowered = tuple(token.lower() for token in tokens)
     return {
-        str(key): deepcopy(value)
-        for key, value in sorted(payload.items(), key=lambda item: str(item[0]))
-        if any(token in str(key).lower() for token in lowered)
+        key: deepcopy(value)
+        for key, value in sorted(payload.items())
+        if any(token in key.lower() for token in lowered)
     }
 
 
-def _identifier(
-    payloads: tuple[Mapping[str, object], ...],
-    keys: tuple[str, ...],
-    default: str,
-) -> str:
-    """Return the first explicit identifier or a stable production default."""
-    for payload in payloads:
-        for key in keys:
-            value = payload.get(key)
-            if value is not None and str(value).strip():
-                return str(value).strip()
-    return default
+def _production_model_identifiers(
+    runtime_config: Mapping[str, object],
+    environment: Mapping[str, object],
+) -> dict[str, str]:
+    """Return canonical model IDs without aliases or caller-selected labels."""
+    retired_runtime = sorted(
+        set(runtime_config).intersection(_RETIRED_RUNTIME_IDENTIFIER_FIELDS)
+    )
+    if retired_runtime:
+        raise ValueError(
+            "Runtime config contains retired model-identifier fields: "
+            f"{retired_runtime}."
+        )
+    retired_environment = sorted(
+        set(environment).intersection(_RETIRED_ENVIRONMENT_IDENTIFIER_FIELDS)
+    )
+    if retired_environment:
+        raise ValueError(
+            "Environment contains retired model-identifier fields: "
+            f"{retired_environment}."
+        )
+    environment_id = environment.get("environment_model_id")
+    if (
+        not isinstance(environment_id, str)
+        or not environment_id
+        or environment_id != environment_id.strip()
+    ):
+        raise ValueError(
+            "Environment must declare a nonempty canonical environment_model_id."
+        )
+    return {
+        **_FIXED_MODEL_IDENTIFIERS,
+        "environment": environment_id,
+    }
 
 
 def _safe_relative_asset_path(path_value: object, *, field_name: str) -> Path:
     """Return one canonical relative asset path without traversal ambiguity."""
-    raw = str(path_value)
-    if not raw.strip():
+    if not isinstance(path_value, str):
+        raise TypeError(f"{field_name} must be a relative path string.")
+    raw = path_value
+    if not raw or raw != raw.strip():
         raise ValueError(f"{field_name} must be a non-empty relative path.")
     if "\\" in raw:
         raise ValueError(f"{field_name} must use portable forward-slash separators.")
@@ -211,7 +276,7 @@ def _file_asset_identity(
     """Return the portable path plus its raw-byte digest."""
     relative = _safe_relative_asset_path(path_value, field_name=field_name)
     resolved = resolve_file_backed_model_asset(
-        relative,
+        relative.as_posix(),
         field_name=field_name,
         run_root=run_root,
         repository_root=repository_root,
@@ -230,8 +295,9 @@ def _runtime_file_asset_references(
     """Discover detector/transport/spectrum path fields recursively."""
     references: list[tuple[str, str, object]] = []
     if isinstance(value, Mapping):
-        for raw_key, child in sorted(value.items(), key=lambda item: str(item[0])):
-            key = str(raw_key)
+        if any(not isinstance(key, str) for key in value):
+            raise TypeError("Runtime configuration keys must be JSON strings.")
+        for key, child in sorted(value.items()):
             child_path = (*path, key)
             normalized_key = "".join(
                 character for character in key.casefold() if character.isalnum()
@@ -252,7 +318,7 @@ def _runtime_file_asset_references(
                 None,
             )
             if child is not None and is_path_field and component is not None:
-                if not isinstance(child, (str, Path)):
+                if not isinstance(child, str):
                     raise TypeError(
                         f"runtime_config.{'.'.join(child_path)} must be a path string."
                     )
@@ -333,7 +399,7 @@ def forward_model_component_payloads(
     """Return the exact payload whose digest identifies every native component."""
     runtime = deepcopy(dict(runtime_config))
     environment_payload = deepcopy(dict(environment))
-    isotope_order = tuple(str(value) for value in isotopes)
+    isotope_order = tuple(isotopes)
     line_table = production_line_mu_by_isotope(isotope_order)
     payloads: dict[str, dict[str, object]] = {
         "detector": _selected(runtime, "detector", "aperture", "crystal", "housing"),
@@ -420,8 +486,10 @@ def build_forward_model_manifest(
     repository_root: str | Path = _REPOSITORY_ROOT,
 ) -> dict[str, object]:
     """Build a complete native manifest bound to resolved production physics."""
-    if str(source_rate_model).strip().lower() != SOURCE_RATE_MODEL:
+    if not isinstance(source_rate_model, str) or source_rate_model != SOURCE_RATE_MODEL:
         raise ValueError(f"source_rate_model must be {SOURCE_RATE_MODEL!r}.")
+    if not isinstance(repository_commit, str) or not repository_commit:
+        raise TypeError("repository_commit must be a nonempty string.")
     component_payloads = forward_model_component_payloads(
         runtime_config=runtime_config,
         environment=environment,
@@ -433,41 +501,10 @@ def build_forward_model_manifest(
     line_table = production_line_mu_by_isotope(isotopes)
     runtime = dict(runtime_config)
     environment_payload = dict(environment)
-    identifiers = {
-        "detector": _identifier(
-            (runtime,),
-            ("detector_model_id", "detector_model_identifier"),
-            "local_detector_observation_geometry.v1",
-        ),
-        "shield": _identifier(
-            (runtime,),
-            ("shield_model_id", "shield_model_identifier"),
-            "rotating_nested_octant_shield.v1",
-        ),
-        "environment": _identifier(
-            (environment_payload, runtime),
-            ("environment_model_id", "environment_id", "environment_mode"),
-            "rectangular_room_surface_environment.v1",
-        ),
-        "obstacle": _identifier(
-            (environment_payload, runtime),
-            ("obstacle_model_id", "obstacle_layout_id"),
-            obstacle_layout_path or "embedded_or_empty_obstacle_grid.v1",
-        ),
-        "transport": _identifier(
-            (runtime,),
-            ("transport_model_id",),
-            "continuous_geometry_additive_noncollided_transport.v1",
-        ),
-        "spectrum": _identifier(
-            (runtime,),
-            ("spectrum_model_id", "spectrum_response_model_id"),
-            "geometry_conditioned_joint_full_spectrum.v1",
-        ),
-    }
+    identifiers = _production_model_identifiers(runtime, environment_payload)
     return {
         "schema_version": FORWARD_MODEL_MANIFEST_SCHEMA_VERSION,
-        "repository_commit": str(repository_commit).strip(),
+        "repository_commit": repository_commit,
         "resolved_config_sha256": _sha256(
             resolved_config_sha256,
             name="resolved_config_sha256",
@@ -495,7 +532,7 @@ def build_forward_model_manifest(
         "model_identifiers": {
             name: {
                 "id": identifiers[name],
-                "sha256": sha256_json(component_payloads[name]),
+                "sha256": strict_sha256_json(component_payloads[name]),
             }
             for name in REQUIRED_MODEL_NAMES
         },
@@ -503,13 +540,12 @@ def build_forward_model_manifest(
 
 
 def _sha256(value: object, *, name: str) -> str:
-    """Return a validated lowercase SHA-256 string."""
-    normalized = str(value).strip().lower()
-    if len(normalized) != 64 or any(
-        character not in "0123456789abcdef" for character in normalized
+    """Return one exact lowercase SHA-256 string without coercion."""
+    if not isinstance(value, str) or len(value) != 64 or any(
+        character not in "0123456789abcdef" for character in value
     ):
         raise ValueError(f"{name} must be a lowercase 64-character SHA-256 digest.")
-    return normalized
+    return value
 
 
 def _validate_model_identifiers(
@@ -532,17 +568,17 @@ def _validate_model_identifiers(
             raise ValueError(
                 f"model_identifiers.{name} must contain exactly id and sha256."
             )
-        identifier = str(entry.get("id", "")).strip()
+        identifier = entry["id"]
+        if not isinstance(identifier, str) or not identifier:
+            raise TypeError(f"model_identifiers.{name}.id must be a nonempty string.")
         digest = _sha256(
-            entry.get("sha256"),
+            entry["sha256"],
             name=f"model_identifiers.{name}.sha256",
         )
         expected_entry = expected[name]
-        if identifier != str(expected_entry["id"]) or digest != str(
-            expected_entry["sha256"]
-        ):
+        if identifier != expected_entry["id"] or digest != expected_entry["sha256"]:
             raise ValueError(
-                f"Forward-model compatibility error for {name}: identifier or "
+                f"Forward-model identity mismatch for {name}: identifier or "
                 "SHA-256 differs from the resolved production model."
             )
         normalized[name] = {"id": identifier, "sha256": digest}
@@ -559,13 +595,15 @@ def _validate_common(
     """Validate semantics shared by production-native manifests."""
     if payload.get("schema_version") != FORWARD_MODEL_MANIFEST_SCHEMA_VERSION:
         raise ValueError("Unsupported forward-model manifest schema_version.")
-    if str(source_rate_model).strip().lower() != SOURCE_RATE_MODEL:
-        raise ValueError("run-manifest source_rate_model is incompatible.")
+    if not isinstance(source_rate_model, str) or source_rate_model != SOURCE_RATE_MODEL:
+        raise ValueError("run-manifest source_rate_model is not the exact contract ID.")
     if payload.get("source_rate_model") != SOURCE_RATE_MODEL:
         raise ValueError("forward-model source_rate_model is incompatible.")
     if payload.get("source_rate_semantics") != SOURCE_RATE_SEMANTICS:
         raise ValueError("forward-model source_rate_semantics is incompatible.")
-    if payload.get("repository_commit") != str(repository_commit).strip():
+    if not isinstance(repository_commit, str) or not repository_commit:
+        raise TypeError("repository_commit must be a nonempty string.")
+    if payload.get("repository_commit") != repository_commit:
         raise ValueError("forward-model repository_commit does not match the log.")
     if payload.get("resolved_config_sha256") != _sha256(
         resolved_config_sha256,
@@ -626,7 +664,11 @@ def validate_forward_model_manifest(
     if not isinstance(manifest, Mapping):
         raise TypeError("forward_model_manifest must be a mapping.")
     payload = deepcopy(dict(manifest))
-    isotope_order = tuple(str(value) for value in isotopes)
+    isotope_order = tuple(isotopes)
+    if not isotope_order or any(
+        not isinstance(value, str) or not value for value in isotope_order
+    ):
+        raise TypeError("isotopes must contain exact nonempty strings.")
     if set(payload) != _NATIVE_FIELDS:
         raise ValueError(
             f"Native forward-model fields must be exactly {sorted(_NATIVE_FIELDS)}."

@@ -10,7 +10,6 @@ from typing import Any
 import numpy as np
 import pytest
 
-import runtime
 import runtime.adaptive_client as adaptive_client_module
 from runtime.adaptive_client import (
     AdaptiveProtocolDirection,
@@ -18,7 +17,6 @@ from runtime.adaptive_client import (
     AdaptiveRuntimeClient,
     adaptive_step_request,
     candidate_index_for_pose,
-    parse_candidate_snapshot,
     parse_run_context,
 )
 from runtime.adaptive_protocol import (
@@ -65,11 +63,15 @@ def _context_payload() -> dict[str, object]:
 def _candidate_payload() -> dict[str, object]:
     """Return one valid candidate snapshot wire payload."""
     return {
+        "current_pose_xyz": [0.5, 0.5, 0.5],
         "candidate_poses_xyz": [[0.5, 0.5, 0.5], [1.0, 0.5, 0.5]],
         "travel_costs": [0.0, 0.5],
         "allowed_pair_ids": list(range(64)),
         "current_pair_id": 0,
         "shield_angular_speed_rad_s": math.pi / 4.0,
+        "horizontal_travel_times_s": [0.0, 0.5],
+        "mast_vertical_times_s": [0.0, 0.0],
+        "settling_times_s": [0.0, 0.0],
     }
 
 
@@ -110,6 +112,15 @@ def test_run_context_payload_is_deeply_immutable_and_round_trips() -> None:
         context.run_id = "changed"
 
 
+def test_run_context_rejects_numpy_scalar_coercion() -> None:
+    """The live context boundary must accept only already-native JSON values."""
+    payload = _context_payload()
+    payload["runtime_config"]["transport"]["threads"] = np.int64(4)
+
+    with pytest.raises(TypeError, match="strict JSON"):
+        RunContext.from_payload(payload)
+
+
 def test_record_codec_preserves_the_existing_wire_payload() -> None:
     """The shared record codec must round-trip exact integer histograms."""
     record = _record()
@@ -121,17 +132,68 @@ def test_record_codec_preserves_the_existing_wire_payload() -> None:
     np.testing.assert_array_equal(parsed.spectrum_counts, record.spectrum_counts)
 
 
+@pytest.mark.parametrize(
+    "energy_axis",
+    (
+        [0.0, "1.0", 2.0],
+        [0.0, np.float64(1.0), 2.0],
+        (0.0, 1.0, 2.0),
+        [0.0, True, 2.0],
+    ),
+)
+def test_record_codec_rejects_non_json_native_energy_axes(
+    energy_axis: object,
+) -> None:
+    """The wire codec must reject energy-axis coercion before NumPy sees it."""
+    payload = measurement_record_to_payload(_record())
+    payload["energy_bin_edges_keV"] = energy_axis
+
+    with pytest.raises(TypeError, match="energy_bin_edges_keV"):
+        measurement_record_from_payload(payload)
+
+
+@pytest.mark.parametrize(
+    "spectrum_counts",
+    (
+        [3, "4"],
+        [np.int64(3), 4],
+        (3, 4),
+        [True, 4],
+    ),
+)
+def test_record_codec_rejects_non_json_native_spectrum_counts(
+    spectrum_counts: object,
+) -> None:
+    """Adjacent histogram parsing must also reject implicit integer coercion."""
+    payload = measurement_record_to_payload(_record())
+    payload["spectrum_counts"] = spectrum_counts
+
+    with pytest.raises(TypeError, match="spectrum_counts"):
+        measurement_record_from_payload(payload)
+
+
 def test_candidate_snapshot_is_frozen_and_wire_compatible() -> None:
-    """Candidate DTOs must own immutable tuples and emit legacy JSON lists."""
+    """Candidate DTOs must own immutable tuples and emit current JSON lists."""
     payload = _candidate_payload()
     snapshot = AdaptiveCandidateSnapshot.from_payload(payload)
     payload["candidate_poses_xyz"][0][0] = 99.0
 
     assert snapshot.to_payload() == _candidate_payload()
     assert isinstance(snapshot.candidate_poses_xyz, tuple)
+    assert not hasattr(snapshot, "to_dict")
     with pytest.raises(FrozenInstanceError):
         snapshot.current_pair_id = 1
-    assert parse_candidate_snapshot(_candidate_payload()) == _candidate_payload()
+
+
+def test_candidate_snapshot_rejects_duplicate_poses() -> None:
+    """Candidate identity must not depend on first-match duplicate handling."""
+    payload = _candidate_payload()
+    payload["candidate_poses_xyz"][1] = payload["candidate_poses_xyz"][0]
+    payload["travel_costs"][1] = 0.0
+    payload["horizontal_travel_times_s"][1] = 0.0
+
+    with pytest.raises(ValueError, match="unique"):
+        AdaptiveCandidateSnapshot.from_payload(payload)
 
 
 def test_candidate_snapshot_quotes_sequential_shield_program_time() -> None:
@@ -147,39 +209,41 @@ def test_candidate_snapshot_quotes_sequential_shield_program_time() -> None:
     assert snapshot.quote_shield_program_time_s((0,)) == 0.0
 
 
-def test_candidate_snapshot_accepts_legacy_payload_with_historical_speed() -> None:
-    """Legacy snapshots remain readable under the historical default speed."""
+@pytest.mark.parametrize(
+    "missing_field",
+    [
+        "current_pose_xyz",
+        "shield_angular_speed_rad_s",
+        "horizontal_travel_times_s",
+        "mast_vertical_times_s",
+        "settling_times_s",
+    ],
+)
+def test_candidate_snapshot_rejects_incomplete_old_payloads(
+    missing_field: str,
+) -> None:
+    """The current protocol must reject every incomplete historical shape."""
     payload = _candidate_payload()
-    del payload["shield_angular_speed_rad_s"]
+    del payload[missing_field]
 
-    snapshot = AdaptiveCandidateSnapshot.from_payload(payload)
-
-    assert snapshot.shield_angular_speed_rad_s == pytest.approx(math.pi / 4.0)
-    assert snapshot.to_payload()["shield_angular_speed_rad_s"] == pytest.approx(
-        math.pi / 4.0
-    )
-    assert snapshot.has_motion_time_components is False
+    with pytest.raises(ValueError, match=f"missing=.*{missing_field}"):
+        AdaptiveCandidateSnapshot.from_payload(payload)
 
 
 def test_candidate_snapshot_round_trips_explicit_motion_time_components() -> None:
     """Motion components must remain explicit and exactly sum to total costs."""
     payload = _candidate_payload()
-    payload.update(
-        {
-            "horizontal_travel_times_s": [0.0, 0.2],
-            "mast_vertical_times_s": [0.0, 0.2],
-            "settling_times_s": [0.0, 0.1],
-        }
-    )
+    payload["horizontal_travel_times_s"] = [0.0, 0.2]
+    payload["mast_vertical_times_s"] = [0.0, 0.2]
+    payload["settling_times_s"] = [0.0, 0.1]
 
     snapshot = AdaptiveCandidateSnapshot.from_payload(payload)
 
-    assert snapshot.has_motion_time_components is True
     assert snapshot.to_payload() == payload
 
 
 def test_candidate_snapshot_rejects_inconsistent_motion_time_components() -> None:
-    """Published motion components must reproduce every legacy total exactly."""
+    """Published motion components must reproduce every total exactly."""
     payload = _candidate_payload()
     payload.update(
         {
@@ -193,6 +257,48 @@ def test_candidate_snapshot_rejects_inconsistent_motion_time_components() -> Non
         AdaptiveCandidateSnapshot.from_payload(payload)
 
 
+def test_candidate_snapshot_rejects_nonzero_declared_current_pose() -> None:
+    """The explicit current pose must identify the exact zero-motion row."""
+    payload = _candidate_payload()
+    payload["current_pose_xyz"] = [1.0, 0.5, 0.5]
+
+    with pytest.raises(ValueError, match="zero-motion row"):
+        AdaptiveCandidateSnapshot.from_payload(payload)
+
+
+def test_candidate_snapshot_rejects_another_zero_motion_row() -> None:
+    """A second zero-cost row would make the runtime motion anchor ambiguous."""
+    payload = _candidate_payload()
+    payload["travel_costs"] = [0.0, 0.0]
+    payload["horizontal_travel_times_s"] = [0.0, 0.0]
+
+    with pytest.raises(ValueError, match="only one zero-motion row"):
+        AdaptiveCandidateSnapshot.from_payload(payload)
+
+
+@pytest.mark.parametrize("mismatch", ["current_pose_xyz", "current_pair_id"])
+def test_record_event_rejects_candidate_state_not_anchored_to_record(
+    mismatch: str,
+) -> None:
+    """Every next snapshot must be anchored to the durable response state."""
+    candidates = _candidate_payload()
+    if mismatch == "current_pose_xyz":
+        candidates["current_pose_xyz"] = [1.0, 0.5, 0.5]
+        candidates["travel_costs"] = [0.5, 0.0]
+        candidates["horizontal_travel_times_s"] = [0.5, 0.0]
+    else:
+        candidates["current_pair_id"] = 1
+
+    with pytest.raises(ValueError, match="durable current"):
+        AdaptiveRecordEvent.from_payload(
+            {
+                "type": "record",
+                "record": measurement_record_to_payload(_record()),
+                "candidates": candidates,
+            }
+        )
+
+
 @pytest.mark.parametrize("pair_ids", [(), (True,), (64,), ("1",)])
 def test_candidate_snapshot_rejects_invalid_shield_programs(
     pair_ids: tuple[object, ...],
@@ -204,13 +310,14 @@ def test_candidate_snapshot_rejects_invalid_shield_programs(
         snapshot.quote_shield_program_time_s(pair_ids)
 
 
-def test_candidate_index_accepts_typed_snapshot_and_legacy_mapping() -> None:
-    """Pose lookup must consume typed snapshots without a dictionary round trip."""
+def test_candidate_index_requires_typed_snapshot() -> None:
+    """Pose lookup must reject unvalidated raw candidate mappings."""
     payload = _candidate_payload()
     snapshot = AdaptiveCandidateSnapshot.from_payload(payload)
 
     assert candidate_index_for_pose(snapshot, (1.0, 0.5, 0.5)) == 1
-    assert candidate_index_for_pose(payload, (0.5, 0.5, 0.5)) == 0
+    with pytest.raises(TypeError, match="AdaptiveCandidateSnapshot"):
+        candidate_index_for_pose(payload, (0.5, 0.5, 0.5))  # type: ignore[arg-type]
 
 
 def test_candidate_index_rejects_invalid_target_pose() -> None:
@@ -223,7 +330,7 @@ def test_candidate_index_rejects_invalid_target_pose() -> None:
 
 def test_estimator_facing_exports_exclude_truth_overlay_parser() -> None:
     """Public client exports must expose pose lookup but no truth parser."""
-    assert runtime.candidate_index_for_pose is candidate_index_for_pose
+    assert adaptive_client_module.candidate_index_for_pose is candidate_index_for_pose
     assert "parse_cui_overlay_payload" not in adaptive_client_module.__all__
     assert not hasattr(adaptive_client_module, "parse_cui_overlay_payload")
 
@@ -232,6 +339,7 @@ def test_public_dto_constructors_reject_coercible_invalid_values() -> None:
     """Direct DTO construction must never hide invalid values by coercion."""
     with pytest.raises(TypeError, match="candidate_index"):
         AdaptiveStepRequest(
+            action_id=0,
             candidate_index="1",
             fe_orientation_index=0,
             pb_orientation_index=0,
@@ -241,6 +349,7 @@ def test_public_dto_constructors_reject_coercible_invalid_values() -> None:
         )
     with pytest.raises(TypeError, match="station_complete"):
         AdaptiveStepRequest(
+            action_id=0,
             candidate_index=1,
             fe_orientation_index=0,
             pb_orientation_index=0,
@@ -250,10 +359,15 @@ def test_public_dto_constructors_reject_coercible_invalid_values() -> None:
         )
     with pytest.raises(TypeError, match="allowed_pair_ids"):
         AdaptiveCandidateSnapshot(
+            current_pose_xyz=(0.5, 0.5, 0.5),
             candidate_poses_xyz=((0.5, 0.5, 0.5),),
             travel_costs=(0.0,),
             allowed_pair_ids=tuple(float(value) for value in range(64)),
             current_pair_id=0,
+            shield_angular_speed_rad_s=math.pi / 4.0,
+            horizontal_travel_times_s=(0.0,),
+            mast_vertical_times_s=(0.0,),
+            settling_times_s=(0.0,),
         )
     with pytest.raises(TypeError, match="fe_orientation_index"):
         AdaptiveBootstrap(
@@ -268,6 +382,7 @@ def test_public_dto_constructors_reject_coercible_invalid_values() -> None:
 def test_public_dto_constructors_canonicalize_valid_numeric_values() -> None:
     """Direct DTO construction must normalize accepted numeric scalar types."""
     request = AdaptiveStepRequest(
+        action_id=np.int64(0),
         candidate_index=np.int64(1),
         fe_orientation_index=np.int64(2),
         pb_orientation_index=np.int64(3),
@@ -279,6 +394,7 @@ def test_public_dto_constructors_canonicalize_valid_numeric_values() -> None:
 
     assert request.to_payload() == {
         "type": "step",
+        "action_id": 0,
         "candidate_index": 1,
         "fe_orientation_index": 2,
         "pb_orientation_index": 3,
@@ -310,9 +426,29 @@ def test_ready_event_round_trips_without_wire_schema_changes() -> None:
     assert parse_run_context(payload["context"]).to_payload() == payload["context"]
 
 
-def test_resume_ready_event_round_trips_completed_prefix() -> None:
-    """A resumed ready event must preserve the schema-v2 durable prefix."""
-    record_payload = measurement_record_to_payload(_record())
+@pytest.mark.parametrize("schema_version", (True, 1.0, "1", np.int64(1)))
+def test_ready_event_requires_an_exact_json_integer_schema(
+    schema_version: object,
+) -> None:
+    """A ready handshake must not coerce schema values equal to integer one."""
+    payload = {
+        "type": "ready",
+        "schema_version": schema_version,
+        "context": _context_payload(),
+        "candidates": _candidate_payload(),
+        "bootstrap": {
+            "candidate_index": 0,
+            "fe_orientation_index": 0,
+            "pb_orientation_index": 0,
+        },
+    }
+
+    with pytest.raises(ValueError, match="schema version 1"):
+        parse_adaptive_event(payload)
+
+
+def test_ready_event_rejects_retired_resume_schema() -> None:
+    """The production protocol must reject the removed resume schema."""
     payload = {
         "type": "ready",
         "schema_version": 2,
@@ -320,17 +456,13 @@ def test_resume_ready_event_round_trips_completed_prefix() -> None:
         "candidates": _candidate_payload(),
         "resume": {
             "record_count": 1,
-            "records": [record_payload],
+            "records": [measurement_record_to_payload(_record())],
             "next_station_id": 1,
         },
     }
 
-    event = parse_adaptive_event(payload)
-
-    assert isinstance(event, AdaptiveReadyEvent)
-    assert event.resume is not None
-    assert event.resume.next_station_id == 1
-    assert event.to_payload() == payload
+    with pytest.raises(ValueError, match="fields disagree|schema version 1"):
+        parse_adaptive_event(payload)
 
 
 @pytest.mark.parametrize(
@@ -390,6 +522,7 @@ def test_typed_client_methods_reuse_raw_transport_without_changing_it() -> None:
     client.request = request
     step = AdaptiveStepRequest.from_payload(
         adaptive_step_request(
+            action_id=0,
             candidate_index=1,
             fe_orientation_index=2,
             pb_orientation_index=3,
@@ -407,6 +540,7 @@ def test_typed_client_methods_reuse_raw_transport_without_changing_it() -> None:
     assert isinstance(candidates_event, AdaptiveCandidatesEvent)
     assert sent == [
         adaptive_step_request(
+            action_id=0,
             candidate_index=1,
             fe_orientation_index=2,
             pb_orientation_index=3,
@@ -481,7 +615,7 @@ def test_concise_typed_client_aliases_delegate_without_new_wire_shapes() -> None
 
     assert client.handshake() is ready
     assert client.acquire(
-        AdaptiveStepRequest(0, 0, 0, 1.0, 0, True)
+        AdaptiveStepRequest(0, 0, 0, 0, 1.0, 0, True)
     ) is record
     assert client.refine_candidates(
         AdaptiveRefineRequest.from_indices([0])
@@ -500,8 +634,6 @@ def test_protocol_observer_receives_ordered_immutable_truth_free_payloads() -> N
         ADAPTIVE_EVENT_PREFIX
         + '{"type":"published","path":"/tmp/log","record_count":1}\n'
     )
-    client.process = type("Process", (), {"poll": lambda self: None})()
-
     response = client.request({"type": "finalize"})
 
     assert response["type"] == "published"
@@ -515,15 +647,20 @@ def test_protocol_observer_receives_ordered_immutable_truth_free_payloads() -> N
         observations[1].payload["type"] = "changed"
 
 
-def test_context_manager_sends_abort_and_waits_with_configured_timeout() -> None:
-    """Leaving an unfinished client scope must perform bounded termination."""
+def test_context_manager_sends_abort_with_configured_socket_timeout() -> None:
+    """Leaving an unfinished client scope must bound the socket abort."""
     class Pipe:
         """Record writes and closure without discarding buffered test data."""
 
-        def __init__(self) -> None:
-            """Initialize an open empty pipe."""
+        def __init__(self, lines: tuple[str, ...] = ()) -> None:
+            """Initialize an open pipe with optional response lines."""
             self.writes: list[str] = []
+            self.lines = lines
             self.closed = False
+
+        def __iter__(self) -> object:
+            """Iterate over configured runtime response lines."""
+            return iter(self.lines)
 
         def write(self, value: str) -> int:
             """Record one write and return its character count."""
@@ -537,32 +674,30 @@ def test_context_manager_sends_abort_and_waits_with_configured_timeout() -> None
             """Mark the pipe closed."""
             self.closed = True
 
-    class Process:
-        """Complete gracefully when the client waits after abort."""
+    class Socket:
+        """Record bounded socket shutdown state."""
 
         def __init__(self) -> None:
-            """Initialize a running process and empty wait record."""
-            self.return_code: int | None = None
-            self.wait_timeouts: list[float | None] = []
+            """Initialize an open socket and empty timeout record."""
+            self.timeouts: list[float] = []
+            self.closed = False
 
-        def poll(self) -> int | None:
-            """Return the current synthetic process state."""
-            return self.return_code
+        def settimeout(self, timeout: float) -> None:
+            """Record the abort timeout."""
+            self.timeouts.append(timeout)
 
-        def wait(self, timeout: float | None = None) -> int:
-            """Record the timeout and complete successfully."""
-            self.wait_timeouts.append(timeout)
-            self.return_code = 0
-            return 0
+        def close(self) -> None:
+            """Mark the socket closed."""
+            self.closed = True
 
     client = AdaptiveRuntimeClient.__new__(AdaptiveRuntimeClient)
     input_pipe = Pipe()
-    output_pipe = Pipe()
-    process = Process()
+    output_pipe = Pipe((f'{ADAPTIVE_EVENT_PREFIX}{{"type":"aborted"}}\n',))
+    active_socket = Socket()
     observations: list[AdaptiveProtocolObservation] = []
     client.input = input_pipe
     client.output = output_pipe
-    client.process = process
+    client._socket = active_socket
     client.command = ["runtime"]
     client.protocol_observer = observations.append
     client._observation_sequence = 0
@@ -575,11 +710,12 @@ def test_context_manager_sends_abort_and_waits_with_configured_timeout() -> None
 
     assert input_pipe.writes == ['{"type": "abort"}\n']
     assert input_pipe.closed and output_pipe.closed
-    assert process.wait_timeouts == [0.75]
+    assert active_socket.timeouts == [0.75]
+    assert active_socket.closed
     assert observations[0].direction is AdaptiveProtocolDirection.REQUEST
     assert observations[0].payload["type"] == "abort"
     client.close()
-    assert process.wait_timeouts == [0.75]
+    assert active_socket.timeouts == [0.75]
 
 
 def test_typed_parser_rejects_unknown_or_truth_bearing_event_fields() -> None:

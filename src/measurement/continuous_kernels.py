@@ -132,18 +132,21 @@ def _finite_sphere_geometric_term_torch(
     distance: "torch.Tensor",
     *,
     detector_radius_m: float,
-    tol: "torch.Tensor",
 ) -> "torch.Tensor":
     """Return finite-sphere detector-cps@1m scaling for torch distances."""
     if torch is None:
         raise RuntimeError("torch is not available")
-    radius = max(float(detector_radius_m), 0.0)
+    radius = float(detector_radius_m)
+    if not np.isfinite(radius) or radius < 0.0:
+        raise ValueError("detector_radius_m must be finite and nonnegative.")
+    _require_valid_source_detector_distances_torch(
+        distance,
+        exclusion_radius_m=radius,
+    )
     if radius <= 0.0:
-        dist = torch.clamp(distance, min=tol)
-        return 1.0 / (dist**2)
+        return 1.0 / (distance**2)
     radius_t = torch.as_tensor(radius, device=distance.device, dtype=distance.dtype)
-    d_eff = torch.maximum(torch.clamp(distance, min=tol), radius_t)
-    ratio = torch.clamp(radius_t / torch.clamp(d_eff, min=tol), max=1.0)
+    ratio = torch.clamp(radius_t / distance, max=1.0)
     fraction = 0.5 * (1.0 - torch.sqrt(torch.clamp(1.0 - ratio * ratio, min=0.0)))
     reference = max(1.0, radius)
     ref_ratio = min(radius / reference, 1.0)
@@ -151,6 +154,28 @@ def _finite_sphere_geometric_term_torch(
         0.5 * (1.0 - float(np.sqrt(max(1.0 - ref_ratio * ref_ratio, 0.0)))), 1.0e-12
     )
     return fraction / ref_fraction
+
+
+def _require_valid_source_detector_distances_torch(
+    distance: "torch.Tensor",
+    *,
+    exclusion_radius_m: float,
+) -> None:
+    """Reject non-finite, coincident, or detector-overlapping Torch geometry."""
+    if torch is None:
+        raise RuntimeError("torch is not available")
+    if not bool(torch.all(torch.isfinite(distance))) or bool(
+        torch.any(distance <= 0.0)
+    ):
+        raise ValueError(
+            "Source-detector distance must be finite and strictly positive."
+        )
+    if exclusion_radius_m > 0.0 and bool(
+        torch.any(distance <= float(exclusion_radius_m))
+    ):
+        raise ValueError(
+            "Every source must lie strictly outside the detector aperture."
+        )
 
 
 def _source_scale_rows_torch(
@@ -182,9 +207,13 @@ def _source_scale_rows_torch(
 
 def geometric_term(detector: NDArray[np.float64], source: NDArray[np.float64]) -> float:
     """Inverse-square geometric term 1/d^2 for detector cps@1m scaling."""
-    d = float(np.linalg.norm(detector - source))
-    if d == 0.0:
-        d = 1e-6
+    detector_arr = np.asarray(detector, dtype=float)
+    source_arr = np.asarray(source, dtype=float)
+    d = float(np.linalg.norm(detector_arr - source_arr))
+    _require_valid_source_detector_distances_numpy(
+        np.asarray([d], dtype=float),
+        exclusion_radius_m=0.0,
+    )
     return float(1.0 / (d**2))
 
 
@@ -199,10 +228,13 @@ def finite_sphere_geometric_term(
     For a configured spherical detector, ``intensity_cps_1m`` is defined as the
     expected detector count rate at 1 m.  The near-field scaling should
     therefore use the sphere solid angle relative to the 1 m solid angle, not a
-    point-detector singularity.  When no detector radius is configured this
-    falls back to the inverse-square term.
+    point-detector singularity. When no detector radius is configured this
+    uses the inverse-square term. Sources on or inside the detector are invalid
+    geometry and are rejected rather than mapped to a saturated response.
     """
-    radius = max(float(detector_radius_m), 0.0)
+    radius = float(detector_radius_m)
+    if not np.isfinite(radius) or radius < 0.0:
+        raise ValueError("detector_radius_m must be finite and nonnegative.")
     if radius <= 0.0:
         return geometric_term(detector, source)
     d = float(
@@ -210,18 +242,38 @@ def finite_sphere_geometric_term(
             np.asarray(detector, dtype=float) - np.asarray(source, dtype=float)
         )
     )
-    d_eff = max(d, radius)
+    _require_valid_source_detector_distances_numpy(
+        np.asarray([d], dtype=float),
+        exclusion_radius_m=radius,
+    )
     reference = max(1.0, radius)
 
     def _sphere_fraction(distance: float) -> float:
         """Return the external point-source solid-angle fraction of a sphere."""
-        if distance <= radius:
-            return 0.5
-        ratio = min(radius / max(distance, 1.0e-12), 1.0)
+        ratio = min(radius / distance, 1.0)
         return 0.5 * (1.0 - float(np.sqrt(max(1.0 - ratio * ratio, 0.0))))
 
     ref_fraction = max(_sphere_fraction(reference), 1.0e-12)
-    return float(_sphere_fraction(d_eff) / ref_fraction)
+    return float(_sphere_fraction(d) / ref_fraction)
+
+
+def _require_valid_source_detector_distances_numpy(
+    distance: NDArray[np.float64],
+    *,
+    exclusion_radius_m: float,
+) -> None:
+    """Reject non-finite, coincident, or detector-overlapping NumPy geometry."""
+    distances = np.asarray(distance, dtype=float)
+    if np.any(~np.isfinite(distances)) or np.any(distances <= 0.0):
+        raise ValueError(
+            "Source-detector distance must be finite and strictly positive."
+        )
+    if exclusion_radius_m > 0.0 and np.any(
+        distances <= float(exclusion_radius_m)
+    ):
+        raise ValueError(
+            "Every source must lie strictly outside the detector aperture."
+        )
 
 
 def _normalize_isotope_key(isotope: str) -> str:
@@ -824,16 +876,19 @@ def _finite_sphere_geometric_term_numpy(
     distance: NDArray[np.float64],
     *,
     detector_radius_m: float,
-    point_distance_floor_m: float = 1.0e-6,
 ) -> NDArray[np.float64]:
     """Return finite-sphere detector-cps@1m scaling for NumPy distances."""
     distances = np.asarray(distance, dtype=float)
-    radius = max(float(detector_radius_m), 0.0)
+    radius = float(detector_radius_m)
+    if not np.isfinite(radius) or radius < 0.0:
+        raise ValueError("detector_radius_m must be finite and nonnegative.")
+    _require_valid_source_detector_distances_numpy(
+        distances,
+        exclusion_radius_m=radius,
+    )
     if radius <= 0.0:
-        safe_distance = np.maximum(distances, float(point_distance_floor_m))
-        return 1.0 / (safe_distance**2)
-    effective_distance = np.maximum(distances, radius)
-    ratio = np.clip(radius / np.maximum(effective_distance, 1.0e-12), 0.0, 1.0)
+        return 1.0 / (distances**2)
+    ratio = np.clip(radius / distances, 0.0, 1.0)
     fraction = 0.5 * (1.0 - np.sqrt(np.clip(1.0 - ratio * ratio, 0.0, None)))
     reference = max(1.0, radius)
     reference_ratio = min(radius / reference, 1.0)
@@ -1201,7 +1256,7 @@ def _torch_device_available(device: str | None = None) -> bool:
 
 
 def _resolve_device(device: str | None) -> "torch.device":
-    """Resolve a torch device string with CUDA fallback."""
+    """Resolve a torch device string without changing the requested backend."""
     if torch is None:
         raise RuntimeError("torch is not available")
     if device is None:
@@ -2635,12 +2690,14 @@ class ContinuousKernel:
         detector = np.asarray(detector_pos, dtype=float)
         source = np.asarray(source_pos, dtype=float)
         aperture_radius = float(self.detector_aperture_radius_m or 0.0)
+        distance = float(np.linalg.norm(detector - source))
+        _require_valid_source_detector_distances_numpy(
+            np.asarray([distance], dtype=float),
+            exclusion_radius_m=max(aperture_radius, self.detector_radius_m),
+        )
         if aperture_radius <= 0.0 or self.detector_aperture_samples <= 1:
             return detector.reshape(1, 3)
         axis = detector - source
-        distance = float(np.linalg.norm(axis))
-        if distance <= 1.0e-12:
-            return detector.reshape(1, 3)
         axis /= distance
         helper = np.array([0.0, 0.0, 1.0], dtype=float)
         if abs(float(np.dot(axis, helper))) > 0.9:
@@ -2648,7 +2705,9 @@ class ContinuousKernel:
         basis_u = np.cross(axis, helper)
         basis_u_norm = float(np.linalg.norm(basis_u))
         if basis_u_norm <= 1.0e-12:
-            return detector.reshape(1, 3)
+            raise RuntimeError(
+                "Failed to construct a detector-aperture basis for valid geometry."
+            )
         basis_u /= basis_u_norm
         basis_v = np.cross(axis, basis_u)
         if self.detector_aperture_sampling == "solid_angle_cone":
@@ -2665,7 +2724,6 @@ class ContinuousKernel:
             detector=detector,
             basis_u=basis_u,
             basis_v=basis_v,
-            distance=distance,
             aperture_radius=aperture_radius,
         )
 
@@ -2673,14 +2731,16 @@ class ContinuousKernel:
     def _ray_perpendicular_basis(
         source_pos: NDArray[np.float64],
         detector_pos: NDArray[np.float64],
-    ) -> tuple[NDArray[np.float64], NDArray[np.float64]] | None:
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
         """Return a stable basis perpendicular to the source-detector ray."""
         source = np.asarray(source_pos, dtype=float)
         detector = np.asarray(detector_pos, dtype=float)
         axis = detector - source
         distance = float(np.linalg.norm(axis))
-        if distance <= 1.0e-12:
-            return None
+        _require_valid_source_detector_distances_numpy(
+            np.asarray([distance], dtype=float),
+            exclusion_radius_m=0.0,
+        )
         axis /= distance
         helper = np.array([0.0, 0.0, 1.0], dtype=float)
         if abs(float(np.dot(axis, helper))) > 0.9:
@@ -2688,7 +2748,9 @@ class ContinuousKernel:
         basis_u = np.cross(axis, helper)
         basis_u_norm = float(np.linalg.norm(basis_u))
         if basis_u_norm <= 1.0e-12:
-            return None
+            raise RuntimeError(
+                "Failed to construct a ray basis for valid source-detector geometry."
+            )
         basis_u /= basis_u_norm
         basis_v = np.cross(axis, basis_u)
         return basis_u, basis_v
@@ -2705,8 +2767,6 @@ class ContinuousKernel:
         if radius <= 0.0 or count <= 1:
             return source.reshape(1, 3)
         basis = self._ray_perpendicular_basis(source, detector_pos)
-        if basis is None:
-            return source.reshape(1, 3)
         basis_u, basis_v = basis
         points = np.empty((count, 3), dtype=float)
         points[0] = source
@@ -2727,6 +2787,19 @@ class ContinuousKernel:
         detector_pos: NDArray[np.float64],
     ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
         """Return flattened source and detector target pairs for area averaging."""
+        center_distance = float(
+            np.linalg.norm(
+                np.asarray(detector_pos, dtype=float)
+                - np.asarray(source_pos, dtype=float)
+            )
+        )
+        _require_valid_source_detector_distances_numpy(
+            np.asarray([center_distance], dtype=float),
+            exclusion_radius_m=max(
+                self.detector_radius_m,
+                float(self.detector_aperture_radius_m or 0.0),
+            ),
+        )
         source_points = self._source_extent_points(source_pos, detector_pos)
         sources: list[NDArray[np.float64]] = []
         targets: list[NDArray[np.float64]] = []
@@ -2736,9 +2809,8 @@ class ContinuousKernel:
                 sources.append(np.asarray(source_point, dtype=float))
                 targets.append(np.asarray(target_point, dtype=float))
         if not sources:
-            return (
-                np.asarray(source_pos, dtype=float).reshape(1, 3),
-                np.asarray(detector_pos, dtype=float).reshape(1, 3),
+            raise RuntimeError(
+                "Ray sampling produced no rays for valid source-detector geometry."
             )
         return np.vstack(sources), np.vstack(targets)
 
@@ -2748,11 +2820,10 @@ class ContinuousKernel:
         detector: NDArray[np.float64],
         basis_u: NDArray[np.float64],
         basis_v: NDArray[np.float64],
-        distance: float,
         aperture_radius: float,
     ) -> NDArray[np.float64]:
-        """Return legacy deterministic points on the detector aperture disk."""
-        radius = min(aperture_radius, 0.95 * distance)
+        """Return deterministic area-sampling points on the aperture disk."""
+        radius = aperture_radius
         count = int(self.detector_aperture_samples)
         targets = np.empty((count, 3), dtype=float)
         targets[0] = detector
@@ -2781,11 +2852,9 @@ class ContinuousKernel:
         aperture_radius: float,
     ) -> NDArray[np.float64]:
         """Return Geant4 detector-cone targets on the aperture sphere."""
-        if distance <= aperture_radius:
-            return detector.reshape(1, 3)
         count = int(self.detector_aperture_samples)
         targets = np.empty((count, 3), dtype=float)
-        sin_theta_max = min(max(aperture_radius / max(distance, 1.0e-12), 0.0), 1.0)
+        sin_theta_max = min(max(aperture_radius / distance, 0.0), 1.0)
         cos_theta_max = float(np.sqrt(max(1.0 - sin_theta_max * sin_theta_max, 0.0)))
         golden_angle = np.pi * (3.0 - np.sqrt(5.0))
         radius_sq = aperture_radius * aperture_radius
@@ -2926,8 +2995,11 @@ class ContinuousKernel:
         detector_arr = np.asarray(detectors, dtype=float)
         direction = detector_arr - source_arr
         distance = np.linalg.norm(direction, axis=-1)
-        safe_distance = np.maximum(distance, float(tol))
-        axis = direction / safe_distance[..., None]
+        _require_valid_source_detector_distances_numpy(
+            distance,
+            exclusion_radius_m=0.0,
+        )
+        axis = direction / distance[..., None]
         helper_z = np.zeros_like(axis)
         helper_z[..., 2] = 1.0
         helper_y = np.zeros_like(axis)
@@ -2939,7 +3011,11 @@ class ContinuousKernel:
         )
         basis_u = np.cross(axis, helper)
         basis_norm = np.linalg.norm(basis_u, axis=-1)
-        basis_u = basis_u / np.maximum(basis_norm, float(tol))[..., None]
+        if np.any(~np.isfinite(basis_norm)) or np.any(basis_norm <= float(tol)):
+            raise RuntimeError(
+                "Failed to construct NumPy ray bases for valid geometry."
+            )
+        basis_u = basis_u / basis_norm[..., None]
         basis_v = np.cross(axis, basis_u)
         return axis, distance, basis_u, basis_v
 
@@ -2957,7 +3033,7 @@ class ContinuousKernel:
         count = max(int(self.source_extent_samples), 1)
         if radius <= 0.0 or count <= 1:
             return source_arr[:, None, :]
-        _, distance, basis_u, basis_v = self._perpendicular_bases_numpy(
+        _, _, basis_u, basis_v = self._perpendicular_bases_numpy(
             source_arr,
             detector_arr,
             tol=tol,
@@ -2972,13 +3048,6 @@ class ContinuousKernel:
             + np.sin(angles)[None, :, None] * basis_v[:, None, :]
         )
         points = source_arr[:, None, :] + offsets
-        degenerate = distance <= float(tol)
-        if np.any(degenerate):
-            points = np.where(
-                degenerate[:, None, None],
-                source_arr[:, None, :],
-                points,
-            )
         return points
 
     def _detector_aperture_targets_numpy(
@@ -2993,9 +3062,14 @@ class ContinuousKernel:
         detector_arr = np.asarray(detectors, dtype=float)
         aperture_radius = float(self.detector_aperture_radius_m or 0.0)
         sample_count = max(int(self.detector_aperture_samples), 1)
+        distance = np.linalg.norm(detector_arr - source_arr, axis=-1)
+        _require_valid_source_detector_distances_numpy(
+            distance,
+            exclusion_radius_m=max(aperture_radius, self.detector_radius_m),
+        )
         if aperture_radius <= 0.0 or sample_count <= 1:
             return detector_arr[:, None, :]
-        axis, distance, basis_u, basis_v = self._perpendicular_bases_numpy(
+        axis, _, basis_u, basis_v = self._perpendicular_bases_numpy(
             source_arr,
             detector_arr,
             tol=tol,
@@ -3008,9 +3082,8 @@ class ContinuousKernel:
             + np.sin(angles)[None, :, None] * basis_v[:, None, :]
         )
         if self.detector_aperture_sampling == "solid_angle_cone":
-            safe_distance = np.maximum(distance, float(tol))
             sin_theta_max = np.clip(
-                aperture_radius / safe_distance,
+                aperture_radius / distance,
                 0.0,
                 1.0,
             )
@@ -3037,13 +3110,6 @@ class ContinuousKernel:
                 source_arr[:, None, :]
                 + path_length[..., None] * direction
             )
-            inside = distance <= aperture_radius
-            if np.any(inside):
-                targets = np.where(
-                    inside[:, None, None],
-                    detector_arr[:, None, :],
-                    targets,
-                )
             return targets
 
         fractions = np.clip(
@@ -3053,21 +3119,12 @@ class ContinuousKernel:
         )
         radii = np.sqrt(fractions)
         radii[0] = 0.0
-        max_radius = np.minimum(aperture_radius, 0.95 * distance)
         offsets = (
-            max_radius[:, None, None]
+            aperture_radius
             * radii[None, :, None]
             * angular_basis
         )
-        targets = detector_arr[:, None, :] + offsets
-        degenerate = distance <= float(tol)
-        if np.any(degenerate):
-            targets = np.where(
-                degenerate[:, None, None],
-                detector_arr[:, None, :],
-                targets,
-            )
-        return targets
+        return detector_arr[:, None, :] + offsets
 
     def _ray_sample_points_numpy(
         self,
@@ -3079,6 +3136,14 @@ class ContinuousKernel:
         """Return flattened source/target rays for matched NumPy kernel rows."""
         source_arr = np.asarray(sources, dtype=float)
         detector_arr = np.asarray(detectors, dtype=float)
+        center_distance = np.linalg.norm(detector_arr - source_arr, axis=-1)
+        _require_valid_source_detector_distances_numpy(
+            center_distance,
+            exclusion_radius_m=max(
+                self.detector_radius_m,
+                float(self.detector_aperture_radius_m or 0.0),
+            ),
+        )
         source_points = self._source_extent_points_numpy(
             source_arr,
             detector_arr,
@@ -3111,17 +3176,21 @@ class ContinuousKernel:
         self,
         sources: "torch.Tensor",
         detector: "torch.Tensor",
-        dist: "torch.Tensor",
         tol: float,
     ) -> tuple["torch.Tensor", int]:
         """Return deterministic source-to-detector aperture targets for torch."""
         if torch is None:
             raise RuntimeError("torch is not available")
         aperture_radius = float(self.detector_aperture_radius_m or 0.0)
-        if aperture_radius <= 0.0 or self.detector_aperture_samples <= 1:
-            return detector.expand_as(sources).unsqueeze(-2), 1
-        sample_count = max(int(self.detector_aperture_samples), 1)
         detector_expanded = detector.expand_as(sources)
+        dist = torch.linalg.norm(detector_expanded - sources, dim=-1)
+        _require_valid_source_detector_distances_torch(
+            dist,
+            exclusion_radius_m=max(aperture_radius, self.detector_radius_m),
+        )
+        if aperture_radius <= 0.0 or self.detector_aperture_samples <= 1:
+            return detector_expanded.unsqueeze(-2), 1
+        sample_count = max(int(self.detector_aperture_samples), 1)
         axis = (detector_expanded - sources) / dist.unsqueeze(-1)
         helper_z = torch.zeros_like(axis)
         helper_z[..., 2] = 1.0
@@ -3129,22 +3198,25 @@ class ContinuousKernel:
         helper_y[..., 1] = 1.0
         helper = torch.where(torch.abs(axis[..., 2:3]) > 0.9, helper_y, helper_z)
         basis_u = torch.linalg.cross(axis, helper, dim=-1)
-        basis_u = basis_u / torch.clamp(
-            torch.linalg.norm(basis_u, dim=-1, keepdim=True), min=tol
-        )
+        basis_norm = torch.linalg.norm(basis_u, dim=-1, keepdim=True)
+        if not bool(torch.all(torch.isfinite(basis_norm))) or bool(
+            torch.any(basis_norm <= float(tol))
+        ):
+            raise RuntimeError(
+                "Failed to construct Torch detector-aperture bases for valid geometry."
+            )
+        basis_u = basis_u / basis_norm
         basis_v = torch.linalg.cross(axis, basis_u, dim=-1)
         if self.detector_aperture_sampling == "solid_angle_cone":
             return (
                 self._detector_aperture_targets_cone_torch(
                     sources=sources,
-                    detector=detector_expanded,
                     axis=axis,
                     basis_u=basis_u,
                     basis_v=basis_v,
                     dist=dist,
                     aperture_radius=aperture_radius,
                     sample_count=sample_count,
-                    tol=tol,
                 ),
                 sample_count,
             )
@@ -3153,7 +3225,6 @@ class ContinuousKernel:
                 detector=detector_expanded,
                 basis_u=basis_u,
                 basis_v=basis_v,
-                dist=dist,
                 aperture_radius=aperture_radius,
                 sample_count=sample_count,
             ),
@@ -3164,7 +3235,6 @@ class ContinuousKernel:
         self,
         sources: "torch.Tensor",
         detector: "torch.Tensor",
-        dist: "torch.Tensor",
         tol: float,
     ) -> tuple["torch.Tensor", int]:
         """Return deterministic source-extent sample points for torch kernels."""
@@ -3179,6 +3249,11 @@ class ContinuousKernel:
             if int(detector.shape[0]) == 1
             else detector.reshape_as(sources)
         )
+        dist = torch.linalg.norm(detector_expanded - sources, dim=-1)
+        _require_valid_source_detector_distances_torch(
+            dist,
+            exclusion_radius_m=0.0,
+        )
         axis = (detector_expanded - sources) / dist.unsqueeze(-1)
         helper_z = torch.zeros_like(axis)
         helper_z[..., 2] = 1.0
@@ -3186,10 +3261,14 @@ class ContinuousKernel:
         helper_y[..., 1] = 1.0
         helper = torch.where(torch.abs(axis[..., 2:3]) > 0.9, helper_y, helper_z)
         basis_u = torch.linalg.cross(axis, helper, dim=-1)
-        basis_u = basis_u / torch.clamp(
-            torch.linalg.norm(basis_u, dim=-1, keepdim=True),
-            min=tol,
-        )
+        basis_norm = torch.linalg.norm(basis_u, dim=-1, keepdim=True)
+        if not bool(torch.all(torch.isfinite(basis_norm))) or bool(
+            torch.any(basis_norm <= float(tol))
+        ):
+            raise RuntimeError(
+                "Failed to construct Torch source-extent bases for valid geometry."
+            )
+        basis_u = basis_u / basis_norm
         basis_v = torch.linalg.cross(axis, basis_u, dim=-1)
         indices = torch.arange(sample_count, device=sources.device, dtype=sources.dtype)
         fractions = torch.zeros_like(indices)
@@ -3207,22 +3286,28 @@ class ContinuousKernel:
         self,
         sources: "torch.Tensor",
         detector: "torch.Tensor",
-        dist: "torch.Tensor",
         tol: float,
     ) -> tuple["torch.Tensor", "torch.Tensor", int]:
         """Return flattened source and detector target pairs for torch kernels."""
         if torch is None:
             raise RuntimeError("torch is not available")
-        source_points, source_sample_count = self._source_extent_points_torch(
-            sources=sources,
-            detector=detector,
-            dist=dist,
-            tol=tol,
-        )
         detector_expanded = (
             detector.expand_as(sources)
             if int(detector.shape[0]) == 1
             else detector.reshape_as(sources)
+        )
+        center_distance = torch.linalg.norm(detector_expanded - sources, dim=-1)
+        _require_valid_source_detector_distances_torch(
+            center_distance,
+            exclusion_radius_m=max(
+                self.detector_radius_m,
+                float(self.detector_aperture_radius_m or 0.0),
+            ),
+        )
+        source_points, source_sample_count = self._source_extent_points_torch(
+            sources=sources,
+            detector=detector,
+            tol=tol,
         )
         flat_sources = source_points.reshape(-1, 3)
         flat_detectors = (
@@ -3231,12 +3316,16 @@ class ContinuousKernel:
             .reshape(-1, 3)
         )
         flat_dist = torch.linalg.norm(flat_detectors - flat_sources, dim=1)
-        tol_t = torch.as_tensor(tol, device=sources.device, dtype=sources.dtype)
-        flat_dist = torch.where(flat_dist <= tol_t, tol_t, flat_dist)
+        _require_valid_source_detector_distances_torch(
+            flat_dist,
+            exclusion_radius_m=max(
+                self.detector_radius_m,
+                float(self.detector_aperture_radius_m or 0.0),
+            ),
+        )
         flat_targets, aperture_sample_count = self._detector_aperture_targets_torch(
             sources=flat_sources,
             detector=flat_detectors,
-            dist=flat_dist,
             tol=tol,
         )
         total_sample_count = int(source_sample_count) * int(aperture_sample_count)
@@ -3253,11 +3342,10 @@ class ContinuousKernel:
         detector: "torch.Tensor",
         basis_u: "torch.Tensor",
         basis_v: "torch.Tensor",
-        dist: "torch.Tensor",
         aperture_radius: float,
         sample_count: int,
     ) -> "torch.Tensor":
-        """Return legacy deterministic disk aperture targets for torch."""
+        """Return deterministic area-sampling aperture targets for torch."""
         indices = torch.arange(
             sample_count,
             device=detector.device,
@@ -3270,11 +3358,10 @@ class ContinuousKernel:
         )
         radii = torch.sqrt(fractions)
         radii[0] = 0.0
-        max_radius = torch.minimum(
-            torch.as_tensor(
-                aperture_radius, device=detector.device, dtype=detector.dtype
-            ),
-            0.95 * dist,
+        radius = torch.as_tensor(
+            aperture_radius,
+            device=detector.device,
+            dtype=detector.dtype,
         )
         angles = indices * torch.as_tensor(
             np.pi * (3.0 - np.sqrt(5.0)),
@@ -3282,7 +3369,7 @@ class ContinuousKernel:
             dtype=detector.dtype,
         )
         offsets = (
-            max_radius.unsqueeze(-1).unsqueeze(-1)
+            radius
             * radii.view(1, sample_count, 1)
             * (
                 torch.cos(angles).view(1, sample_count, 1) * basis_u.unsqueeze(-2)
@@ -3295,14 +3382,12 @@ class ContinuousKernel:
         self,
         *,
         sources: "torch.Tensor",
-        detector: "torch.Tensor",
         axis: "torch.Tensor",
         basis_u: "torch.Tensor",
         basis_v: "torch.Tensor",
         dist: "torch.Tensor",
         aperture_radius: float,
         sample_count: int,
-        tol: float,
     ) -> "torch.Tensor":
         """Return Geant4 detector-cone targets on the aperture sphere for torch."""
         radius_t = torch.as_tensor(
@@ -3312,8 +3397,7 @@ class ContinuousKernel:
         )
         indices = torch.arange(sample_count, device=sources.device, dtype=sources.dtype)
         fractions = (indices + 0.5) / float(sample_count)
-        dist_safe = torch.clamp(dist, min=tol)
-        sin_theta_max = torch.clamp(radius_t / dist_safe, min=0.0, max=1.0)
+        sin_theta_max = torch.clamp(radius_t / dist, min=0.0, max=1.0)
         cos_theta_max = torch.sqrt(
             torch.clamp(1.0 - sin_theta_max * sin_theta_max, min=0.0)
         )
@@ -3335,12 +3419,7 @@ class ContinuousKernel:
         radial_sq = (dist.unsqueeze(-1) * sin_theta) ** 2
         chord = torch.sqrt(torch.clamp(radius_t * radius_t - radial_sq, min=0.0))
         path_length = dist.unsqueeze(-1) * cos_theta - chord
-        targets = sources.unsqueeze(-2) + path_length.unsqueeze(-1) * direction
-        inside = dist <= radius_t
-        if bool(torch.any(inside)):
-            fallback = detector.unsqueeze(-2).expand_as(targets)
-            targets = torch.where(inside.view(-1, 1, 1), fallback, targets)
-        return targets
+        return sources.unsqueeze(-2) + path_length.unsqueeze(-1) * direction
 
     def _expected_rate_pair_torch(
         self,
@@ -3375,22 +3454,21 @@ class ContinuousKernel:
         )
         direction = detector_t - sources_t
         dist = torch.linalg.norm(direction, dim=1)
-        tol_t = torch.as_tensor(tol, device=device, dtype=dtype)
-        dist = torch.where(dist <= tol_t, tol_t, dist)
         geom = _finite_sphere_geometric_term_torch(
             dist,
             detector_radius_m=self.detector_radius_m,
-            tol=tol_t,
         )
         sampled_sources, targets, sample_count = self._ray_sample_points_torch(
             sources=sources_t,
             detector=detector_t,
-            dist=dist,
             tol=tol,
         )
         sampled_direction = targets - sampled_sources
         sampled_dist = torch.linalg.norm(sampled_direction, dim=-1)
-        sampled_dist = torch.where(sampled_dist <= tol_t, tol_t, sampled_dist)
+        _require_valid_source_detector_distances_torch(
+            sampled_dist,
+            exclusion_radius_m=0.0,
+        )
 
         center = detector_t.expand_as(sources_t).unsqueeze(-2)
         fe_normal = -np.asarray(self.orientations[fe_index], dtype=float)
@@ -3555,22 +3633,21 @@ class ContinuousKernel:
         )
         direction = detector_t - sources_t
         dist = torch.linalg.norm(direction, dim=1)
-        tol_t = torch.as_tensor(tol, device=device, dtype=dtype)
-        dist = torch.where(dist <= tol_t, tol_t, dist)
         geom = _finite_sphere_geometric_term_torch(
             dist,
             detector_radius_m=self.detector_radius_m,
-            tol=tol_t,
         )
         sampled_sources, targets, sample_count = self._ray_sample_points_torch(
             sources=sources_t,
             detector=detector_t,
-            dist=dist,
             tol=tol,
         )
         sampled_direction = targets - sampled_sources
         sampled_dist = torch.linalg.norm(sampled_direction, dim=-1)
-        sampled_dist = torch.where(sampled_dist <= tol_t, tol_t, sampled_dist)
+        _require_valid_source_detector_distances_torch(
+            sampled_dist,
+            exclusion_radius_m=0.0,
+        )
         unique_orients = np.unique(np.concatenate([fe_arr, pb_arr]))
         path_lengths: dict[int, tuple["torch.Tensor", "torch.Tensor"]] = {}
         for orient_idx in unique_orients:
@@ -3969,22 +4046,21 @@ class ContinuousKernel:
         with torch.no_grad():
             direction = detectors_t - sources_t
             dist = torch.linalg.norm(direction, dim=1)
-            tol_t = torch.as_tensor(tol, device=device, dtype=dtype)
-            dist = torch.where(dist <= tol_t, tol_t, dist)
             geom = _finite_sphere_geometric_term_torch(
                 dist,
                 detector_radius_m=self.detector_radius_m,
-                tol=tol_t,
             )
             sampled_sources, targets, sample_count = self._ray_sample_points_torch(
                 sources=sources_t,
                 detector=detectors_t,
-                dist=dist,
                 tol=tol,
             )
             sampled_direction = targets - sampled_sources
             sampled_dist = torch.linalg.norm(sampled_direction, dim=-1)
-            sampled_dist = torch.where(sampled_dist <= tol_t, tol_t, sampled_dist)
+            _require_valid_source_detector_distances_torch(
+                sampled_dist,
+                exclusion_radius_m=0.0,
+            )
             response_distance = torch.linalg.norm(
                 sampled_sources - detectors_t.unsqueeze(-2),
                 dim=-1,
@@ -5090,21 +5166,13 @@ class ContinuousKernel:
         with torch.no_grad():
             direction = detectors_t - sources_t
             distance = torch.linalg.norm(direction, dim=1)
-            tol_t = torch.as_tensor(tol, device=device, dtype=dtype)
-            safe_distance = torch.where(
-                distance <= tol_t,
-                tol_t,
-                distance,
-            )
             geom = _finite_sphere_geometric_term_torch(
-                safe_distance,
+                distance,
                 detector_radius_m=self.detector_radius_m,
-                tol=tol_t,
             )
             sampled_sources, targets, _ = self._ray_sample_points_torch(
                 sources=sources_t,
                 detector=detectors_t,
-                dist=safe_distance,
                 tol=tol,
             )
             tau_obstacle = torch.zeros(
@@ -5264,22 +5332,21 @@ class ContinuousKernel:
         with torch.no_grad():
             direction = detectors_t - sources_t
             dist = torch.linalg.norm(direction, dim=1)
-            tol_t = torch.as_tensor(tol, device=device, dtype=dtype)
-            dist = torch.where(dist <= tol_t, tol_t, dist)
             geom = _finite_sphere_geometric_term_torch(
                 dist,
                 detector_radius_m=self.detector_radius_m,
-                tol=tol_t,
             )
             sampled_sources, targets, sample_count = self._ray_sample_points_torch(
                 sources=sources_t,
                 detector=detectors_t,
-                dist=dist,
                 tol=tol,
             )
             sampled_direction = targets - sampled_sources
             sampled_dist = torch.linalg.norm(sampled_direction, dim=-1)
-            sampled_dist = torch.where(sampled_dist <= tol_t, tol_t, sampled_dist)
+            _require_valid_source_detector_distances_torch(
+                sampled_dist,
+                exclusion_radius_m=0.0,
+            )
             response_distance = torch.linalg.norm(
                 sampled_sources - detectors_t.unsqueeze(-2),
                 dim=-1,
@@ -7470,13 +7537,11 @@ def expected_counts_single_isotope(
     gpu_device: str = "cuda",
     gpu_dtype: str = "float32",
 ) -> float:
-    """
-    Continuous expected counts Λ_{k,h} for a single isotope and time step (Sec. 3.2–3.3).
+    """Return continuous expected counts for one isotope and time step.
 
     Matrix-valued RFe / RPb are active physical placements of the local
     positive octant. Their incoming orientation normal is therefore
-    ``-(R @ (1, 1, 1) / sqrt(3))``. A legacy 3-vector is interpreted directly
-    as an incoming source-to-detector orientation normal.
+    ``-(R @ (1, 1, 1) / sqrt(3))``. Direct normal-vector inputs are retired.
     mu_by_isotope and shield_params are used only when a kernel is not provided.
     use_gpu controls optional CUDA acceleration for batch kernel evaluation.
     """
@@ -7492,15 +7557,28 @@ def expected_counts_single_isotope(
         k = kernel
 
     def _normal_from_R(R: NDArray[np.float64]) -> NDArray[np.float64]:
-        """Return a shield normal from either a vector or rotation matrix."""
-        if R.ndim == 1:
-            return np.asarray(R, dtype=float)
-        if R.shape == (3, 3):
-            return np.asarray(
-                -(R @ (np.ones(3, dtype=float) / np.sqrt(3.0))),
-                dtype=float,
+        """Return the incoming normal from one proper rotation matrix."""
+        raw = np.asarray(R)
+        if raw.shape != (3, 3) or not np.issubdtype(raw.dtype, np.number):
+            raise ValueError("RFe/RPb must be numeric 3x3 rotation matrices.")
+        rotation = np.asarray(raw, dtype=np.float64)
+        if (
+            np.any(~np.isfinite(rotation))
+            or not np.allclose(
+                rotation.T @ rotation,
+                np.eye(3, dtype=np.float64),
+                rtol=0.0,
+                atol=1.0e-10,
             )
-        raise ValueError("RFe/RPb must be shape (3,) or (3,3)")
+            or not np.isclose(
+                np.linalg.det(rotation),
+                1.0,
+                rtol=0.0,
+                atol=1.0e-10,
+            )
+        ):
+            raise ValueError("RFe/RPb must be finite proper rotation matrices.")
+        return -(rotation @ (np.ones(3, dtype=np.float64) / np.sqrt(3.0)))
 
     n_fe = _normal_from_R(RFe)
     n_pb = _normal_from_R(RPb)

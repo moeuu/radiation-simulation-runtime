@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-from hashlib import sha256
 from collections.abc import Sequence
 
 from runtime.measurement_log import (
     MeasurementLogRecord,
     measurement_records_content_sha256,
 )
-from runtime.provenance import DigestIdentity, canonical_json_bytes
+from runtime.provenance import DigestIdentity, strict_sha256_json
 
 
 MEASUREMENT_RECORDS_DIGEST_ALGORITHM = (
@@ -72,7 +71,7 @@ def covered_station_boundaries_sha256(
         "source_run_id": str(source_run_id),
         "station_end_steps": entries,
     }
-    return sha256(canonical_json_bytes(payload)).hexdigest()
+    return strict_sha256_json(payload)
 
 
 def covered_station_boundaries_digest(

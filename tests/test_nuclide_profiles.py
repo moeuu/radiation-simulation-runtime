@@ -20,7 +20,7 @@ from sim.geant4_app.app import Geant4AppConfig
 from spectrum.isotope_profiles import (
     available_isotope_profiles,
     require_isotope_profile,
-    resolve_isotope_selection,
+    resolve_profile_model_runtime_config,
 )
 from spectrum.library import default_library, nuclide_catalog_sha256
 from spectrum.transport_spectral import (
@@ -41,8 +41,8 @@ def test_evaluated_catalog_contains_requested_decommissioning_nuclides() -> None
     assert len(nuclide_catalog_sha256()) == 64
 
 
-def test_legacy_nuclides_expose_current_evaluated_decay_metadata() -> None:
-    """Legacy truth nuclides must retain physical decay and placement data."""
+def test_core_nuclides_expose_current_evaluated_decay_metadata() -> None:
+    """Core truth nuclides must retain physical decay and placement data."""
     library = default_library()
 
     assert library["Cs-137"].half_life_s == pytest.approx(
@@ -71,7 +71,7 @@ def test_catalog_transport_lines_are_immutable() -> None:
         cobalt.lines.append(cobalt.lines[0])
 
 
-def test_legacy_transport_basis_is_separate_from_decay_probabilities() -> None:
+def test_detector_transport_basis_is_separate_from_decay_probabilities() -> None:
     """The fixed RA-L response basis must not masquerade as decay branching."""
     cobalt = default_library()["Co-60"]
 
@@ -83,24 +83,11 @@ def test_legacy_transport_basis_is_separate_from_decay_probabilities() -> None:
     assert sum(line.intensity for line in cobalt.decay_lines) > 1.99
 
 
-def test_named_profile_selects_one_isotope_set_without_ambiguity() -> None:
-    """One profile name must resolve isotope and placement policy together."""
-    names, profile = resolve_isotope_selection(
-        profile_name="fukushima_eu152",
-        explicit_isotopes=None,
-        fallback_isotopes=("Cs-137",),
-    )
-
-    assert names == ("Cs-137", "Co-60", "Eu-152")
-    assert profile == require_isotope_profile("fukushima_eu152")
-    assert profile.material_conditioning == "catalog_physical"
-    assert "fukushima_nb94" in available_isotope_profiles()
-    with pytest.raises(ValueError, match="mutually exclusive"):
-        resolve_isotope_selection(
-            profile_name="fukushima_eu152",
-            explicit_isotopes=("Cs-137",),
-            fallback_isotopes=("Cs-137",),
-        )
+@pytest.mark.parametrize("name", (" fukushima_eu152 ", "FUKUSHIMA_EU152"))
+def test_profile_names_require_one_exact_canonical_identifier(name: str) -> None:
+    """Profile lookup must not retain whitespace or case aliases."""
+    with pytest.raises(ValueError, match="Unknown isotope_experiment_profile"):
+        require_isotope_profile(name)
 
 
 @pytest.mark.parametrize("profile_name", available_isotope_profiles())
@@ -192,6 +179,60 @@ def test_profile_registry_digest_fails_closed() -> None:
                 "isotope_experiment_profile": "fukushima_eu152",
                 "full_spectrum_model_registry_path": str(registry_path),
                 "full_spectrum_model_registry_file_sha256": "0" * 64,
+            },
+            run_root=root,
+        )
+
+
+@pytest.mark.parametrize("schema_version", (True, 1.0, "1"))
+def test_profile_registry_requires_an_exact_integer_schema(
+    tmp_path: Path,
+    schema_version: object,
+) -> None:
+    """Registry schema values merely equal to one must not be accepted."""
+    root = Path(__file__).resolve().parents[1]
+    committed_path = (
+        root / "configs/geant4/models/isotope_profile_model_registry.json"
+    )
+    payload = json.loads(committed_path.read_text(encoding="utf-8"))
+    payload["schema_version"] = schema_version
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(json.dumps(payload), encoding="utf-8")
+    registry_bytes = registry_path.read_bytes()
+
+    with pytest.raises(ValueError, match="registry payload is invalid"):
+        resolve_profile_model_runtime_config(
+            {
+                "isotope_experiment_profile": "fukushima_eu152",
+                "full_spectrum_model_registry_path": str(registry_path),
+                "full_spectrum_model_registry_file_sha256": hashlib.sha256(
+                    registry_bytes
+                ).hexdigest(),
+            },
+            run_root=root,
+        )
+
+
+def test_profile_registry_rejects_unknown_outer_fields(tmp_path: Path) -> None:
+    """Unknown registry fields must not be silently ignored."""
+    root = Path(__file__).resolve().parents[1]
+    committed_path = (
+        root / "configs/geant4/models/isotope_profile_model_registry.json"
+    )
+    payload = json.loads(committed_path.read_text(encoding="utf-8"))
+    payload["ignored_setting"] = "unsafe"
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(json.dumps(payload), encoding="utf-8")
+    registry_bytes = registry_path.read_bytes()
+
+    with pytest.raises(ValueError, match="registry payload is invalid"):
+        resolve_profile_model_runtime_config(
+            {
+                "isotope_experiment_profile": "fukushima_eu152",
+                "full_spectrum_model_registry_path": str(registry_path),
+                "full_spectrum_model_registry_file_sha256": hashlib.sha256(
+                    registry_bytes
+                ).hexdigest(),
             },
             run_root=root,
         )

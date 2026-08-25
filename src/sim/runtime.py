@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 import atexit
+from collections.abc import Mapping
 import json
 import math
 from numbers import Real
@@ -17,6 +18,7 @@ import time
 from typing import Any
 
 from measurement.model import PointSource
+from runtime.provenance import strict_sha256_json
 from sim.protocol import (
     SimulationCommand,
     SimulationObservation,
@@ -30,8 +32,7 @@ from sim.approx.python_transport import PythonTransportSpectrumModel
 def _reject_nonfinite_json_constant(value: str) -> None:
     """Reject non-standard non-finite constants in runtime JSON."""
     raise ValueError(
-        "Runtime configuration must use finite standard-JSON numbers; "
-        f"found {value}."
+        f"Runtime configuration must use finite standard-JSON numbers; found {value}."
     )
 
 
@@ -42,9 +43,7 @@ def _runtime_json_object(
     result: dict[str, Any] = {}
     for key, value in pairs:
         if key in result:
-            raise ValueError(
-                f"Runtime configuration contains duplicate key {key!r}."
-            )
+            raise ValueError(f"Runtime configuration contains duplicate key {key!r}.")
         result[key] = value
     return result
 
@@ -168,10 +167,16 @@ class AnalyticSimulationRuntime(SimulationRuntime):
 
     def step(self, command: SimulationCommand) -> SimulationObservation:
         """Generate a spectrum at the requested pose and shield orientation."""
+        half_yaw = 0.5 * float(command.target_base_yaw_rad)
         return self.transport_model.observe(
             command,
             detector_pose_xyz=command.target_pose_xyz,
-            detector_quat_wxyz=(1.0, 0.0, 0.0, 0.0),
+            detector_quat_wxyz=(
+                math.cos(half_yaw),
+                0.0,
+                0.0,
+                math.sin(half_yaw),
+            ),
             backend_label="analytic",
         )
 
@@ -232,19 +237,18 @@ class TCPSidecarClientRuntime(SimulationRuntime):
         return SimulationObservation.from_dict(payload["observation"])
 
     def close(self) -> None:
-        """Request clean sidecar shutdown and ignore transport errors."""
+        """Require an acknowledged clean shutdown from the remote sidecar."""
         if not self.close_on_close:
             return None
-        try:
-            self._round_trip("shutdown", {})
-        except OSError:
-            return None
-        except RuntimeError:
-            return None
+        response = self._round_trip("shutdown", {})
+        if response.get("status") != "shutdown":
+            raise RuntimeError(
+                "Simulator sidecar did not acknowledge a clean shutdown."
+            )
 
 
 class IsaacSimTCPClientRuntime(TCPSidecarClientRuntime):
-    """Backward-compatible TCP client for the Isaac Sim sidecar."""
+    """TCP client for the Isaac Sim visualization sidecar."""
 
     def visualize_observation(self, observation: SimulationObservation) -> None:
         """Send observation metadata to Isaac Sim for stage visualization."""
@@ -276,6 +280,10 @@ class Geant4TCPClientRuntime(TCPSidecarClientRuntime):
         expected_background_cps: float | None = None,
         expected_dead_time_tau_s: float | None = None,
         expected_detector_response_sampling: bool = False,
+        expected_runtime_config_sha256: str | None = None,
+        expected_native_executable_sha256: str | None = None,
+        expected_native_execution_environment_sha256: str | None = None,
+        expected_implementation_bundle_sha256: str | None = None,
     ) -> None:
         """Store connection parameters and expected sidecar fidelity."""
         from sim.geant4_app.app import require_primary_sampling_fraction
@@ -376,11 +384,48 @@ class Geant4TCPClientRuntime(TCPSidecarClientRuntime):
         ):
             raise ValueError("expected_dead_time_tau_s must be finite and nonnegative.")
         if not isinstance(expected_detector_response_sampling, bool):
-            raise ValueError(
-                "expected_detector_response_sampling must be a boolean."
-            )
+            raise ValueError("expected_detector_response_sampling must be a boolean.")
         self.expected_detector_response_sampling = bool(
             expected_detector_response_sampling
+        )
+        if expected_runtime_config_sha256 is not None and (
+            not isinstance(expected_runtime_config_sha256, str)
+            or len(expected_runtime_config_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in expected_runtime_config_sha256
+            )
+        ):
+            raise ValueError(
+                "expected_runtime_config_sha256 must be a lowercase SHA-256 string."
+            )
+        self.expected_runtime_config_sha256 = expected_runtime_config_sha256
+        for field_name, value in (
+            (
+                "expected_native_executable_sha256",
+                expected_native_executable_sha256,
+            ),
+            (
+                "expected_native_execution_environment_sha256",
+                expected_native_execution_environment_sha256,
+            ),
+            (
+                "expected_implementation_bundle_sha256",
+                expected_implementation_bundle_sha256,
+            ),
+        ):
+            if value is not None and (
+                type(value) is not str
+                or len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
+            ):
+                raise ValueError(f"{field_name} must be a lowercase SHA-256 string.")
+        self.expected_native_executable_sha256 = expected_native_executable_sha256
+        self.expected_native_execution_environment_sha256 = (
+            expected_native_execution_environment_sha256
+        )
+        self.expected_implementation_bundle_sha256 = (
+            expected_implementation_bundle_sha256
         )
         self.expected_surface_source_contract_sha256: str | None = None
         self.expected_scene_hash: str | None = None
@@ -395,8 +440,7 @@ class Geant4TCPClientRuntime(TCPSidecarClientRuntime):
         sources = reset_payload.get("sources")
         if not isinstance(sources, list) or not sources:
             raise RuntimeError(
-                "Geant4 reset requires a nonempty canonical surface-source "
-                "payload."
+                "Geant4 reset requires a nonempty canonical surface-source payload."
             )
         self.expected_surface_source_contract_sha256 = (
             surface_source_runtime_contract_sha256(sources)
@@ -415,9 +459,7 @@ class Geant4TCPClientRuntime(TCPSidecarClientRuntime):
             expected_primary_sampling_fraction=(
                 self.expected_primary_sampling_fraction
             ),
-            expected_target_sampled_primaries=(
-                self.expected_target_sampled_primaries
-            ),
+            expected_target_sampled_primaries=(self.expected_target_sampled_primaries),
             accelerated_weighted_transport_enable=(
                 self.accelerated_weighted_transport_enable
             ),
@@ -496,6 +538,39 @@ class Geant4TCPClientRuntime(TCPSidecarClientRuntime):
                 "Geant4 sidecar reset did not return a runtime_fidelity "
                 "handshake; refusing to reuse an unverified process."
             )
+        if self.expected_runtime_config_sha256 is not None:
+            actual_runtime_config_sha256 = fidelity.get(
+                "production_runtime_config_sha256"
+            )
+            if actual_runtime_config_sha256 != self.expected_runtime_config_sha256:
+                raise RuntimeError(
+                    "Geant4 sidecar production runtime-config hash mismatch: "
+                    f"expected {self.expected_runtime_config_sha256}, got "
+                    f"{actual_runtime_config_sha256 or 'missing'}."
+                )
+        for field_name, expected_value in (
+            (
+                "native_executable_sha256",
+                self.expected_native_executable_sha256,
+            ),
+            (
+                "native_execution_environment_sha256",
+                self.expected_native_execution_environment_sha256,
+            ),
+            (
+                "implementation_bundle_sha256",
+                self.expected_implementation_bundle_sha256,
+            ),
+        ):
+            if (
+                expected_value is not None
+                and fidelity.get(field_name) != expected_value
+            ):
+                raise RuntimeError(
+                    "Geant4 sidecar native execution provenance mismatch for "
+                    f"{field_name}: expected {expected_value}, got "
+                    f"{fidelity.get(field_name) or 'missing'}."
+                )
         expected_float_fields = {
             "primary_sampling_fraction": self.expected_primary_sampling_fraction,
             "requested_primary_sampling_fraction": (
@@ -520,8 +595,7 @@ class Geant4TCPClientRuntime(TCPSidecarClientRuntime):
                     f"Geant4 sidecar requires {key}={expected_value}, got {value}."
                 )
         if (
-            fidelity.get("source_position_semantics")
-            != "air_side_native_emission_xyz"
+            fidelity.get("source_position_semantics") != "air_side_native_emission_xyz"
             or fidelity.get("source_anchor_semantics")
             != "exact_surface_chart_uv_evaluation_truth"
             or not self._required_handshake_bool(
@@ -553,9 +627,7 @@ class Geant4TCPClientRuntime(TCPSidecarClientRuntime):
             raise RuntimeError(
                 "Geant4 sidecar source epsilon differs from the shared contract."
             )
-        source_contract_hash = fidelity.get(
-            "surface_source_contract_sha256"
-        )
+        source_contract_hash = fidelity.get("surface_source_contract_sha256")
         scene_hash = fidelity.get("scene_hash")
         for key, value in (
             ("surface_source_contract_sha256", source_contract_hash),
@@ -564,18 +636,14 @@ class Geant4TCPClientRuntime(TCPSidecarClientRuntime):
             if (
                 not isinstance(value, str)
                 or len(value) != 64
-                or any(
-                    character not in "0123456789abcdef"
-                    for character in value
-                )
+                or any(character not in "0123456789abcdef" for character in value)
             ):
                 raise RuntimeError(
                     f"Geant4 sidecar fidelity handshake has invalid {key}."
                 )
         if (
             self.expected_surface_source_contract_sha256 is not None
-            and source_contract_hash
-            != self.expected_surface_source_contract_sha256
+            and source_contract_hash != self.expected_surface_source_contract_sha256
         ):
             raise RuntimeError(
                 "Geant4 sidecar source strength/position contract hash differs "
@@ -676,9 +744,7 @@ class Geant4TCPClientRuntime(TCPSidecarClientRuntime):
                 "detector_response_sampling_contract_sha256": (
                     NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
                 ),
-                "background_spectrum_model_id": (
-                    NATIVE_GEANT4_BACKGROUND_MODEL_ID
-                ),
+                "background_spectrum_model_id": (NATIVE_GEANT4_BACKGROUND_MODEL_ID),
             }
             for key, expected_value in expected_response_text.items():
                 actual_value = str(fidelity.get(key, ""))
@@ -800,15 +866,118 @@ class Geant4WithIsaacSimRuntime(SimulationRuntime):
 
     def close(self) -> None:
         """Close both runtimes, preserving the first close error if any."""
-        first_error: Exception | None = None
+        first_error: BaseException | None = None
         for runtime in (self.geant4_runtime, self.isaacsim_runtime):
             try:
                 runtime.close()
-            except Exception as exc:  # pragma: no cover - defensive cleanup path
+            except BaseException as exc:
                 if first_error is None:
                     first_error = exc
+                else:
+                    first_error.add_note(
+                        "Companion runtime cleanup also failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
         if first_error is not None:
             raise first_error
+
+
+def _force_stop_owned_process(
+    process: subprocess.Popen[str],
+) -> list[BaseException]:
+    """Best-effort terminate then kill, returning every cleanup failure."""
+    failures: list[BaseException] = []
+    try:
+        running = process.poll() is None
+    except BaseException as failure:
+        failures.append(failure)
+        running = True
+    if running:
+        try:
+            process.terminate()
+        except BaseException as failure:
+            failures.append(failure)
+    needs_kill = False
+    try:
+        process.wait(timeout=5.0)
+    except subprocess.TimeoutExpired:
+        needs_kill = True
+    except BaseException as failure:
+        failures.append(failure)
+        needs_kill = True
+    if needs_kill:
+        try:
+            still_running = process.poll() is None
+        except BaseException as failure:
+            failures.append(failure)
+            still_running = True
+        if still_running:
+            try:
+                process.kill()
+            except BaseException as failure:
+                failures.append(failure)
+        try:
+            process.wait(timeout=5.0)
+        except BaseException as failure:
+            failures.append(failure)
+    return failures
+
+
+def _finish_managed_sidecar_close(
+    *,
+    process: subprocess.Popen[str],
+    log_handle: object | None,
+    temp_config_path: Path | None,
+    shutdown_failure: BaseException | None,
+) -> None:
+    """Verify graceful child exit and release every owned sidecar handle."""
+    failures: list[BaseException] = []
+    if shutdown_failure is not None:
+        failures.append(shutdown_failure)
+    forced_stop = False
+    try:
+        try:
+            process.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            forced_stop = True
+        except BaseException as wait_failure:
+            failures.append(wait_failure)
+            forced_stop = True
+        if forced_stop:
+            failures.append(
+                RuntimeError("Sidecar required forced termination after shutdown.")
+            )
+            failures.extend(_force_stop_owned_process(process))
+        returncode = process.poll()
+        if not forced_stop and returncode != 0:
+            failures.append(
+                RuntimeError(
+                    "Sidecar exited with nonzero status after shutdown: "
+                    f"returncode={returncode}."
+                )
+            )
+    except BaseException as cleanup_failure:
+        failures.append(cleanup_failure)
+    if log_handle is not None:
+        try:
+            close = getattr(log_handle, "close", None)
+            if close is not None:
+                close()
+        except BaseException as cleanup_failure:
+            failures.append(cleanup_failure)
+    if temp_config_path is not None:
+        try:
+            temp_config_path.unlink(missing_ok=True)
+        except BaseException as cleanup_failure:
+            failures.append(cleanup_failure)
+    if failures:
+        primary = failures[0]
+        for cleanup_failure in failures[1:]:
+            primary.add_note(
+                "Sidecar close also failed: "
+                f"{type(cleanup_failure).__name__}: {cleanup_failure}"
+            )
+        raise primary
 
 
 class ManagedIsaacSimTCPClientRuntime(IsaacSimTCPClientRuntime):
@@ -832,10 +1001,21 @@ class ManagedIsaacSimTCPClientRuntime(IsaacSimTCPClientRuntime):
         self.process = process
         self.log_handle = log_handle
         self.temp_config_path = temp_config_path
+        self._closed = False
+        self._atexit_callback = self._close_at_interpreter_exit
+        atexit.register(self._atexit_callback)
 
     def close(self) -> None:
-        """Shutdown the sidecar and clean up process resources."""
-        super().close()
+        """Require clean shutdown and release the owned sidecar process."""
+        if self._closed:
+            return
+        self._closed = True
+        atexit.unregister(self._atexit_callback)
+        shutdown_failure: BaseException | None = None
+        try:
+            super().close()
+        except BaseException as failure:
+            shutdown_failure = failure
         if not self.close_on_close:
             if self.log_handle is not None:
                 close = getattr(self.log_handle, "close", None)
@@ -843,22 +1023,22 @@ class ManagedIsaacSimTCPClientRuntime(IsaacSimTCPClientRuntime):
                     close()
             if self.temp_config_path is not None:
                 self.temp_config_path.unlink(missing_ok=True)
+            if shutdown_failure is not None:
+                raise shutdown_failure
             return
+        _finish_managed_sidecar_close(
+            process=self.process,
+            log_handle=self.log_handle,
+            temp_config_path=self.temp_config_path,
+            shutdown_failure=shutdown_failure,
+        )
+
+    def _close_at_interpreter_exit(self) -> None:
+        """Best-effort cleanup if ownership outlives the acquisition loop."""
         try:
-            self.process.wait(timeout=5.0)
-        except subprocess.TimeoutExpired:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=5.0)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=5.0)
-        if self.log_handle is not None:
-            close = getattr(self.log_handle, "close", None)
-            if close is not None:
-                close()
-        if self.temp_config_path is not None:
-            self.temp_config_path.unlink(missing_ok=True)
+            self.close()
+        except BaseException:
+            return
 
 
 class ManagedGeant4TCPClientRuntime(Geant4TCPClientRuntime):
@@ -873,7 +1053,6 @@ class ManagedGeant4TCPClientRuntime(Geant4TCPClientRuntime):
         process: subprocess.Popen[str],
         log_handle: object | None = None,
         temp_config_path: Path | None = None,
-        restart_config: dict[str, Any] | None = None,
         expected_primary_sampling_fraction: float = 1.0,
         expected_target_sampled_primaries: int | None = None,
         accelerated_weighted_transport_enable: bool = False,
@@ -886,6 +1065,10 @@ class ManagedGeant4TCPClientRuntime(Geant4TCPClientRuntime):
         expected_background_cps: float | None = None,
         expected_dead_time_tau_s: float | None = None,
         expected_detector_response_sampling: bool = False,
+        expected_runtime_config_sha256: str | None = None,
+        expected_native_executable_sha256: str | None = None,
+        expected_native_execution_environment_sha256: str | None = None,
+        expected_implementation_bundle_sha256: str | None = None,
     ) -> None:
         """Store the client parameters and owned process handles."""
         super().__init__(
@@ -893,9 +1076,7 @@ class ManagedGeant4TCPClientRuntime(Geant4TCPClientRuntime):
             port=port,
             timeout_s=timeout_s,
             expected_primary_sampling_fraction=(expected_primary_sampling_fraction),
-            expected_target_sampled_primaries=(
-                expected_target_sampled_primaries
-            ),
+            expected_target_sampled_primaries=(expected_target_sampled_primaries),
             accelerated_weighted_transport_enable=(
                 accelerated_weighted_transport_enable
             ),
@@ -907,127 +1088,40 @@ class ManagedGeant4TCPClientRuntime(Geant4TCPClientRuntime):
             expected_source_bias_mode=expected_source_bias_mode,
             expected_background_cps=expected_background_cps,
             expected_dead_time_tau_s=expected_dead_time_tau_s,
-            expected_detector_response_sampling=(
-                expected_detector_response_sampling
+            expected_detector_response_sampling=(expected_detector_response_sampling),
+            expected_runtime_config_sha256=expected_runtime_config_sha256,
+            expected_native_executable_sha256=(expected_native_executable_sha256),
+            expected_native_execution_environment_sha256=(
+                expected_native_execution_environment_sha256
+            ),
+            expected_implementation_bundle_sha256=(
+                expected_implementation_bundle_sha256
             ),
         )
         self.process = process
         self.log_handle = log_handle
         self.temp_config_path = temp_config_path
-        self.restart_config = {} if restart_config is None else dict(restart_config)
-        self._last_reset_payload: dict[str, Any] | None = None
-        self._restart_count = 0
         self._closed = False
         self._atexit_callback = self._close_at_interpreter_exit
         atexit.register(self._atexit_callback)
 
-    def reset(self, payload: dict[str, Any] | None = None) -> None:
-        """Reset the sidecar and retain the payload for crash recovery."""
-        reset_payload = {} if payload is None else dict(payload)
-        self._last_reset_payload = reset_payload
-        response = self._round_trip("reset", reset_payload)
-        self._validate_fidelity_handshake(response)
-
-    def _round_trip(self, message_type: str, payload: dict[str, Any]) -> dict[str, Any]:
-        """Send a request, restarting a crashed managed sidecar when safe."""
-        try:
-            return super()._round_trip(message_type, payload)
-        except OSError:
-            if not self._can_restart_for(message_type):
-                raise
-            self._restart_sidecar()
-            if message_type != "reset":
-                if self._last_reset_payload is None:
-                    raise RuntimeError(
-                        "Managed Geant4 sidecar crashed before any reset payload was recorded."
-                    )
-                reset_response = super()._round_trip("reset", self._last_reset_payload)
-                self._validate_fidelity_handshake(reset_response)
-            return super()._round_trip(message_type, payload)
-
-    def _can_restart_for(self, message_type: str) -> bool:
-        """Return whether a transport failure can be retried without changing semantics."""
-        if message_type == "shutdown":
-            return False
-        if not _config_bool(self.restart_config, "enabled", True):
-            return False
-        max_restarts = _config_integer(
-            self.restart_config,
-            "max_restarts",
-            2,
-            minimum=0,
-        )
-        return self._restart_count < max_restarts
-
-    def _restart_sidecar(self) -> None:
-        """Restart the owned Geant4 bridge process using the original config."""
-        script_path = Path(str(self.restart_config["script_path"]))
-        config_path = Path(str(self.restart_config["config_path"]))
-        config = dict(self.restart_config.get("config", {}))
-        log_path = Path(str(self.restart_config["log_path"]))
-        extra_args = list(self.restart_config.get("extra_args", []))
-        startup_timeout_s = _config_number(
-            self.restart_config,
-            "startup_timeout_s",
-            30.0,
-            minimum=0.0,
-            strict_minimum=True,
-        )
-        if self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=5.0)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=5.0)
-        if self.log_handle is not None:
-            close = getattr(self.log_handle, "close", None)
-            if close is not None:
-                close()
-            self.log_handle = None
-        self._restart_count += 1
-        process, log_handle = _start_sidecar_process(
-            script_path=script_path,
-            config_path=config_path,
-            config=config,
-            host=self.host,
-            port=self.port,
-            timeout_s=startup_timeout_s,
-            log_path=log_path,
-            sidecar_name="Geant4",
-            extra_args=extra_args,
-        )
-        self.process = process
-        self.log_handle = log_handle
-
     def close(self) -> None:
-        """Shutdown the sidecar and clean up process resources."""
+        """Require clean shutdown and release the owned sidecar process."""
         if self._closed:
             return
         self._closed = True
         atexit.unregister(self._atexit_callback)
-        first_error: Exception | None = None
+        shutdown_failure: BaseException | None = None
         try:
             super().close()
-        except Exception as exc:  # pragma: no cover - defensive cleanup path
-            first_error = exc
-        try:
-            self.process.wait(timeout=5.0)
-        except subprocess.TimeoutExpired:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=5.0)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=5.0)
-        if self.log_handle is not None:
-            close = getattr(self.log_handle, "close", None)
-            if close is not None:
-                close()
-        if self.temp_config_path is not None:
-            self.temp_config_path.unlink(missing_ok=True)
-        if first_error is not None:
-            raise first_error
+        except BaseException as failure:
+            shutdown_failure = failure
+        _finish_managed_sidecar_close(
+            process=self.process,
+            log_handle=self.log_handle,
+            temp_config_path=self.temp_config_path,
+            shutdown_failure=shutdown_failure,
+        )
 
     def _close_at_interpreter_exit(self) -> None:
         """Best-effort cleanup for failures before the live-loop ``finally``."""
@@ -1040,6 +1134,205 @@ class ManagedGeant4TCPClientRuntime(Geant4TCPClientRuntime):
 def load_runtime_config(path: str | Path | None) -> dict[str, Any]:
     """Load a JSON runtime configuration file with optional inheritance."""
     return _load_runtime_config(path, seen=set())
+
+
+PRODUCTION_RUNTIME_CONFIG_FIELDS = frozenset(
+    {
+        "absorbing_transport_groups",
+        "author_obstacle_prims",
+        "author_room_boundary_prims",
+        "auto_start_sidecar",
+        "backend",
+        "background_cps",
+        "background_rate_cps",
+        "background_spectrum_model_id",
+        "bin_width_keV",
+        "dead_time_tau_s",
+        "detector_aperture_samples",
+        "detector_aperture_sampling",
+        "detector_height_m",
+        "detector_model",
+        "detector_scoring_mode",
+        "energy_bin_count",
+        "energy_max_keV",
+        "energy_min_keV",
+        "engine_mode",
+        "executable_path",
+        "full_spectrum_model_registry_file_sha256",
+        "full_spectrum_model_registry_path",
+        "headless",
+        "host",
+        "isotope_experiment_profile",
+        "line_resolved_shield_attenuation",
+        "obstacle_attenuation_enabled",
+        "obstacle_height_m",
+        "persistent_process",
+        "physics_profile",
+        "port",
+        "primary_sampling_fraction",
+        "random_seed_base",
+        "renderer",
+        "sample_detector_response",
+        "secondary_transport_mode",
+        "shield_transmission_target",
+        "simulation_runtime_schema_version",
+        "source_bias_cone_half_angle_deg",
+        "source_extent_radius_m",
+        "source_extent_samples",
+        "source_rate_model",
+        "stage_material_rules",
+        "start_isaacsim_sidecar_with_geant4",
+        "thread_count",
+        "timeout_s",
+        "usd_path",
+        "use_mock_stage",
+    }
+)
+PRODUCTION_GUI_RUNTIME_CONFIG_FIELDS = frozenset(
+    {
+        "isaacsim_keep_sidecar_alive",
+        "isaacsim_sidecar_config_path",
+        "isaacsim_sidecar_python_env",
+        "isaacsim_sidecar_startup_timeout_s",
+    }
+)
+_PRODUCTION_DETECTOR_MODEL_FIELDS = frozenset(
+    {
+        "crystal_length_m",
+        "crystal_material",
+        "crystal_radius_m",
+        "crystal_shape",
+        "housing_material",
+        "housing_thickness_m",
+    }
+)
+_PRODUCTION_BOOLEAN_FIELDS = frozenset(
+    {
+        "author_obstacle_prims",
+        "author_room_boundary_prims",
+        "auto_start_sidecar",
+        "headless",
+        "line_resolved_shield_attenuation",
+        "obstacle_attenuation_enabled",
+        "persistent_process",
+        "sample_detector_response",
+        "start_isaacsim_sidecar_with_geant4",
+        "use_mock_stage",
+    }
+)
+
+
+def validate_production_runtime_config(config: Mapping[str, Any]) -> None:
+    """Require the complete canonical production transport configuration."""
+    if not isinstance(config, Mapping) or any(
+        not isinstance(key, str) for key in config
+    ):
+        raise TypeError("Production runtime config must be a string-keyed object.")
+    actual = frozenset(config)
+    gui_enabled = config.get("start_isaacsim_sidecar_with_geant4") is True
+    expected = PRODUCTION_RUNTIME_CONFIG_FIELDS | (
+        PRODUCTION_GUI_RUNTIME_CONFIG_FIELDS if gui_enabled else frozenset()
+    )
+    missing = sorted(expected - actual)
+    unknown = sorted(actual - expected)
+    if missing or unknown:
+        raise ValueError(
+            "Production runtime config fields differ from the canonical schema: "
+            f"missing={missing}, unknown_or_retired={unknown}."
+        )
+    schema_version = config["simulation_runtime_schema_version"]
+    if (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version != 1
+    ):
+        raise ValueError(
+            "Production runtime config requires simulation_runtime_schema_version=1."
+        )
+    invalid_booleans = sorted(
+        name for name in _PRODUCTION_BOOLEAN_FIELDS if type(config[name]) is not bool
+    )
+    if invalid_booleans:
+        raise TypeError(
+            "Production runtime Boolean fields require exact JSON booleans: "
+            f"{invalid_booleans}."
+        )
+    detector = config["detector_model"]
+    if not isinstance(detector, Mapping):
+        raise TypeError("Production detector_model must be an object.")
+    detector_actual = frozenset(detector)
+    detector_missing = sorted(_PRODUCTION_DETECTOR_MODEL_FIELDS - detector_actual)
+    detector_unknown = sorted(detector_actual - _PRODUCTION_DETECTOR_MODEL_FIELDS)
+    if detector_missing or detector_unknown:
+        raise ValueError(
+            "Production detector_model fields differ from the canonical schema: "
+            f"missing={detector_missing}, unknown={detector_unknown}."
+        )
+    if config["backend"] != "geant4":
+        raise ValueError("Production runtime config requires backend='geant4'.")
+    expected_mock_stage = not config["start_isaacsim_sidecar_with_geant4"]
+    if config["use_mock_stage"] is not expected_mock_stage:
+        raise ValueError(
+            "Production use_mock_stage must be true for no-Isaac in-memory scene "
+            "authoring and false when the Isaac Sim sidecar is enabled."
+        )
+    if gui_enabled:
+        if type(config["isaacsim_keep_sidecar_alive"]) is not bool:
+            raise TypeError(
+                "Production isaacsim_keep_sidecar_alive requires an exact JSON boolean."
+            )
+        if config["isaacsim_keep_sidecar_alive"] is not False:
+            raise ValueError(
+                "Production GUI requires isaacsim_keep_sidecar_alive=false so "
+                "the fresh Isaac Sim sidecar has one exact acquisition owner."
+            )
+
+
+def load_production_runtime_config(path: str | Path) -> dict[str, Any]:
+    """Load one self-contained canonical production runtime configuration."""
+    config_path = Path(path).expanduser().resolve()
+    if not config_path.is_file():
+        raise FileNotFoundError(f"Simulation config not found: {config_path}")
+    with config_path.open("r", encoding="utf-8") as handle:
+        data = json.load(
+            handle,
+            object_pairs_hook=_runtime_json_object,
+            parse_constant=_reject_nonfinite_json_constant,
+        )
+    if not isinstance(data, dict):
+        raise ValueError("Production simulation config must be a JSON object.")
+    if "extends" in data:
+        raise ValueError(
+            "Production runtime config cannot use retired 'extends' inheritance."
+        )
+    validate_production_runtime_config(data)
+    usd_path = data["usd_path"]
+    if not isinstance(usd_path, str) or not usd_path.strip():
+        raise TypeError("Production usd_path must be a nonempty JSON string.")
+    resolved_usd_path = Path(usd_path).expanduser()
+    if not resolved_usd_path.is_absolute():
+        resolved_usd_path = (
+            _repo_root() / "configs" / "geant4" / resolved_usd_path
+        ).resolve()
+    data["usd_path"] = resolved_usd_path.as_posix()
+    from sim.geant4_app.app import Geant4AppConfig
+
+    Geant4AppConfig.from_dict(data)
+    return data
+
+
+def production_runtime_config_sha256(config: Mapping[str, Any]) -> str:
+    """Hash one normalized exact production runtime configuration."""
+    validate_production_runtime_config(config)
+    usd_path = config["usd_path"]
+    if not isinstance(usd_path, str) or not Path(usd_path).is_absolute():
+        raise ValueError(
+            "Production runtime config must be loaded and canonicalized before hashing."
+        )
+    from sim.geant4_app.app import Geant4AppConfig
+
+    Geant4AppConfig.from_dict(dict(config))
+    return strict_sha256_json(dict(config))
 
 
 def _load_runtime_config(
@@ -1069,9 +1362,7 @@ def _load_runtime_config(
     if parent_ref is None:
         return data
     if not isinstance(parent_ref, str) or not parent_ref.strip():
-        raise ValueError(
-            "Runtime config 'extends' must be a nonempty JSON string."
-        )
+        raise ValueError("Runtime config 'extends' must be a nonempty JSON string.")
     parent_path = Path(parent_ref).expanduser()
     if not parent_path.is_absolute():
         parent_path = (config_path.parent / parent_path).resolve()
@@ -1205,7 +1496,6 @@ def _start_sidecar_process(
     root = _repo_root()
     log_path.parent.mkdir(parents=True, exist_ok=True)
     python_executable = _resolve_sidecar_python(config, sidecar_name)
-    log_handle = log_path.open("a", encoding="utf-8")
     command = [
         python_executable,
         script_path.as_posix(),
@@ -1214,59 +1504,81 @@ def _start_sidecar_process(
     ]
     if extra_args:
         command.extend(extra_args)
-    process = subprocess.Popen(
-        command,
-        cwd=root.as_posix(),
-        stdout=log_handle,
-        stderr=subprocess.STDOUT,
-        text=True,
-        start_new_session=True,
-    )
-    deadline = time.monotonic() + float(timeout_s)
-    while time.monotonic() < deadline:
-        if process.poll() is not None:
-            log_handle.close()
-            raise RuntimeError(
-                f"Auto-started {sidecar_name} sidecar exited before accepting connections. "
-                f"See log: {log_path}"
-            )
-        if _tcp_server_available(host, port):
-            print(
-                f"Auto-started {sidecar_name} sidecar on {host}:{port} (log: {log_path})"
-            )
-            return process, log_handle
-        time.sleep(0.1)
-    process.terminate()
+    log_handle: object | None = None
+    process: subprocess.Popen[str] | None = None
     try:
-        process.wait(timeout=5.0)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait(timeout=5.0)
-    log_handle.close()
-    raise TimeoutError(
-        f"Timed out waiting for auto-started {sidecar_name} sidecar on {host}:{port}. "
-        f"See log: {log_path}"
-    )
+        log_handle = log_path.open("a", encoding="utf-8")
+        process = subprocess.Popen(
+            command,
+            cwd=root.as_posix(),
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+        deadline = time.monotonic() + float(timeout_s)
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise RuntimeError(
+                    f"Auto-started {sidecar_name} sidecar exited before "
+                    f"accepting connections. See log: {log_path}"
+                )
+            if _tcp_server_available(host, port):
+                print(
+                    f"Auto-started {sidecar_name} sidecar on {host}:{port} "
+                    f"(log: {log_path})"
+                )
+                return process, log_handle
+            time.sleep(0.1)
+        raise TimeoutError(
+            f"Timed out waiting for auto-started {sidecar_name} sidecar on "
+            f"{host}:{port}. See log: {log_path}"
+        )
+    except BaseException as startup_failure:
+        _cleanup_failed_sidecar_process(
+            process=process,
+            log_handle=log_handle,
+            failure=startup_failure,
+        )
+        raise
+
+
+def _cleanup_failed_sidecar_process(
+    *,
+    process: subprocess.Popen[str] | None,
+    log_handle: object | None,
+    failure: BaseException,
+) -> None:
+    """Terminate startup-owned process handles without masking the failure."""
+    cleanup_failures: list[BaseException] = []
+    if process is not None:
+        try:
+            running = process.poll() is None
+        except BaseException as cleanup_failure:
+            cleanup_failures.append(cleanup_failure)
+            running = True
+        if running:
+            cleanup_failures.extend(_force_stop_owned_process(process))
+    if log_handle is not None:
+        try:
+            close = getattr(log_handle, "close", None)
+            if close is not None:
+                close()
+        except BaseException as cleanup_failure:
+            cleanup_failures.append(cleanup_failure)
+    for cleanup_failure in cleanup_failures:
+        failure.add_note(
+            "Sidecar startup cleanup also failed: "
+            f"{type(cleanup_failure).__name__}: {cleanup_failure}"
+        )
 
 
 def _resolve_geant4_sidecar_config_path(
     config: dict[str, Any],
     runtime_config_path: str | Path | None,
 ) -> tuple[Path, Path | None]:
-    """Return the config path passed to the sidecar and an optional temp file."""
-    if runtime_config_path is not None:
-        return Path(runtime_config_path).expanduser().resolve(), None
-    configured = config.get("sidecar_config_path")
-    if configured not in (None, ""):
-        return Path(str(configured)).expanduser().resolve(), None
-    default_path = (
-        _repo_root()
-        / "configs"
-        / "geant4"
-        / "variance_reduction_external_no_isaac_32threads.json"
-    )
-    if not config and default_path.exists():
-        return default_path, None
+    """Freeze the validated mapping for the child without rereading its source."""
+    del runtime_config_path
     temp_path = _write_temp_sidecar_config(config)
     return temp_path, temp_path
 
@@ -1277,6 +1589,10 @@ def _start_geant4_sidecar(
     host: str,
     port: int,
     runtime_config_path: str | Path | None,
+    expected_runtime_config_sha256: str | None = None,
+    expected_native_executable_sha256: str | None = None,
+    expected_native_execution_environment_sha256: str | None = None,
+    expected_implementation_bundle_sha256: str | None = None,
 ) -> ManagedGeant4TCPClientRuntime:
     """Start a Geant4 bridge sidecar subprocess and return its managed client."""
     from sim.geant4_app.app import Geant4AppConfig
@@ -1288,7 +1604,9 @@ def _start_geant4_sidecar(
         config,
         runtime_config_path,
     )
-    sidecar_geant4_config = Geant4AppConfig.from_dict(load_runtime_config(config_path))
+    sidecar_geant4_config = Geant4AppConfig.from_dict(
+        load_production_runtime_config(config_path)
+    )
     if sidecar_geant4_config != validated_geant4_config:
         if temp_config_path is not None:
             temp_config_path.unlink(missing_ok=True)
@@ -1313,11 +1631,6 @@ def _start_geant4_sidecar(
         minimum=0.0,
         strict_minimum=True,
     )
-    sidecar_mock_stage = _config_bool(
-        config,
-        "sidecar_mock_stage",
-        False,
-    )
     try:
         process, log_handle = _start_sidecar_process(
             script_path=script_path,
@@ -1328,67 +1641,74 @@ def _start_geant4_sidecar(
             timeout_s=startup_timeout_s,
             log_path=log_path,
             sidecar_name="Geant4",
-            extra_args=["--mock-stage"] if sidecar_mock_stage else None,
+            extra_args=None,
         )
-    except Exception:
+    except BaseException:
         if temp_config_path is not None:
             temp_config_path.unlink(missing_ok=True)
         raise
-    return ManagedGeant4TCPClientRuntime(
-        host=host,
-        port=port,
-        timeout_s=_config_number(
-            config,
-            "timeout_s",
-            120.0,
-            minimum=0.0,
-            strict_minimum=True,
-        ),
-        process=process,
-        log_handle=log_handle,
-        temp_config_path=temp_config_path,
-        expected_primary_sampling_fraction=(
-            validated_geant4_config.primary_sampling_fraction
-        ),
-        expected_target_sampled_primaries=(
-            validated_geant4_config.target_sampled_primaries
-        ),
-        accelerated_weighted_transport_enable=(
-            validated_geant4_config.accelerated_weighted_transport_enable
-        ),
-        expected_source_rate_model=validated_geant4_config.source_rate_model,
-        expected_thread_count=validated_geant4_config.thread_count,
-        expected_physics_profile=validated_geant4_config.physics_profile,
-        expected_detector_scoring_mode=(validated_geant4_config.detector_scoring_mode),
-        expected_secondary_transport_mode=(
-            validated_geant4_config.secondary_transport_mode
-        ),
-        expected_source_bias_mode=validated_geant4_config.source_bias_mode,
-        expected_background_cps=validated_geant4_config.background_cps,
-        expected_dead_time_tau_s=validated_geant4_config.dead_time_tau_s,
-        expected_detector_response_sampling=(
-            validated_geant4_config.sample_detector_response
-        ),
-        restart_config={
-            "enabled": _config_bool(
+    try:
+        return ManagedGeant4TCPClientRuntime(
+            host=host,
+            port=port,
+            timeout_s=_config_number(
                 config,
-                "sidecar_restart_on_disconnect",
-                True,
+                "timeout_s",
+                120.0,
+                minimum=0.0,
+                strict_minimum=True,
             ),
-            "max_restarts": _config_integer(
-                config,
-                "sidecar_max_restarts",
-                2,
-                minimum=0,
+            process=process,
+            log_handle=log_handle,
+            temp_config_path=temp_config_path,
+            expected_primary_sampling_fraction=(
+                validated_geant4_config.primary_sampling_fraction
             ),
-            "script_path": script_path.as_posix(),
-            "config_path": config_path.as_posix(),
-            "config": dict(config),
-            "log_path": log_path.as_posix(),
-            "startup_timeout_s": startup_timeout_s,
-            "extra_args": ["--mock-stage"] if sidecar_mock_stage else [],
-        },
-    )
+            expected_target_sampled_primaries=(
+                validated_geant4_config.target_sampled_primaries
+            ),
+            accelerated_weighted_transport_enable=(
+                validated_geant4_config.accelerated_weighted_transport_enable
+            ),
+            expected_source_rate_model=validated_geant4_config.source_rate_model,
+            expected_thread_count=validated_geant4_config.thread_count,
+            expected_physics_profile=validated_geant4_config.physics_profile,
+            expected_detector_scoring_mode=(
+                validated_geant4_config.detector_scoring_mode
+            ),
+            expected_secondary_transport_mode=(
+                validated_geant4_config.secondary_transport_mode
+            ),
+            expected_source_bias_mode=validated_geant4_config.source_bias_mode,
+            expected_background_cps=validated_geant4_config.background_cps,
+            expected_dead_time_tau_s=validated_geant4_config.dead_time_tau_s,
+            expected_detector_response_sampling=(
+                validated_geant4_config.sample_detector_response
+            ),
+            expected_runtime_config_sha256=expected_runtime_config_sha256,
+            expected_native_executable_sha256=(expected_native_executable_sha256),
+            expected_native_execution_environment_sha256=(
+                expected_native_execution_environment_sha256
+            ),
+            expected_implementation_bundle_sha256=(
+                expected_implementation_bundle_sha256
+            ),
+        )
+    except BaseException as startup_failure:
+        _cleanup_failed_sidecar_process(
+            process=process,
+            log_handle=log_handle,
+            failure=startup_failure,
+        )
+        if temp_config_path is not None:
+            try:
+                temp_config_path.unlink(missing_ok=True)
+            except BaseException as cleanup_failure:
+                startup_failure.add_note(
+                    "Sidecar config cleanup also failed: "
+                    f"{type(cleanup_failure).__name__}: {cleanup_failure}"
+                )
+        raise
 
 
 def _resolve_isaacsim_sidecar_config_path(
@@ -1440,8 +1760,9 @@ def _start_isaacsim_sidecar(
     runtime_config_path: str | Path | None = None,
     *,
     direct_config: bool = False,
+    require_fresh_owned_process: bool = False,
 ) -> IsaacSimTCPClientRuntime:
-    """Start or reuse an Isaac Sim bridge sidecar for Geant4 companion motion."""
+    """Start an Isaac sidecar, optionally forbidding all endpoint reuse."""
     config_path, temp_config_path, isaac_config = _resolve_isaacsim_sidecar_config_path(
         config,
         runtime_config_path=runtime_config_path,
@@ -1471,9 +1792,21 @@ def _start_isaacsim_sidecar(
         if "isaacsim_keep_sidecar_alive" in config
         else _config_bool(isaac_config, "keep_sidecar_alive", False)
     )
+    if require_fresh_owned_process and keep_alive:
+        if temp_config_path is not None:
+            temp_config_path.unlink(missing_ok=True)
+        raise ValueError(
+            "Production Isaac Sim requires isaacsim_keep_sidecar_alive=false "
+            "so every GUI sidecar remains owned by one acquisition."
+        )
     if _tcp_server_available(host, port):
         if temp_config_path is not None:
             temp_config_path.unlink(missing_ok=True)
+        if require_fresh_owned_process:
+            raise RuntimeError(
+                "Production Isaac Sim refuses to attach to an existing TCP "
+                f"endpoint at {host}:{port}."
+            )
         return IsaacSimTCPClientRuntime(
             host=host,
             port=port,
@@ -1524,24 +1857,42 @@ def _start_isaacsim_sidecar(
                 else None
             ),
         )
-    except Exception:
+    except BaseException:
         if temp_config_path is not None:
             temp_config_path.unlink(missing_ok=True)
         raise
-    return ManagedIsaacSimTCPClientRuntime(
-        host=host,
-        port=port,
-        timeout_s=timeout_s,
-        process=process,
-        log_handle=log_handle,
-        temp_config_path=temp_config_path,
-        close_on_close=not keep_alive,
-    )
+    try:
+        return ManagedIsaacSimTCPClientRuntime(
+            host=host,
+            port=port,
+            timeout_s=timeout_s,
+            process=process,
+            log_handle=log_handle,
+            temp_config_path=temp_config_path,
+            close_on_close=not keep_alive,
+        )
+    except BaseException as startup_failure:
+        _cleanup_failed_sidecar_process(
+            process=process,
+            log_handle=log_handle,
+            failure=startup_failure,
+        )
+        if temp_config_path is not None:
+            try:
+                temp_config_path.unlink(missing_ok=True)
+            except BaseException as cleanup_failure:
+                startup_failure.add_note(
+                    "Sidecar config cleanup also failed: "
+                    f"{type(cleanup_failure).__name__}: {cleanup_failure}"
+                )
+        raise
 
 
 def _maybe_pair_geant4_with_isaacsim(
     config: dict[str, Any],
     geant4_runtime: SimulationRuntime,
+    *,
+    require_fresh_isaacsim: bool = False,
 ) -> SimulationRuntime:
     """Wrap Geant4 with an Isaac Sim companion runtime when configured."""
     if not _config_bool(
@@ -1551,9 +1902,18 @@ def _maybe_pair_geant4_with_isaacsim(
     ):
         return geant4_runtime
     try:
-        isaacsim_runtime = _start_isaacsim_sidecar(config)
-    except Exception:
-        geant4_runtime.close()
+        isaacsim_runtime = _start_isaacsim_sidecar(
+            config,
+            require_fresh_owned_process=require_fresh_isaacsim,
+        )
+    except BaseException as startup_failure:
+        try:
+            geant4_runtime.close()
+        except BaseException as cleanup_failure:
+            startup_failure.add_note(
+                "Geant4 cleanup after Isaac Sim startup failure also failed: "
+                f"{type(cleanup_failure).__name__}: {cleanup_failure}"
+            )
         raise
     return Geant4WithIsaacSimRuntime(
         geant4_runtime=geant4_runtime,
@@ -1569,6 +1929,10 @@ def create_simulation_runtime(
     shield_params: Any,
     runtime_config: dict[str, Any] | None = None,
     runtime_config_path: str | Path | None = None,
+    expected_runtime_config_sha256: str | None = None,
+    expected_native_executable_sha256: str | None = None,
+    expected_native_execution_environment_sha256: str | None = None,
+    expected_implementation_bundle_sha256: str | None = None,
 ) -> SimulationRuntime:
     """Instantiate the requested simulation runtime."""
     config = {} if runtime_config is None else dict(runtime_config)
@@ -1655,6 +2019,29 @@ def create_simulation_runtime(
     if normalized == "geant4":
         from sim.geant4_app.app import Geant4AppConfig
 
+        gui_enabled = config.get("start_isaacsim_sidecar_with_geant4") is True
+        production_fields = PRODUCTION_RUNTIME_CONFIG_FIELDS | (
+            PRODUCTION_GUI_RUNTIME_CONFIG_FIELDS if gui_enabled else frozenset()
+        )
+        production_config = frozenset(config) == production_fields
+        if production_config:
+            actual_runtime_config_sha256 = production_runtime_config_sha256(config)
+            if expected_runtime_config_sha256 is None:
+                expected_runtime_config_sha256 = actual_runtime_config_sha256
+            elif expected_runtime_config_sha256 != actual_runtime_config_sha256:
+                raise ValueError(
+                    "Expected production runtime-config hash does not authenticate "
+                    "the supplied canonical configuration."
+                )
+            if (
+                expected_native_executable_sha256 is None
+                or expected_native_execution_environment_sha256 is None
+                or expected_implementation_bundle_sha256 is None
+            ):
+                raise ValueError(
+                    "Production Geant4 startup requires approved native "
+                    "executable and execution-environment digests."
+                )
         validated_geant4_config = Geant4AppConfig.from_dict(config)
         host = _config_string(config, "host", "127.0.0.1")
         port = _config_integer(
@@ -1672,12 +2059,28 @@ def create_simulation_runtime(
             strict_minimum=True,
         )
         auto_start = _config_bool(config, "auto_start_sidecar", True)
-        if auto_start and not _tcp_server_available(host, port):
+        endpoint_occupied = _tcp_server_available(host, port)
+        if production_config and auto_start is not True:
+            raise ValueError("Production Geant4 requires auto_start_sidecar=true.")
+        if production_config and endpoint_occupied:
+            raise RuntimeError(
+                "Production Geant4 refuses to attach to an existing TCP "
+                f"endpoint at {host}:{port}."
+            )
+        if auto_start and not endpoint_occupied:
             geant4_runtime = _start_geant4_sidecar(
                 config,
                 host=host,
                 port=port,
                 runtime_config_path=runtime_config_path,
+                expected_runtime_config_sha256=(expected_runtime_config_sha256),
+                expected_native_executable_sha256=(expected_native_executable_sha256),
+                expected_native_execution_environment_sha256=(
+                    expected_native_execution_environment_sha256
+                ),
+                expected_implementation_bundle_sha256=(
+                    expected_implementation_bundle_sha256
+                ),
             )
         else:
             geant4_runtime = Geant4TCPClientRuntime(
@@ -1708,6 +2111,18 @@ def create_simulation_runtime(
                 expected_detector_response_sampling=(
                     validated_geant4_config.sample_detector_response
                 ),
+                expected_runtime_config_sha256=(expected_runtime_config_sha256),
+                expected_native_executable_sha256=(expected_native_executable_sha256),
+                expected_native_execution_environment_sha256=(
+                    expected_native_execution_environment_sha256
+                ),
+                expected_implementation_bundle_sha256=(
+                    expected_implementation_bundle_sha256
+                ),
             )
-        return _maybe_pair_geant4_with_isaacsim(config, geant4_runtime)
+        return _maybe_pair_geant4_with_isaacsim(
+            config,
+            geant4_runtime,
+            require_fresh_isaacsim=production_config,
+        )
     raise ValueError(f"Unknown simulation backend: {backend}")

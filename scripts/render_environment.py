@@ -20,7 +20,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from measurement.obstacles import ObstacleGrid, build_obstacle_grid
-from runtime_defaults import DEFAULT_ENVIRONMENT_MODE, DEFAULT_FIXED_OBSTACLE_CONFIG
+from runtime.defaults import DEFAULT_ENVIRONMENT_MODE, DEFAULT_FIXED_OBSTACLE_CONFIG
 
 
 def build_parser() -> argparse.ArgumentParser:

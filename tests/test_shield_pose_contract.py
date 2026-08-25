@@ -9,11 +9,36 @@ from measurement.shielding import (
     physical_shield_normal_from_orientation_index,
 )
 from sim.geant4_app.engine import Geant4StepRequest
-from sim.isaacsim_app.robot_controller import RobotController
+from sim.isaacsim_app.robot_controller import (
+    RobotController,
+    _movement_yaw_rad,
+    _rotation_between_vectors_wxyz,
+)
 from sim.isaacsim_app.scene_builder import StagePrimPaths
 from sim.isaacsim_app.stage_backend import FakeStageBackend
 from sim.protocol import SimulationCommand
 from sim.shield_geometry import shield_normal_from_quaternion_wxyz
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    ((0.0, 0.0, 0.0), (np.nan, 0.0, 1.0), (np.inf, 0.0, 1.0)),
+)
+def test_robot_rotation_rejects_degenerate_directions(
+    invalid: tuple[float, float, float],
+) -> None:
+    """Isaac shield placement must not substitute a direction for invalid input."""
+    with pytest.raises(ValueError, match="Direction vectors"):
+        _rotation_between_vectors_wxyz(invalid, (1.0, 0.0, 0.0))
+
+
+def test_vertical_robot_motion_preserves_the_commanded_yaw() -> None:
+    """A vertical move has no planar heading and keeps its explicit command yaw."""
+    assert _movement_yaw_rad(
+        np.asarray((1.0, 2.0, 0.5)),
+        np.asarray((1.0, 2.0, 1.5)),
+        preserved_yaw_rad=0.75,
+    ) == pytest.approx(0.75)
 
 
 @pytest.mark.parametrize("base_yaw_rad", [0.0, 0.37, -1.2, np.pi])

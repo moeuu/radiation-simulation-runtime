@@ -19,6 +19,7 @@ class Geant4BridgeServerConfig:
     host: str = "127.0.0.1"
     port: int = 5556
     app_config: dict[str, Any] = field(default_factory=dict)
+    production_runtime_config_sha256: str | None = None
 
 
 class _BridgeTCPServer(socketserver.TCPServer):
@@ -78,7 +79,12 @@ class _BridgeRequestHandler(socketserver.BaseRequestHandler):
 
 def serve_forever(config: Geant4BridgeServerConfig) -> None:
     """Run the Geant4 TCP bridge until shutdown is requested."""
-    app = Geant4Application(app_config=config.app_config)
+    app = Geant4Application(
+        app_config=config.app_config,
+        production_runtime_config_sha256=(
+            config.production_runtime_config_sha256
+        ),
+    )
     with _BridgeTCPServer((config.host, config.port), _BridgeRequestHandler, app) as server:
         try:
             server.serve_forever()

@@ -191,7 +191,7 @@ def test_renewal_sampler_matches_exact_moments_and_support() -> None:
 
 
 def test_mean_one_gamma_sampler_matches_moments() -> None:
-    """Batched Marsaglia-Tsang draws must preserve Gamma means and variances."""
+    """The canonical Torch Gamma kernel must preserve means and variances."""
     concentrations = torch.tensor(
         [0.2, 1.0, 5.0, 100.0],
         dtype=torch.float64,
@@ -211,6 +211,19 @@ def test_mean_one_gamma_sampler_matches_moments() -> None:
         rtol=0.035,
         atol=0.004,
     )
+
+
+def test_gamma_sampler_rejects_missing_canonical_torch_kernel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Torch compatibility gap must fail instead of selecting another RNG."""
+    monkeypatch.setattr(torch, "_standard_gamma", None)
+
+    with pytest.raises(RuntimeError, match="requires torch._standard_gamma"):
+        sample_mean_one_gamma_torch(
+            torch.ones(2, dtype=torch.float64),
+            generator=_generator(811),
+        )
 
 
 def test_balanced_multinomial_tree_preserves_totals_and_moments() -> None:

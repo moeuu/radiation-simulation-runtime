@@ -213,7 +213,7 @@ def line_resolved_shield_mu_by_isotope(
     attenuation coefficients in 1/cm.
     """
     from sim.isaacsim_app.materials import (  # local import avoids a hard startup dependency
-        composition_mass_attenuation_at_energy,
+        require_composition_mass_attenuation_at_energy,
         resolve_material_preset,
     )
     from spectrum.library import default_library
@@ -222,15 +222,23 @@ def line_resolved_shield_mu_by_isotope(
     requested = list(isotopes) if isotopes is not None else list(library.keys())
     fe_preset = resolve_material_preset("iron")
     pb_preset = resolve_material_preset("lead")
-    if fe_preset is None or pb_preset is None:
-        return {}
+    if (
+        fe_preset is None
+        or pb_preset is None
+        or fe_preset.density_g_cm3 is None
+        or pb_preset.density_g_cm3 is None
+    ):
+        raise RuntimeError("Production Fe/Pb material presets are incomplete.")
     result: dict[str, tuple[dict[str, float], ...]] = {}
-    fallback = mu_by_isotope_from_tvl_mm(HVL_TVL_TABLE_MM, isotopes=requested)
     for isotope in requested:
         nuclide = library.get(str(isotope))
         if nuclide is None or not nuclide.lines:
-            continue
+            raise ValueError(
+                f"No exact production gamma-line definition exists for {isotope!r}."
+            )
         total_intensity = sum(max(float(line.intensity), 0.0) for line in nuclide.lines)
+        if total_intensity <= 0.0:
+            raise ValueError(f"Isotope {isotope!r} has no positive gamma-line weight.")
         entries: list[dict[str, float]] = []
         for line in nuclide.lines:
             raw_weight = max(float(line.intensity), 0.0)
@@ -239,30 +247,16 @@ def line_resolved_shield_mu_by_isotope(
             weight = raw_weight
             if normalize_line_intensities and total_intensity > 0.0:
                 weight = raw_weight / total_intensity
-            fe_mass_att = composition_mass_attenuation_at_energy(
+            fe_mass_att = require_composition_mass_attenuation_at_energy(
                 fe_preset.composition_by_mass,
                 float(line.energy_keV),
             )
-            pb_mass_att = composition_mass_attenuation_at_energy(
+            pb_mass_att = require_composition_mass_attenuation_at_energy(
                 pb_preset.composition_by_mass,
                 float(line.energy_keV),
             )
-            if (
-                fe_mass_att is None
-                or pb_mass_att is None
-                or fe_preset.density_g_cm3 is None
-                or pb_preset.density_g_cm3 is None
-            ):
-                iso_fallback = fallback.get(str(isotope), {})
-                mu_fe = float(
-                    iso_fallback.get("fe", mu_from_tvl_mm(CS137_TVL_FE_MM))
-                )
-                mu_pb = float(
-                    iso_fallback.get("pb", mu_from_tvl_mm(CS137_TVL_PB_MM))
-                )
-            else:
-                mu_fe = float(fe_preset.density_g_cm3) * float(fe_mass_att)
-                mu_pb = float(pb_preset.density_g_cm3) * float(pb_mass_att)
+            mu_fe = float(fe_preset.density_g_cm3) * fe_mass_att
+            mu_pb = float(pb_preset.density_g_cm3) * pb_mass_att
             entries.append(
                 {
                     "energy_keV": float(line.energy_keV),

@@ -371,6 +371,7 @@ class AtomicBundlePublisher:
         if self._published:
             raise RuntimeError("Artifact bundle has already been published.")
         inventory = self.inventory()
+        _fsync_tree_regular_files(self._staging)
         _fsync_tree_directories(self._staging)
         if self.policy == "create":
             _linux_renameat2(self._staging, self.target, flags=1)
@@ -518,6 +519,15 @@ def _fsync_tree_directories(root: Path) -> None:
     directories = [root, *(path for path in root.rglob("*") if path.is_dir())]
     for directory in sorted(directories, key=lambda value: len(value.parts), reverse=True):
         _fsync_directory(directory)
+
+
+def _fsync_tree_regular_files(root: Path) -> None:
+    """Synchronize every regular staged member before directory publication."""
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink() or not path.is_file():
+            continue
+        with path.open("rb") as handle:
+            os.fsync(handle.fileno())
 
 
 __all__ = [

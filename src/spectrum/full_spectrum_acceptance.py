@@ -25,7 +25,7 @@ from spectrum.transport_spectral import (
 )
 
 
-ACCEPTANCE_SCENE_ARTIFACT_SCHEMA_VERSION = 1
+ACCEPTANCE_SCENE_ARTIFACT_SCHEMA_VERSION = 3
 SURFACE_BOUNDARY_GATE_SCHEMA_VERSION = 1
 SURFACE_BOUNDARY_NATIVE_POSITION_VARIANTS = (
     "exact_surface_anchor",
@@ -36,6 +36,11 @@ _SCENE_ARTIFACT_KEYS = frozenset(
     {
         "schema_version",
         "acceptance_contract_sha256",
+        "acceptance_run_contract_sha256",
+        "runtime_config_sha256",
+        "native_executable_sha256",
+        "native_execution_environment_sha256",
+        "implementation_bundle_sha256",
         "scene_seed",
         "split",
         "scenario_ids",
@@ -75,6 +80,11 @@ class AcceptanceSceneArtifact:
     split: str
     model_contract_sha256: str
     additive_scatter_contract_sha256: str
+    acceptance_run_contract_sha256: str
+    runtime_config_sha256: str
+    native_executable_sha256: str
+    native_execution_environment_sha256: str
+    implementation_bundle_sha256: str
     scene_hash_by_scenario: Mapping[str, str]
     surface_source_contract_sha256_by_scenario: Mapping[str, str]
     metrics: Mapping[str, float]
@@ -234,6 +244,26 @@ def load_acceptance_scene_artifact(
         payload["additive_scatter_contract_sha256"],
         field_name="additive_scatter_contract_sha256",
     )
+    run_contract_hash = _require_sha256(
+        payload["acceptance_run_contract_sha256"],
+        field_name="acceptance_run_contract_sha256",
+    )
+    runtime_config_hash = _require_sha256(
+        payload["runtime_config_sha256"],
+        field_name="runtime_config_sha256",
+    )
+    native_executable_hash = _require_sha256(
+        payload["native_executable_sha256"],
+        field_name="native_executable_sha256",
+    )
+    native_execution_environment_hash = _require_sha256(
+        payload["native_execution_environment_sha256"],
+        field_name="native_execution_environment_sha256",
+    )
+    implementation_bundle_hash = _require_sha256(
+        payload["implementation_bundle_sha256"],
+        field_name="implementation_bundle_sha256",
+    )
     scene_hashes = payload["scene_hash_by_scenario"]
     source_hashes = payload["surface_source_contract_sha256_by_scenario"]
     if (
@@ -291,6 +321,13 @@ def load_acceptance_scene_artifact(
         split=split,
         model_contract_sha256=model_hash,
         additive_scatter_contract_sha256=additive_hash,
+        acceptance_run_contract_sha256=run_contract_hash,
+        runtime_config_sha256=runtime_config_hash,
+        native_executable_sha256=native_executable_hash,
+        native_execution_environment_sha256=(
+            native_execution_environment_hash
+        ),
+        implementation_bundle_sha256=implementation_bundle_hash,
         scene_hash_by_scenario=validated_scene_hashes,
         surface_source_contract_sha256_by_scenario=(
             validated_source_hashes
@@ -320,9 +357,32 @@ def _load_exact_scene_set(
     additive_hashes = {
         artifact.additive_scatter_contract_sha256 for artifact in ordered
     }
-    if len(model_hashes) != 1 or len(additive_hashes) != 1:
+    provenance_sets = {
+        "acceptance_run_contract_sha256": {
+            artifact.acceptance_run_contract_sha256 for artifact in ordered
+        },
+        "runtime_config_sha256": {
+            artifact.runtime_config_sha256 for artifact in ordered
+        },
+        "native_executable_sha256": {
+            artifact.native_executable_sha256 for artifact in ordered
+        },
+        "native_execution_environment_sha256": {
+            artifact.native_execution_environment_sha256
+            for artifact in ordered
+        },
+        "implementation_bundle_sha256": {
+            artifact.implementation_bundle_sha256 for artifact in ordered
+        },
+    }
+    if (
+        len(model_hashes) != 1
+        or len(additive_hashes) != 1
+        or any(len(values) != 1 for values in provenance_sets.values())
+    ):
         raise ValueError(
-            "Acceptance artifacts disagree on the evaluated model contracts."
+            "Acceptance artifacts disagree on the evaluated model or native "
+            "execution contracts."
         )
     return ordered
 
@@ -375,11 +435,24 @@ def build_independent_validation_manifest(
             "passed": bool(passed),
         }
     return {
-        "schema_version": 1,
+        "schema_version": 3,
         "validation_contract_sha256": (
             FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256
         ),
         "approved_model_contract_sha256": model_hash,
+        "acceptance_run_contract_sha256": (
+            artifacts[0].acceptance_run_contract_sha256
+        ),
+        "runtime_config_sha256": artifacts[0].runtime_config_sha256,
+        "native_executable_sha256": (
+            artifacts[0].native_executable_sha256
+        ),
+        "native_execution_environment_sha256": (
+            artifacts[0].native_execution_environment_sha256
+        ),
+        "implementation_bundle_sha256": (
+            artifacts[0].implementation_bundle_sha256
+        ),
         "native_response_contract_sha256": (
             NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
         ),

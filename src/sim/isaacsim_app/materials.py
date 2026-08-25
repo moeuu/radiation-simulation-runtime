@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from numbers import Real
 
 import numpy as np
 
 
 @dataclass(frozen=True)
 class MaterialPreset:
-    """Describe a reusable material preset for attenuation fallback."""
+    """Describe a reusable material preset for physical attenuation lookup."""
 
     name: str
     density_g_cm3: float | None = None
@@ -18,11 +19,24 @@ class MaterialPreset:
 
 
 # XCOM total mass attenuation coefficients in cm^2/g for the gamma-energy
-# range used by the runtime isotopes.  These values are tabulated by NIST and
-# match the material physics used by the Geant4 sidecar more closely than the
-# older three-point engineering approximations.
+# range used by the runtime isotopes. Values are from NIST X-Ray Mass
+# Attenuation Coefficients, Table 3:
+# https://physics.nist.gov/PhysRefData/XrayMassCoef/tab3.html
+# The 20--400 keV rows are required by the committed Eu-152, Sb-125, and
+# Am-241 transport-line contracts. Production callers reject extrapolation.
 ELEMENTAL_MASS_ATT_CURVES_CM2_G: dict[str, dict[float, float]] = {
     "H": {
+        20.0: 0.36950,
+        30.0: 0.35700,
+        40.0: 0.34580,
+        50.0: 0.33550,
+        60.0: 0.32600,
+        80.0: 0.30910,
+        100.0: 0.29440,
+        150.0: 0.26510,
+        200.0: 0.24290,
+        300.0: 0.21120,
+        400.0: 0.18930,
         500.0: 0.17290,
         600.0: 0.15990,
         800.0: 0.14050,
@@ -32,6 +46,17 @@ ELEMENTAL_MASS_ATT_CURVES_CM2_G: dict[str, dict[float, float]] = {
         2000.0: 0.08769,
     },
     "C": {
+        20.0: 0.44200,
+        30.0: 0.25620,
+        40.0: 0.20760,
+        50.0: 0.18710,
+        60.0: 0.17530,
+        80.0: 0.16100,
+        100.0: 0.15140,
+        150.0: 0.13470,
+        200.0: 0.12290,
+        300.0: 0.10660,
+        400.0: 0.09546,
         500.0: 0.08715,
         600.0: 0.08058,
         800.0: 0.07076,
@@ -41,6 +66,17 @@ ELEMENTAL_MASS_ATT_CURVES_CM2_G: dict[str, dict[float, float]] = {
         2000.0: 0.04442,
     },
     "N": {
+        20.0: 0.61780,
+        30.0: 0.30660,
+        40.0: 0.22880,
+        50.0: 0.19800,
+        60.0: 0.18170,
+        80.0: 0.16390,
+        100.0: 0.15290,
+        150.0: 0.13530,
+        200.0: 0.12330,
+        300.0: 0.10680,
+        400.0: 0.09557,
         500.0: 0.08719,
         600.0: 0.08063,
         800.0: 0.07081,
@@ -50,6 +86,17 @@ ELEMENTAL_MASS_ATT_CURVES_CM2_G: dict[str, dict[float, float]] = {
         2000.0: 0.04450,
     },
     "O": {
+        20.0: 0.86510,
+        30.0: 0.37790,
+        40.0: 0.25850,
+        50.0: 0.21320,
+        60.0: 0.19070,
+        80.0: 0.16780,
+        100.0: 0.15510,
+        150.0: 0.13610,
+        200.0: 0.12370,
+        300.0: 0.10700,
+        400.0: 0.09566,
         500.0: 0.08729,
         600.0: 0.08070,
         800.0: 0.07087,
@@ -59,6 +106,17 @@ ELEMENTAL_MASS_ATT_CURVES_CM2_G: dict[str, dict[float, float]] = {
         2000.0: 0.04459,
     },
     "Al": {
+        20.0: 3.44100,
+        30.0: 1.12800,
+        40.0: 0.56850,
+        50.0: 0.36810,
+        60.0: 0.27780,
+        80.0: 0.20180,
+        100.0: 0.17040,
+        150.0: 0.13780,
+        200.0: 0.12230,
+        300.0: 0.10420,
+        400.0: 0.09276,
         500.0: 0.08445,
         600.0: 0.07802,
         800.0: 0.06841,
@@ -68,6 +126,17 @@ ELEMENTAL_MASS_ATT_CURVES_CM2_G: dict[str, dict[float, float]] = {
         2000.0: 0.04324,
     },
     "Si": {
+        20.0: 4.46400,
+        30.0: 1.43600,
+        40.0: 0.70120,
+        50.0: 0.43850,
+        60.0: 0.32070,
+        80.0: 0.22280,
+        100.0: 0.18350,
+        150.0: 0.14480,
+        200.0: 0.12750,
+        300.0: 0.10820,
+        400.0: 0.09614,
         500.0: 0.08748,
         600.0: 0.08077,
         800.0: 0.07082,
@@ -77,6 +146,17 @@ ELEMENTAL_MASS_ATT_CURVES_CM2_G: dict[str, dict[float, float]] = {
         2000.0: 0.04480,
     },
     "Ca": {
+        20.0: 13.0600,
+        30.0: 4.08000,
+        40.0: 1.83000,
+        50.0: 1.01900,
+        60.0: 0.65780,
+        80.0: 0.36560,
+        100.0: 0.25710,
+        150.0: 0.16740,
+        200.0: 0.13760,
+        300.0: 0.11160,
+        400.0: 0.09783,
         500.0: 0.08851,
         600.0: 0.08148,
         800.0: 0.07122,
@@ -86,6 +166,17 @@ ELEMENTAL_MASS_ATT_CURVES_CM2_G: dict[str, dict[float, float]] = {
         2000.0: 0.04524,
     },
     "Cr": {
+        20.0: 20.3800,
+        30.0: 6.43400,
+        40.0: 2.85600,
+        50.0: 1.55000,
+        60.0: 0.96390,
+        80.0: 0.49050,
+        100.0: 0.31660,
+        150.0: 0.17880,
+        200.0: 0.13780,
+        300.0: 0.10670,
+        400.0: 0.09213,
         500.0: 0.08281,
         600.0: 0.07598,
         800.0: 0.06620,
@@ -95,6 +186,17 @@ ELEMENTAL_MASS_ATT_CURVES_CM2_G: dict[str, dict[float, float]] = {
         2000.0: 0.04213,
     },
     "Fe": {
+        20.0: 25.6800,
+        30.0: 8.17600,
+        40.0: 3.62900,
+        50.0: 1.95800,
+        60.0: 1.20500,
+        80.0: 0.59520,
+        100.0: 0.37170,
+        150.0: 0.19640,
+        200.0: 0.14600,
+        300.0: 0.10990,
+        400.0: 0.09400,
         500.0: 0.08414,
         600.0: 0.07704,
         800.0: 0.06699,
@@ -104,6 +206,17 @@ ELEMENTAL_MASS_ATT_CURVES_CM2_G: dict[str, dict[float, float]] = {
         2000.0: 0.04265,
     },
     "Ni": {
+        20.0: 32.2000,
+        30.0: 10.3400,
+        40.0: 4.60000,
+        50.0: 2.47400,
+        60.0: 1.51200,
+        80.0: 0.73060,
+        100.0: 0.44400,
+        150.0: 0.22080,
+        200.0: 0.15820,
+        300.0: 0.11540,
+        400.0: 0.09765,
         500.0: 0.08698,
         600.0: 0.07944,
         800.0: 0.06891,
@@ -113,6 +226,17 @@ ELEMENTAL_MASS_ATT_CURVES_CM2_G: dict[str, dict[float, float]] = {
         2000.0: 0.04387,
     },
     "Ar": {
+        20.0: 8.62900,
+        30.0: 2.69700,
+        40.0: 1.22800,
+        50.0: 0.70120,
+        60.0: 0.46640,
+        80.0: 0.27600,
+        100.0: 0.20430,
+        150.0: 0.14270,
+        200.0: 0.12050,
+        300.0: 0.09953,
+        400.0: 0.08776,
         500.0: 0.07958,
         600.0: 0.07335,
         800.0: 0.06419,
@@ -122,6 +246,17 @@ ELEMENTAL_MASS_ATT_CURVES_CM2_G: dict[str, dict[float, float]] = {
         2000.0: 0.04074,
     },
     "Pb": {
+        20.0: 86.3600,
+        30.0: 30.3200,
+        40.0: 14.3600,
+        50.0: 8.04100,
+        60.0: 5.02100,
+        80.0: 2.41900,
+        100.0: 5.54900,
+        150.0: 2.01400,
+        200.0: 0.99850,
+        300.0: 0.40310,
+        400.0: 0.23230,
         500.0: 0.16140,
         600.0: 0.12480,
         800.0: 0.08870,
@@ -358,3 +493,38 @@ def composition_mass_attenuation_at_energy(
     if total_weight <= 0.0:
         return None
     return weighted_mu / total_weight
+
+
+def require_composition_mass_attenuation_at_energy(
+    composition_by_mass: dict[str, float] | str | None,
+    energy_keV: float,
+) -> float:
+    """Return an in-range XCOM mixture coefficient or fail explicitly."""
+    if isinstance(energy_keV, bool) or not isinstance(energy_keV, Real):
+        raise TypeError("energy_keV must be a real number.")
+    energy = float(energy_keV)
+    if not np.isfinite(energy) or energy <= 0.0:
+        raise ValueError("energy_keV must be finite and positive.")
+    composition = normalize_composition_by_mass(composition_by_mass)
+    if not composition:
+        raise ValueError("Material composition must be nonempty.")
+    for element, weight in composition.items():
+        numeric_weight = float(weight)
+        if not np.isfinite(numeric_weight) or numeric_weight < 0.0:
+            raise ValueError("Material mass fractions must be finite and nonnegative.")
+        if numeric_weight == 0.0:
+            continue
+        curve = ELEMENTAL_MASS_ATT_CURVES_CM2_G.get(element)
+        if curve is None:
+            raise ValueError(f"No XCOM attenuation curve exists for {element!r}.")
+        lower = min(float(value) for value in curve)
+        upper = max(float(value) for value in curve)
+        if not lower <= energy <= upper:
+            raise ValueError(
+                f"energy_keV={energy} is outside the XCOM range "
+                f"[{lower}, {upper}] for {element!r}."
+            )
+    result = composition_mass_attenuation_at_energy(composition, energy)
+    if result is None or not np.isfinite(result) or result <= 0.0:
+        raise ValueError("No positive XCOM attenuation coefficient is available.")
+    return float(result)

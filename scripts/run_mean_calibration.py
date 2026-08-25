@@ -69,7 +69,7 @@ def _add_layout_arguments(parser: argparse.ArgumentParser) -> None:
         type=int,
         help=(
             "Predeclare one training scene seed; repeat as needed. The "
-            "default is the full legacy training set."
+            "default is the complete designated training set."
         ),
     )
     parser.add_argument(

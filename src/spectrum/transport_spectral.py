@@ -35,6 +35,7 @@ from measurement.shielding import (
 from runtime.forward_model_manifest import resolve_file_backed_model_asset
 from spectrum.additive_scatter import (
     ADDITIVE_SCATTER_INCIDENT_LABEL_SEMANTICS,
+    DETECTOR_CONE_AIR_XCOM_SINGLE_SCATTER_BASIS_SEMANTICS,
     LEGACY_PHYSICS_ONLY_TRANSPORT_RESPONSE_ID,
     PHYSICS_ONLY_TRANSPORT_RESPONSE_ID,
     AdditiveNoncollidedTransportResponse,
@@ -1257,18 +1258,18 @@ def nonparalyzable_count_log_probability_numpy(
         )
     use_lower = lower_first <= 0.5
     selected = np.where(use_lower, lower_log, upper_log)
-    fallback = ~np.isfinite(selected)
-    if np.any(fallback):
+    needs_exact_recovery = ~np.isfinite(selected)
+    if np.any(needs_exact_recovery):
         recovered = _renewal_positive_decomposition_numpy(
-            m[fallback],
-            first_argument[fallback],
-            second_argument[fallback],
+            m[needs_exact_recovery],
+            first_argument[needs_exact_recovery],
+            second_argument[needs_exact_recovery],
         )
         if np.any(np.isnan(recovered)) or np.any(np.isposinf(recovered)):
             raise RuntimeError(
                 "Positive-term renewal likelihood recovery was invalid."
             )
-        selected[fallback] = recovered
+        selected[needs_exact_recovery] = recovered
     result[positive] = selected
     return result
 
@@ -1358,12 +1359,12 @@ def nonparalyzable_count_log_probability_torch(
         torch.log(upper_first),
     )
     selected = torch.where(lower_first <= 0.5, lower_log, upper_log)
-    fallback = positive & ~torch.isfinite(selected)
-    if bool(torch.any(fallback)):
+    needs_exact_recovery = positive & ~torch.isfinite(selected)
+    if bool(torch.any(needs_exact_recovery)):
         recovered = _renewal_positive_decomposition_torch(
-            m[fallback],
-            first_argument[fallback],
-            second_argument[fallback],
+            m[needs_exact_recovery],
+            first_argument[needs_exact_recovery],
+            second_argument[needs_exact_recovery],
         )
         invalid_recovery = torch.stack(
             (
@@ -1375,7 +1376,7 @@ def nonparalyzable_count_log_probability_torch(
             raise RuntimeError(
                 "Torch positive-term renewal likelihood recovery was invalid."
             )
-        selected = selected.masked_scatter(fallback, recovered)
+        selected = selected.masked_scatter(needs_exact_recovery, recovered)
     return torch.where(positive, selected, -mean)
 
 
@@ -2809,7 +2810,7 @@ class GeometryConditionedSpectralModel:
         ):
             raise ValueError(
                 "Physical-component discrepancy cannot be combined with the "
-                "legacy global discrepancy or rate-scale mixture."
+                "retired global discrepancy or rate-scale mixture."
             )
         physics_response = isinstance(
             self.additive_scatter_response,
@@ -3995,6 +3996,13 @@ class GeometryConditionedSpectralModel:
         """Return whether a fixed independent all-64 holdout approved the model."""
         if not self.runtime_ready:
             return False
+        additive_response = self.additive_scatter_response
+        if (
+            additive_response is None
+            or additive_response.feature_basis_semantics
+            != DETECTOR_CONE_AIR_XCOM_SINGLE_SCATTER_BASIS_SEMANTICS
+        ):
+            return False
         manifest = self.validation_manifest
         if not isinstance(manifest, Mapping):
             return False
@@ -4002,6 +4010,11 @@ class GeometryConditionedSpectralModel:
             "schema_version",
             "validation_contract_sha256",
             "approved_model_contract_sha256",
+            "acceptance_run_contract_sha256",
+            "runtime_config_sha256",
+            "native_executable_sha256",
+            "native_execution_environment_sha256",
+            "implementation_bundle_sha256",
             "native_response_contract_sha256",
             "additive_scatter_contract_sha256",
             "surface_emission_policy_sha256",
@@ -4022,11 +4035,22 @@ class GeometryConditionedSpectralModel:
         if set(manifest) != expected_keys:
             return False
         if (
-            manifest.get("schema_version") != 1
+            manifest.get("schema_version") != 3
             or manifest.get("validation_contract_sha256")
             != FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256
             or manifest.get("approved_model_contract_sha256")
             != self.contract_hash_sha256
+            or not _is_sha256(
+                manifest.get("acceptance_run_contract_sha256")
+            )
+            or not _is_sha256(manifest.get("runtime_config_sha256"))
+            or not _is_sha256(manifest.get("native_executable_sha256"))
+            or not _is_sha256(
+                manifest.get("native_execution_environment_sha256")
+            )
+            or not _is_sha256(
+                manifest.get("implementation_bundle_sha256")
+            )
             or manifest.get("native_response_contract_sha256")
             != NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
             or manifest.get("additive_scatter_contract_sha256")
@@ -8192,11 +8216,11 @@ class GeometryConditionedSpectralModel:
         )
         zero_rate = pre_total <= 0.0
         if np.any(zero_rate):
-            fallback = np.zeros_like(probabilities)
-            fallback[..., 0] = 1.0
+            zero_count_sentinel = np.zeros_like(probabilities)
+            zero_count_sentinel[..., 0] = 1.0
             probabilities = np.where(
                 zero_rate[..., np.newaxis],
-                fallback,
+                zero_count_sentinel,
                 probabilities,
             )
         if hierarchical_marks:

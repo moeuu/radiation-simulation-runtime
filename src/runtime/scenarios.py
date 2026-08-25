@@ -9,6 +9,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from measurement.obstacle_assets import obstacle_instances_to_dicts
 from measurement.obstacles import build_obstacle_grid
 from measurement.source_surfaces import generate_surface_sources
@@ -25,7 +27,7 @@ from runtime.experiment_profiles import (
     require_private_scene_variant,
 )
 from runtime_environment import attach_random_manchester_transport_geometry
-from sim.runtime import load_runtime_config
+from sim.runtime import load_production_runtime_config
 
 _MAX_FRESH_SEED = (1 << 48) - 18
 
@@ -46,6 +48,47 @@ def _source_payload(source: object) -> dict[str, object]:
         "surface_uv": [float(value) for value in source.surface_uv],
         "surface_normal": [float(value) for value in source.surface_normal],
         "surface_emission_policy_sha256": str(source.surface_emission_policy_sha256),
+    }
+
+
+def _adaptive_measurement_payload(
+    config: Mapping[str, object],
+    *,
+    size_z: float,
+    candidate_count: int,
+    candidate_seed: int,
+) -> dict[str, object]:
+    """Return the complete explicit standard adaptive-motion contract."""
+    detector = config["detector_model"]
+    if not isinstance(detector, Mapping):
+        raise TypeError("Production detector_model must be an object.")
+    crystal_radius = detector["crystal_radius_m"]
+    housing_thickness = detector["housing_thickness_m"]
+    for name, value in (
+        ("crystal_radius_m", crystal_radius),
+        ("housing_thickness_m", housing_thickness),
+    ):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError(f"detector_model.{name} must be a JSON number.")
+    head_radius = float(crystal_radius) + float(housing_thickness)
+    base_height = 0.2
+    detector_height_min = base_height + head_radius
+    return {
+        "candidate_count": int(candidate_count),
+        "candidate_seed": int(candidate_seed),
+        "detector_height_min_m": detector_height_min,
+        "detector_height_max_m": float(size_z) - head_radius,
+        "local_refinement_count": 64,
+        "local_refinement_radius_m": 0.5,
+        "base_radius_m": 0.2,
+        "base_height_m": base_height,
+        "mast_radius_m": 0.03,
+        "head_radius_m": head_radius,
+        "transport_height_m": detector_height_min,
+        "horizontal_speed_m_s": 0.5,
+        "vertical_speed_m_s": 0.25,
+        "settling_time_s": 1.0,
+        "shield_angular_speed_rad_s": float(np.pi / 4.0),
     }
 
 
@@ -88,17 +131,12 @@ def build_random_surface_scenario(
     )
     if not config_path.is_file():
         raise FileNotFoundError(f"Runtime configuration is missing: {config_path}")
-    config = load_runtime_config(config_path)
-    obstacle_height_m = float(config.get("obstacle_height_m", 2.0))
-    chart_max_edge_m = float(config.get("structural_rj_surface_chart_max_edge_m", 1.0))
-    include_room_boundaries = bool(config.get("author_room_boundary_prims", False))
-    room_boundary_thickness_m = float(config.get("room_boundary_thickness_m", 0.1))
-    environment_model_id = str(
-        config.get(
-            "environment_model_id",
-            "random_manchester_component_union_v1",
-        )
-    )
+    config = load_production_runtime_config(config_path)
+    obstacle_height_m = float(config["obstacle_height_m"])
+    chart_max_edge_m = float(profile.surface_chart_max_edge_m)
+    include_room_boundaries = config["author_room_boundary_prims"]
+    room_boundary_thickness_m = float(profile.room_boundary_thickness_m)
+    environment_model_id = profile.environment_model_id
     environment = profile.environment
     obstacle_seed = named_stream_seed(seed, "physical_obstacle_environment")
     candidate_seed = named_stream_seed(seed, "adaptive_candidate_workspace")
@@ -149,10 +187,12 @@ def build_random_surface_scenario(
         "detector_position": [float(value) for value in environment.detector_position],
         "obstacle_grid": grid.to_dict(),
         "obstacle_instances": obstacle_payload,
-        "adaptive_measurement": {
-            "candidate_count": int(profile.candidate_count),
-            "candidate_seed": int(candidate_seed),
-        },
+        "adaptive_measurement": _adaptive_measurement_payload(
+            config,
+            size_z=float(environment.size_z),
+            candidate_count=int(profile.candidate_count),
+            candidate_seed=int(candidate_seed),
+        ),
     }
     scene_payload: dict[str, object] = {
         "room_size_xyz": [
@@ -180,16 +220,17 @@ def build_random_surface_scenario(
             for isotope, rows in grid.transport_line_compton_mu_by_isotope.items()
         },
         "obstacle_instances": obstacle_payload,
-        "author_obstacle_prims": True,
+        "obstacle_material": profile.obstacle_material,
+        "author_obstacle_prims": config["author_obstacle_prims"],
         "author_room_boundary_prims": include_room_boundaries,
-        "use_config_usd_fallback": True,
+        "usd_path": config["usd_path"],
+        "use_config_usd_fallback": False,
     }
     run_metadata = dict(metadata or {})
     run_metadata.update(
         {
             "scenario_family": (
-                "random_physical_surface_v1:"
-                f"{profile.profile_id}:{selected_variant_id}"
+                f"random_physical_surface_v1:{profile.profile_id}:{selected_variant_id}"
             ),
             "experiment_profile_id": profile.profile_id,
             "private_scene_variant_id": selected_variant_id,
@@ -202,9 +243,7 @@ def build_random_surface_scenario(
                     "adaptive_candidate_workspace",
                 ),
             ),
-            "same_isotope_min_distance_m": float(
-                profile.same_isotope_min_distance_m
-            ),
+            "same_isotope_min_distance_m": float(profile.same_isotope_min_distance_m),
             "measurement_actions_precomputed": False,
         }
     )

@@ -19,22 +19,24 @@ import runtime.cui as cui_module
 from measurement.model import EnvironmentConfig
 from measurement.obstacles import ObstacleGrid
 
-from runtime import (
-    CUIAcquisitionFrame,
+from runtime.cui import (
     CUIDashboardConfig,
-    CUIPanelSpec,
     CUIRoute,
-    CUIScene,
     CUIServerHandle,
-    CUIStatus,
-    CUITruthDisplayMode,
     CUI_URL_MESSAGE_PREFIX,
     cui_browser_url,
     cui_route_from_records,
-    cui_scene_from_run_context,
-    shared_cui_panel_specs,
     resolve_cui_public_host,
     start_cui_server,
+)
+from runtime.cui_components import (
+    CUIAcquisitionFrame,
+    CUIPanelSpec,
+    CUIScene,
+    CUIStatus,
+    CUITruthDisplayMode,
+    cui_scene_from_run_context,
+    shared_cui_panel_specs,
     write_cui_index,
     write_cui_status,
 )
@@ -427,10 +429,10 @@ def test_disabled_server_returns_a_nonserving_handle(tmp_path: Path) -> None:
     assert not handle.persistent
 
 
-def test_fixed_server_skips_unknown_occupied_port_and_closes(
+def test_fixed_server_fails_when_the_requested_port_is_occupied(
     tmp_path: Path,
 ) -> None:
-    """A fixed-port server must bind the next port and remain handle-managed."""
+    """A fixed-port server must never silently publish on another port."""
     root = tmp_path / "static"
     root.mkdir()
     (root / "index.html").write_text(
@@ -442,33 +444,19 @@ def test_fixed_server_skips_unknown_occupied_port_and_closes(
     occupied.bind(("127.0.0.1", 0))
     occupied.listen()
     requested_port = int(occupied.getsockname()[1])
-    handle: CUIServerHandle | None = None
     try:
-        handle = start_cui_server(
-            root,
-            config=CUIDashboardConfig(
-                host="127.0.0.1",
-                port=requested_port,
-                public_host="127.0.0.1",
-            ),
-        )
-        assert not handle.persistent
-        assert handle.managed
-        assert handle.port is not None
-        assert handle.port != requested_port
-        assert handle.process_id is None
-        assert _fetch_text(str(handle.url)) == "fixed-dashboard"
-
-        handle.close()
-
-        assert _wait_until_closed("127.0.0.1", handle.port)
+        with pytest.raises(OSError) as error:
+            start_cui_server(
+                root,
+                config=CUIDashboardConfig(
+                    host="127.0.0.1",
+                    port=requested_port,
+                    public_host="127.0.0.1",
+                ),
+            )
+        assert error.value.errno == errno.EADDRINUSE
     finally:
         occupied.close()
-        if handle is not None:
-            port = handle.port
-            handle.terminate()
-            if port is not None:
-                assert _wait_until_closed("127.0.0.1", port)
 
 
 def test_fixed_server_preserves_non_occupancy_bind_errors(
@@ -595,7 +583,7 @@ def test_route_normalizes_waypoints_station_visits_and_latest_observation() -> N
 
     assert isinstance(route, CUIRoute)
     assert len(route.travel_path_segments_xyz) == 2
-    np.testing.assert_allclose(route.path_segments_xyz[0], first_segment)
+    np.testing.assert_allclose(route.travel_path_segments_xyz[0], first_segment)
     np.testing.assert_allclose(
         route.measurement_stations_xyz,
         np.asarray([base[0].detector_pose_xyz, base[2].detector_pose_xyz]),
@@ -604,7 +592,7 @@ def test_route_normalizes_waypoints_station_visits_and_latest_observation() -> N
     np.testing.assert_array_equal(route.measurement_step_ids, [0, 2])
     np.testing.assert_array_equal(route.measurement_visit_counts, [2, 1])
     np.testing.assert_allclose(
-        route.current_pose_xyz,
+        route.current_detector_position_xyz,
         base[2].detector_pose_xyz,
     )
     np.testing.assert_array_equal(

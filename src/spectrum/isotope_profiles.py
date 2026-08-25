@@ -4,12 +4,24 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
-import json
 from pathlib import Path
 from types import MappingProxyType
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 
+from runtime.provenance import strict_json_loads
 from spectrum.library import require_nuclide
+
+
+_REGISTRY_FIELDS = frozenset({"schema_version", "model", "profiles"})
+_REGISTRY_ENTRY_FIELDS = frozenset(
+    {
+        "isotopes",
+        "model_path",
+        "model_file_sha256",
+        "model_contract_hash_sha256",
+        "calibration_status",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -25,17 +37,23 @@ class IsotopeExperimentProfile:
         """Validate one immutable named experiment profile."""
         if not isinstance(self.name, str) or not self.name:
             raise ValueError("Isotope profile name must be a nonempty string.")
-        isotopes = tuple(str(value) for value in self.isotopes)
-        if not isotopes or len(set(isotopes)) != len(isotopes):
+        if (
+            type(self.isotopes) is not tuple
+            or not self.isotopes
+            or any(
+                type(value) is not str or not value
+                for value in self.isotopes
+            )
+            or len(set(self.isotopes)) != len(self.isotopes)
+        ):
             raise ValueError("Isotope profile isotopes must be nonempty and unique.")
-        for isotope in isotopes:
+        for isotope in self.isotopes:
             require_nuclide(isotope)
         if self.material_conditioning not in {"none", "catalog_physical"}:
             raise ValueError(
                 "Isotope profile material_conditioning must be none or "
                 "catalog_physical."
             )
-        object.__setattr__(self, "isotopes", isotopes)
 
 
 _PROFILES: Mapping[str, IsotopeExperimentProfile] = MappingProxyType(
@@ -102,58 +120,15 @@ def available_isotope_profiles() -> tuple[str, ...]:
 
 def require_isotope_profile(name: str) -> IsotopeExperimentProfile:
     """Return a named profile or fail with the complete supported set."""
-    normalized = str(name).strip().lower()
+    if type(name) is not str or not name:
+        raise TypeError("Isotope profile name must be a nonempty JSON string.")
     try:
-        return _PROFILES[normalized]
+        return _PROFILES[name]
     except KeyError as exc:
         supported = ", ".join(available_isotope_profiles())
         raise ValueError(
             f"Unknown isotope_experiment_profile {name!r}; expected: {supported}."
         ) from exc
-
-
-def resolve_isotope_selection(
-    *,
-    profile_name: object,
-    explicit_isotopes: object,
-    fallback_isotopes: Sequence[str],
-) -> tuple[tuple[str, ...], IsotopeExperimentProfile | None]:
-    """Resolve one profile or explicit list without ambiguous precedence."""
-    if profile_name is not None and explicit_isotopes is not None:
-        raise ValueError(
-            "isotope_experiment_profile and random_source_isotopes are "
-            "mutually exclusive."
-        )
-    if profile_name is not None:
-        if not isinstance(profile_name, str) or not profile_name.strip():
-            raise TypeError("isotope_experiment_profile must be a JSON string.")
-        profile = require_isotope_profile(profile_name)
-        return profile.isotopes, profile
-    if explicit_isotopes is None:
-        names = tuple(str(value) for value in fallback_isotopes)
-    elif isinstance(explicit_isotopes, str):
-        names = tuple(
-            value.strip()
-            for value in explicit_isotopes.split(",")
-            if value.strip()
-        )
-    elif isinstance(explicit_isotopes, Sequence):
-        if any(not isinstance(value, str) for value in explicit_isotopes):
-            raise TypeError(
-                "random_source_isotopes entries must be JSON strings."
-            )
-        names = tuple(value.strip() for value in explicit_isotopes if value.strip())
-    else:
-        raise TypeError("random_source_isotopes must be a string or sequence.")
-    if not names or len(set(names)) != len(names):
-        raise ValueError(
-            "random_source_isotopes must be nonempty and must not contain "
-            "duplicates."
-        )
-    for isotope in names:
-        require_nuclide(isotope)
-    return tuple(sorted(names)), None
-
 
 def resolve_profile_model_runtime_config(
     runtime_config: Mapping[str, object],
@@ -184,7 +159,9 @@ def resolve_profile_model_runtime_config(
             "Profile registry selection cannot be combined with an explicit "
             "full-spectrum model."
         )
-    profile = require_isotope_profile(str(profile_value))
+    if type(profile_value) is not str:
+        raise TypeError("isotope_experiment_profile must be a JSON string.")
+    profile = require_isotope_profile(profile_value)
     registry_path = _resolve_registry_path(registry_value, run_root=run_root)
     raw_bytes = registry_path.read_bytes()
     declared_registry_hash = resolved.get(
@@ -195,12 +172,15 @@ def resolve_profile_model_runtime_config(
         raise ValueError(
             "Full-spectrum model registry SHA-256 does not match its file."
         )
-    payload = json.loads(raw_bytes)
+    payload = strict_json_loads(raw_bytes)
+    if not isinstance(payload, Mapping) or set(payload) != _REGISTRY_FIELDS:
+        raise ValueError("Full-spectrum model registry payload is invalid.")
+    schema_version = payload["schema_version"]
+    if type(schema_version) is not int or schema_version != 1:
+        raise ValueError("Full-spectrum model registry payload is invalid.")
     if (
-        not isinstance(payload, Mapping)
-        or payload.get("schema_version") != 1
-        or payload.get("model") != "isotope_profile_full_spectrum_registry"
-        or not isinstance(payload.get("profiles"), Mapping)
+        payload["model"] != "isotope_profile_full_spectrum_registry"
+        or not isinstance(payload["profiles"], Mapping)
     ):
         raise ValueError("Full-spectrum model registry payload is invalid.")
     entry = payload["profiles"].get(profile.name)
@@ -208,21 +188,30 @@ def resolve_profile_model_runtime_config(
         raise ValueError(
             f"Profile {profile.name!r} has no full-spectrum model asset."
         )
-    expected_keys = {
-        "isotopes",
+    if set(entry) != _REGISTRY_ENTRY_FIELDS:
+        raise ValueError(
+            f"Profile registry entry {profile.name!r} has invalid fields."
+        )
+    entry_isotopes = entry["isotopes"]
+    if (
+        type(entry_isotopes) is not list
+        or any(type(value) is not str for value in entry_isotopes)
+        or tuple(entry_isotopes) != profile.isotopes
+    ):
+        raise ValueError(
+            f"Profile registry isotopes disagree for {profile.name!r}."
+        )
+    for key in (
         "model_path",
         "model_file_sha256",
         "model_contract_hash_sha256",
         "calibration_status",
-    }
-    if set(entry) != expected_keys:
-        raise ValueError(
-            f"Profile registry entry {profile.name!r} has invalid fields."
-        )
-    if tuple(entry["isotopes"]) != profile.isotopes:
-        raise ValueError(
-            f"Profile registry isotopes disagree for {profile.name!r}."
-        )
+    ):
+        if type(entry[key]) is not str or not entry[key]:
+            raise TypeError(
+                f"Profile registry entry {profile.name!r} field {key} "
+                "must be a nonempty JSON string."
+            )
     _resolve_registry_asset_path(
         entry["model_path"],
         registry_path=registry_path,

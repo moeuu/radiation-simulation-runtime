@@ -21,6 +21,7 @@ from measurement.obstacle_assets import (
     known_obstacle_transport_model,
     known_obstacle_traversability_rects,
     material_mu_cm_inv,
+    material_mu_cm_inv_at_energy,
     nominal_obstacle_minimum_transmission,
     obstacle_instances_from_dicts,
     obstacle_instances_to_dicts,
@@ -305,6 +306,46 @@ def test_material_mu_uses_known_material_presets() -> None:
     assert steel_mu > water_mu
     assert steel_mu > 0.0
     assert water_mu > 0.0
+
+
+@pytest.mark.parametrize(
+    ("material", "isotope"),
+    (
+        ("unobtainium", "Cs-137"),
+        ("concrete", "Cs137"),
+        ("Fe", "Cs-137"),
+    ),
+)
+def test_material_mu_rejects_unknown_identity(
+    material: str,
+    isotope: str,
+) -> None:
+    """Unknown materials and isotope aliases must not select a fallback table."""
+    with pytest.raises(ValueError, match="Unknown|No exact|canonical"):
+        material_mu_cm_inv(material, isotope)
+
+
+@pytest.mark.parametrize("energy_keV", (0.0, 19.0, 2001.0, float("nan")))
+def test_material_mu_rejects_unsupported_energy(energy_keV: float) -> None:
+    """Invalid or untabulated energies must not be clamped or averaged."""
+    with pytest.raises(ValueError, match="energy_keV|XCOM"):
+        material_mu_cm_inv_at_energy(
+            "concrete",
+            energy_keV,
+            isotope="Cs-137",
+        )
+
+
+def test_material_mu_supports_committed_low_energy_transport_lines() -> None:
+    """NIST rows must cover the lowest committed Am-241 line without fallback."""
+    result = material_mu_cm_inv_at_energy(
+        "iron",
+        26.345,
+        isotope="Am-241",
+    )
+
+    assert np.isfinite(result)
+    assert result > 0.0
 
 
 def test_continuous_kernel_uses_known_transport_components() -> None:

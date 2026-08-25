@@ -167,15 +167,43 @@ def _obstacle_mu_by_isotope_from_runtime_config(
     }
 
 
-def build_runtime_observation_model(
+def _require_training_model_approval(
+    model: GeometryConditionedSpectralModel,
+) -> None:
+    """Require exact training readiness for non-production model tooling."""
+    model.require_runtime_ready()
+    runtime_ready = model.runtime_ready
+    if type(runtime_ready) is not bool or runtime_ready is not True:
+        raise RuntimeError(
+            "Full-spectrum model reported runtime_ready=False after its "
+            "training-only runtime gate."
+        )
+
+
+def require_production_model_approval(
+    model: GeometryConditionedSpectralModel,
+) -> None:
+    """Require literal independent-holdout approval for production use."""
+    _require_training_model_approval(model)
+    model.require_production_ready()
+    production_ready = model.production_ready
+    if type(production_ready) is not bool or production_ready is not True:
+        raise RuntimeError(
+            "Full-spectrum model reported production_ready=False after its "
+            "independent holdout gate."
+        )
+
+
+def _build_observation_model(
     runtime_config: Mapping[str, Any] | None,
     *,
     isotopes: Sequence[str],
     authenticated_full_spectrum_model: (
         GeometryConditionedSpectralModel | None
     ) = None,
+    production: bool,
 ) -> RuntimeObservationModel:
-    """Build the shared observation model used by PF, planning, and validation."""
+    """Build one observation model under an explicit approval boundary."""
     if runtime_config is None:
         payload: Mapping[str, Any] = {}
     elif isinstance(runtime_config, Mapping):
@@ -275,7 +303,6 @@ def build_runtime_observation_model(
                 "An authenticated full-spectrum model requires a matching "
                 "runtime model selector."
             )
-        authenticated_full_spectrum_model.require_runtime_ready()
         if (
             payload.get("full_spectrum_contract_hash_sha256")
             != authenticated_full_spectrum_model.contract_hash_sha256
@@ -291,6 +318,11 @@ def build_runtime_observation_model(
             if full_spectrum_selector_keys.intersection(payload)
             else None
         )
+    if full_spectrum_model is not None:
+        if production:
+            require_production_model_approval(full_spectrum_model)
+        else:
+            _require_training_model_approval(full_spectrum_model)
     obstacle_mu_by_isotope = _obstacle_mu_by_isotope_from_runtime_config(
         payload,
         isotopes=isotope_order,
@@ -327,6 +359,40 @@ def build_runtime_observation_model(
         obstacle_buildup_coeff=buildup_obstacle,
         source_extent_radius_m=source_extent_radius_m,
         source_extent_samples=source_extent_samples,
+    )
+
+
+def build_runtime_observation_model(
+    runtime_config: Mapping[str, Any] | None,
+    *,
+    isotopes: Sequence[str],
+    authenticated_full_spectrum_model: (
+        GeometryConditionedSpectralModel | None
+    ) = None,
+) -> RuntimeObservationModel:
+    """Build an independently approved production observation model."""
+    return _build_observation_model(
+        runtime_config,
+        isotopes=isotopes,
+        authenticated_full_spectrum_model=authenticated_full_spectrum_model,
+        production=True,
+    )
+
+
+def build_nonproduction_observation_model(
+    runtime_config: Mapping[str, Any] | None,
+    *,
+    isotopes: Sequence[str],
+    authenticated_full_spectrum_model: (
+        GeometryConditionedSpectralModel | None
+    ) = None,
+) -> RuntimeObservationModel:
+    """Build a training/holdout model that cannot authorize production use."""
+    return _build_observation_model(
+        runtime_config,
+        isotopes=isotopes,
+        authenticated_full_spectrum_model=authenticated_full_spectrum_model,
+        production=False,
     )
 
 

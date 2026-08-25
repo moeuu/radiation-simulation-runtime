@@ -2,27 +2,35 @@
 
 from __future__ import annotations
 
+from hashlib import sha256
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from runtime.session import (
+    _native_executable_sha256,
     estimator_neutral_physical_runtime_config,
     estimator_neutral_runtime_config,
+    require_production_runtime_preflight,
 )
 from runtime.forward_model_manifest import forward_model_component_payloads
 from measurement.observation_model import build_runtime_observation_model
-from sim.runtime import load_runtime_config
+from measurement.observation_model import build_nonproduction_observation_model
+from sim.geant4_app.app import Geant4Application
+from sim.isaacsim_app.scene_builder import SceneDescription
+from sim.runtime import load_production_runtime_config, load_runtime_config
 from spectrum.transport_spectral import GeometryConditionedSpectralModel
 from spectrum.additive_scatter import PhysicsOnlyNoncollidedTransportResponse
+from tests.runtime_test_support import (
+    approved_full_spectrum_model,
+    runtime_config,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
 STANDARD_CONFIG = (
-    ROOT
-    / "configs"
-    / "geant4"
-    / "variance_reduction_external_no_isaac_32threads.json"
+    ROOT / "configs" / "geant4" / "variance_reduction_external_no_isaac_32threads.json"
 )
 
 
@@ -31,16 +39,14 @@ def test_standard_runtime_config_is_estimator_neutral() -> None:
     payload = load_runtime_config(STANDARD_CONFIG)
 
     forbidden_prefixes = ("pf_", "mle_", "dss_", "structural_rj_")
-    assert not [
-        key for key in payload if str(key).startswith(forbidden_prefixes)
-    ]
+    assert not [key for key in payload if str(key).startswith(forbidden_prefixes)]
     assert "estimator_profile" not in payload
     assert "pure_pf_schema_version" not in payload
     assert "variable_cardinality" not in payload
 
 
-def test_combined_config_is_split_at_the_acquisition_boundary() -> None:
-    """PF controls in a legacy combined config must not reach acquisition."""
+def test_combined_config_is_rejected_at_the_acquisition_boundary() -> None:
+    """PF controls in a legacy combined config must fail production preflight."""
     payload = load_runtime_config(STANDARD_CONFIG)
     payload.update(
         {
@@ -56,19 +62,8 @@ def test_combined_config_is_split_at_the_acquisition_boundary() -> None:
         }
     )
 
-    physical = estimator_neutral_physical_runtime_config(payload)
-
-    assert physical["backend"] == "geant4"
-    assert physical["primary_sampling_fraction"] == pytest.approx(1.0)
-    assert "cui_truth_display_mode" not in physical
-    assert "joint_strength_block_probability" not in physical
-    assert "max_temper_steps" not in physical
-    assert "num_particles" not in physical
-    assert "pf_max_sources" not in physical
-    assert "pure_pf_schema_version" not in physical
-    assert "structural_rj_merge_probability" not in physical
-    assert "target_ess_ratio" not in physical
-    assert "variable_cardinality" not in physical
+    with pytest.raises(ValueError, match="estimator-owned or retired"):
+        estimator_neutral_physical_runtime_config(payload)
 
 
 def test_standard_runtime_preserves_full_transport_fidelity() -> None:
@@ -84,10 +79,275 @@ def test_standard_runtime_preserves_full_transport_fidelity() -> None:
     assert payload["sample_detector_response"] is True
 
 
-def test_standard_profile_resolves_once_for_estimator_neutral_log() -> None:
-    """Profile registry selection must produce one immutable logged model."""
+def test_production_geant4_reset_rejects_scene_config_overrides() -> None:
+    """Production reset must reject mismatches without mutating the scene."""
+    app = Geant4Application.__new__(Geant4Application)
+    app.production_runtime_config_sha256 = "0" * 64
+    app.config = SimpleNamespace(
+        usd_path="/approved/room.usda",
+        author_obstacle_prims=True,
+        author_room_boundary_prims=True,
+    )
+    fallback_scene = SceneDescription(
+        usd_path=None,
+        use_config_usd_fallback=True,
+        author_obstacle_prims=True,
+        author_room_boundary_prims=True,
+    )
+
+    with pytest.raises(ValueError, match="forbids config USD fallback"):
+        app.reset(fallback_scene)
+
+    assert fallback_scene.usd_path is None
+    mismatched_authoring = SceneDescription(
+        usd_path="/approved/room.usda",
+        use_config_usd_fallback=False,
+        author_obstacle_prims=False,
+        author_room_boundary_prims=True,
+    )
+
+    with pytest.raises(ValueError, match="author_obstacle_prims differs"):
+        app.reset(mismatched_authoring)
+
+    assert mismatched_authoring.author_obstacle_prims is False
+
+
+def test_standard_unapproved_profile_cannot_open_production_session() -> None:
+    """The current unvalidated profile must fail before acquisition starts."""
     payload = load_runtime_config(STANDARD_CONFIG)
 
+    with pytest.raises(RuntimeError, match="independent all-64 holdout"):
+        estimator_neutral_runtime_config(
+            payload,
+            backend="geant4",
+            isotopes=("Co-60", "Cs-137", "Eu-154"),
+            run_root=ROOT,
+        )
+
+
+def test_production_session_rejects_analytic_requested_backend() -> None:
+    """An exact Geant4 config cannot authorize an approximate runtime backend."""
+    payload = load_runtime_config(STANDARD_CONFIG)
+
+    with pytest.raises(ValueError, match="requires backend='geant4'"):
+        estimator_neutral_runtime_config(
+            payload,
+            backend="analytic",
+            isotopes=("Co-60", "Cs-137", "Eu-154"),
+            run_root=ROOT,
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("background_rate", "background_cps and background_rate_cps"),
+        ("background_model", "background_spectrum_model_id"),
+    ),
+)
+def test_production_preflight_rejects_background_contract_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    message: str,
+) -> None:
+    """Transport background settings must match one approved spectral contract."""
+    payload = load_production_runtime_config(STANDARD_CONFIG)
+    approved = approved_full_spectrum_model()
+    monkeypatch.setattr(
+        "runtime.session.geometry_conditioned_model_from_runtime_config",
+        lambda *args, **kwargs: approved,
+    )
+    if mutation == "background_rate":
+        payload["background_rate_cps"] = float(payload["background_cps"]) + 1.0
+    else:
+        payload["background_spectrum_model_id"] = "wrong-background-model"
+
+    with pytest.raises(ValueError, match=message):
+        require_production_runtime_preflight(
+            payload,
+            requested_backend="geant4",
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    (
+        ("auto_start_sidecar", False),
+        ("author_obstacle_prims", False),
+        ("author_room_boundary_prims", False),
+        ("detector_scoring_mode", "energy_deposit"),
+        ("line_resolved_shield_attenuation", False),
+        ("obstacle_attenuation_enabled", False),
+        ("primary_sampling_fraction", 0.5),
+        ("sample_detector_response", False),
+        ("secondary_transport_mode", "primary_only"),
+        ("source_rate_model", "activity_bq"),
+    ),
+)
+def test_production_preflight_rejects_lower_fidelity_transport(
+    field: str,
+    invalid: object,
+) -> None:
+    """Canonical production cannot disable required full-spectrum physics."""
+    payload = load_runtime_config(STANDARD_CONFIG)
+    payload[field] = invalid
+
+    with pytest.raises(ValueError, match="transport invariants"):
+        require_production_runtime_preflight(
+            payload,
+            requested_backend="geant4",
+        )
+
+
+def test_native_executable_digest_hashes_one_exact_regular_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Production executable identity must come from the selected file bytes."""
+    executable = tmp_path / "geant4_sidecar"
+    executable.write_bytes(b"approved-native-geant4-build")
+    executable.chmod(0o755)
+    monkeypatch.setattr(
+        "runtime.session._RUNTIME_REPOSITORY_ROOT",
+        tmp_path,
+    )
+
+    digest = _native_executable_sha256({"executable_path": executable.name})
+
+    assert digest == sha256(executable.read_bytes()).hexdigest()
+    symlink = tmp_path / "geant4_sidecar_link"
+    symlink.symlink_to(executable)
+    with pytest.raises(ValueError, match="cannot be a symlink"):
+        _native_executable_sha256({"executable_path": symlink.name})
+
+
+@pytest.mark.parametrize(
+    (
+        "native_digest",
+        "native_environment_digest",
+        "implementation_digest",
+        "message",
+    ),
+    (
+        (
+            "0" * 64,
+            "e" * 64,
+            "c" * 64,
+            "native Geant4 executable SHA-256",
+        ),
+        (
+            "b" * 64,
+            "0" * 64,
+            "c" * 64,
+            "execution-environment SHA-256",
+        ),
+        (
+            "b" * 64,
+            "e" * 64,
+            "0" * 64,
+            "implementation bundle SHA-256",
+        ),
+    ),
+)
+def test_production_preflight_rejects_unapproved_execution_bundle(
+    monkeypatch: pytest.MonkeyPatch,
+    native_digest: str,
+    native_environment_digest: str,
+    implementation_digest: str,
+    message: str,
+) -> None:
+    """A changed native binary or Python transport bundle must abort startup."""
+    payload = load_runtime_config(STANDARD_CONFIG)
+    approved = approved_full_spectrum_model()
+    monkeypatch.setattr(
+        "runtime.session.geometry_conditioned_model_from_runtime_config",
+        lambda *args, **kwargs: approved,
+    )
+    monkeypatch.setattr(
+        "runtime.session._native_executable_sha256",
+        lambda _config: native_digest,
+    )
+    monkeypatch.setattr(
+        "runtime.session.production_runtime_config_sha256",
+        lambda _config: "a" * 64,
+    )
+    monkeypatch.setattr(
+        "runtime.session.native_execution_environment_bundle_sha256",
+        lambda _path: native_environment_digest,
+    )
+    monkeypatch.setattr(
+        "runtime.session.acceptance_implementation_bundle_sha256",
+        lambda _root: implementation_digest,
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        require_production_runtime_preflight(
+            payload,
+            requested_backend="geant4",
+        )
+
+
+def test_production_preflight_rejects_unapproved_runtime_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A different canonical transport config cannot reuse model approval."""
+    payload = load_production_runtime_config(STANDARD_CONFIG)
+    approved = approved_full_spectrum_model()
+    monkeypatch.setattr(
+        "runtime.session.geometry_conditioned_model_from_runtime_config",
+        lambda *args, **kwargs: approved,
+    )
+
+    with pytest.raises(RuntimeError, match="runtime-config SHA-256"):
+        require_production_runtime_preflight(
+            payload,
+            requested_backend="geant4",
+        )
+
+
+def test_approved_profile_resolves_once_for_estimator_neutral_log(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An approved model must produce one immutable logged contract."""
+    payload = load_runtime_config(STANDARD_CONFIG)
+    approved = approved_full_spectrum_model()
+
+    def resolve_approved_profile(
+        config: dict[str, object],
+        *,
+        run_root: Path,
+    ) -> dict[str, object]:
+        """Embed the approved synthetic model without altering physical fields."""
+        del run_root
+        resolved = dict(config)
+        resolved["full_spectrum_generative_model"] = approved.manifest_payload()
+        resolved["full_spectrum_contract_hash_sha256"] = approved.contract_hash_sha256
+        return resolved
+
+    monkeypatch.setattr(
+        "runtime.session.geometry_conditioned_model_from_runtime_config",
+        lambda *args, **kwargs: approved,
+    )
+    monkeypatch.setattr(
+        "runtime.session.resolve_profile_model_runtime_config",
+        resolve_approved_profile,
+    )
+    monkeypatch.setattr(
+        "runtime.session._native_executable_sha256",
+        lambda _config: "b" * 64,
+    )
+    monkeypatch.setattr(
+        "runtime.session.production_runtime_config_sha256",
+        lambda _config: "a" * 64,
+    )
+    monkeypatch.setattr(
+        "runtime.session.native_execution_environment_bundle_sha256",
+        lambda _path: "e" * 64,
+    )
+    monkeypatch.setattr(
+        "runtime.session.acceptance_implementation_bundle_sha256",
+        lambda _root: "c" * 64,
+    )
     resolved = estimator_neutral_runtime_config(
         payload,
         backend="geant4",
@@ -106,20 +366,25 @@ def test_standard_profile_resolves_once_for_estimator_neutral_log() -> None:
     model = GeometryConditionedSpectralModel.from_manifest_payload(
         resolved["full_spectrum_generative_model"]
     )
-    assert isinstance(
-        model.additive_scatter_response,
-        PhysicsOnlyNoncollidedTransportResponse,
-    )
-    assert model.discrepancy_training_manifest is None
-    assert model.low_rank_spectral_mean_correction is None
     assert model.runtime_ready is True
+    assert model.production_ready is True
+    assert (
+        model.contract_hash_sha256
+        == approved_full_spectrum_model().contract_hash_sha256
+    )
 
 
 def test_standard_profile_reaches_shared_continuous_kernel_contract() -> None:
-    """Registry-backed physics must not disappear at observation construction."""
+    """Only explicit non-production tooling may inspect an unapproved model."""
     payload = load_runtime_config(STANDARD_CONFIG)
 
-    observation = build_runtime_observation_model(
+    with pytest.raises(RuntimeError, match="independent all-64 holdout"):
+        build_runtime_observation_model(
+            payload,
+            isotopes=("Co-60", "Cs-137", "Eu-154"),
+        )
+
+    observation = build_nonproduction_observation_model(
         payload,
         isotopes=("Co-60", "Cs-137", "Eu-154"),
     )
@@ -128,9 +393,32 @@ def test_standard_profile_reaches_shared_continuous_kernel_contract() -> None:
         observation.additive_scatter_response,
         PhysicsOnlyNoncollidedTransportResponse,
     )
-    assert "air_xcom" in (
-        observation.additive_scatter_response.feature_basis_semantics
+    assert "air_xcom" in (observation.additive_scatter_response.feature_basis_semantics)
+
+
+def test_runtime_observation_model_requires_literal_production_approval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A truthy non-boolean flag cannot authorize production observations."""
+    payload = runtime_config()
+    model = approved_full_spectrum_model()
+    monkeypatch.setattr(
+        type(model),
+        "production_ready",
+        property(lambda _self: "true"),
     )
+    monkeypatch.setattr(
+        type(model),
+        "require_production_ready",
+        lambda _self: None,
+    )
+
+    with pytest.raises(RuntimeError, match="production_ready=False"):
+        build_runtime_observation_model(
+            payload,
+            isotopes=("Co-60", "Cs-137", "Eu-154"),
+            authenticated_full_spectrum_model=model,
+        )
 
 
 def test_archived_embedded_model_uses_logged_registry_digest() -> None:

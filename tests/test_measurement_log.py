@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import errno
 from hashlib import sha256
 import json
+import os
 from pathlib import Path
 import zipfile
 
@@ -13,6 +15,7 @@ import pytest
 
 from runtime.measurement_log import (
     MEASUREMENT_LOG_SCHEMA_VERSION,
+    MeasurementLogStreamWriter,
     MeasurementLogValidationError,
     _validate_full_spectrum_contract_alignment,
     _validate_environment_payload,
@@ -22,7 +25,14 @@ from runtime.measurement_log import (
 from runtime.records import validate_truth_free_estimator_input
 from measurement.obstacle_assets import KnownObstacleInstance, ObstacleComponent
 from measurement.obstacles import ObstacleGrid
-from tests.runtime_test_support import make_measurement_log, records
+from tests.runtime_test_support import (
+    TEST_COMMIT,
+    TEST_ISOTOPES,
+    environment,
+    make_measurement_log,
+    records,
+    runtime_config,
+)
 
 
 def test_measurement_log_round_trip_preserves_raw_integer_spectra(tmp_path) -> None:
@@ -42,6 +52,119 @@ def test_measurement_log_round_trip_preserves_raw_integer_spectra(tmp_path) -> N
     with np.load(root / "observations.npz", allow_pickle=False) as arrays:
         assert "spectrum_counts" in arrays.files
         assert not any("isotope_count" in key for key in arrays.files)
+
+
+def test_measurement_log_publication_never_replaces_a_racing_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A target created after staging begins must remain untouched."""
+    target = tmp_path / "measurement-log"
+
+    def _inject_racing_target(
+        source: Path,
+        destination: Path,
+        *,
+        flags: int,
+    ) -> None:
+        """Create a competing generation at the final no-replace operation."""
+        del source
+        assert flags == 1
+        destination.mkdir()
+        (destination / "owner.txt").write_text("racer", encoding="utf-8")
+        raise FileExistsError(errno.EEXIST, "target exists", destination)
+
+    monkeypatch.setattr("runtime.artifacts._linux_renameat2", _inject_racing_target)
+
+    with pytest.raises(FileExistsError):
+        make_measurement_log(target)
+
+    assert (target / "owner.txt").read_text(encoding="utf-8") == "racer"
+    assert not tuple(tmp_path.glob(".measurement-log.bundle-*"))
+
+
+def test_stream_cleanup_failure_prevents_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A WAL cleanup failure must abort before public bundle publication."""
+    writer = object.__new__(MeasurementLogStreamWriter)
+    writer.output_dir = tmp_path / "measurement-log"
+    writer.stage_dir = tmp_path / f".measurement-log.stream-{os.getpid()}"
+    writer.stage_dir.mkdir()
+    writer.run_id = "run"
+    writer.repository_commit = "a" * 40
+    writer.runtime_config = {}
+    writer.environment = {}
+    writer.forward_model_manifest = {}
+    writer.isotopes = ("Cs-137",)
+    writer.records = []
+    writer.metadata = {}
+    writer.obstacle_layout_path = None
+    writer.source_layout_path = None
+    publication_attempted = False
+
+    def _publish(*args: object, **kwargs: object) -> object:
+        """Record an invalid publication attempt after failed cleanup."""
+        nonlocal publication_attempted
+        del args, kwargs
+        publication_attempted = True
+        return object()
+
+    def _fail_cleanup(path: Path) -> None:
+        """Model an OS cleanup error before publication."""
+        assert path == writer.stage_dir
+        raise OSError("injected cleanup failure")
+
+    monkeypatch.setattr("runtime.measurement_log.write_measurement_log", _publish)
+    monkeypatch.setattr("runtime.measurement_log.shutil.rmtree", _fail_cleanup)
+
+    with pytest.raises(OSError, match="injected cleanup failure"):
+        writer.finalize()
+    assert not publication_attempted
+
+
+def test_stream_abort_removes_owned_wal_idempotently(tmp_path: Path) -> None:
+    """An aborted fresh run must leave no recoverable partial stage."""
+    writer = object.__new__(MeasurementLogStreamWriter)
+    writer.output_dir = tmp_path / "measurement-log"
+    writer.stage_dir = tmp_path / f".measurement-log.stream-{os.getpid()}"
+    writer.stage_dir.mkdir()
+    (writer.stage_dir / "record_00000000.npz").write_bytes(b"partial")
+
+    writer.abort()
+    writer.abort()
+
+    assert not writer.stage_dir.exists()
+
+
+def test_stream_constructor_failure_removes_its_private_wal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A partial writer constructor must roll back its newly owned WAL."""
+    output_dir = tmp_path / "measurement-log"
+
+    def fail_manifest_write(*args: object, **kwargs: object) -> None:
+        """Inject failure after the private staging directory is created."""
+        del args, kwargs
+        raise OSError("injected WAL manifest write failure")
+
+    monkeypatch.setattr("runtime.measurement_log._write_json", fail_manifest_write)
+
+    with pytest.raises(OSError, match="injected WAL manifest write failure"):
+        MeasurementLogStreamWriter(
+            output_dir,
+            run_id="stream-constructor-failure-test",
+            repository_commit=TEST_COMMIT,
+            runtime_config=runtime_config(),
+            environment=environment(),
+            forward_model_manifest={},
+            isotopes=TEST_ISOTOPES,
+        )
+
+    assert not output_dir.exists()
+    assert not tuple(tmp_path.glob(".measurement-log.stream-*"))
 
 
 def test_record_rejects_fractional_or_projected_counts() -> None:
@@ -123,6 +246,46 @@ def test_record_rejects_removed_isotope_count_metadata() -> None:
                 "runtime_likelihood_route_by_isotope": {"Cs-137": "legacy"},
             },
         )
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    (
+        Path("implicit-path.json"),
+        np.int64(7),
+        object(),
+        {1: "non-string-key"},
+    ),
+)
+def test_record_metadata_rejects_lossy_json_coercions(invalid: object) -> None:
+    """Production metadata must already be JSON-native at its write boundary."""
+    valid = records(1)[0]
+
+    with pytest.raises(
+        MeasurementLogValidationError,
+        match="JSON",
+    ):
+        replace(
+            valid,
+            metadata={**dict(valid.metadata), "invalid": invalid},
+        )
+
+
+@pytest.mark.parametrize("invalid", (Path("config.json"), np.float32(1.0), object()))
+def test_runtime_config_rejects_lossy_json_coercions_before_publication(
+    tmp_path: Path,
+    invalid: object,
+) -> None:
+    """A non-JSON runtime value must fail before any log directory is published."""
+    target = tmp_path / "measurement-log"
+
+    with pytest.raises((TypeError, MeasurementLogValidationError)):
+        make_measurement_log(
+            target,
+            runtime_overrides={"invalid_runtime_value": invalid},
+        )
+
+    assert not target.exists()
 
 
 def test_record_accepts_truth_free_source_position_contract_label() -> None:

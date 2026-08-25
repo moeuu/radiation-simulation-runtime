@@ -22,8 +22,12 @@ from numpy.typing import NDArray
 
 from measurement.model import EnvironmentConfig
 from measurement.obstacles import ObstacleGrid
-from runtime.artifacts import ArtifactInventory
-from runtime.provenance import DigestIdentity, canonical_json_bytes, json_safe
+from runtime.artifacts import AtomicBundlePublisher, ArtifactInventory
+from runtime.provenance import (
+    DigestIdentity,
+    strict_canonical_json_bytes,
+    strict_json_loads,
+)
 from runtime.contracts import FULL_SPECTRUM_CONTRACT_HASH_METADATA_KEY
 from runtime.forward_model_manifest import (
     CANONICAL_UNITS,
@@ -51,19 +55,6 @@ _CANONICAL_REQUIRED_FILES = (
     "observations.npz",
     "observation_metadata.jsonl",
     "repository_commit.txt",
-)
-_STREAM_STATIC_FILES = frozenset(
-    {
-        "runtime_config.resolved.json",
-        "environment.json",
-        "forward_model_manifest.input.json",
-        "observation_metadata.jsonl",
-        "repository_commit.txt",
-    }
-)
-_STREAM_RECORD_PATTERN = re.compile(r"^record_([0-9]{8})\.npz$")
-_STREAM_METADATA_TEMP_PATTERN = re.compile(
-    r"^\.observation_metadata\.jsonl\.tmp-[0-9]+$"
 )
 _NPZ_MEMBER_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _MODEL_KEYS = REQUIRED_MODEL_NAMES
@@ -673,12 +664,13 @@ class MeasurementLogRecord:
         )
         _validate_truth_free_payload(self.metadata, location="record.metadata")
         try:
-            metadata_copy = json.loads(
-                canonical_json_bytes(dict(self.metadata)).decode("utf-8")
+            metadata_copy = _strict_json_copy(
+                dict(self.metadata),
+                location="record.metadata",
             )
         except (TypeError, ValueError) as exc:
             raise MeasurementLogValidationError(
-                "metadata must contain only finite JSON values."
+                "metadata must contain only finite JSON-native values."
             ) from exc
         immutable_edges = np.array(edges, dtype=np.float64, copy=True)
         immutable_spectrum = np.array(
@@ -1130,11 +1122,11 @@ class MeasurementLog:
 
     @property
     def log_sha256(self) -> str:
-        """Return the directory digest, including for a path-retaining prefix.
+        """Return the source directory digest for one file-backed log.
 
-        This legacy property identifies the on-disk source bundle. It does not
-        identify the selected records of an in-memory :meth:`prefix` result.
-        New prefix consumers should compare :attr:`source_log_sha256` and
+        This value does not identify selected records of an in-memory
+        :meth:`prefix` result. Prefix consumers must compare
+        :attr:`source_log_sha256` and
         :attr:`records_content_sha256` explicitly.
         """
         if self.path is None:
@@ -1157,11 +1149,6 @@ class MeasurementLog:
     def records_content_sha256(self) -> str:
         """Return the digest of exactly the records selected by this object."""
         return measurement_records_content_sha256(self.records)
-
-    @property
-    def content_sha256(self) -> str:
-        """Return the source directory digest under its legacy consumer name."""
-        return self.log_sha256
 
     def array_view(self) -> MeasurementLogArrayView:
         """Return exact read-only arrays for all records selected by this object."""
@@ -1213,6 +1200,16 @@ def _sha256_bytes(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _strict_json_copy(value: object, *, location: str) -> object:
+    """Return a detached JSON-native value without type coercion."""
+    try:
+        return strict_json_loads(strict_canonical_json_bytes(value))
+    except (TypeError, ValueError) as exc:
+        raise MeasurementLogValidationError(
+            f"{location} must contain only finite JSON-native values."
+        ) from exc
+
+
 def _record_content_payload(record: MeasurementLogRecord) -> dict[str, object]:
     """Return every estimator-visible record field for a content digest."""
     return {
@@ -1242,7 +1239,9 @@ def measurement_records_content_sha256(
     if any(not isinstance(record, MeasurementLogRecord) for record in rows):
         raise TypeError("records must contain only MeasurementLogRecord values.")
     return _sha256_bytes(
-        canonical_json_bytes([_record_content_payload(record) for record in rows])
+        strict_canonical_json_bytes(
+            [_record_content_payload(record) for record in rows]
+        )
     )
 
 
@@ -1257,13 +1256,14 @@ def _sha256_file(path: Path) -> str:
 
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
     """Write one canonical JSON artifact."""
-    path.write_bytes(canonical_json_bytes(dict(payload)))
+    path.write_bytes(strict_canonical_json_bytes(dict(payload)))
 
 
 def _json_line_bytes(payload: Mapping[str, Any]) -> bytes:
     """Serialize one compact deterministic JSONL record."""
+    normalized = _strict_json_copy(dict(payload), location="JSONL payload")
     text = json.dumps(
-        json_safe(dict(payload)),
+        normalized,
         sort_keys=True,
         ensure_ascii=False,
         allow_nan=False,
@@ -1915,7 +1915,10 @@ def _metadata_line(
         "step_id": int(record.step_id),
         "action_id": int(record.action_id),
         "station_id": int(record.station_id),
-        "metadata": json_safe(dict(record.metadata)),
+        "metadata": _strict_json_copy(
+            dict(record.metadata),
+            location="record.metadata",
+        ),
     }
 
 
@@ -2031,7 +2034,10 @@ def _write_measurement_log_unpublished(
         "source_rate_model": "detector_cps_1m",
         "source_rate_semantics": dict(_SOURCE_RATE_SEMANTICS),
         "isotopes": list(isotope_names),
-        "environment": json_safe(dict(environment)),
+        "environment": _strict_json_copy(
+            dict(environment),
+            location="environment",
+        ),
         "obstacle_layout_path": obstacle_layout_path,
         "source_layout_path": source_layout_path,
         "sim_backend": runtime_config["sim_backend"],
@@ -2064,7 +2070,10 @@ def _write_measurement_log_unpublished(
         "model_identifiers": model_identifiers,
         "index_conventions": dict(_INDEX_CONVENTIONS),
         "artifact_hashes": artifact_hashes,
-        "metadata": json_safe(dict(metadata or {})),
+        "metadata": _strict_json_copy(
+            dict(metadata or {}),
+            location="run_manifest.metadata",
+        ),
     }
     _validate_full_spectrum_contract_alignment(
         run_manifest=run_manifest,
@@ -2095,17 +2104,9 @@ def write_measurement_log(
         location="run_manifest.source_layout_path",
     )
     target = Path(output_dir)
-    if target.exists():
-        raise FileExistsError(f"Refusing to replace MeasurementLog directory {target}.")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_name(f".{target.name}.tmp-{os.getpid()}")
-    if temporary.exists():
-        raise FileExistsError(
-            f"Temporary MeasurementLog path already exists: {temporary}."
-        )
-    try:
+    with AtomicBundlePublisher(target, policy="create") as publisher:
         _write_measurement_log_unpublished(
-            temporary,
+            publisher.staging_path,
             run_id=run_id,
             repository_commit=repository_commit,
             runtime_config=runtime_config,
@@ -2117,10 +2118,7 @@ def write_measurement_log(
             obstacle_layout_path=obstacle_layout_path,
             source_layout_path=source_layout_path,
         )
-        os.replace(temporary, target)
-    except BaseException:
-        shutil.rmtree(temporary, ignore_errors=True)
-        raise
+        publisher.publish()
     return load_measurement_log(target)
 
 
@@ -2166,7 +2164,7 @@ def _load_json_object(path: Path) -> dict[str, Any]:
 
 
 def _validate_run_manifest(payload: Mapping[str, Any]) -> dict[str, Any]:
-    """Validate the canonical manifest without legacy aliases."""
+    """Validate the one canonical manifest schema exactly."""
     if set(payload) != _RUN_MANIFEST_FIELDS:
         missing = sorted(_RUN_MANIFEST_FIELDS - set(payload))
         unknown = sorted(set(payload) - _RUN_MANIFEST_FIELDS)
@@ -2778,624 +2776,48 @@ class MeasurementLogStreamWriter:
             raise FileExistsError(
                 f"MeasurementLog staging path exists: {self.stage_dir}."
             )
-        self.stage_dir.mkdir(parents=True)
-        self.metadata_stage_path = self.stage_dir / "observation_metadata.jsonl"
-        self.run_id = run_id
-        self.repository_commit = repository_commit
-        self.runtime_config = dict(runtime_config)
-        self.environment = dict(environment)
-        self.forward_model_manifest = dict(forward_model_manifest)
-        self.isotopes = isotope_names
-        self.metadata = dict(metadata or {})
-        self.obstacle_layout_path = obstacle_layout_path
-        self.source_layout_path = source_layout_path
-        self.resume_record_metadata: dict[str, Any] = {}
-        self.records: list[MeasurementLogRecord] = []
-        self.metadata_stage_path.write_text("", encoding="utf-8")
-        _write_json(
-            self.stage_dir / "runtime_config.resolved.json", self.runtime_config
-        )
-        _write_json(self.stage_dir / "environment.json", self.environment)
-        _write_json(
-            self.stage_dir / "forward_model_manifest.input.json",
-            self.forward_model_manifest,
-        )
-        (self.stage_dir / "repository_commit.txt").write_text(
-            f"{self.repository_commit}\n",
-            encoding="utf-8",
-        )
-
-    @classmethod
-    def resume_from_stage(
-        cls,
-        output_dir: str | Path,
-        *,
-        stage_dir: str | Path,
-        run_id: str,
-        repository_commit: str,
-        runtime_config: Mapping[str, Any],
-        environment: Mapping[str, Any],
-        forward_model_manifest: Mapping[str, Any],
-        isotopes: Sequence[str],
-        metadata: Mapping[str, Any] | None = None,
-        obstacle_layout_path: str | None = None,
-        source_layout_path: str | None = None,
-        resume_execution_commit: str,
-        resume_compatibility: Mapping[str, Any],
-    ) -> "MeasurementLogStreamWriter":
-        """Copy a verified station prefix, dropping only one incomplete WAL tail."""
-        _validate_source_layout_sentinel(
-            source_layout_path,
-            location="run_manifest.source_layout_path",
-        )
-        _validate_run_identity(run_id, repository_commit)
-        if (
-            not isinstance(resume_execution_commit, str)
-            or _GIT_COMMIT_PATTERN.fullmatch(resume_execution_commit) is None
-        ):
-            raise MeasurementLogValidationError(
-                "resume_execution_commit must be a full lowercase Git hash."
-            )
-        isotope_names = _canonical_isotope_names(
-            isotopes,
-            location="isotopes",
-        )
-        _validate_runtime_observation_contract(
-            runtime_config,
-            isotopes=isotope_names,
-        )
-        if obstacle_layout_path is not None and not isinstance(
-            obstacle_layout_path,
-            str,
-        ):
-            raise MeasurementLogValidationError(
-                "obstacle_layout_path must be a JSON string or null."
-            )
-        if metadata is not None and not isinstance(metadata, Mapping):
-            raise MeasurementLogValidationError("metadata must be an object or null.")
-        if not isinstance(resume_compatibility, Mapping):
-            raise MeasurementLogValidationError(
-                "resume_compatibility must be an object."
-            )
-        _validate_truth_free_payload(runtime_config, location="runtime_config")
-        _validate_truth_free_payload(environment, location="environment")
-        _validate_truth_free_payload(metadata or {}, location="run_manifest.metadata")
-        _validate_environment_payload(environment)
-
-        target = Path(output_dir).resolve()
-        stage_input = Path(stage_dir)
-        if stage_input.is_symlink():
-            raise MeasurementLogValidationError(
-                "The MeasurementLog resume stage must not be a symlink."
-            )
-        stage = stage_input.resolve()
-        if target.exists():
-            raise FileExistsError(
-                f"Refusing to replace MeasurementLog directory {target}."
-            )
-        expected_stage_pattern = re.compile(
-            rf"^\.{re.escape(target.name)}\.stream-[0-9]+$"
-        )
-        if (
-            stage.parent != target.parent
-            or expected_stage_pattern.fullmatch(stage.name) is None
-        ):
-            raise MeasurementLogValidationError(
-                "The resume stage must be the hidden stream directory belonging "
-                "to the requested MeasurementLog output."
-            )
-        if not stage.is_dir() or stage.is_symlink():
-            raise MeasurementLogValidationError(
-                f"MeasurementLog stream stage is not a real directory: {stage}."
-            )
-
-        entries = list(stage.iterdir())
-        if any(entry.is_symlink() or not entry.is_file() for entry in entries):
-            raise MeasurementLogValidationError(
-                "A resumable MeasurementLog stage may contain regular files only."
-            )
-        entry_names = {entry.name for entry in entries}
-        shard_entries: list[tuple[int, Path]] = []
-        for entry in entries:
-            match = _STREAM_RECORD_PATTERN.fullmatch(entry.name)
-            if match is not None:
-                shard_entries.append((int(match.group(1)), entry))
-        shard_entries.sort(key=lambda item: item[0])
-        expected_indices = list(range(len(shard_entries)))
-        if [index for index, _ in shard_entries] != expected_indices:
-            raise MeasurementLogValidationError(
-                "MeasurementLog stream shards must be contiguous from record zero."
-            )
-        metadata_temp_entries = tuple(
-            entry
-            for entry in entries
-            if _STREAM_METADATA_TEMP_PATTERN.fullmatch(entry.name) is not None
-        )
-        if len(metadata_temp_entries) > 1:
-            raise MeasurementLogValidationError(
-                "A resumable MeasurementLog stage has multiple metadata "
-                "rewrite orphans."
-            )
-        expected_inventory = (
-            _STREAM_STATIC_FILES
-            | {path.name for _, path in shard_entries}
-            | {path.name for path in metadata_temp_entries}
-        )
-        if entry_names != expected_inventory:
-            missing = sorted(expected_inventory - entry_names)
-            extra = sorted(entry_names - expected_inventory)
-            raise MeasurementLogValidationError(
-                "MeasurementLog stream inventory mismatch; "
-                f"missing={missing}, extra={extra}."
-            )
-        if not shard_entries:
-            raise MeasurementLogValidationError(
-                "A resumable MeasurementLog stage needs at least one record."
-            )
-
-        staged_runtime = _load_json_object(stage / "runtime_config.resolved.json")
-        staged_environment = _load_json_object(stage / "environment.json")
-        staged_forward = _load_json_object(stage / "forward_model_manifest.input.json")
-        identity_pairs = (
-            ("runtime configuration", staged_runtime, dict(runtime_config)),
-            ("environment", staged_environment, dict(environment)),
-            (
-                "forward-model manifest",
-                staged_forward,
-                dict(forward_model_manifest),
-            ),
-        )
-        for name, staged_value, expected_value in identity_pairs:
-            if canonical_json_bytes(staged_value) != canonical_json_bytes(
-                expected_value
-            ):
-                raise MeasurementLogValidationError(
-                    f"Resume {name} does not match the staged acquisition."
-                )
-        commit_bytes = (stage / "repository_commit.txt").read_bytes()
-        expected_commit_bytes = f"{repository_commit}\n".encode("utf-8")
-        if commit_bytes != expected_commit_bytes:
-            raise MeasurementLogValidationError(
-                "Resume repository commit does not match the staged acquisition."
-            )
-        compatibility_payload = dict(resume_compatibility)
-        _validate_truth_free_payload(
-            compatibility_payload,
-            location="run_manifest.metadata.resume_compatibility",
-        )
-        if (
-            compatibility_payload.get("prefix_repository_commit") != repository_commit
-            or compatibility_payload.get("resume_execution_commit")
-            != resume_execution_commit
-        ):
-            raise MeasurementLogValidationError(
-                "Resume compatibility provenance identifies different commits."
-            )
-        metadata_path = stage / "observation_metadata.jsonl"
-        compatibility_payload["prefix_identity_sha256"] = {
-            filename: _sha256_file(stage / filename)
-            for filename in (
-                "runtime_config.resolved.json",
-                "environment.json",
-                "forward_model_manifest.input.json",
-                "repository_commit.txt",
-            )
-        }
-        source_shard_hashes = {
-            path.name: _sha256_file(path) for _, path in shard_entries
-        }
-        source_inventory_hashes = {
-            entry.name: _sha256_file(entry)
-            for entry in sorted(entries, key=lambda value: value.name)
-        }
-        compatibility_payload["source_stage_inventory_sha256"] = _sha256_bytes(
-            canonical_json_bytes(source_inventory_hashes)
-        )
-        compatibility_payload["source_stage_record_shards_sha256"] = _sha256_bytes(
-            canonical_json_bytes(source_shard_hashes)
-        )
-        compatibility_payload["source_stage_metadata_sha256"] = _sha256_file(
-            metadata_path
-        )
-
-        configured_isotopes = staged_runtime.get("candidate_isotopes")
-        if configured_isotopes is not None and (
-            not isinstance(configured_isotopes, list)
-            or any(not isinstance(value, str) for value in configured_isotopes)
-            or tuple(configured_isotopes) != isotope_names
-        ):
-            raise MeasurementLogValidationError(
-                "Resume isotope order does not match candidate_isotopes in the "
-                "staged runtime configuration."
-            )
-        line_table = staged_forward.get("line_mu_by_isotope")
-        if not isinstance(line_table, Mapping) or set(line_table) != set(isotope_names):
-            raise MeasurementLogValidationError(
-                "Resume isotopes do not match the staged forward model."
-            )
-
-        metadata_rows: list[dict[str, Any]] = []
-        truncated_metadata_tail = False
+        stage_created = False
         try:
-            metadata_bytes = metadata_path.read_bytes()
-            metadata_lines = metadata_bytes.splitlines(keepends=True)
-            for line_number, line_bytes in enumerate(metadata_lines, start=1):
-                if not line_bytes.endswith(b"\n"):
-                    if line_number != len(metadata_lines):
-                        raise MeasurementLogValidationError(
-                            "Only the final staged metadata line may be truncated."
-                        )
-                    truncated_metadata_tail = True
-                    break
+            self.stage_dir.mkdir(parents=True)
+            stage_created = True
+            self.metadata_stage_path = self.stage_dir / "observation_metadata.jsonl"
+            self.run_id = run_id
+            self.repository_commit = repository_commit
+            self.runtime_config = dict(runtime_config)
+            self.environment = dict(environment)
+            self.forward_model_manifest = dict(forward_model_manifest)
+            self.isotopes = isotope_names
+            self.metadata = dict(metadata or {})
+            self.obstacle_layout_path = obstacle_layout_path
+            self.source_layout_path = source_layout_path
+            self.records: list[MeasurementLogRecord] = []
+            self.metadata_stage_path.write_text("", encoding="utf-8")
+            _write_json(
+                self.stage_dir / "runtime_config.resolved.json",
+                self.runtime_config,
+            )
+            _write_json(self.stage_dir / "environment.json", self.environment)
+            _write_json(
+                self.stage_dir / "forward_model_manifest.input.json",
+                self.forward_model_manifest,
+            )
+            (self.stage_dir / "repository_commit.txt").write_text(
+                f"{self.repository_commit}\n",
+                encoding="utf-8",
+            )
+        except BaseException as startup_failure:
+            if stage_created:
                 try:
-                    line = line_bytes.decode("utf-8")
-                except UnicodeDecodeError as exc:
-                    raise MeasurementLogValidationError(
-                        "The staged metadata JSONL is not valid UTF-8."
-                    ) from exc
-                try:
-                    row = _parse_json_value(
-                        line,
-                        location=(
-                            f"staged observation_metadata.jsonl line {line_number}"
-                        ),
+                    shutil.rmtree(self.stage_dir)
+                except BaseException as cleanup_failure:
+                    startup_failure.add_note(
+                        "MeasurementLog WAL constructor cleanup also failed: "
+                        f"{type(cleanup_failure).__name__}: {cleanup_failure}"
                     )
-                except json.JSONDecodeError as exc:
-                    raise MeasurementLogValidationError(
-                        f"Invalid staged metadata JSON on line {line_number}."
-                    ) from exc
-                if not isinstance(row, dict):
-                    raise MeasurementLogValidationError(
-                        f"Metadata line {line_number} must be an object."
-                    )
-                metadata_rows.append(row)
-        except OSError as exc:
-            raise MeasurementLogValidationError(
-                "Cannot read the staged metadata JSONL."
-            ) from exc
-        if len(metadata_rows) > len(shard_entries):
-            raise MeasurementLogValidationError(
-                "Staged metadata cannot outnumber record shards."
-            )
-        orphan_shard_count = len(shard_entries) - len(metadata_rows)
-        if orphan_shard_count > 1:
-            raise MeasurementLogValidationError(
-                "At most one shard may follow the durable metadata tail."
-            )
-        if truncated_metadata_tail and orphan_shard_count != 1:
-            raise MeasurementLogValidationError(
-                "A truncated final metadata line is recoverable only when its "
-                "corresponding record shard is durably present."
-            )
-
-        recovered_records: list[MeasurementLogRecord] = []
-        for record_index, shard_path in shard_entries[: len(metadata_rows)]:
-            metadata_row = metadata_rows[record_index]
-            if set(metadata_row) != {
-                "run_id",
-                "array_index",
-                "step_id",
-                "action_id",
-                "station_id",
-                "metadata",
-            }:
-                raise MeasurementLogValidationError(
-                    "Staged metadata rows must contain exactly the canonical "
-                    "schema fields."
-                )
-            if metadata_row.get("run_id") != run_id:
-                raise MeasurementLogValidationError(
-                    "Resume run_id does not match the staged acquisition."
-                )
-            if (
-                _required_json_integer(
-                    metadata_row,
-                    "array_index",
-                    location=f"metadata_rows[{record_index}]",
-                    minimum=0,
-                )
-                != record_index
-            ):
-                raise MeasurementLogValidationError(
-                    "Staged metadata array_index must match its record shard."
-                )
-            try:
-                with np.load(shard_path, allow_pickle=False) as loaded:
-                    if len(loaded.files) != len(set(loaded.files)):
-                        raise MeasurementLogValidationError(
-                            f"{shard_path.name} contains duplicate array names."
-                        )
-                    arrays = {
-                        name: np.array(loaded[name], copy=True) for name in loaded.files
-                    }
-            except MeasurementLogValidationError:
-                raise
-            except (OSError, ValueError, zipfile.BadZipFile) as exc:
-                raise MeasurementLogValidationError(
-                    f"Cannot read valid staged shard {shard_path.name}."
-                ) from exc
-            edges = np.asarray(arrays.get("energy_bin_edges_keV", ()))
-            local_metadata = dict(metadata_row)
-            local_metadata["array_index"] = 0
-            record = _records_from_arrays(
-                arrays,
-                (local_metadata,),
-                isotope_names,
-                run_id=run_id,
-                record_count=1,
-                energy_bin_count=int(edges.size - 1),
-            )[0]
-            recovered_records.append(record)
-
-        if not recovered_records:
-            raise MeasurementLogValidationError(
-                "A resumable MeasurementLog stage has no durable metadata records."
-            )
-        _validate_record_sequence(recovered_records, isotope_names)
-        for record_index, record in enumerate(recovered_records):
-            if int(record.step_id) != record_index or int(record.action_id) != (
-                record_index
-            ):
-                raise MeasurementLogValidationError(
-                    "Live resume requires zero-based step_id and action_id to "
-                    "equal record order."
-                )
-        station_ids = [int(record.station_id) for record in recovered_records]
-        if sorted(set(station_ids)) != list(range(station_ids[-1] + 1)):
-            raise MeasurementLogValidationError(
-                "Live resume requires contiguous zero-based station identifiers."
-            )
-        for record_index, record in enumerate(recovered_records):
-            _station_complete_marker(
-                record.metadata,
-                location=f"records[{record_index}].metadata",
-            )
-            station_start = record_index == 0 or (
-                station_ids[record_index - 1] != station_ids[record_index]
-            )
-            if not station_start:
-                previous = recovered_records[record_index - 1]
-                if (
-                    record.detector_pose_xyz != previous.detector_pose_xyz
-                    or record.detector_quat_wxyz != previous.detector_quat_wxyz
-                ):
-                    raise MeasurementLogValidationError(
-                        "All records in a resumable station must share one "
-                        "detector pose."
-                    )
-
-        completed_indices = [
-            index
-            for index, record in enumerate(recovered_records)
-            if _station_complete_marker(
-                record.metadata,
-                location=f"records[{index}].metadata",
-            )
-        ]
-        if not completed_indices:
-            raise MeasurementLogValidationError(
-                "Live resume requires at least one durable station_complete boundary."
-            )
-        prefix_record_count = int(completed_indices[-1] + 1)
-        complete_records = recovered_records[:prefix_record_count]
-        complete_station_ids = station_ids[:prefix_record_count]
-        for record_index, record in enumerate(complete_records):
-            station_end = (
-                record_index + 1 == len(complete_records)
-                or complete_station_ids[record_index + 1]
-                != complete_station_ids[record_index]
-            )
-            marker = _station_complete_marker(
-                record.metadata,
-                location=f"records[{record_index}].metadata",
-            )
-            if marker is not station_end:
-                raise MeasurementLogValidationError(
-                    "The committed prefix must have exactly one station_complete "
-                    "marker on each station's final record."
-                )
-
-        tail_records = recovered_records[prefix_record_count:]
-        if any(
-            _station_complete_marker(
-                record.metadata,
-                location=(f"records[{prefix_record_count + index}].metadata"),
-            )
-            for index, record in enumerate(tail_records)
-        ):
-            raise MeasurementLogValidationError(
-                "A station_complete marker cannot appear after the committed "
-                "resume boundary."
-            )
-        if tail_records:
-            expected_tail_station = int(complete_records[-1].station_id) + 1
-            if any(
-                int(record.station_id) != expected_tail_station
-                for record in tail_records
-            ):
-                raise MeasurementLogValidationError(
-                    "Discardable resume tail records must belong to exactly the "
-                    "next incomplete station."
-                )
-
-        discarded_record_count = len(shard_entries) - prefix_record_count
-
-        prefix_metadata_bytes = b"".join(
-            _json_line_bytes(
-                _metadata_line(
-                    record,
-                    run_id=run_id,
-                    record_index=index,
-                )
-            )
-            for index, record in enumerate(complete_records)
-        )
-        prefix_shard_entries = shard_entries[:prefix_record_count]
-        prefix_shard_hashes = {
-            path.name: source_shard_hashes[path.name]
-            for _, path in prefix_shard_entries
-        }
-        compatibility_payload["prefix_record_shards_sha256"] = _sha256_bytes(
-            canonical_json_bytes(prefix_shard_hashes)
-        )
-        compatibility_payload["prefix_metadata_sha256"] = _sha256_bytes(
-            prefix_metadata_bytes
-        )
-        compatibility_payload["source_stage_recovery"] = {
-            "source_stage_name": stage.name,
-            "source_record_shard_count": int(len(shard_entries)),
-            "source_metadata_record_count": int(len(metadata_rows)),
-            "committed_prefix_record_count": int(prefix_record_count),
-            "discarded_tail_record_count": int(discarded_record_count),
-            "orphan_shard_count": int(orphan_shard_count),
-            "truncated_metadata_tail": bool(truncated_metadata_tail),
-            "metadata_temp_orphan_count": int(len(metadata_temp_entries)),
-            "copy_on_adopt": True,
-        }
-
-        fork_stage: Path | None = None
-        for attempt in range(1000):
-            suffix = str(os.getpid()) if attempt == 0 else f"{os.getpid()}{attempt:03d}"
-            candidate = target.with_name(f".{target.name}.stream-{suffix}")
-            if candidate == stage:
-                continue
-            try:
-                candidate.mkdir()
-            except FileExistsError:
-                continue
-            fork_stage = candidate
-            break
-        if fork_stage is None:
-            raise FileExistsError(
-                "Cannot allocate a new copy-on-resume MeasurementLog stage."
-            )
-        fork_metadata_path = fork_stage / "observation_metadata.jsonl"
-        try:
-            for filename in _STREAM_STATIC_FILES - {"observation_metadata.jsonl"}:
-                shutil.copyfile(stage / filename, fork_stage / filename)
-            for _, shard_path in prefix_shard_entries:
-                shutil.copyfile(shard_path, fork_stage / shard_path.name)
-            with fork_metadata_path.open("wb") as handle:
-                handle.write(prefix_metadata_bytes)
-                handle.flush()
-                os.fsync(handle.fileno())
-            for copied_path in fork_stage.iterdir():
-                if copied_path == fork_metadata_path:
-                    continue
-                with copied_path.open("rb") as handle:
-                    os.fsync(handle.fileno())
-            directory_fd = os.open(fork_stage, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
-
-            current_source_entries = list(stage.iterdir())
-            if any(
-                entry.is_symlink() or not entry.is_file()
-                for entry in current_source_entries
-            ):
-                raise MeasurementLogValidationError(
-                    "The source MeasurementLog stage changed during adoption."
-                )
-            current_source_hashes = {
-                entry.name: _sha256_file(entry)
-                for entry in sorted(
-                    current_source_entries,
-                    key=lambda value: value.name,
-                )
-            }
-            if current_source_hashes != source_inventory_hashes:
-                raise MeasurementLogValidationError(
-                    "The source MeasurementLog stage changed during adoption."
-                )
-
-            expected_fork_hashes = {
-                filename: source_inventory_hashes[filename]
-                for filename in _STREAM_STATIC_FILES
-                if filename != "observation_metadata.jsonl"
-            }
-            expected_fork_hashes.update(prefix_shard_hashes)
-            expected_fork_hashes["observation_metadata.jsonl"] = _sha256_bytes(
-                prefix_metadata_bytes
-            )
-            actual_fork_entries = list(fork_stage.iterdir())
-            if any(
-                entry.is_symlink() or not entry.is_file()
-                for entry in actual_fork_entries
-            ):
-                raise MeasurementLogValidationError(
-                    "The copied MeasurementLog stage has an invalid inventory."
-                )
-            actual_fork_hashes = {
-                entry.name: _sha256_file(entry)
-                for entry in sorted(actual_fork_entries, key=lambda value: value.name)
-            }
-            if actual_fork_hashes != expected_fork_hashes:
-                raise MeasurementLogValidationError(
-                    "The copied MeasurementLog stage failed hash verification."
-                )
-            parent_directory_fd = os.open(fork_stage.parent, os.O_RDONLY)
-            try:
-                os.fsync(parent_directory_fd)
-            finally:
-                os.close(parent_directory_fd)
-        except Exception:
-            shutil.rmtree(fork_stage, ignore_errors=True)
             raise
-
-        instance = cls.__new__(cls)
-        instance.output_dir = target
-        instance.stage_dir = fork_stage
-        instance.metadata_stage_path = fork_metadata_path
-        instance.run_id = run_id
-        instance.repository_commit = repository_commit
-        instance.runtime_config = dict(runtime_config)
-        instance.environment = dict(environment)
-        instance.forward_model_manifest = dict(forward_model_manifest)
-        instance.isotopes = isotope_names
-        instance.metadata = {
-            **dict(metadata or {}),
-            "resume_prefix_repository_commit": repository_commit,
-            "resume_execution_commit": resume_execution_commit,
-            "resume_prefix_record_count": int(prefix_record_count),
-            "resume_compatibility": compatibility_payload,
-        }
-        instance.obstacle_layout_path = obstacle_layout_path
-        instance.source_layout_path = source_layout_path
-        instance.resume_record_metadata = {
-            "resume_execution_commit": resume_execution_commit,
-            "resume_prefix_record_count": int(prefix_record_count),
-        }
-        instance.records = list(complete_records)
-        return instance
-
-    def write_canonical_prefix(self, output_dir: str | Path) -> MeasurementLog:
-        """Write the currently staged prefix as an independently hashed bundle."""
-        return write_measurement_log(
-            output_dir,
-            run_id=self.run_id,
-            repository_commit=self.repository_commit,
-            runtime_config=self.runtime_config,
-            environment=self.environment,
-            forward_model_manifest=self.forward_model_manifest,
-            isotopes=self.isotopes,
-            records=self.records,
-            metadata=self.metadata,
-            obstacle_layout_path=self.obstacle_layout_path,
-            source_layout_path=self.source_layout_path,
-        )
 
     def append_before_update(self, record: MeasurementLogRecord) -> int:
         """Durably stage one record and return its index before any PF update."""
-        if self.resume_record_metadata:
-            record = replace(
-                record,
-                metadata={
-                    **dict(record.metadata),
-                    **self.resume_record_metadata,
-                },
-            )
         if "station_complete" in record.metadata:
             raise MeasurementLogValidationError(
                 "station_complete is writer-owned and must be marked only after "
@@ -3533,6 +2955,20 @@ class MeasurementLogStreamWriter:
         self.records[record_index] = completed
         return record_index
 
+    def abort(self) -> None:
+        """Delete this writer's incomplete private WAL without publication."""
+        expected_name = f".{self.output_dir.name}.stream-{os.getpid()}"
+        if (
+            self.stage_dir.name != expected_name
+            or self.stage_dir.parent.resolve() != self.output_dir.parent.resolve()
+            or self.stage_dir.is_symlink()
+        ):
+            raise MeasurementLogValidationError(
+                "Refusing to remove an unrecognized MeasurementLog WAL path."
+            )
+        if self.stage_dir.exists():
+            shutil.rmtree(self.stage_dir)
+
     def finalize(self) -> MeasurementLog:
         """Consolidate staged records into the canonical hashed bundle."""
         if self.records:
@@ -3549,7 +2985,10 @@ class MeasurementLogStreamWriter:
                         "Every station must have exactly one causal station_complete "
                         "marker on its final record."
                     )
-        result = write_measurement_log(
+        # Resume is intentionally unsupported.  Once acquisition ends, remove
+        # the private WAL before attempting the all-or-nothing public bundle.
+        self.abort()
+        return write_measurement_log(
             self.output_dir,
             run_id=self.run_id,
             repository_commit=self.repository_commit,
@@ -3562,5 +3001,3 @@ class MeasurementLogStreamWriter:
             obstacle_layout_path=self.obstacle_layout_path,
             source_layout_path=self.source_layout_path,
         )
-        shutil.rmtree(self.stage_dir)
-        return result

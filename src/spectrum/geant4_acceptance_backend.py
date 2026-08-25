@@ -25,7 +25,7 @@ from numpy.typing import NDArray
 
 from measurement.model import EnvironmentConfig, PointSource
 from measurement.observation_model import (
-    build_runtime_observation_model,
+    build_nonproduction_observation_model,
     continuous_kernel_from_observation_model,
 )
 from measurement.geometry_family import (
@@ -48,13 +48,20 @@ from measurement.surface_atlas import ContinuousSurfaceAtlas
 from runtime_environment import attach_random_manchester_transport_geometry
 from sim.geant4_app.app import Geant4AppConfig, Geant4Application
 from sim.geant4_app.engine import Geant4StepRequest
+from sim.geant4_app.execution_environment import (
+    native_execution_environment_bundle_sha256,
+    require_native_execution_bundle,
+)
 from sim.geant4_app.io_format import (
     write_request_file,
     write_scene_file,
 )
 from sim.isaacsim_app.scene_builder import build_scene_description
 from sim.protocol import SimulationCommand
-from sim.runtime import load_runtime_config
+from sim.runtime import (
+    load_production_runtime_config,
+    production_runtime_config_sha256,
+)
 from spectrum.additive_scatter import (
     ADDITIVE_SCATTER_FEATURE_ORDER,
     ADDITIVE_SCATTER_INCIDENT_LABEL_SEMANTICS,
@@ -70,6 +77,7 @@ from spectrum.full_spectrum_acceptance_runner import (
     AcceptanceScenarioSession,
     AcceptanceTransportBackend,
     NATIVE_ACCEPTANCE_FIDELITY,
+    acceptance_implementation_bundle_sha256,
     acceptance_transport_seed,
     canonical_json_sha256,
 )
@@ -940,6 +948,31 @@ def _surface_boundary_gate(
         write_request_file(request, request_path)
         base_scene = base_scene_path.read_text(encoding="utf-8")
         for variant in variants:
+            expected_executable = app.native_executable_sha256
+            expected_environment = (
+                app.native_execution_environment_sha256
+            )
+            if expected_executable is None or expected_environment is None:
+                raise RuntimeError(
+                    "Acceptance boundary probe lacks native execution provenance."
+                )
+            require_native_execution_bundle(
+                executable,
+                expected_executable_sha256=expected_executable,
+                expected_environment_sha256=expected_environment,
+            )
+            expected_implementation = app.implementation_bundle_sha256
+            if (
+                expected_implementation is None
+                or acceptance_implementation_bundle_sha256(
+                    Path(__file__).resolve().parents[2]
+                )
+                != expected_implementation
+            ):
+                raise RuntimeError(
+                    "Acceptance Python implementation changed before native "
+                    "boundary-probe launch."
+                )
             scene_path = root / f"scene_{variant}.txt"
             response_path = root / f"response_{variant}.txt"
             scene_text = _mutated_surface_scene(
@@ -1252,7 +1285,9 @@ class ExternalGeant4AcceptanceBackend(AcceptanceTransportBackend):
         """Load and authenticate the standard native runtime configuration."""
         self.repository_root = Path(repository_root).resolve()
         self.runtime_config_path = Path(runtime_config_path).resolve()
-        self.runtime_config = load_runtime_config(self.runtime_config_path)
+        self.runtime_config = load_production_runtime_config(
+            self.runtime_config_path
+        )
         app_payload = dict(self.runtime_config)
         app_payload["validation_entry_class_spectra"] = True
         executable_raw = app_payload.get(
@@ -1292,8 +1327,16 @@ class ExternalGeant4AcceptanceBackend(AcceptanceTransportBackend):
                 "full unit-weight histories, full secondary transport, and "
                 "native detector-response sampling."
             )
-        self.runtime_config_sha256 = _file_sha256(self.runtime_config_path)
+        self.runtime_config_sha256 = production_runtime_config_sha256(
+            self.runtime_config
+        )
         self.native_executable_sha256 = _file_sha256(executable)
+        self.native_execution_environment_sha256 = (
+            native_execution_environment_bundle_sha256(executable)
+        )
+        self.implementation_bundle_sha256 = (
+            acceptance_implementation_bundle_sha256(self.repository_root)
+        )
         self._boundary_gate_by_seed: dict[int, Mapping[str, object]] = {}
 
     def _room_boundary_thickness_m(self) -> float:
@@ -1328,7 +1371,7 @@ class ExternalGeant4AcceptanceBackend(AcceptanceTransportBackend):
         use_gpu = observation_payload.get("use_gpu", False)
         if not isinstance(use_gpu, bool):
             raise TypeError("Acceptance use_gpu must be a JSON boolean.")
-        observation = build_runtime_observation_model(
+        observation = build_nonproduction_observation_model(
             observation_payload,
             isotopes=ACCEPTANCE_ISOTOPES,
         )
@@ -1362,7 +1405,18 @@ class ExternalGeant4AcceptanceBackend(AcceptanceTransportBackend):
         sources: Sequence[PointSource],
     ) -> Geant4Application:
         """Create one native app and load one exact generated scene."""
-        app = Geant4Application(app_config=dict(self.app_payload))
+        app = Geant4Application(
+            app_config=dict(self.app_payload),
+            expected_native_executable_sha256=(
+                self.native_executable_sha256
+            ),
+            expected_native_execution_environment_sha256=(
+                self.native_execution_environment_sha256
+            ),
+            expected_implementation_bundle_sha256=(
+                self.implementation_bundle_sha256
+            ),
+        )
         app.reset(
             build_scene_description(
                 _scene_payload(

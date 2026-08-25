@@ -7,19 +7,18 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-import runtime
 import runtime.prefix as runtime_prefix
 
-from runtime import (
+from runtime.artifacts import (
     ArtifactInventory,
+    build_artifact_inventory,
+)
+from runtime.measurement_log import (
     MeasurementLogArrayView,
     MeasurementLogStationView,
     MeasurementLogView,
-    build_artifact_inventory,
     measurement_log_artifact_inventory,
     measurement_records_content_sha256,
-)
-from runtime.measurement_log import (
     MeasurementLogValidationError,
     load_measurement_log,
 )
@@ -30,9 +29,7 @@ from tests.runtime_test_support import make_measurement_log
 def test_runtime_exposes_views_and_digests_without_prefix_bundle_writer() -> None:
     """Completed logs must not launch a second materialized-prefix workflow."""
     for name in ("MeasurementLogPrefix", "materialize_measurement_log_prefix"):
-        assert not hasattr(runtime, name)
         assert not hasattr(runtime_prefix, name)
-        assert name not in runtime.__all__
         assert name not in runtime_prefix.__all__
 
 

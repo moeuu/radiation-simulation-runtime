@@ -227,3 +227,22 @@ def test_line_resolved_shield_mu_uses_normalized_gamma_lines() -> None:
     eu_pb_values = {round(float(row["pb"]), 8) for row in table["Eu-154"]}
     assert len(co_pb_values) > 1
     assert len(eu_pb_values) > 1
+
+
+def test_line_resolved_shield_mu_rejects_unknown_isotope() -> None:
+    """An unknown isotope must not inherit Cs-137 shield coefficients."""
+    with pytest.raises(ValueError, match="exact production gamma-line"):
+        line_resolved_shield_mu_by_isotope(isotopes=["Cs137"])
+
+
+def test_line_resolved_shield_mu_supports_low_energy_nist_lines() -> None:
+    """Am-241 shield coefficients must come from the in-range NIST table."""
+    rows = line_resolved_shield_mu_by_isotope(isotopes=["Am-241"])["Am-241"]
+
+    assert tuple(row["energy_keV"] for row in rows) == (
+        26.345,
+        33.196,
+        43.423,
+        59.541,
+    )
+    assert all(row["fe"] > 0.0 and row["pb"] > 0.0 for row in rows)

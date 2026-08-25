@@ -1,17 +1,16 @@
-"""Estimator-neutral client for one adaptive acquisition subprocess."""
+"""Estimator-neutral client for one opaque adaptive-session socket."""
 
 from __future__ import annotations
 
 import json
 import socket
-import subprocess
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, TextIO
+from typing import Any
 
 import numpy as np
 
@@ -28,7 +27,6 @@ from runtime.adaptive_protocol import (
     AdaptiveReadyEvent,
     AdaptiveRecordEvent,
     AdaptiveRefineRequest,
-    AdaptiveResumePrefix,
     AdaptiveSessionEvent,
     AdaptiveStepRequest,
     parse_adaptive_event,
@@ -65,25 +63,11 @@ def parse_adaptive_record(payload: object) -> MeasurementLogRecord:
     return measurement_record_from_payload(payload)
 
 
-def parse_adaptive_resume_prefix(payload: object) -> AdaptiveResumePrefix:
-    """Parse and validate one truth-free adaptive resume handshake prefix."""
-    if not isinstance(payload, dict):
-        raise TypeError("Adaptive resume prefix must be an object.")
-    return AdaptiveResumePrefix.from_payload(payload)
-
-
 def parse_run_context(payload: object) -> RunContext:
     """Parse the truth-free runtime handshake context."""
     if not isinstance(payload, dict):
         raise TypeError("Adaptive runtime context must be an object.")
     return RunContext.from_payload(payload)
-
-
-def parse_candidate_snapshot(payload: object) -> dict[str, object]:
-    """Validate one runtime-owned reachable candidate snapshot."""
-    if not isinstance(payload, dict):
-        raise TypeError("Adaptive candidates must be an object.")
-    return AdaptiveCandidateSnapshot.from_payload(payload).to_payload()
 
 
 def _parse_truth_free_cui_overlay_payload(payload: object) -> dict[str, object]:
@@ -106,6 +90,7 @@ def _parse_truth_free_cui_overlay_payload(payload: object) -> dict[str, object]:
 
 def adaptive_step_request(
     *,
+    action_id: int,
     candidate_index: int,
     fe_orientation_index: int,
     pb_orientation_index: int,
@@ -113,30 +98,26 @@ def adaptive_step_request(
     station_id: int,
     station_complete: bool,
 ) -> dict[str, object]:
-    """Build one schema-v1 adaptive observation request."""
-    return {
-        "type": "step",
-        "candidate_index": int(candidate_index),
-        "fe_orientation_index": int(fe_orientation_index),
-        "pb_orientation_index": int(pb_orientation_index),
-        "dwell_time_s": float(dwell_time_s),
-        "station_id": int(station_id),
-        "station_complete": bool(station_complete),
-    }
+    """Build one exact adaptive observation request without coercion."""
+    return AdaptiveStepRequest(
+        action_id=action_id,
+        candidate_index=candidate_index,
+        fe_orientation_index=fe_orientation_index,
+        pb_orientation_index=pb_orientation_index,
+        dwell_time_s=dwell_time_s,
+        station_id=station_id,
+        station_complete=station_complete,
+    ).to_payload()
 
 
 def candidate_index_for_pose(
-    candidates: Mapping[str, object] | AdaptiveCandidateSnapshot,
+    candidates: AdaptiveCandidateSnapshot,
     pose_xyz: Sequence[float],
 ) -> int:
-    """Locate one exact retained pose in a mapping or typed snapshot."""
-    if isinstance(candidates, AdaptiveCandidateSnapshot):
-        raw_poses = candidates.candidate_poses_xyz
-    elif isinstance(candidates, Mapping):
-        raw_poses = candidates["candidate_poses_xyz"]
-    else:
-        raise TypeError("candidates must be a mapping or AdaptiveCandidateSnapshot.")
-    poses = np.asarray(raw_poses, dtype=np.float64)
+    """Locate one exact retained pose in a validated typed snapshot."""
+    if not isinstance(candidates, AdaptiveCandidateSnapshot):
+        raise TypeError("candidates must be an AdaptiveCandidateSnapshot.")
+    poses = np.asarray(candidates.candidate_poses_xyz, dtype=np.float64)
     if (
         poses.ndim != 2
         or poses.shape[0] == 0
@@ -229,76 +210,12 @@ class AdaptiveProtocolObservation:
 class AdaptiveRuntimeClient:
     """Drive the shared runtime without opening its private physical scenario."""
 
-    def __init__(
-        self,
-        scenario_path: str | Path,
-        *,
-        runtime_root: str | Path,
-        resume_stage_path: str | Path | None = None,
-        resume_compatibility_path: str | Path | None = None,
-        output_hook: Callable[[str], None] = print,
-        protocol_observer: Callable[[AdaptiveProtocolObservation], None] | None = None,
-        terminate_timeout_s: float = 10.0,
-    ) -> None:
-        """Start one persistent runtime-owned adaptive subprocess."""
-        scenario = Path(scenario_path).expanduser().resolve()
-        if not scenario.is_file():
-            raise FileNotFoundError(f"Private adaptive scenario is missing: {scenario}")
-        root = Path(runtime_root).expanduser().resolve()
-        command = [
-            "uv",
-            "run",
-            "--project",
-            root.as_posix(),
-            "rotating-shield-sim",
-            "run-adaptive-session",
-            scenario.as_posix(),
-        ]
-        if resume_compatibility_path is not None and resume_stage_path is None:
-            raise ValueError("resume_compatibility_path requires resume_stage_path.")
-        if resume_stage_path is not None:
-            stage = Path(resume_stage_path).expanduser().resolve()
-            if not stage.is_dir():
-                raise FileNotFoundError(f"Adaptive resume stage is missing: {stage}")
-            command.extend(("--resume-stage", stage.as_posix()))
-        if resume_compatibility_path is not None:
-            compatibility = Path(resume_compatibility_path).expanduser().resolve()
-            if not compatibility.is_file():
-                raise FileNotFoundError(
-                    f"Adaptive resume compatibility file is missing: {compatibility}"
-                )
-            command.extend(("--resume-compatibility", compatibility.as_posix()))
-        self.command = command
-        self.output_hook = output_hook
-        if protocol_observer is not None and not callable(protocol_observer):
-            raise TypeError("protocol_observer must be callable or null.")
-        if (
-            isinstance(terminate_timeout_s, bool)
-            or not isinstance(terminate_timeout_s, (int, float))
-            or not np.isfinite(float(terminate_timeout_s))
-            or float(terminate_timeout_s) <= 0.0
-        ):
-            raise ValueError("terminate_timeout_s must be finite and positive.")
-        self.protocol_observer = protocol_observer
-        self.terminate_timeout_s = float(terminate_timeout_s)
-        self._observation_sequence = 0
-        self._closed = False
-        self._finalized = False
-        self._socket: socket.socket | None = None
-        self.process = subprocess.Popen(
-            command,
-            cwd=root,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        """Reject direct construction that could expose a private scenario path."""
+        raise TypeError(
+            "AdaptiveRuntimeClient must connect to a runtime-owned opaque socket "
+            "through AdaptiveRuntimeClient.connect()."
         )
-        self.input: TextIO | None = self.process.stdin
-        self.output: TextIO | None = self.process.stdout
-        if self.input is None or self.output is None:
-            self.process.kill()
-            raise RuntimeError("Shared runtime did not expose adaptive pipes.")
 
     @classmethod
     def connect(
@@ -347,7 +264,6 @@ class AdaptiveRuntimeClient:
         instance._closed = False
         instance._finalized = False
         instance._socket = connection
-        instance.process = None
         instance.input = connection.makefile("w", encoding="utf-8", buffering=1)
         instance.output = connection.makefile("r", encoding="utf-8")
         return instance
@@ -395,11 +311,7 @@ class AdaptiveRuntimeClient:
             validate_truth_free_estimator_input(payload, path="adaptive.event")
             self._observe(AdaptiveProtocolDirection.EVENT, payload)
             return payload
-        return_code = None if self.process is None else self.process.poll()
-        raise RuntimeError(
-            "Shared adaptive runtime closed before its next event; "
-            f"return_code={return_code}."
-        )
+        raise RuntimeError("Shared adaptive runtime closed before its next event.")
 
     def read_session_event(self) -> AdaptiveSessionEvent:
         """Read and parse the next event through the typed protocol API."""
@@ -486,22 +398,16 @@ class AdaptiveRuntimeClient:
                     "overlay request."
                 )
             self.output_hook(line)
-        return_code = None if self.process is None else self.process.poll()
         raise RuntimeError(
-            "Shared adaptive runtime closed before its CUI overlay event; "
-            f"return_code={return_code}."
+            "Shared adaptive runtime closed before its CUI overlay event."
         )
 
     def finalize(self) -> dict[str, Any]:
-        """Finalize the runtime log and require a clean process exit."""
+        """Finalize the runtime log and close the opaque session socket."""
         event = self.request({"type": "finalize"})
         if self.input is not None:
             self.input.close()
             self.input = None
-        if self.process is not None:
-            return_code = self.process.wait()
-            if return_code != 0:
-                raise subprocess.CalledProcessError(return_code, self.command)
         self._finalized = True
         self._closed = True
         if self.output is not None:
@@ -526,8 +432,13 @@ class AdaptiveRuntimeClient:
         """Finalize and return the typed published-log event."""
         return self.finalize_event()
 
-    def terminate(self, timeout: float | None = None) -> None:
-        """End an incomplete session within a bounded graceful shutdown window."""
+    def _terminate(
+        self,
+        timeout: float | None,
+        *,
+        suppress_abort_error: bool,
+    ) -> None:
+        """Close transport after an abort request, optionally preserving errors."""
         if bool(getattr(self, "_closed", False)):
             return
         configured = float(getattr(self, "terminate_timeout_s", 10.0))
@@ -539,46 +450,33 @@ class AdaptiveRuntimeClient:
             or float(timeout_s) <= 0.0
         ):
             raise ValueError("terminate timeout must be finite and positive.")
-        timeout_value = float(timeout_s)
-        if self.process is None:
-            try:
-                event = self.request({"type": "abort"})
-                if event != {"type": "aborted"}:
-                    raise RuntimeError(
-                        "Adaptive socket did not acknowledge session abort."
-                    )
-            except (BrokenPipeError, OSError, RuntimeError, ValueError):
-                pass
-        elif self.process.poll() is None:
-            try:
-                self._write_request({"type": "abort"})
-            except (BrokenPipeError, OSError, RuntimeError, ValueError):
-                pass
-            if self.input is not None:
-                try:
-                    self.input.close()
-                finally:
-                    self.input = None
-            try:
-                self.process.wait(timeout=timeout_value)
-            except subprocess.TimeoutExpired:
-                self.process.terminate()
-                try:
-                    self.process.wait(timeout=min(timeout_value, 2.0))
-                except subprocess.TimeoutExpired:
-                    self.process.kill()
-                    self.process.wait()
-        if self.input is not None:
-            self.input.close()
-            self.input = None
-        if self.output is not None:
-            self.output.close()
-            self.output = None
         active_socket = getattr(self, "_socket", None)
         if active_socket is not None:
-            active_socket.close()
-            self._socket = None
-        self._closed = True
+            active_socket.settimeout(float(timeout_s))
+        abort_error: BaseException | None = None
+        try:
+            event = self.request({"type": "abort"})
+            if event != {"type": "aborted"}:
+                raise RuntimeError("Adaptive socket did not acknowledge session abort.")
+        except (BrokenPipeError, OSError, RuntimeError, ValueError) as exc:
+            abort_error = exc
+        finally:
+            if self.input is not None:
+                self.input.close()
+                self.input = None
+            if self.output is not None:
+                self.output.close()
+                self.output = None
+            if active_socket is not None:
+                active_socket.close()
+                self._socket = None
+            self._closed = True
+        if abort_error is not None and not suppress_abort_error:
+            raise abort_error
+
+    def terminate(self, timeout: float | None = None) -> None:
+        """Best-effort close within a bounded graceful shutdown window."""
+        self._terminate(timeout, suppress_abort_error=True)
 
     def close(self) -> None:
         """Close this client using its configured bounded termination policy."""
@@ -599,8 +497,8 @@ class AdaptiveRuntimeClient:
         self.close()
 
     def abort(self) -> None:
-        """Best-effort close of an incomplete acquisition session."""
-        self.terminate()
+        """Abort an incomplete acquisition and require runtime acknowledgement."""
+        self._terminate(None, suppress_abort_error=False)
 
 
 __all__ = [
@@ -614,7 +512,6 @@ __all__ = [
     "AdaptiveReadyEvent",
     "AdaptiveRecordEvent",
     "AdaptiveRefineRequest",
-    "AdaptiveResumePrefix",
     "AdaptiveRuntimeClient",
     "AdaptiveSessionEvent",
     "AdaptiveStepRequest",
@@ -622,7 +519,5 @@ __all__ = [
     "candidate_index_for_pose",
     "parse_adaptive_event",
     "parse_adaptive_record",
-    "parse_adaptive_resume_prefix",
-    "parse_candidate_snapshot",
     "parse_run_context",
 ]

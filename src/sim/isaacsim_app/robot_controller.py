@@ -31,11 +31,13 @@ MIN_VISUAL_MAST_HEIGHT_M = 1.0e-6
 def _normalize_vector(
     vector_xyz: tuple[float, float, float],
 ) -> tuple[float, float, float]:
-    """Normalize a 3D vector and fall back to +X for degenerate inputs."""
+    """Normalize one finite nonzero 3-D direction exactly."""
     vector = np.asarray(vector_xyz, dtype=float)
+    if vector.shape != (3,) or np.any(~np.isfinite(vector)):
+        raise ValueError("Direction vectors must contain exactly three finite values.")
     norm = float(np.linalg.norm(vector))
     if norm <= 1e-9:
-        return (1.0, 0.0, 0.0)
+        raise ValueError("Direction vectors must be nonzero.")
     vector /= norm
     return (float(vector[0]), float(vector[1]), float(vector[2]))
 
@@ -51,11 +53,14 @@ def _rotation_between_vectors_wxyz(
     if dot > 1.0 - 1e-9:
         return (1.0, 0.0, 0.0, 0.0)
     if dot < -1.0 + 1e-9:
-        fallback = np.asarray((0.0, 0.0, 1.0), dtype=float)
-        if abs(float(np.dot(source, fallback))) > 0.9:
-            fallback = np.asarray((0.0, 1.0, 0.0), dtype=float)
-        axis = np.cross(source, fallback)
-        axis /= max(float(np.linalg.norm(axis)), 1e-12)
+        reference_axis = np.asarray((0.0, 0.0, 1.0), dtype=float)
+        if abs(float(np.dot(source, reference_axis))) > 0.9:
+            reference_axis = np.asarray((0.0, 1.0, 0.0), dtype=float)
+        axis = np.cross(source, reference_axis)
+        axis_norm = float(np.linalg.norm(axis))
+        if not np.isfinite(axis_norm) or axis_norm <= 1e-12:
+            raise RuntimeError("Cannot construct an antiparallel rotation axis.")
+        axis /= axis_norm
         return (0.0, float(axis[0]), float(axis[1]), float(axis[2]))
     cross = np.cross(source, target)
     cross_norm = float(np.linalg.norm(cross))
@@ -73,12 +78,12 @@ def _rotation_between_vectors_wxyz(
 def _movement_yaw_rad(
     start_xyz: np.ndarray,
     target_xyz: np.ndarray,
-    fallback_yaw_rad: float,
+    preserved_yaw_rad: float,
 ) -> float:
-    """Return a planar heading yaw from start to target, or a fallback for tiny moves."""
+    """Return planar motion yaw, preserving commanded yaw for vertical motion."""
     delta = np.asarray(target_xyz, dtype=float) - np.asarray(start_xyz, dtype=float)
     if float(np.linalg.norm(delta[:2])) <= 1e-9:
-        return float(fallback_yaw_rad)
+        return float(preserved_yaw_rad)
     return float(atan2(delta[1], delta[0]))
 
 
@@ -264,7 +269,7 @@ class RobotController:
             motion_yaw = _movement_yaw_rad(
                 segment_start,
                 detector_sample,
-                fallback_yaw_rad=float(command.target_base_yaw_rad),
+                preserved_yaw_rad=float(command.target_base_yaw_rad),
             )
             self._apply_pose_and_shields(
                 base_pose_xyz=interp_base_pose,

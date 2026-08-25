@@ -27,6 +27,7 @@ from spectrum.full_spectrum_acceptance_runner import (
     canonical_json_bytes,
     line_identity_contract_sha256,
     load_acceptance_pair,
+    load_acceptance_run_contract,
 )
 from spectrum.native_metadata import native_source_line_token
 from spectrum.response_matrix import NATIVE_GEANT4_BIN_COUNT
@@ -51,10 +52,12 @@ def test_acceptance_run_contract_authenticates_python_implementation() -> None:
     contract = build_acceptance_run_contract(
         runtime_config_sha256="a" * 64,
         native_executable_sha256="b" * 64,
+        native_execution_environment_sha256="d" * 64,
         implementation_bundle_sha256="c" * 64,
     )
 
-    assert contract["schema_version"] == 2
+    assert contract["schema_version"] == 3
+    assert contract["native_execution_environment_sha256"] == "d" * 64
     assert contract["implementation_bundle_sha256"] == "c" * 64
 
 
@@ -64,8 +67,32 @@ def test_acceptance_run_contract_rejects_invalid_implementation_digest() -> None
         build_acceptance_run_contract(
             runtime_config_sha256="a" * 64,
             native_executable_sha256="b" * 64,
+            native_execution_environment_sha256="d" * 64,
             implementation_bundle_sha256="not-a-digest",
         )
+
+
+def test_acceptance_run_contract_loader_rejects_schema_drift(
+    tmp_path: Path,
+) -> None:
+    """Approval phases must reauthenticate the exact run-contract schema."""
+    contract = build_acceptance_run_contract(
+        runtime_config_sha256="a" * 64,
+        native_executable_sha256="b" * 64,
+        native_execution_environment_sha256="d" * 64,
+        implementation_bundle_sha256="c" * 64,
+    )
+    path = tmp_path / "run_contract.json"
+    path.write_bytes(canonical_json_bytes(contract))
+
+    loaded, digest = load_acceptance_run_contract(path)
+
+    assert loaded == contract
+    assert len(digest) == 64
+    contract["legacy_fallback"] = True
+    path.write_bytes(canonical_json_bytes(contract))
+    with pytest.raises(ValueError, match="current exact schema"):
+        load_acceptance_run_contract(path)
 
 
 def _boundary_gate() -> dict[str, object]:

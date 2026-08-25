@@ -27,7 +27,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from measurement.observation_model import (
-    build_runtime_observation_model,
+    build_nonproduction_observation_model,
     continuous_kernel_from_observation_model,
 )
 from measurement.geometry_family import (
@@ -717,7 +717,7 @@ class ExternalGeant4MeanCalibrationBackend:
             for key, value in self.runtime_config.items()
             if key not in _FULL_SPECTRUM_RUNTIME_KEYS
         }
-        observation = build_runtime_observation_model(
+        observation = build_nonproduction_observation_model(
             observation_payload,
             isotopes=ACCEPTANCE_ISOTOPES,
         )

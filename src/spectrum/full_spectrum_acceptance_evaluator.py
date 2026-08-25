@@ -29,6 +29,13 @@ from numpy.typing import NDArray
 from scipy import special, stats
 
 from measurement.source_boundary import surface_emission_policy_sha256
+from measurement.shielding import (
+    DEFAULT_DETECTOR_CRYSTAL_RADIUS_CM,
+    DEFAULT_FE_SHIELD_INNER_RADIUS_CM,
+    DEFAULT_FE_SHIELD_THICKNESS_CM,
+    DEFAULT_PB_SHIELD_INNER_RADIUS_CM,
+    DEFAULT_PB_SHIELD_THICKNESS_CM,
+)
 from spectrum.additive_scatter import scatter_basis_from_stored_geometry_numpy
 from spectrum.full_spectrum_acceptance import (
     build_independent_validation_manifest,
@@ -41,6 +48,7 @@ from spectrum.full_spectrum_acceptance_runner import (
     AcceptanceRunLayout,
     canonical_json_bytes,
     line_identity_contract_sha256,
+    load_acceptance_run_contract,
     load_frozen_candidate_model,
     validate_scene_corpus,
 )
@@ -209,21 +217,19 @@ def _scenario_data(
         target_semantics=(
             model.additive_scatter_response.feature_basis_semantics
         ),
-        detector_radius_m=getattr(
-            model.additive_scatter_response,
-            "detector_radius_m",
-            None,
+        detector_radius_m=(
+            DEFAULT_DETECTOR_CRYSTAL_RADIUS_CM / 100.0
         ),
-        fe_scatter_distance_m=getattr(
-            model.additive_scatter_response,
-            "fe_scatter_distance_m",
-            None,
-        ),
-        pb_scatter_distance_m=getattr(
-            model.additive_scatter_response,
-            "pb_scatter_distance_m",
-            None,
-        ),
+        fe_scatter_distance_m=(
+            DEFAULT_FE_SHIELD_INNER_RADIUS_CM
+            + 0.5 * DEFAULT_FE_SHIELD_THICKNESS_CM
+        )
+        / 100.0,
+        pb_scatter_distance_m=(
+            DEFAULT_PB_SHIELD_INNER_RADIUS_CM
+            + 0.5 * DEFAULT_PB_SHIELD_THICKNESS_CM
+        )
+        / 100.0,
     )
     total = model.additive_scatter_response.total_kernel_numpy(
         unattenuated,
@@ -265,21 +271,19 @@ def _scenario_data(
             target_semantics=(
                 model.additive_scatter_response.feature_basis_semantics
             ),
-            detector_radius_m=getattr(
-                model.additive_scatter_response,
-                "detector_radius_m",
-                None,
+            detector_radius_m=(
+                DEFAULT_DETECTOR_CRYSTAL_RADIUS_CM / 100.0
             ),
-            fe_scatter_distance_m=getattr(
-                model.additive_scatter_response,
-                "fe_scatter_distance_m",
-                None,
-            ),
-            pb_scatter_distance_m=getattr(
-                model.additive_scatter_response,
-                "pb_scatter_distance_m",
-                None,
-            ),
+            fe_scatter_distance_m=(
+                DEFAULT_FE_SHIELD_INNER_RADIUS_CM
+                + 0.5 * DEFAULT_FE_SHIELD_THICKNESS_CM
+            )
+            / 100.0,
+            pb_scatter_distance_m=(
+                DEFAULT_PB_SHIELD_INNER_RADIUS_CM
+                + 0.5 * DEFAULT_PB_SHIELD_THICKNESS_CM
+            )
+            / 100.0,
         )
         perturbed_total = (
             model.additive_scatter_response.total_kernel_numpy(
@@ -1043,11 +1047,25 @@ def evaluate_scene_acceptance(
     }
     if model.additive_scatter_response is None:
         raise RuntimeError("Frozen candidate lacks additive scatter.")
+    run_contract, run_contract_sha256 = load_acceptance_run_contract(
+        layout.run_contract_path
+    )
     artifact = {
-        "schema_version": 1,
+        "schema_version": 3,
         "acceptance_contract_sha256": (
             FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256
         ),
+        "acceptance_run_contract_sha256": run_contract_sha256,
+        "runtime_config_sha256": run_contract["runtime_config_sha256"],
+        "native_executable_sha256": run_contract[
+            "native_executable_sha256"
+        ],
+        "native_execution_environment_sha256": run_contract[
+            "native_execution_environment_sha256"
+        ],
+        "implementation_bundle_sha256": run_contract[
+            "implementation_bundle_sha256"
+        ],
         "scene_seed": int(scene_seed),
         "split": split,
         "scenario_ids": list(VALIDATION_SCENARIO_IDS),

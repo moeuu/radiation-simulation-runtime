@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from types import MappingProxyType
 from collections.abc import Mapping
-from numbers import Real
+import math
 from typing import Any
 
 import numpy as np
@@ -16,7 +16,7 @@ from runtime.measurement_log import (
     MeasurementLogRecord,
     _validate_truth_free_payload,
 )
-from runtime.provenance import canonical_json_bytes, sha256_json
+from runtime.provenance import strict_canonical_json_bytes, strict_sha256_json
 
 
 MeasurementRecord = MeasurementLogRecord
@@ -74,23 +74,24 @@ def _freeze_json(value: object, *, path: str) -> object:
         )
     if value is None or isinstance(value, (str, bool)):
         return value
-    if isinstance(value, (int, np.integer)) and not isinstance(
-        value,
-        (bool, np.bool_),
-    ):
-        return int(value)
-    if isinstance(value, Real) and not isinstance(value, (bool, np.bool_)):
-        parsed = float(value)
-        if not np.isfinite(parsed):
+    if type(value) is int:
+        return value
+    if type(value) is float:
+        if not np.isfinite(value):
             raise ValueError(f"{path} must not contain non-finite numbers.")
-        return parsed
+        return value
     raise TypeError(f"{path} must contain only strict JSON values.")
 
 
 def _thaw_json(value: object) -> object:
     """Return a mutable JSON-compatible copy of one frozen JSON value."""
     if isinstance(value, Mapping):
-        return {str(key): _thaw_json(nested) for key, nested in value.items()}
+        thawed: dict[str, object] = {}
+        for key, nested in value.items():
+            if not isinstance(key, str):
+                raise TypeError("Frozen JSON mappings must retain string keys.")
+            thawed[key] = _thaw_json(nested)
+        return thawed
     if isinstance(value, (list, tuple)):
         return [_thaw_json(nested) for nested in value]
     return value
@@ -119,9 +120,35 @@ def _require_exact_fields(
         )
 
 
+def _exact_json_number_list(value: object, *, name: str) -> list[int | float]:
+    """Return one finite list containing only native JSON numbers."""
+    if type(value) is not list:
+        raise TypeError(f"{name} must be a JSON array.")
+    for index, item in enumerate(value):
+        if type(item) not in (int, float):
+            raise TypeError(f"{name}[{index}] must be a JSON number.")
+        try:
+            finite = math.isfinite(float(item))
+        except OverflowError as exc:
+            raise ValueError(f"{name}[{index}] must be finite.") from exc
+        if not finite:
+            raise ValueError(f"{name}[{index}] must be finite.")
+    return value
+
+
+def _exact_json_integer_list(value: object, *, name: str) -> list[int]:
+    """Return one list containing only native JSON integers."""
+    if type(value) is not list:
+        raise TypeError(f"{name} must be a JSON array.")
+    for index, item in enumerate(value):
+        if type(item) is not int:
+            raise TypeError(f"{name}[{index}] must be a JSON integer.")
+    return value
+
+
 def canonical_json_sha256(value: object) -> str:
     """Return the canonical JSON digest used by shared runtime artifacts."""
-    return sha256_json(value)
+    return strict_sha256_json(value)
 
 
 def validate_truth_free_estimator_input(
@@ -312,9 +339,14 @@ def measurement_record_from_payload(
         raise TypeError("Adaptive record must be an object.")
     validate_truth_free_estimator_input(payload, path="adaptive.record")
     _require_exact_fields(payload, _MEASUREMENT_RECORD_FIELDS, name="adaptive record")
-    raw_counts = np.asarray(payload["spectrum_counts"])
-    if raw_counts.ndim != 1 or not np.issubdtype(raw_counts.dtype, np.integer):
-        raise TypeError("Adaptive spectrum_counts must contain exact integers.")
+    raw_edges = _exact_json_number_list(
+        payload["energy_bin_edges_keV"],
+        name="energy_bin_edges_keV",
+    )
+    raw_counts = _exact_json_integer_list(
+        payload["spectrum_counts"],
+        name="spectrum_counts",
+    )
     return MeasurementLogRecord(
         step_id=payload["step_id"],
         action_id=payload["action_id"],
@@ -326,10 +358,7 @@ def measurement_record_from_payload(
         live_time_s=payload["live_time_s"],
         travel_time_s=payload["travel_time_s"],
         shield_actuation_time_s=payload["shield_actuation_time_s"],
-        energy_bin_edges_keV=np.asarray(
-            payload["energy_bin_edges_keV"],
-            dtype=np.float64,
-        ),
+        energy_bin_edges_keV=raw_edges,
         spectrum_counts=np.asarray(raw_counts, dtype=np.int64),
         metadata=payload["metadata"],
     )
@@ -339,7 +368,7 @@ __all__ = [
     "MEASUREMENT_LOG_SCHEMA_VERSION",
     "MeasurementRecord",
     "RunContext",
-    "canonical_json_bytes",
+    "strict_canonical_json_bytes",
     "canonical_json_sha256",
     "measurement_record_from_payload",
     "measurement_record_to_payload",

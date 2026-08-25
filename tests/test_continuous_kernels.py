@@ -17,6 +17,7 @@ from measurement.obstacles import ObstacleGrid
 from measurement.shielding import (
     DEFAULT_FE_SHIELD_INNER_RADIUS_CM,
     DEFAULT_PB_SHIELD_INNER_RADIUS_CM,
+    rotation_matrix_from_normal,
 )
 from measurement.continuous_kernels import expected_counts_single_isotope
 from spectrum.additive_scatter import PhysicsOnlyNoncollidedTransportResponse
@@ -258,7 +259,7 @@ def test_geometric_term_inverse_square() -> None:
 
 
 def test_finite_sphere_geometric_term_preserves_one_meter_definition() -> None:
-    """Finite detector geometry should remove the near-field point singularity."""
+    """Finite detector geometry should preserve valid external-source scaling."""
     det = np.array([0.0, 0.0, 0.0], dtype=float)
     radius = 0.04
 
@@ -272,12 +273,23 @@ def test_finite_sphere_geometric_term_preserves_one_meter_definition() -> None:
         np.array([2.0, 0.0, 0.0], dtype=float),
         radius,
     )
-    at_center = finite_sphere_geometric_term(det, det, radius)
-
     assert at_one_meter == pytest.approx(1.0)
     assert at_two_meters == pytest.approx(0.25, rel=1.0e-3)
-    assert np.isfinite(at_center)
-    assert at_center < 1.0e4
+
+
+def test_geometric_terms_reject_detector_overlapping_sources() -> None:
+    """Invalid near-field geometry must not become a finite saturated response."""
+    detector = np.zeros(3, dtype=float)
+    radius = 0.04
+
+    with pytest.raises(ValueError, match="strictly positive"):
+        geometric_term(detector, detector)
+    with pytest.raises(ValueError, match="strictly outside"):
+        finite_sphere_geometric_term(
+            detector,
+            np.asarray([radius, 0.0, 0.0], dtype=float),
+            radius,
+        )
 
 
 def test_torch_rotated_octant_shell_cached_rotation_matches_direct() -> None:
@@ -1454,14 +1466,88 @@ def test_detector_cone_aperture_targets_match_outer_sphere() -> None:
     assert np.linalg.matrix_rank(targets - targets.mean(axis=0)) == 3
 
 
+@pytest.mark.parametrize("distance_factor", [0.5, 1.0])
+def test_detector_aperture_rejects_overlapping_sources_in_scalar_and_numpy(
+    distance_factor: float,
+) -> None:
+    """Scalar and batched NumPy kernels must reject aperture-overlapping sources."""
+    aperture_radius = 0.08
+    kernel = ContinuousKernel(
+        mu_by_isotope={"TestIso": {"fe": 0.0, "pb": 0.0}},
+        detector_radius_m=0.0,
+        detector_aperture_radius_m=aperture_radius,
+        detector_aperture_samples=5,
+        use_gpu=False,
+    )
+    detector = np.zeros(3, dtype=float)
+    invalid_source = np.asarray(
+        [distance_factor * aperture_radius, 0.0, 0.0],
+        dtype=float,
+    )
+
+    with pytest.raises(ValueError, match="strictly outside"):
+        kernel.kernel_value_pair(
+            "TestIso",
+            detector,
+            invalid_source,
+            fe_index=0,
+            pb_index=0,
+        )
+    with pytest.raises(ValueError, match="strictly outside"):
+        kernel._kernel_values_selected_pairs_for_detector_source_numpy_chunk(
+            "TestIso",
+            np.asarray([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=float),
+            np.asarray(
+                [invalid_source, [2.0, 0.0, 0.0]],
+                dtype=float,
+            ),
+            np.asarray([0, 0], dtype=np.int64),
+            np.asarray([0, 0], dtype=np.int64),
+        )
+
+
+@pytest.mark.parametrize("distance_factor", [0.5, 1.0])
+def test_detector_aperture_rejects_overlapping_sources_in_torch(
+    distance_factor: float,
+) -> None:
+    """The Torch kernel must enforce the same aperture boundary as NumPy."""
+    pytest.importorskip("torch")
+    aperture_radius = 0.08
+    kernel = ContinuousKernel(
+        mu_by_isotope={"TestIso": {"fe": 0.0, "pb": 0.0}},
+        detector_radius_m=0.0,
+        detector_aperture_radius_m=aperture_radius,
+        detector_aperture_samples=5,
+        use_gpu=True,
+        gpu_device="cpu",
+        gpu_dtype="float64",
+    )
+    invalid_source = np.asarray(
+        [distance_factor * aperture_radius, 0.0, 0.0],
+        dtype=float,
+    )
+
+    with pytest.raises(ValueError, match="strictly outside"):
+        kernel._kernel_values_selected_pairs_for_detector_source_torch_chunk(
+            "TestIso",
+            np.asarray([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=float),
+            np.asarray(
+                [invalid_source, [2.0, 0.0, 0.0]],
+                dtype=float,
+            ),
+            np.asarray([0, 0], dtype=np.int64),
+            np.asarray([0, 0], dtype=np.int64),
+        )
+
+
 def test_expected_counts_single_isotope_attenuation_levels() -> None:
     """Fe/Pb blocking should scale expected counts via exp(-mu*L)."""
     det = np.array([0.0, 0.0, 0.0])
     src = np.array([[1.0, 1.0, 1.0]])
     strengths = np.array([10.0])
     # Orientation normal aligned with direction (-,-,-) from src to det
-    orient_block = np.array([-1.0, -1.0, -1.0])
-    orient_free = np.array([1.0, 1.0, 1.0])
+    orient_block = rotation_matrix_from_normal(np.array([1.0, 1.0, 1.0]))
+    orient_free = rotation_matrix_from_normal(np.array([-1.0, -1.0, -1.0]))
     base = expected_counts_single_isotope(
         detector_position=det,
         RFe=orient_free,
@@ -1507,6 +1593,22 @@ def test_expected_counts_single_isotope_attenuation_levels() -> None:
     assert np.isclose(both, expected_both_ratio * base, rtol=1e-6)
 
 
+def test_expected_counts_single_isotope_rejects_retired_normal_vectors() -> None:
+    """The test oracle must not retain the ambiguous orientation-vector API."""
+    with pytest.raises(ValueError, match="3x3 rotation matrices"):
+        expected_counts_single_isotope(
+            detector_position=np.zeros(3),
+            RFe=np.ones(3),
+            RPb=np.ones(3),
+            sources=np.ones((1, 3)),
+            strengths=np.ones(1),
+            background=0.0,
+            duration=1.0,
+            isotope_id="Cs-137",
+            use_gpu=False,
+        )
+
+
 def test_concrete_obstacle_path_reduces_kernel_value() -> None:
     """A blocked concrete cell should attenuate the source-detector kernel by its path length."""
     grid = ObstacleGrid(
@@ -1538,7 +1640,7 @@ def test_concrete_obstacle_path_reduces_kernel_value() -> None:
     assert blocked == pytest.approx(unblocked * np.exp(-1.0), rel=1e-12)
 
 
-def test_collision_boxes_replace_grid_columns_as_pf_attenuation_fallback() -> None:
+def test_collision_boxes_replace_coarse_grid_columns_for_pf_attenuation() -> None:
     """PF counts should use the exact physical AABB before coarse blocked cells."""
     collision_box = (0.0, -0.5, 0.0, 1.0, 0.5, 2.0)
     grid = ObstacleGrid(

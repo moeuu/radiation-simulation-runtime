@@ -5,11 +5,36 @@ from __future__ import annotations
 import pytest
 
 from runtime.experiment_profiles import (
+    AcquisitionContract,
     DEFAULT_EXPERIMENT_PROFILE_ID,
     STANDARD_EXPERIMENT_PROFILE,
     acquisition_contract_from_environment,
     experiment_profile_from_environment,
 )
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    (
+        ("schema_version", True),
+        ("schema_version", 1.0),
+        ("max_stations", True),
+        ("views_per_station", 8.0),
+        ("live_time_s", True),
+        ("live_time_s", "20.0"),
+        ("coverage_radius_m", float("nan")),
+    ),
+)
+def test_acquisition_contract_rejects_coerced_wire_scalars(
+    field: str,
+    invalid: object,
+) -> None:
+    """The public acquisition contract must accept exact JSON scalar types only."""
+    payload = STANDARD_EXPERIMENT_PROFILE.acquisition.to_payload()
+    payload[field] = invalid
+
+    with pytest.raises((TypeError, ValueError)):
+        AcquisitionContract.from_payload(payload)
 
 
 def test_standard_profile_owns_every_shared_acquisition_value() -> None:

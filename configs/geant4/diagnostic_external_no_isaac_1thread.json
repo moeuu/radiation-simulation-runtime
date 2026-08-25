@@ -1,6 +1,68 @@
 {
-  "extends": "variance_reduction_external_no_isaac_32threads.json",
+  "absorbing_transport_groups": [
+    "wall"
+  ],
+  "author_obstacle_prims": true,
+  "author_room_boundary_prims": true,
+  "auto_start_sidecar": true,
+  "backend": "geant4",
+  "background_cps": 12.0,
+  "background_rate_cps": 12.0,
+  "background_spectrum_model_id": "native_geant4_background_shape_v1_bin_centres",
+  "bin_width_keV": 2.0,
+  "dead_time_tau_s": 5.813e-09,
+  "detector_aperture_samples": 121,
+  "detector_aperture_sampling": "solid_angle_cone",
+  "detector_height_m": 0.5,
+  "detector_model": {
+    "crystal_length_m": 0.076,
+    "crystal_material": "cebr3",
+    "crystal_radius_m": 0.038,
+    "crystal_shape": "sphere",
+    "housing_material": "aluminum",
+    "housing_thickness_m": 0.0015
+  },
+  "detector_scoring_mode": "incident_gamma_energy",
+  "energy_bin_count": 851,
+  "energy_max_keV": 1700.0,
+  "energy_min_keV": 0.0,
+  "engine_mode": "external",
+  "executable_path": "build/geant4_sidecar",
+  "full_spectrum_model_registry_file_sha256": "6a511c48f37e1a54e43880eb86868bf77cf93b64424b1194d66531a91d7b3cb2",
+  "full_spectrum_model_registry_path": "configs/geant4/models/isotope_profile_model_registry.json",
+  "headless": true,
+  "host": "127.0.0.1",
+  "isotope_experiment_profile": "unconditioned_eu154",
+  "line_resolved_shield_attenuation": true,
   "obstacle_attenuation_enabled": true,
+  "obstacle_height_m": 2.0,
+  "persistent_process": true,
+  "physics_profile": "balanced",
+  "port": 5561,
+  "primary_sampling_fraction": 1.0,
+  "random_seed_base": 20260429,
+  "renderer": "RayTracedLighting",
+  "sample_detector_response": true,
+  "secondary_transport_mode": "full_transport",
+  "shield_transmission_target": 0.2,
   "simulation_runtime_schema_version": 1,
-  "thread_count": 1
+  "source_bias_cone_half_angle_deg": 0.0,
+  "source_extent_radius_m": 0.0,
+  "source_extent_samples": 1,
+  "source_rate_model": "detector_cps_1m",
+  "stage_material_rules": [
+    {
+      "material": "concrete",
+      "path_prefix": "/World/SimBridge/Obstacles"
+    },
+    {
+      "material": "concrete",
+      "path_prefix": "/World/Environment"
+    }
+  ],
+  "start_isaacsim_sidecar_with_geant4": false,
+  "thread_count": 1,
+  "timeout_s": 86400.0,
+  "usd_path": "../isaacsim/demo_room.usda",
+  "use_mock_stage": true
 }

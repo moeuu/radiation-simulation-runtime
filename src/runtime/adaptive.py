@@ -9,7 +9,6 @@ import socket
 from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from hashlib import sha256
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -17,6 +16,11 @@ import numpy as np
 from scipy.stats import qmc
 
 from measurement.kernels import ShieldParams
+from measurement.obstacle_assets import (
+    KnownObstacleInstance,
+    obstacle_instances_from_dicts,
+    validate_component_transport_contract,
+)
 from measurement.obstacles import ObstacleGrid
 from runtime.adaptive_protocol import (
     ADAPTIVE_CUI_OVERLAY_PREFIX,
@@ -30,11 +34,9 @@ from runtime.adaptive_protocol import (
     AdaptiveReadyEvent,
     AdaptiveRecordEvent,
     AdaptiveRefineRequest,
-    AdaptiveResumePrefix,
     AdaptiveStepRequest,
 )
 from runtime.shield_timing import (
-    DEFAULT_SHIELD_ANGULAR_SPEED_RAD_S,
     shield_pair_transition_time_s,
 )
 from runtime.forward_model_manifest import (
@@ -42,30 +44,38 @@ from runtime.forward_model_manifest import (
     build_forward_model_manifest,
 )
 from runtime.experiment_profiles import (
+    ExperimentProfile,
     experiment_profile_from_environment,
     require_private_scene_variant,
 )
 from runtime.measurement_log import (
     MEASUREMENT_LOG_SCHEMA_VERSION,
     MeasurementLog,
-    MeasurementLogRecord,
-    MeasurementLogStreamWriter,
-    MeasurementLogValidationError,
 )
 from runtime.provenance import (
-    canonical_json_bytes,
+    load_strict_json,
     repository_commit,
     repository_source_snapshot_sha256,
+    strict_json_loads,
+    strict_sha256_json,
 )
 from runtime.records import RunContext, validate_truth_free_estimator_input
 from runtime.session import (
     AcquisitionAction,
     ObservationSession,
+    _close_observation_session_after_failure,
+    _open_owned_observation_session,
     estimator_neutral_runtime_config,
+    production_energy_bin_edges_keV,
+    production_native_execution_digests,
 )
-from sim.isaacsim_app.scene_builder import build_scene_description
+from sim.isaacsim_app.scene_builder import SceneDescription, build_scene_description
 from sim.protocol import SimulationCommand
-from sim.runtime import create_simulation_runtime, load_runtime_config
+from sim.runtime import (
+    create_simulation_runtime,
+    load_production_runtime_config,
+    production_runtime_config_sha256,
+)
 
 _SCENARIO_FIELDS = frozenset(
     {
@@ -82,6 +92,56 @@ _SCENARIO_FIELDS = frozenset(
     }
 )
 _CUI_OVERLAY_FIELDS = frozenset({"type", "include_truth"})
+_PRODUCTION_ENVIRONMENT_FIELDS = frozenset(
+    {
+        "experiment_profile_id",
+        "acquisition_contract",
+        "environment_model_id",
+        "size_x",
+        "size_y",
+        "size_z",
+        "detector_position",
+        "obstacle_grid",
+        "obstacle_instances",
+        "adaptive_measurement",
+    }
+)
+_PRODUCTION_OBSTACLE_GRID_FIELDS = frozenset(
+    {
+        "version",
+        "origin",
+        "cell_size",
+        "grid_shape",
+        "blocked_cells",
+        "blocked_fraction",
+        "collision_boxes_m",
+        "transport_boxes_m",
+        "transport_mu_by_isotope",
+        "transport_line_mu_by_isotope",
+        "transport_line_compton_mu_by_isotope",
+    }
+)
+_PRODUCTION_SCENE_FIELDS = frozenset(
+    {
+        "room_size_xyz",
+        "sources",
+        "obstacle_origin_xy",
+        "obstacle_cell_size_m",
+        "obstacle_material",
+        "obstacle_grid_shape",
+        "obstacle_cells",
+        "collision_boxes_m",
+        "transport_boxes_m",
+        "transport_mu_by_isotope",
+        "transport_line_mu_by_isotope",
+        "transport_line_compton_mu_by_isotope",
+        "obstacle_instances",
+        "author_obstacle_prims",
+        "author_room_boundary_prims",
+        "usd_path",
+        "use_config_usd_fallback",
+    }
+)
 _ADAPTIVE_MEASUREMENT_FIELDS = frozenset(
     {
         "candidate_count",
@@ -159,69 +219,81 @@ class AdaptiveMotionConfig:
         runtime_config: Mapping[str, Any] | None,
     ) -> "AdaptiveMotionConfig":
         """Resolve a strict motion configuration from truth-free runtime inputs."""
-        raw = environment.get("adaptive_measurement", {})
+        if "adaptive_measurement" not in environment:
+            raise ValueError(
+                "environment.adaptive_measurement is required for production."
+            )
+        raw = environment["adaptive_measurement"]
         if not isinstance(raw, Mapping):
             raise TypeError("environment.adaptive_measurement must be an object.")
-        unknown = sorted(set(raw) - _ADAPTIVE_MEASUREMENT_FIELDS)
-        if unknown:
+        actual = frozenset(raw)
+        missing = sorted(_ADAPTIVE_MEASUREMENT_FIELDS - actual)
+        unknown = sorted(actual - _ADAPTIVE_MEASUREMENT_FIELDS)
+        if missing or unknown:
             raise ValueError(
-                f"environment.adaptive_measurement contains unknown fields: {unknown}."
+                "environment.adaptive_measurement fields differ from the exact "
+                f"production schema: missing={missing}, unknown={unknown}."
             )
-        runtime = {} if runtime_config is None else runtime_config
-        detector = runtime.get("detector_model", {})
-        if not isinstance(detector, Mapping):
-            raise TypeError("runtime detector_model must be an object.")
-        crystal_radius = _finite_number(
-            detector.get("crystal_radius_m", 0.038),
-            field_name="detector_model.crystal_radius_m",
-            positive=True,
-        )
-        housing = _finite_number(
-            detector.get("housing_thickness_m", 0.0015),
-            field_name="detector_model.housing_thickness_m",
-            minimum=0.0,
-        )
         head_radius = _finite_number(
-            raw.get("head_radius_m", crystal_radius + housing),
+            raw["head_radius_m"],
             field_name="adaptive_measurement.head_radius_m",
             positive=True,
         )
+        if runtime_config is not None:
+            detector = runtime_config.get("detector_model")
+            if not isinstance(detector, Mapping):
+                raise TypeError("runtime detector_model must be an object.")
+            crystal_radius = _finite_number(
+                detector["crystal_radius_m"],
+                field_name="detector_model.crystal_radius_m",
+                positive=True,
+            )
+            housing = _finite_number(
+                detector["housing_thickness_m"],
+                field_name="detector_model.housing_thickness_m",
+                minimum=0.0,
+            )
+            if head_radius != crystal_radius + housing:
+                raise ValueError(
+                    "adaptive_measurement.head_radius_m must equal the configured "
+                    "crystal radius plus housing thickness."
+                )
         base_height = _finite_number(
-            raw.get("base_height_m", 0.2),
+            raw["base_height_m"],
             field_name="adaptive_measurement.base_height_m",
             positive=True,
         )
         size_z = _finite_number(
-            environment.get("size_z", 0.0),
+            environment["size_z"],
             field_name="environment.size_z",
             positive=True,
         )
         minimum_height = _finite_number(
-            raw.get("detector_height_min_m", base_height + head_radius),
+            raw["detector_height_min_m"],
             field_name="adaptive_measurement.detector_height_min_m",
             minimum=base_height + head_radius,
         )
         maximum_height = _finite_number(
-            raw.get("detector_height_max_m", size_z - head_radius),
+            raw["detector_height_max_m"],
             field_name="adaptive_measurement.detector_height_max_m",
             minimum=minimum_height,
         )
         if maximum_height + head_radius > size_z + 1.0e-12:
             raise ValueError("Maximum detector height places the head above the room.")
         transport_height = _finite_number(
-            raw.get("transport_height_m", minimum_height),
+            raw["transport_height_m"],
             field_name="adaptive_measurement.transport_height_m",
             minimum=minimum_height,
         )
         if transport_height > maximum_height:
             raise ValueError("transport_height_m must not exceed the height maximum.")
         base_radius = _finite_number(
-            raw.get("base_radius_m", 0.2),
+            raw["base_radius_m"],
             field_name="adaptive_measurement.base_radius_m",
             positive=True,
         )
         mast_radius = _finite_number(
-            raw.get("mast_radius_m", 0.03),
+            raw["mast_radius_m"],
             field_name="adaptive_measurement.mast_radius_m",
             minimum=0.0,
         )
@@ -229,24 +301,24 @@ class AdaptiveMotionConfig:
             raise ValueError("mast_radius_m must not exceed base_radius_m.")
         return cls(
             candidate_count=_exact_integer(
-                raw.get("candidate_count", 256),
+                raw["candidate_count"],
                 field_name="adaptive_measurement.candidate_count",
                 minimum=8,
             ),
             candidate_seed=_exact_integer(
-                raw.get("candidate_seed", 0),
+                raw["candidate_seed"],
                 field_name="adaptive_measurement.candidate_seed",
                 minimum=0,
             ),
             detector_height_min_m=minimum_height,
             detector_height_max_m=maximum_height,
             local_refinement_count=_exact_integer(
-                raw.get("local_refinement_count", 64),
+                raw["local_refinement_count"],
                 field_name="adaptive_measurement.local_refinement_count",
                 minimum=0,
             ),
             local_refinement_radius_m=_finite_number(
-                raw.get("local_refinement_radius_m", 0.5),
+                raw["local_refinement_radius_m"],
                 field_name="adaptive_measurement.local_refinement_radius_m",
                 minimum=0.0,
             ),
@@ -256,34 +328,265 @@ class AdaptiveMotionConfig:
             head_radius_m=head_radius,
             transport_height_m=transport_height,
             horizontal_speed_m_s=_finite_number(
-                raw.get("horizontal_speed_m_s", 0.5),
+                raw["horizontal_speed_m_s"],
                 field_name="adaptive_measurement.horizontal_speed_m_s",
                 positive=True,
             ),
             vertical_speed_m_s=_finite_number(
-                raw.get("vertical_speed_m_s", 0.25),
+                raw["vertical_speed_m_s"],
                 field_name="adaptive_measurement.vertical_speed_m_s",
                 positive=True,
             ),
             settling_time_s=_finite_number(
-                raw.get("settling_time_s", 1.0),
+                raw["settling_time_s"],
                 field_name="adaptive_measurement.settling_time_s",
                 minimum=0.0,
             ),
             shield_angular_speed_rad_s=_finite_number(
-                raw.get(
-                    "shield_angular_speed_rad_s",
-                    DEFAULT_SHIELD_ANGULAR_SPEED_RAD_S,
-                ),
+                raw["shield_angular_speed_rad_s"],
                 field_name="adaptive_measurement.shield_angular_speed_rad_s",
                 positive=True,
             ),
         )
 
 
+def _require_exact_fields(
+    payload: Mapping[str, object],
+    expected: frozenset[str],
+    *,
+    field_name: str,
+) -> None:
+    """Require one production object to match its complete schema exactly."""
+    actual = frozenset(payload)
+    missing = sorted(expected - actual)
+    unknown = sorted(actual - expected)
+    if missing or unknown:
+        raise ValueError(
+            f"{field_name} fields differ from the exact production schema: "
+            f"missing={missing}, unknown={unknown}."
+        )
+
+
+def _finite_vector(
+    value: object,
+    *,
+    length: int,
+    field_name: str,
+) -> tuple[float, ...]:
+    """Return one exact-length vector of finite JSON numbers."""
+    if not isinstance(value, (list, tuple)) or len(value) != length:
+        raise TypeError(f"{field_name} must be a {length}-element JSON array.")
+    return tuple(
+        _finite_number(component, field_name=f"{field_name}[{index}]")
+        for index, component in enumerate(value)
+    )
+
+
+def _validate_json_native(value: object, *, field_name: str) -> None:
+    """Reject non-JSON metadata values without coercing their Python types."""
+    if value is None or type(value) in (bool, int, str):
+        return
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError(f"{field_name} must not contain non-finite numbers.")
+        return
+    if type(value) is list:
+        for index, item in enumerate(value):
+            _validate_json_native(
+                item,
+                field_name=f"{field_name}[{index}]",
+            )
+        return
+    if type(value) is dict:
+        for key, item in value.items():
+            if type(key) is not str:
+                raise TypeError(f"{field_name} keys must be JSON strings.")
+            _validate_json_native(
+                item,
+                field_name=f"{field_name}.{key}",
+            )
+        return
+    raise TypeError(f"{field_name} must contain only exact finite JSON-native values.")
+
+
+def _validate_production_scenario(scenario: Mapping[str, Any]) -> None:
+    """Validate the exact production adaptive-scenario envelope."""
+    _require_exact_fields(
+        scenario,
+        _SCENARIO_FIELDS,
+        field_name="scenario",
+    )
+    schema_version = scenario["schema_version"]
+    if type(schema_version) is not int or schema_version != 1:
+        raise ValueError("Adaptive scenario schema_version must be exact integer 1.")
+    for field_name in ("run_id", "runtime_config_path", "output_dir"):
+        value = scenario[field_name]
+        if type(value) is not str or not value.strip():
+            raise TypeError(
+                f"Adaptive scenario {field_name} must be a nonempty JSON string."
+            )
+    if type(scenario["backend"]) is not str or scenario["backend"] != "geant4":
+        raise ValueError("Adaptive production scenario backend must equal 'geant4'.")
+    raw_isotopes = scenario["isotopes"]
+    if type(raw_isotopes) is not list or not raw_isotopes:
+        raise TypeError("Adaptive scenario isotopes must be a nonempty JSON array.")
+    if any(type(isotope) is not str or not isotope.strip() for isotope in raw_isotopes):
+        raise TypeError(
+            "Adaptive scenario isotopes must contain nonempty JSON strings."
+        )
+    if len(set(raw_isotopes)) != len(raw_isotopes):
+        raise ValueError("Adaptive scenario isotopes must be unique.")
+    if scenario["obstacle_layout_path"] is not None:
+        raise ValueError(
+            "Production adaptive scenarios require one embedded obstacle_grid "
+            "and obstacle_layout_path=null."
+        )
+    metadata = scenario["metadata"]
+    if type(metadata) is not dict:
+        raise TypeError("Private scenario metadata must be a JSON object.")
+    _validate_json_native(metadata, field_name="scenario.metadata")
+
+
+def _validate_production_environment(
+    environment: Mapping[str, Any],
+    runtime_config: Mapping[str, Any],
+) -> tuple[
+    ExperimentProfile,
+    ObstacleGrid,
+    tuple[KnownObstacleInstance, ...],
+]:
+    """Validate one complete production environment without physical defaults."""
+    _require_exact_fields(
+        environment,
+        _PRODUCTION_ENVIRONMENT_FIELDS,
+        field_name="environment",
+    )
+    profile = experiment_profile_from_environment(environment)
+    room_size = tuple(
+        _finite_number(
+            environment[field],
+            field_name=f"environment.{field}",
+            positive=True,
+        )
+        for field in ("size_x", "size_y", "size_z")
+    )
+    expected_room_size = (
+        float(profile.environment.size_x),
+        float(profile.environment.size_y),
+        float(profile.environment.size_z),
+    )
+    if room_size != expected_room_size:
+        raise ValueError(
+            "Environment room dimensions differ from its experiment profile."
+        )
+    detector_position = _finite_vector(
+        environment["detector_position"],
+        length=3,
+        field_name="environment.detector_position",
+    )
+    if detector_position != tuple(profile.environment.detector_position):
+        raise ValueError(
+            "Environment detector position differs from its experiment profile."
+        )
+    if environment["environment_model_id"] != profile.environment_model_id:
+        raise ValueError(
+            "Environment model identifier differs from its experiment profile."
+        )
+    obstacle_payload = environment["obstacle_grid"]
+    if not isinstance(obstacle_payload, dict):
+        raise TypeError("environment.obstacle_grid must be a JSON object.")
+    _require_exact_fields(
+        obstacle_payload,
+        _PRODUCTION_OBSTACLE_GRID_FIELDS,
+        field_name="environment.obstacle_grid",
+    )
+    obstacle_grid = ObstacleGrid.from_dict(obstacle_payload)
+    instances_payload = environment["obstacle_instances"]
+    if not isinstance(instances_payload, list):
+        raise TypeError("environment.obstacle_instances must be a JSON array.")
+    obstacle_instances = obstacle_instances_from_dicts(instances_payload)
+    validate_component_transport_contract(
+        obstacle_grid,
+        obstacle_instances,
+        room_size_xyz=expected_room_size,
+    )
+    motion = AdaptiveMotionConfig.from_inputs(environment, runtime_config)
+    if motion.candidate_count != profile.candidate_count:
+        raise ValueError(
+            "Adaptive candidate count differs from its experiment profile."
+        )
+    return profile, obstacle_grid, obstacle_instances
+
+
+def _validate_production_scene(
+    scene: Mapping[str, Any],
+    *,
+    runtime_config: Mapping[str, Any],
+    environment: Mapping[str, Any],
+    experiment_profile: ExperimentProfile,
+    obstacle_grid: ObstacleGrid,
+    obstacle_instances: tuple[KnownObstacleInstance, ...],
+) -> SceneDescription:
+    """Validate one production scene and all duplicated physical geometry."""
+    _require_exact_fields(
+        scene,
+        _PRODUCTION_SCENE_FIELDS,
+        field_name="scene",
+    )
+    if scene["use_config_usd_fallback"] is not False:
+        raise ValueError("Production scene must set use_config_usd_fallback=false.")
+    for field_name in (
+        "author_obstacle_prims",
+        "author_room_boundary_prims",
+    ):
+        scene_value = scene[field_name]
+        configured_value = runtime_config[field_name]
+        if type(scene_value) is not bool or scene_value is not configured_value:
+            raise ValueError(
+                f"Production scene {field_name} differs from its runtime config."
+            )
+    configured_usd_path = runtime_config["usd_path"]
+    if (
+        not isinstance(scene["usd_path"], str)
+        or scene["usd_path"] != configured_usd_path
+    ):
+        raise ValueError(
+            "Production scene usd_path must equal the canonical runtime config path."
+        )
+    description = build_scene_description(dict(scene))
+    expected_room_size = tuple(
+        float(environment[field]) for field in ("size_x", "size_y", "size_z")
+    )
+    if description.room_size_xyz != expected_room_size:
+        raise ValueError("Production scene room_size_xyz differs from its environment.")
+    if description.obstacle_material != experiment_profile.obstacle_material:
+        raise ValueError(
+            "Production scene obstacle material differs from its experiment profile."
+        )
+    geometry_matches = (
+        description.obstacle_origin_xy == obstacle_grid.origin
+        and description.obstacle_cell_size_m == obstacle_grid.cell_size
+        and description.obstacle_grid_shape == obstacle_grid.grid_shape
+        and tuple(description.obstacle_cells) == obstacle_grid.blocked_cells
+        and description.collision_boxes_m == obstacle_grid.collision_boxes_m
+        and description.transport_boxes_m == obstacle_grid.transport_boxes_m
+        and description.transport_mu_by_isotope == obstacle_grid.transport_mu_by_isotope
+        and description.transport_line_mu_by_isotope
+        == obstacle_grid.transport_line_mu_by_isotope
+        and description.transport_line_compton_mu_by_isotope
+        == obstacle_grid.transport_line_compton_mu_by_isotope
+        and description.obstacle_instances == obstacle_instances
+    )
+    if not geometry_matches:
+        raise ValueError(
+            "Production scene obstacle geometry differs from its environment."
+        )
+    return description
+
+
 def _load_json_object(path: Path) -> dict[str, Any]:
     """Load one strict JSON object."""
-    value = json.loads(path.read_text(encoding="utf-8"))
+    value = load_strict_json(path)
     if not isinstance(value, dict):
         raise TypeError(f"{path} must contain a JSON object.")
     return value
@@ -354,28 +657,6 @@ def _initial_detector_pose(
     if any(not math.isfinite(value) for value in pose):
         raise ValueError("environment.detector_position must be finite.")
     return pose
-
-
-def _obstacle_grid(
-    environment: Mapping[str, Any],
-    obstacle_layout_path: object,
-    *,
-    runtime_root: Path,
-) -> ObstacleGrid | None:
-    """Load estimator-neutral traversability geometry owned by the runtime."""
-    embedded = environment.get("obstacle_grid")
-    if embedded is not None:
-        if not isinstance(embedded, dict):
-            raise TypeError("environment.obstacle_grid must be an object or null.")
-        return ObstacleGrid.from_dict(embedded)
-    if obstacle_layout_path is None:
-        return None
-    if not isinstance(obstacle_layout_path, str) or not obstacle_layout_path:
-        raise TypeError("obstacle_layout_path must be a nonempty string or null.")
-    path = Path(obstacle_layout_path)
-    if not path.is_absolute():
-        path = runtime_root / path
-    return ObstacleGrid.load(path.resolve())
 
 
 def _cylinder_intersects_box(
@@ -886,6 +1167,7 @@ class AdaptiveCandidateProvider:
         if not selected:
             raise RuntimeError("No reachable adaptive measurement pose remains.")
         return AdaptiveCandidateSnapshot(
+            current_pose_xyz=tuple(float(value) for value in current_pose),
             candidate_poses_xyz=tuple(selected),
             travel_costs=tuple(costs),
             allowed_pair_ids=tuple(range(64)),
@@ -910,84 +1192,6 @@ class AdaptiveCandidateProvider:
         )
 
 
-def _resume_stage_repository_commit(stage_dir: str | Path) -> str:
-    """Read the immutable acquisition commit from one candidate resume stage."""
-    stage = Path(stage_dir)
-    if stage.is_symlink():
-        raise MeasurementLogValidationError(
-            "The adaptive resume stage must not be a symlink."
-        )
-    try:
-        raw = (stage / "repository_commit.txt").read_text(encoding="utf-8")
-    except OSError as exc:
-        raise MeasurementLogValidationError(
-            "The adaptive resume stage has no readable repository commit."
-        ) from exc
-    value = raw.removesuffix("\n")
-    if (
-        len(value) != 40
-        or value.lower() != value
-        or any(character not in "0123456789abcdef" for character in value)
-    ):
-        raise MeasurementLogValidationError(
-            "The adaptive resume stage repository commit is invalid."
-        )
-    return value
-
-
-def _adaptive_resume_compatibility(
-    *,
-    prefix_repository_commit: str,
-    resume_execution_commit: str,
-    supplied: Mapping[str, object] | None,
-) -> dict[str, object]:
-    """Build explicit, durable compatibility provenance for one live resume."""
-    commits_match = prefix_repository_commit == resume_execution_commit
-    if not commits_match and not supplied:
-        raise MeasurementLogValidationError(
-            "Adaptive resume across runtime commits requires an explicit, "
-            "nonempty resume_compatibility mapping."
-        )
-    payload = dict(supplied or {})
-    for name, expected in (
-        ("prefix_repository_commit", prefix_repository_commit),
-        ("resume_execution_commit", resume_execution_commit),
-    ):
-        existing = payload.get(name)
-        if existing is not None and existing != expected:
-            raise MeasurementLogValidationError(
-                f"resume_compatibility.{name} disagrees with the runtime."
-            )
-        payload[name] = expected
-    payload["repository_commits_match"] = commits_match
-    payload.setdefault(
-        "compatibility_mode",
-        "identical_runtime_commit" if commits_match else "explicit_cross_commit",
-    )
-    return payload
-
-
-def _yaw_from_quaternion_wxyz(quaternion: Sequence[float]) -> float:
-    """Return Z-axis yaw from one finite WXYZ detector quaternion."""
-    values = np.asarray(quaternion, dtype=np.float64)
-    if values.shape != (4,) or np.any(~np.isfinite(values)):
-        raise MeasurementLogValidationError(
-            "The resumed detector quaternion must contain four finite values."
-        )
-    norm = float(np.linalg.norm(values))
-    if norm <= 0.0:
-        raise MeasurementLogValidationError(
-            "The resumed detector quaternion must have positive norm."
-        )
-    w, x, y, z = values / norm
-    return float(
-        math.atan2(
-            2.0 * (w * z + x * y),
-            1.0 - 2.0 * (y * y + z * z),
-        )
-    )
-
-
 class AdaptiveRuntimeSession:
     """Own one private scene while executing estimator-selected actions."""
 
@@ -996,42 +1200,29 @@ class AdaptiveRuntimeSession:
         observation_session: ObservationSession,
         context: RunContext,
         candidates: AdaptiveCandidateProvider,
+        experiment_profile: ExperimentProfile,
         cui_truth_overlay: Mapping[str, object] | None = None,
-        resume_records: Sequence[MeasurementLogRecord] = (),
     ) -> None:
-        """Initialize live action resolution at the fresh or resumed pose."""
+        """Initialize live action resolution for one fresh acquisition."""
+        if not isinstance(experiment_profile, ExperimentProfile):
+            raise TypeError("experiment_profile must be an ExperimentProfile.")
+        if observation_session.writer.records:
+            raise ValueError("An adaptive runtime session must start with no records.")
         self.observation_session = observation_session
         self.context = context
         self.candidates = candidates
+        self.experiment_profile = experiment_profile
+        self.acquisition_contract = experiment_profile.acquisition
         self.cui_truth_overlay = (
             {}
             if cui_truth_overlay is None
             else json.loads(json.dumps(dict(cui_truth_overlay), allow_nan=False))
         )
-        self._resume_records = tuple(resume_records)
-        if self._resume_records:
-            latest = self._resume_records[-1]
-            if latest.metadata.get("station_complete") is not True:
-                raise MeasurementLogValidationError(
-                    "Adaptive resume must start after a completed station."
-                )
-            self.current_pose = tuple(latest.detector_pose_xyz)
-            self.current_base_yaw_rad = _yaw_from_quaternion_wxyz(
-                latest.detector_quat_wxyz
-            )
-            self.current_pair_id = int(latest.fe_orientation_index) * 8 + int(
-                latest.pb_orientation_index
-            )
-        else:
-            self.current_pose = candidates.initial_pose
-            self.current_base_yaw_rad = 0.0
-            self.current_pair_id = 0
+        self.current_pose = candidates.initial_pose
+        self.current_base_yaw_rad = 0.0
+        self.current_pair_id = 0
         self._candidate_snapshot = candidates.snapshot(self.current_pose, 0)
-        if self.current_pair_id != 0:
-            self._candidate_snapshot = candidates.snapshot(
-                self.current_pose,
-                self.current_pair_id,
-            )
+        self._active_station_pose: tuple[float, float, float] | None = None
         self._closed = False
 
     @classmethod
@@ -1040,71 +1231,42 @@ class AdaptiveRuntimeSession:
         scenario_path: str | Path,
     ) -> AdaptiveRuntimeSession:
         """Open a private scenario that contains no acquisition action list."""
-        return cls._open(
-            scenario_path,
-            resume_stage_dir=None,
-            resume_compatibility=None,
-        )
-
-    @classmethod
-    def resume(
-        cls,
-        scenario_path: str | Path,
-        *,
-        stage_dir: str | Path,
-        resume_compatibility: Mapping[str, object] | None = None,
-    ) -> AdaptiveRuntimeSession:
-        """Resume after the last verified station boundary in a stream stage."""
-        return cls._open(
-            scenario_path,
-            resume_stage_dir=stage_dir,
-            resume_compatibility=resume_compatibility,
-        )
+        return cls._open(scenario_path)
 
     @classmethod
     def _open(
         cls,
         scenario_path: str | Path,
-        *,
-        resume_stage_dir: str | Path | None,
-        resume_compatibility: Mapping[str, object] | None,
     ) -> AdaptiveRuntimeSession:
-        """Open one fresh or verified-resume private adaptive session."""
+        """Open one fresh private adaptive session."""
         path = Path(scenario_path).expanduser().resolve()
         scenario = _load_json_object(path)
-        if set(scenario) != _SCENARIO_FIELDS or scenario.get("schema_version") != 1:
-            raise ValueError("Adaptive scenario must match schema version 1 exactly.")
+        _validate_production_scenario(scenario)
         base = path.parent
-        config_path = (base / str(scenario["runtime_config_path"])).resolve()
-        output_dir = (base / str(scenario["output_dir"])).resolve()
-        raw_config = load_runtime_config(config_path)
-        isotopes = tuple(sorted(str(value) for value in scenario["isotopes"]))
-        if not isotopes or len(set(isotopes)) != len(isotopes):
-            raise ValueError("Scenario isotopes must be nonempty and unique.")
-        backend = str(scenario["backend"])
+        config_path = (base / scenario["runtime_config_path"]).resolve()
+        output_dir = (base / scenario["output_dir"]).resolve()
+        raw_config = load_production_runtime_config(config_path)
+        isotopes = tuple(sorted(scenario["isotopes"]))
+        backend = scenario["backend"]
         runtime_root = Path(__file__).resolve().parents[2]
-        logged_config = estimator_neutral_runtime_config(
-            raw_config,
-            backend=backend,
-            isotopes=isotopes,
-            run_root=config_path.parents[2],
-        )
         environment = scenario["environment"]
         scene = scenario["scene"]
         if not isinstance(environment, dict) or not isinstance(scene, dict):
             raise TypeError("Scenario environment and scene must be JSON objects.")
-        execution_commit = repository_commit(runtime_root)
-        if len(execution_commit) != 40:
-            raise RuntimeError("Acquisition runtime must execute from a Git commit.")
-        prefix_commit = (
-            execution_commit
-            if resume_stage_dir is None
-            else _resume_stage_repository_commit(resume_stage_dir)
+        (
+            experiment_profile,
+            obstacle,
+            obstacle_instances,
+        ) = _validate_production_environment(environment, raw_config)
+        scene_description = _validate_production_scene(
+            scene,
+            runtime_config=raw_config,
+            environment=environment,
+            experiment_profile=experiment_profile,
+            obstacle_grid=obstacle,
+            obstacle_instances=obstacle_instances,
         )
         private_metadata = scenario["metadata"]
-        if not isinstance(private_metadata, Mapping):
-            raise TypeError("Private scenario metadata must be a JSON object.")
-        experiment_profile = experiment_profile_from_environment(environment)
         metadata_profile_id = private_metadata.get("experiment_profile_id")
         if metadata_profile_id != experiment_profile.profile_id:
             raise ValueError(
@@ -1119,30 +1281,38 @@ class AdaptiveRuntimeSession:
             raise ValueError(
                 "Scenario candidate isotopes differ from its experiment profile."
             )
-        run_metadata = {
-            "repository_source_snapshot_sha256": (
-                repository_source_snapshot_sha256(runtime_root)
-            ),
-        }
-        resolved_hash = sha256(canonical_json_bytes(logged_config)).hexdigest()
-        forward = build_forward_model_manifest(
-            runtime_config=logged_config,
-            environment=environment,
-            obstacle_layout_path=scenario["obstacle_layout_path"],
-            isotopes=isotopes,
-            repository_commit=prefix_commit,
-            resolved_config_sha256=resolved_hash,
-            repository_root=runtime_root,
-        )
-        scene_description = build_scene_description(scene)
         _validate_private_scene_variant(
             scene_description,
             experiment_profile.profile_id,
             private_scene_variant,
         )
+        logged_config = estimator_neutral_runtime_config(
+            raw_config,
+            backend=backend,
+            isotopes=isotopes,
+            run_root=runtime_root,
+        )
+        execution_commit = repository_commit(runtime_root)
+        if len(execution_commit) != 40:
+            raise RuntimeError("Acquisition runtime must execute from a Git commit.")
+        run_metadata = {
+            "repository_source_snapshot_sha256": (
+                repository_source_snapshot_sha256(runtime_root)
+            ),
+        }
+        resolved_hash = strict_sha256_json(logged_config)
+        forward = build_forward_model_manifest(
+            runtime_config=logged_config,
+            environment=environment,
+            obstacle_layout_path=scenario["obstacle_layout_path"],
+            isotopes=isotopes,
+            repository_commit=execution_commit,
+            resolved_config_sha256=resolved_hash,
+            repository_root=runtime_root,
+        )
         writer_arguments = {
-            "run_id": str(scenario["run_id"]),
-            "repository_commit": prefix_commit,
+            "run_id": scenario["run_id"],
+            "repository_commit": execution_commit,
             "runtime_config": logged_config,
             "environment": environment,
             "forward_model_manifest": forward,
@@ -1151,20 +1321,15 @@ class AdaptiveRuntimeSession:
             "obstacle_layout_path": scenario["obstacle_layout_path"],
             "source_layout_path": None,
         }
-        if resume_stage_dir is None:
-            writer = MeasurementLogStreamWriter(output_dir, **writer_arguments)
-        else:
-            writer = MeasurementLogStreamWriter.resume_from_stage(
-                output_dir,
-                stage_dir=resume_stage_dir,
-                resume_execution_commit=execution_commit,
-                resume_compatibility=_adaptive_resume_compatibility(
-                    prefix_repository_commit=prefix_commit,
-                    resume_execution_commit=execution_commit,
-                    supplied=resume_compatibility,
-                ),
-                **writer_arguments,
-            )
+        (
+            native_executable_digest,
+            native_environment_digest,
+            implementation_bundle_digest,
+        ) = production_native_execution_digests(logged_config)
+        energy_bin_edges_keV = production_energy_bin_edges_keV(logged_config)
+        full_spectrum_contract_hash_sha256 = logged_config[
+            "full_spectrum_contract_hash_sha256"
+        ]
         simulation_runtime = create_simulation_runtime(
             backend,
             sources=scene_description.to_point_sources(),
@@ -1172,28 +1337,29 @@ class AdaptiveRuntimeSession:
             shield_params=ShieldParams(),
             runtime_config=raw_config,
             runtime_config_path=config_path,
-        )
-        observation = ObservationSession(
-            simulation_runtime=simulation_runtime,
-            writer=writer,
-            full_spectrum_contract_hash_sha256=str(
-                logged_config["full_spectrum_contract_hash_sha256"]
+            expected_runtime_config_sha256=(
+                production_runtime_config_sha256(raw_config)
             ),
+            expected_native_executable_sha256=native_executable_digest,
+            expected_native_execution_environment_sha256=(native_environment_digest),
+            expected_implementation_bundle_sha256=(implementation_bundle_digest),
+        )
+        observation = _open_owned_observation_session(
+            simulation_runtime=simulation_runtime,
+            output_dir=output_dir,
+            writer_arguments=writer_arguments,
+            full_spectrum_contract_hash_sha256=(full_spectrum_contract_hash_sha256),
+            energy_bin_edges_keV=energy_bin_edges_keV,
         )
         try:
             observation.reset(scene)
-            obstacle = _obstacle_grid(
-                environment,
-                scenario["obstacle_layout_path"],
-                runtime_root=runtime_root,
-            )
             provider = AdaptiveCandidateProvider(
                 environment,
                 obstacle,
                 runtime_config=raw_config,
             )
             context = RunContext(
-                repository_commit=prefix_commit,
+                repository_commit=execution_commit,
                 runtime_config=logged_config,
                 environment=environment,
                 sim_backend=backend,
@@ -1202,8 +1368,8 @@ class AdaptiveRuntimeSession:
                 obstacle_layout_path=scenario["obstacle_layout_path"],
                 source_layout_path=None,
                 source_rate_model="detector_cps_1m",
-                metadata=writer.metadata,
-                run_id=str(scenario["run_id"]),
+                metadata=observation.writer.metadata,
+                run_id=scenario["run_id"],
                 source_rate_semantics=SOURCE_RATE_SEMANTICS,
                 forward_model_manifest=forward,
                 runtime_config_sha256=resolved_hash,
@@ -1213,27 +1379,15 @@ class AdaptiveRuntimeSession:
                 observation,
                 context,
                 provider,
+                experiment_profile,
                 cui_truth_overlay=_cui_truth_overlay(scene_description),
-                resume_records=(
-                    tuple(writer.records) if resume_stage_dir is not None else ()
-                ),
             )
-        except BaseException:
-            observation.close()
+        except BaseException as failure:
+            _close_observation_session_after_failure(observation, failure)
             raise
 
     def ready_payload(self) -> dict[str, object]:
         """Return the initial truth-free handshake."""
-        if self._resume_records:
-            return AdaptiveReadyEvent(
-                schema_version=2,
-                context=self.context,
-                candidates=self._candidate_snapshot,
-                resume=AdaptiveResumePrefix(
-                    records=self._resume_records,
-                    next_station_id=int(self._resume_records[-1].station_id) + 1,
-                ),
-            ).to_payload()
         return AdaptiveReadyEvent(
             schema_version=1,
             context=self.context,
@@ -1249,11 +1403,43 @@ class AdaptiveRuntimeSession:
         """Execute one estimator selection and return its durable record."""
         if self._closed:
             raise RuntimeError("Adaptive runtime session is closed.")
+        expected_station_id, view_index = self._next_contract_position()
         typed_request = AdaptiveStepRequest.from_payload(request)
+        expected_action_id = len(self.observation_session.writer.records)
+        if typed_request.action_id != expected_action_id:
+            raise ValueError(
+                "Adaptive action_id must equal the next causal record index: "
+                f"expected {expected_action_id}, got {typed_request.action_id}."
+            )
+        if typed_request.station_id != expected_station_id:
+            raise ValueError(
+                "Adaptive station_id must equal the next contract station: "
+                f"expected {expected_station_id}, got {typed_request.station_id}."
+            )
+        expected_station_complete = (
+            view_index + 1 == self.acquisition_contract.views_per_station
+        )
+        if typed_request.station_complete is not expected_station_complete:
+            raise ValueError(
+                "Adaptive station_complete must mark exactly the final view of "
+                f"each station; station {expected_station_id} view {view_index} "
+                f"requires {expected_station_complete}."
+            )
+        if typed_request.dwell_time_s != self.acquisition_contract.live_time_s:
+            raise ValueError(
+                "Adaptive dwell_time_s differs from the acquisition contract: "
+                f"expected {self.acquisition_contract.live_time_s}, "
+                f"got {typed_request.dwell_time_s}."
+            )
         candidate_index = typed_request.candidate_index
         if not 0 <= candidate_index < len(self._candidate_snapshot.candidate_poses_xyz):
             raise ValueError("candidate_index is outside the current runtime snapshot.")
         target = self._candidate_snapshot.candidate_poses_xyz[candidate_index]
+        if view_index and target != self._active_station_pose:
+            raise ValueError(
+                "Every view in one station must use the station's first detector "
+                "pose."
+            )
         travel_time = self._candidate_snapshot.travel_costs[candidate_index]
         travel_waypoints = self.candidates.travel_waypoints_xyz(
             self.current_pose,
@@ -1274,7 +1460,7 @@ class AdaptiveRuntimeSession:
             station_id=typed_request.station_id,
             station_complete=typed_request.station_complete,
             command=SimulationCommand(
-                step_id=len(self.observation_session.writer.records),
+                step_id=typed_request.action_id,
                 target_pose_xyz=target,
                 target_base_yaw_rad=yaw,
                 fe_orientation_index=typed_request.fe_orientation_index,
@@ -1292,6 +1478,7 @@ class AdaptiveRuntimeSession:
         self.current_pair_id = int(record.fe_orientation_index) * 8 + int(
             record.pb_orientation_index
         )
+        self._active_station_pose = None if expected_station_complete else target
         self._candidate_snapshot = self.candidates.snapshot(
             self.current_pose,
             self.current_pair_id,
@@ -1305,6 +1492,7 @@ class AdaptiveRuntimeSession:
         """Refine runtime-owned candidates around estimator-ranked seed indices."""
         if self._closed:
             raise RuntimeError("Adaptive runtime session is closed.")
+        self._require_request_before_measurement_limit()
         typed_request = AdaptiveRefineRequest.from_payload(request)
         indices: list[int] = []
         for value in typed_request.candidate_indices:
@@ -1330,6 +1518,7 @@ class AdaptiveRuntimeSession:
         """Return private CUI overlay data outside estimator-visible events."""
         if self._closed:
             raise RuntimeError("Adaptive runtime session is closed.")
+        self._require_request_before_measurement_limit()
         if set(request) != _CUI_OVERLAY_FIELDS or request.get("type") != "cui_overlay":
             raise ValueError("CUI overlay request fields disagree with schema 1.")
         include_truth = request["include_truth"]
@@ -1351,10 +1540,39 @@ class AdaptiveRuntimeSession:
             ),
         )
 
+    def _require_request_before_measurement_limit(self) -> None:
+        """Reject non-finalization requests once the acquisition is complete."""
+        record_count = len(self.observation_session.writer.records)
+        if record_count >= self.acquisition_contract.max_measurements:
+            raise RuntimeError(
+                "The acquisition measurement limit has been reached; only "
+                "finalize or abort is permitted."
+            )
+
+    def _next_contract_position(self) -> tuple[int, int]:
+        """Return the next zero-based station and view under the exact contract."""
+        self._require_request_before_measurement_limit()
+        record_count = len(self.observation_session.writer.records)
+        station_id, view_index = divmod(
+            record_count,
+            self.acquisition_contract.views_per_station,
+        )
+        if station_id >= self.acquisition_contract.max_stations:
+            raise RuntimeError("The acquisition station limit has been reached.")
+        return station_id, view_index
+
     def finalize(self) -> tuple[MeasurementLog, dict[str, object]]:
         """Publish the immutable log and close the live session."""
         if self._closed:
             raise RuntimeError("Adaptive runtime session is already closed.")
+        record_count = len(self.observation_session.writer.records)
+        if record_count == 0:
+            raise RuntimeError("Cannot finalize an acquisition with zero records.")
+        if record_count % self.acquisition_contract.views_per_station:
+            raise RuntimeError(
+                "Cannot finalize an acquisition before the current station is "
+                "complete."
+            )
         log = self.observation_session.finalize()
         self._closed = True
         return log, AdaptivePublishedEvent(
@@ -1387,26 +1605,13 @@ def serve_adaptive_session(
     *,
     input_stream: TextIO,
     output_stream: TextIO,
-    resume_stage_dir: str | Path | None = None,
-    resume_compatibility: Mapping[str, object] | None = None,
 ) -> int:
-    """Serve one fresh or verified-resume acquisition over JSON lines."""
-    if resume_stage_dir is None:
-        if resume_compatibility is not None:
-            raise ValueError("resume_compatibility requires a resume_stage_dir.")
-        session = AdaptiveRuntimeSession.open(
-            scenario_path,
-        )
-    else:
-        session = AdaptiveRuntimeSession.resume(
-            scenario_path,
-            stage_dir=resume_stage_dir,
-            resume_compatibility=resume_compatibility,
-        )
+    """Serve one fresh acquisition over JSON lines."""
+    session = AdaptiveRuntimeSession.open(scenario_path)
     try:
         _write_event(output_stream, session.ready_payload())
         for line in input_stream:
-            request = json.loads(line)
+            request = strict_json_loads(line)
             if not isinstance(request, dict):
                 raise TypeError("Adaptive session request must be an object.")
             request_type = request.get("type")
@@ -1443,8 +1648,6 @@ def serve_adaptive_session_socket(
     scenario_path: str | Path,
     *,
     socket_path: str | Path,
-    resume_stage_dir: str | Path | None = None,
-    resume_compatibility: Mapping[str, object] | None = None,
 ) -> int:
     """Serve one private adaptive session over a local estimator-neutral socket."""
     endpoint = Path(socket_path).expanduser().resolve()
@@ -1468,8 +1671,6 @@ def serve_adaptive_session_socket(
                         scenario_path,
                         input_stream=input_stream,
                         output_stream=output_stream,
-                        resume_stage_dir=resume_stage_dir,
-                        resume_compatibility=resume_compatibility,
                     )
     finally:
         server.close()

@@ -6,6 +6,13 @@ Standard top-level configs use `primary_sampling_fraction=1.0`. The Python
 Geant4 application rejects fractional primary-history sampling unless the
 nonstandard accelerated mode is selected explicitly, and it checks native
 response provenance before returning any observation to an estimator.
+Production adaptive sessions accept only complete, self-contained schema-1
+documents with the canonical field set. Unknown fields, missing fields,
+estimator-owned controls, implicit type coercion, and `extends` inheritance are
+rejected before simulator construction. Diagnostic tooling may still use the
+generic inherited-config loader, but that loader is not a production entrypoint.
+The live CUI lifecycle and all `cui_split_view_*` settings are PF-owned; Geant4
+production configs reject those keys instead of accepting ignored duplicates.
 
 - `variance_reduction_external_no_isaac_32threads.json`: standard no-GUI
   standard no-GUI Geant4 acquisition config for the shared runtime,
@@ -16,17 +23,23 @@ response provenance before returning any observation to an estimator.
   discrepancy; the rejected deterministic low-rank mean correction is not in
   the runtime path.
 - `variance_reduction_external_gui_32threads.json`: standard Geant4 acquisition
-  simulation config plus an Isaac Sim sidecar for visualization. It inherits
-  the no-GUI config; the intended runtime difference is Isaac Sim startup only.
+  simulation config plus an Isaac Sim sidecar for visualization. It is a
+  complete standalone production document; the intended runtime difference is
+  Isaac Sim startup only.
 - `high_fidelity_external_no_isaac.json`: full-transport verification config.
   It is intentionally slower and should be selected explicitly.
 - `external_gui_scene.json`: explicit USD-backed Manchester Drum Store scene.
 - `shield_validation_scene.json`: material/shield validation config.
 
-The profile registry hash proves which model asset was loaded. It does not
-claim independent accuracy validation. `runtime_ready` permits normal runs;
-`production_ready` remains validation metadata and does not couple ordinary
-startup to the optional long all-64 evaluation.
+The profile registry hash proves which model asset was loaded. Production
+startup additionally requires literal `production_ready=true` provenance for
+the exact model contract; training-only `runtime_ready` models are rejected.
+That approval also binds the canonical runtime configuration, native executable,
+resolved dynamic-library bytes, explicit Geant4 environment and complete physics
+data trees, and the Python implementation bundle. Production requires
+`auto_start_sidecar=true`, refuses an already occupied TCP endpoint, validates all
+bundle digests in the reset handshake, and revalidates the launch inputs immediately
+before starting the native process.
 
 ## Versioned asset retention
 
@@ -39,6 +52,6 @@ seven `physics_only` files authenticated by
 
 Generation suffixes are omitted when only one active asset exists. Explicit
 serialized schema numbers and stable contract identifiers remain versioned
-when their values participate in authentication or compatibility checks.
+when their values participate in authentication or exact-identity checks.
 MeasurementLog publication is fixed at schema version 2 and has no schema-1
-compatibility writer or loader.
+writer or loader.

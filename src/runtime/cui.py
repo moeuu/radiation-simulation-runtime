@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-import errno
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from http import HTTPStatus
@@ -459,21 +458,6 @@ class CUIRoute:
         object.__setattr__(self, "energy_bin_edges_keV", edges)
         object.__setattr__(self, "latest_step_id", latest_step_id)
 
-    @property
-    def path_segments_xyz(self) -> tuple[NDArray[np.float64], ...]:
-        """Return the obstacle-aware travel segments under a short alias."""
-        return self.travel_path_segments_xyz
-
-    @property
-    def measurement_points_xyz(self) -> NDArray[np.float64]:
-        """Return measurement stations under the PF display vocabulary."""
-        return self.measurement_stations_xyz
-
-    @property
-    def current_pose_xyz(self) -> NDArray[np.float64] | None:
-        """Return the current detector position under a short alias."""
-        return self.current_detector_position_xyz
-
     def to_payload(self) -> dict[str, object]:
         """Return a JSON-safe renderer payload without realized source truth."""
         stations = [
@@ -843,25 +827,16 @@ def _start_fixed_port_server(
     relative_index: Path,
     config: CUIDashboardConfig,
 ) -> CUIServerHandle:
-    """Bind the first available fixed port without probing another listener."""
+    """Bind exactly the configured fixed port or propagate the bind failure."""
     display_host = resolve_cui_public_host(config.host, config.public_host)
-    for port in range(config.port, min(65535, config.port + 99) + 1):
-        try:
-            server = _build_http_server(root, config.host, port)
-        except OSError as exc:
-            if exc.errno == errno.EADDRINUSE:
-                continue
-            raise
-        return _start_server_thread(
-            server,
-            root=root,
-            index_path=index_path,
-            relative_index=relative_index,
-            host=config.host,
-            display_host=display_host,
-        )
-    raise RuntimeError(
-        "No available CUI dashboard TCP port was found in the configured range."
+    server = _build_http_server(root, config.host, config.port)
+    return _start_server_thread(
+        server,
+        root=root,
+        index_path=index_path,
+        relative_index=relative_index,
+        host=config.host,
+        display_host=display_host,
     )
 
 
@@ -903,7 +878,7 @@ def start_cui_server(
     index_path: str | Path = "index.html",
     config: CUIDashboardConfig | None = None,
 ) -> CUIServerHandle:
-    """Start a managed CUI server on an ephemeral or first available fixed port."""
+    """Start a managed CUI server on an ephemeral or exact fixed port."""
     resolved_config = CUIDashboardConfig() if config is None else config
     if not isinstance(resolved_config, CUIDashboardConfig):
         raise TypeError("config must be a CUIDashboardConfig.")

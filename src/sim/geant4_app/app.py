@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 import math
 from numbers import Real
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -24,6 +25,10 @@ from sim.geant4_app.engine import (
     Geant4EngineConfig,
     Geant4StepRequest,
     build_geant4_engine,
+)
+from sim.geant4_app.execution_environment import (
+    native_executable_sha256,
+    native_execution_environment_bundle_sha256,
 )
 from sim.geant4_app.scene_export import (
     DEFAULT_DETECTOR_COINCIDENCE_WINDOW_S,
@@ -415,24 +420,18 @@ def validate_transport_metadata(
 ) -> None:
     """Fail when native transport provenance disagrees with configured semantics."""
     if not isinstance(expected_detector_response_sampling, bool):
-        raise ValueError(
-            "expected_detector_response_sampling must be a JSON boolean."
-        )
+        raise ValueError("expected_detector_response_sampling must be a JSON boolean.")
     if expected_primary_emission_model not in {
         "independent_gamma_lines",
         "geant4_radioactive_decay",
     }:
-        raise ValueError(
-            "expected_primary_emission_model has an unsupported value."
-        )
+        raise ValueError("expected_primary_emission_model has an unsupported value.")
     if expected_thread_count is not None and (
         isinstance(expected_thread_count, bool)
         or not isinstance(expected_thread_count, int)
         or expected_thread_count <= 0
     ):
-        raise ValueError(
-            "expected_thread_count must be a positive JSON integer."
-        )
+        raise ValueError("expected_thread_count must be a positive JSON integer.")
     configured_fraction = require_primary_sampling_fraction(
         expected_primary_sampling_fraction,
         accelerated_weighted_transport_enable=(accelerated_weighted_transport_enable),
@@ -524,12 +523,8 @@ def validate_transport_metadata(
             f"config: expected {expected_primary_emission_model}, got "
             f"{primary_emission_model or 'missing'}."
         )
-    radioactive_decay_emission = (
-        primary_emission_model == "geant4_radioactive_decay"
-    )
-    if radioactive_decay_emission and source_rate_model != (
-        "parent_decay_activity_bq"
-    ):
+    radioactive_decay_emission = primary_emission_model == "geant4_radioactive_decay"
+    if radioactive_decay_emission and source_rate_model != ("parent_decay_activity_bq"):
         raise RuntimeError(
             "Geant4 radioactive-decay emission requires parent activity in Bq."
         )
@@ -540,27 +535,30 @@ def validate_transport_metadata(
             "source_rate_model=detector_cps_1m."
         )
     if radioactive_decay_emission:
-        if _required_metadata_string(
-            metadata,
-            "activity_bq_definition",
-        ) != "parent_decays_per_second_at_acquisition_start":
+        if (
+            _required_metadata_string(
+                metadata,
+                "activity_bq_definition",
+            )
+            != "parent_decays_per_second_at_acquisition_start"
+        ):
             raise RuntimeError(
                 "Native Geant4 response has invalid activity_bq semantics."
             )
         if _required_metadata_string(
             metadata,
             "radioactive_source_state_semantics",
-        ) != (
-            "scheduled_parent_decays_no_preexisting_daughter_inventory"
-        ):
+        ) != ("scheduled_parent_decays_no_preexisting_daughter_inventory"):
             raise RuntimeError(
-                "Native Geant4 response has invalid radioactive source-state "
-                "semantics."
+                "Native Geant4 response has invalid radioactive source-state semantics."
             )
-    elif _required_metadata_string(
-        metadata,
-        "intensity_cps_1m_definition",
-    ) != "pre_dead_time_detector_pulse_rate_at_1m":
+    elif (
+        _required_metadata_string(
+            metadata,
+            "intensity_cps_1m_definition",
+        )
+        != "pre_dead_time_detector_pulse_rate_at_1m"
+    ):
         raise RuntimeError(
             "Native Geant4 response has invalid intensity_cps_1m semantics."
         )
@@ -607,18 +605,10 @@ def validate_transport_metadata(
         if (
             not isinstance(actual_hash, str)
             or len(actual_hash) != 64
-            or any(
-                character not in "0123456789abcdef"
-                for character in actual_hash
-            )
-            or (
-                expected_hash is not None
-                and actual_hash != str(expected_hash)
-            )
+            or any(character not in "0123456789abcdef" for character in actual_hash)
+            or (expected_hash is not None and actual_hash != str(expected_hash))
         ):
-            raise RuntimeError(
-                f"Native Geant4 {key} is missing, invalid, or stale."
-            )
+            raise RuntimeError(f"Native Geant4 {key} is missing, invalid, or stale.")
 
     physics_profile = _required_metadata_string(
         metadata,
@@ -654,33 +644,31 @@ def validate_transport_metadata(
         "detector_response_sampling_mode",
     )
     response_sampling_enabled = (
-        response_sampling_mode
-        == "multinomial_marking_with_nonparalyzable_event_time"
+        response_sampling_mode == "multinomial_marking_with_nonparalyzable_event_time"
     )
-    if response_sampling_enabled != bool(
-        expected_detector_response_sampling
-    ):
+    if response_sampling_enabled != bool(expected_detector_response_sampling):
         raise RuntimeError(
             "Native Geant4 detector-response sampling disagrees with runtime "
             "configuration."
         )
-    if response_sampling_enabled and detector_scoring_mode != (
-        "incident_gamma_energy"
-    ):
+    if response_sampling_enabled and detector_scoring_mode != ("incident_gamma_energy"):
         raise RuntimeError(
             "Native detector-response marking requires incident-gamma scoring."
         )
-    if response_sampling_enabled and _required_metadata_string(
-        metadata,
-        "detector_response_sampling_contract_sha256",
-    ) != NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256:
+    if (
+        response_sampling_enabled
+        and _required_metadata_string(
+            metadata,
+            "detector_response_sampling_contract_sha256",
+        )
+        != NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
+    ):
         raise RuntimeError(
             "Native detector-response sampling contract differs from the "
             "shared full-spectrum model."
         )
     if detector_response_applied != (
-        detector_scoring_mode != "incident_gamma_energy"
-        or response_sampling_enabled
+        detector_scoring_mode != "incident_gamma_energy" or response_sampling_enabled
     ):
         raise RuntimeError(
             "Native Geant4 detector-response provenance is inconsistent with "
@@ -705,9 +693,7 @@ def validate_transport_metadata(
         bin_width_keV,
     )
     if not all(np.isfinite(value) for value in axis_values):
-        raise RuntimeError(
-            "Native Geant4 spectrum-axis provenance must be finite."
-        )
+        raise RuntimeError("Native Geant4 spectrum-axis provenance must be finite.")
     if (
         not np.isclose(
             energy_min_keV,
@@ -730,15 +716,12 @@ def validate_transport_metadata(
         or bin_count != NATIVE_GEANT4_BIN_COUNT
     ):
         raise RuntimeError(
-            "Native Geant4 spectrum axis differs from the fixed production "
-            "contract."
+            "Native Geant4 spectrum axis differs from the fixed production contract."
         )
     if _required_metadata_string(
         metadata,
         "background_spectrum_model_id",
-    ) != (
-        NATIVE_GEANT4_BACKGROUND_MODEL_ID
-    ):
+    ) != (NATIVE_GEANT4_BACKGROUND_MODEL_ID):
         raise RuntimeError(
             "Native Geant4 background-spectrum model provenance is invalid."
         )
@@ -789,10 +772,7 @@ def validate_transport_metadata(
         metadata,
         "requested_threads",
     )
-    if (
-        expected_thread_count is not None
-        and requested_threads != expected_thread_count
-    ):
+    if expected_thread_count is not None and requested_threads != expected_thread_count:
         raise RuntimeError(
             "Native Geant4 thread count disagrees with runtime config: "
             f"expected {expected_thread_count}, got {requested_threads}."
@@ -844,10 +824,7 @@ def validate_transport_metadata(
             f"expected {resolved_source_bias_mode}, "
             f"got {reported_source_bias_mode}."
         )
-    if (
-        _required_metadata_string(metadata, "emission_model")
-        != expected_emission_model
-    ):
+    if _required_metadata_string(metadata, "emission_model") != expected_emission_model:
         raise RuntimeError(
             "Native Geant4 emission-model provenance disagrees with source-rate "
             "semantics."
@@ -866,10 +843,13 @@ def validate_transport_metadata(
         if radioactive_decay_emission
         else "disabled"
     )
-    if _required_metadata_string(
-        metadata,
-        "true_coincidence_summing",
-    ) != expected_summing:
+    if (
+        _required_metadata_string(
+            metadata,
+            "true_coincidence_summing",
+        )
+        != expected_summing
+    ):
         raise RuntimeError(
             "Native Geant4 coincidence-summing provenance is inconsistent."
         )
@@ -878,9 +858,7 @@ def validate_transport_metadata(
         "detector_coincidence_window_s",
     )
     if not np.isfinite(coincidence_window_s) or coincidence_window_s <= 0.0:
-        raise RuntimeError(
-            "Native Geant4 detector coincidence window is invalid."
-        )
+        raise RuntimeError("Native Geant4 detector coincidence window is invalid.")
     if (
         _required_metadata_bool(metadata, "delayed_decay_pulse_separation")
         != radioactive_decay_emission
@@ -893,13 +871,15 @@ def validate_transport_metadata(
         if radioactive_decay_emission
         else "disabled"
     )
-    if _required_metadata_string(
-        metadata,
-        "radioactive_decay_time_window",
-    ) != expected_decay_time_window:
+    if (
+        _required_metadata_string(
+            metadata,
+            "radioactive_decay_time_window",
+        )
+        != expected_decay_time_window
+    ):
         raise RuntimeError(
-            "Native Geant4 radioactive-decay time-window provenance is "
-            "inconsistent."
+            "Native Geant4 radioactive-decay time-window provenance is inconsistent."
         )
     if (
         _required_metadata_bool(
@@ -975,9 +955,7 @@ def validate_transport_metadata(
     if _required_metadata_string(
         metadata,
         "spectrum_variance_semantics",
-    ) != (
-        expected_variance_semantics
-    ):
+    ) != (expected_variance_semantics):
         raise RuntimeError(
             "Native Geant4 response is missing weighted sumw2 variance semantics."
         )
@@ -989,9 +967,7 @@ def validate_transport_metadata(
     if _required_metadata_string(
         metadata,
         "spectrum_variance_dead_time_propagation",
-    ) != (
-        expected_dead_time_semantics
-    ):
+    ) != (expected_dead_time_semantics):
         raise RuntimeError(
             "Native Geant4 response has invalid dead-time variance provenance."
         )
@@ -1047,9 +1023,7 @@ def validate_transport_metadata(
         if _required_metadata_string(
             metadata,
             "dead_time_scale_semantics",
-        ) != (
-            "realized_global_acceptance_fraction"
-        ):
+        ) != ("realized_global_acceptance_fraction"):
             raise RuntimeError(
                 "Native event-time dead-time acceptance provenance is invalid."
             )
@@ -1065,8 +1039,7 @@ def validate_transport_metadata(
                 rtol=0.0,
                 atol=1.0e-15,
             )
-            or
-            not np.isclose(
+            or not np.isclose(
                 pre_dead_time_sumw2,
                 pre_dead_time_counts,
                 rtol=0.0,
@@ -1198,9 +1171,7 @@ def validate_transport_metadata(
         if _required_metadata_string(
             metadata,
             "primary_sampling_fraction_resolution",
-        ) != (
-            expected_resolution
-        ):
+        ) != (expected_resolution):
             raise RuntimeError(
                 "Native Geant4 sampling-fraction resolution provenance disagrees "
                 f"with runtime configuration: expected {expected_resolution}."
@@ -1241,9 +1212,7 @@ def _mean_calibration_metadata_vector(
     """Parse one comma-delimited native calibration vector."""
     value = metadata.get(key)
     if not isinstance(value, str):
-        raise RuntimeError(
-            f"Native Geant4 mean calibration is missing vector {key}."
-        )
+        raise RuntimeError(f"Native Geant4 mean calibration is missing vector {key}.")
     try:
         vector = np.asarray(
             [float(token) for token in value.split(",")],
@@ -1258,9 +1227,7 @@ def _mean_calibration_metadata_vector(
         or np.any(~np.isfinite(vector))
         or np.any(vector < 0.0)
     ):
-        raise RuntimeError(
-            f"Native Geant4 mean-calibration vector {key} is invalid."
-        )
+        raise RuntimeError(f"Native Geant4 mean-calibration vector {key} is invalid.")
     return vector
 
 
@@ -1307,9 +1274,7 @@ def validate_mean_calibration_transport_metadata(
 ) -> None:
     """Validate fixed-quota weighted-mean calibration provenance."""
     integer_inputs = {
-        "expected_histories_per_source_line": (
-            expected_histories_per_source_line
-        ),
+        "expected_histories_per_source_line": (expected_histories_per_source_line),
         "expected_angle_strata_mu": expected_angle_strata_mu,
         "expected_angle_strata_phi": expected_angle_strata_phi,
     }
@@ -1330,17 +1295,13 @@ def validate_mean_calibration_transport_metadata(
             "expected_histories_per_source_line must be divisible by the "
             "configured angular stratum count."
         )
-    histories_per_stratum = (
-        expected_histories_per_source_line // stratum_count
-    )
+    histories_per_stratum = expected_histories_per_source_line // stratum_count
     if histories_per_stratum < 2:
         raise ValueError(
             "Mean calibration requires at least two histories per stratum."
         )
     if expected_source_rate_model != "detector_cps_1m":
-        raise ValueError(
-            "Mean calibration requires source_rate_model=detector_cps_1m."
-        )
+        raise ValueError("Mean calibration requires source_rate_model=detector_cps_1m.")
     if (
         expected_detector_scoring_mode != "incident_gamma_energy"
         or expected_secondary_transport_mode != "full_transport"
@@ -1358,25 +1319,17 @@ def validate_mean_calibration_transport_metadata(
         "primary_emission_model": "independent_gamma_lines",
         "true_coincidence_summing": "disabled",
         "radioactive_decay_time_window": "disabled",
-        "intensity_cps_1m_definition": (
-            "pre_dead_time_detector_pulse_rate_at_1m"
-        ),
+        "intensity_cps_1m_definition": ("pre_dead_time_detector_pulse_rate_at_1m"),
         "source_position_semantics": "air_side_native_emission_xyz",
-        "source_anchor_semantics": (
-            "exact_surface_chart_uv_evaluation_truth"
-        ),
+        "source_anchor_semantics": ("exact_surface_chart_uv_evaluation_truth"),
         "detector_scoring_mode": expected_detector_scoring_mode,
         "detector_response_sampling_mode": "disabled",
         "secondary_transport_mode": expected_secondary_transport_mode,
         "source_bias_mode": expected_source_bias_mode,
         "emission_model": "detector_equivalent_cone",
         "expected_primary_semantics": "detector_equivalent_histories",
-        "primary_schedule_mode": (
-            "fixed_source_line_stratified_mean_calibration"
-        ),
-        "transport_history_mode": (
-            "fixed_source_line_stratified_weighted_mean"
-        ),
+        "primary_schedule_mode": ("fixed_source_line_stratified_mean_calibration"),
+        "transport_history_mode": ("fixed_source_line_stratified_weighted_mean"),
         "mean_calibration_history_weight_semantics": (
             "expected_source_line_mean_divided_by_fixed_quota"
         ),
@@ -1391,9 +1344,7 @@ def validate_mean_calibration_transport_metadata(
         "spectrum_variance_dead_time_propagation": (
             "disabled_zero_dead_time_mean_calibration"
         ),
-        "dead_time_scale_semantics": (
-            "identity_zero_dead_time_mean_calibration"
-        ),
+        "dead_time_scale_semantics": ("identity_zero_dead_time_mean_calibration"),
         "validation_entry_spectrum_space": (
             "pre_dead_time_raw_incident_gamma_weighted_mean"
         ),
@@ -1440,13 +1391,9 @@ def validate_mean_calibration_transport_metadata(
         metadata,
         "detector_coincidence_window_s",
     )
-    if (
-        not np.isfinite(coincidence_window_s)
-        or coincidence_window_s <= 0.0
-    ):
+    if not np.isfinite(coincidence_window_s) or coincidence_window_s <= 0.0:
         raise RuntimeError(
-            "Native Geant4 mean-calibration detector coincidence window is "
-            "invalid."
+            "Native Geant4 mean-calibration detector coincidence window is invalid."
         )
 
     exact_integers = {
@@ -1488,10 +1435,7 @@ def validate_mean_calibration_transport_metadata(
             force_leaf_count <= 0
             or force_split_count <= 0
             or any(error < 0.0 for error in force_weight_errors)
-            or (
-                absolute_error > 1.0e-9
-                and relative_error > 1.0e-9
-            )
+            or (absolute_error > 1.0e-9 and relative_error > 1.0e-9)
         ):
             raise RuntimeError(
                 "Native Geant4 forced-collision diagnostics are invalid."
@@ -1519,18 +1463,22 @@ def validate_mean_calibration_transport_metadata(
         raise RuntimeError(
             "Native Geant4 mean calibration must disable history thinning."
         )
-    if not np.isclose(
-        _required_metadata_number(
+    if (
+        not np.isclose(
+            _required_metadata_number(
+                metadata,
+                "requested_primary_sampling_fraction",
+            ),
+            1.0,
+            rtol=0.0,
+            atol=1.0e-15,
+        )
+        or _required_metadata_string(
             metadata,
-            "requested_primary_sampling_fraction",
-        ),
-        1.0,
-        rtol=0.0,
-        atol=1.0e-15,
-    ) or _required_metadata_string(
-        metadata,
-        "primary_sampling_fraction_resolution",
-    ) != "fixed_source_line_mean_calibration":
+            "primary_sampling_fraction_resolution",
+        )
+        != "fixed_source_line_mean_calibration"
+    ):
         raise RuntimeError(
             "Native Geant4 mean-calibration sampling resolution is invalid."
         )
@@ -1560,14 +1508,9 @@ def validate_mean_calibration_transport_metadata(
             not isinstance(actual_hash, str)
             or len(actual_hash) != 64
             or any(character not in "0123456789abcdef" for character in actual_hash)
-            or (
-                expected_hash is not None
-                and actual_hash != str(expected_hash)
-            )
+            or (expected_hash is not None and actual_hash != str(expected_hash))
         ):
-            raise RuntimeError(
-                f"Native Geant4 {key} is missing, invalid, or stale."
-            )
+            raise RuntimeError(f"Native Geant4 {key} is missing, invalid, or stale.")
 
     axis_values = {
         "spectrum_energy_min_keV": NATIVE_GEANT4_ENERGY_MIN_KEV,
@@ -1602,19 +1545,15 @@ def validate_mean_calibration_transport_metadata(
         "requested_threads",
     )
     if requested_threads <= 0 or (
-        expected_thread_count is not None
-        and requested_threads != expected_thread_count
+        expected_thread_count is not None and requested_threads != expected_thread_count
     ):
-        raise RuntimeError(
-            "Native Geant4 mean-calibration thread count is invalid."
-        )
+        raise RuntimeError("Native Geant4 mean-calibration thread count is invalid.")
     if requested_threads > 1 and not _required_metadata_bool(
         metadata,
         "multithreaded_run_manager",
     ):
         raise RuntimeError(
-            "Native Geant4 mean calibration did not use the requested MT "
-            "run manager."
+            "Native Geant4 mean calibration did not use the requested MT run manager."
         )
 
     zero_numbers = (
@@ -1674,8 +1613,7 @@ def validate_mean_calibration_transport_metadata(
         )
     ):
         raise RuntimeError(
-            "Native Geant4 mean-calibration zero-dead-time provenance is "
-            "inconsistent."
+            "Native Geant4 mean-calibration zero-dead-time provenance is inconsistent."
         )
 
     batch_count = _required_metadata_integer(
@@ -1683,30 +1621,29 @@ def validate_mean_calibration_transport_metadata(
         "primary_history_batch_count",
     )
     if batch_count <= 0 or batch_count % stratum_count != 0:
-        raise RuntimeError(
-            "Native Geant4 mean-calibration batch count is invalid."
-        )
+        raise RuntimeError("Native Geant4 mean-calibration batch count is invalid.")
     line_count = batch_count // stratum_count
-    expected_num_primaries = (
-        line_count * expected_histories_per_source_line
-    )
-    if _required_metadata_integer(
-        metadata,
-        "num_primaries",
-    ) != expected_num_primaries:
+    expected_num_primaries = line_count * expected_histories_per_source_line
+    if (
+        _required_metadata_integer(
+            metadata,
+            "num_primaries",
+        )
+        != expected_num_primaries
+    ):
         raise RuntimeError(
             "Native Geant4 mean calibration did not run the fixed line quota."
         )
-    expected_beam_on_calls = (
-        expected_num_primaries + 999_999_999
-    ) // 1_000_000_000
-    if _required_metadata_integer(
-        metadata,
-        "primary_beam_on_calls",
-    ) != expected_beam_on_calls:
+    expected_beam_on_calls = (expected_num_primaries + 999_999_999) // 1_000_000_000
+    if (
+        _required_metadata_integer(
+            metadata,
+            "primary_beam_on_calls",
+        )
+        != expected_beam_on_calls
+    ):
         raise RuntimeError(
-            "Native Geant4 mean calibration did not use the batched BeamOn "
-            "schedule."
+            "Native Geant4 mean calibration did not use the batched BeamOn schedule."
         )
 
     try:
@@ -1931,9 +1868,7 @@ def validate_full_history_transport_metadata(
         expected_source_bias_mode=expected_source_bias_mode,
         expected_background_cps=expected_background_cps,
         expected_dead_time_tau_s=expected_dead_time_tau_s,
-        expected_detector_response_sampling=(
-            expected_detector_response_sampling
-        ),
+        expected_detector_response_sampling=(expected_detector_response_sampling),
         expected_surface_source_contract_sha256=(
             expected_surface_source_contract_sha256
         ),
@@ -2023,9 +1958,7 @@ def _json_string(
     if not isinstance(value, str) or not value:
         raise ValueError(f"{key} must be a nonempty JSON string.")
     if choices is not None and value not in choices:
-        raise ValueError(
-            f"{key} must be one of {sorted(choices)}, got {value!r}."
-        )
+        raise ValueError(f"{key} must be one of {sorted(choices)}, got {value!r}.")
     return value
 
 
@@ -2192,8 +2125,7 @@ class Geant4AppConfig:
         if not isinstance(absorbing_path_prefixes, (list, tuple)):
             raise ValueError("absorbing_path_prefixes must be a list of strings.")
         if any(
-            not isinstance(value, str) or not value
-            for value in absorbing_path_prefixes
+            not isinstance(value, str) or not value for value in absorbing_path_prefixes
         ):
             raise ValueError(
                 "absorbing_path_prefixes entries must be nonempty strings."
@@ -2215,13 +2147,9 @@ class Geant4AppConfig:
             False,
         )
         if not isinstance(sample_detector_response, bool):
-            raise ValueError(
-                "sample_detector_response must be a JSON boolean."
-            )
+            raise ValueError("sample_detector_response must be a JSON boolean.")
         if not isinstance(validation_entry_class_spectra, bool):
-            raise ValueError(
-                "validation_entry_class_spectra must be a JSON boolean."
-            )
+            raise ValueError("validation_entry_class_spectra must be a JSON boolean.")
         use_mock_stage = _json_boolean(
             payload,
             "use_mock_stage",
@@ -2273,8 +2201,7 @@ class Geant4AppConfig:
             mean_calibration_histories_per_source_line is not None
         )
         stratum_count = (
-            mean_calibration_angle_strata_mu
-            * mean_calibration_angle_strata_phi
+            mean_calibration_angle_strata_mu * mean_calibration_angle_strata_phi
         )
         if (
             mean_calibration_enabled
@@ -2286,21 +2213,16 @@ class Geant4AppConfig:
             )
         if (
             mean_calibration_enabled
-            and mean_calibration_histories_per_source_line
-                // stratum_count
-                < 2
+            and mean_calibration_histories_per_source_line // stratum_count < 2
         ):
             raise ValueError(
                 "Mean calibration requires at least two histories per "
                 "mu/phi stratum for covariance estimation."
             )
-        if (
-            not mean_calibration_enabled
-            and (
-                mean_calibration_angle_strata_mu != 1
-                or mean_calibration_angle_strata_phi != 1
-                or mean_calibration_forced_collision
-            )
+        if not mean_calibration_enabled and (
+            mean_calibration_angle_strata_mu != 1
+            or mean_calibration_angle_strata_phi != 1
+            or mean_calibration_forced_collision
         ):
             raise ValueError(
                 "Mean-calibration strata and forced collision require "
@@ -2309,13 +2231,9 @@ class Geant4AppConfig:
         target_sampled_primaries = require_target_sampled_primaries(
             payload.get("target_sampled_primaries")
         )
-        if (
-            mean_calibration_enabled
-            and target_sampled_primaries is not None
-        ):
+        if mean_calibration_enabled and target_sampled_primaries is not None:
             raise ValueError(
-                "Mean calibration cannot combine with "
-                "target_sampled_primaries."
+                "Mean calibration cannot combine with target_sampled_primaries."
             )
         if (
             target_sampled_primaries is not None
@@ -2352,9 +2270,7 @@ class Geant4AppConfig:
             payload,
             "source_bias_mode",
             default="detector_cone",
-            choices=frozenset(
-                {"analog", "detector_cone", "mixture_cone_isotropic"}
-            ),
+            choices=frozenset({"analog", "detector_cone", "mixture_cone_isotropic"}),
         )
         source_bias_cone_half_angle_deg = _json_number(
             payload,
@@ -2363,9 +2279,7 @@ class Geant4AppConfig:
             minimum=0.0,
         )
         if source_bias_cone_half_angle_deg > 180.0:
-            raise ValueError(
-                "source_bias_cone_half_angle_deg must not exceed 180."
-            )
+            raise ValueError("source_bias_cone_half_angle_deg must not exceed 180.")
         source_bias_isotropic_fraction = _json_number(
             payload,
             "source_bias_isotropic_fraction",
@@ -2373,9 +2287,7 @@ class Geant4AppConfig:
             strictly_positive=True,
         )
         if source_bias_isotropic_fraction > 1.0:
-            raise ValueError(
-                "source_bias_isotropic_fraction must lie in (0, 1]."
-            )
+            raise ValueError("source_bias_isotropic_fraction must lie in (0, 1].")
         if source_rate_model == "detector_cps_1m":
             if source_bias_mode != "detector_cone":
                 raise ValueError(
@@ -2428,17 +2340,15 @@ class Geant4AppConfig:
                 )
             if secondary_transport_mode != "full_transport":
                 raise ValueError(
-                    "Mean calibration requires "
-                    "secondary_transport_mode=full_transport."
+                    "Mean calibration requires secondary_transport_mode=full_transport."
                 )
             if not validation_entry_class_spectra:
                 raise ValueError(
-                    "Mean calibration requires "
-                    "validation_entry_class_spectra=true."
+                    "Mean calibration requires validation_entry_class_spectra=true."
                 )
             if accelerated_weighted_transport_enable:
                 raise ValueError(
-                    "Mean calibration cannot combine with legacy weighted "
+                    "Mean calibration cannot combine with retired weighted "
                     "history thinning."
                 )
             if not np.isclose(primary_sampling_fraction, 1.0):
@@ -2485,17 +2395,12 @@ class Geant4AppConfig:
         if mean_calibration_enabled:
             if source_rate_model != "detector_cps_1m":
                 raise ValueError(
-                    "Mean calibration requires "
-                    "source_rate_model=detector_cps_1m."
+                    "Mean calibration requires source_rate_model=detector_cps_1m."
                 )
             if background_cps != 0.0:
-                raise ValueError(
-                    "Mean calibration requires background_cps=0."
-                )
+                raise ValueError("Mean calibration requires background_cps=0.")
             if dead_time_tau_s != 0.0:
-                raise ValueError(
-                    "Mean calibration requires dead_time_tau_s=0."
-                )
+                raise ValueError("Mean calibration requires dead_time_tau_s=0.")
         renderer = _json_string(
             payload,
             "renderer",
@@ -2532,8 +2437,7 @@ class Geant4AppConfig:
         )
         if scatter_gain != 0.0:
             raise ValueError(
-                "scatter_gain is not a native Geant4 runtime option and must "
-                "be 0.0."
+                "scatter_gain is not a native Geant4 runtime option and must be 0.0."
             )
         crystal_shape = _nonempty_string(
             detector_payload.get("crystal_shape", "sphere"),
@@ -2624,23 +2528,15 @@ class Geant4AppConfig:
             mean_calibration_histories_per_source_line=(
                 mean_calibration_histories_per_source_line
             ),
-            mean_calibration_angle_strata_mu=(
-                mean_calibration_angle_strata_mu
-            ),
-            mean_calibration_angle_strata_phi=(
-                mean_calibration_angle_strata_phi
-            ),
-            mean_calibration_forced_collision=(
-                bool(mean_calibration_forced_collision)
-            ),
+            mean_calibration_angle_strata_mu=(mean_calibration_angle_strata_mu),
+            mean_calibration_angle_strata_phi=(mean_calibration_angle_strata_phi),
+            mean_calibration_forced_collision=(bool(mean_calibration_forced_collision)),
             accelerated_weighted_transport_enable=(
                 accelerated_weighted_transport_enable
             ),
             background_cps=background_cps,
             sample_detector_response=sample_detector_response,
-            validation_entry_class_spectra=(
-                validation_entry_class_spectra
-            ),
+            validation_entry_class_spectra=(validation_entry_class_spectra),
             detector_model=ExportedDetectorModel(
                 crystal_radius_m=_json_number(
                     detector_payload,
@@ -2687,9 +2583,94 @@ class Geant4Application:
         *,
         app_config: dict[str, Any] | None = None,
         stage_backend: StageBackend | None = None,
+        production_runtime_config_sha256: str | None = None,
+        expected_native_executable_sha256: str | None = None,
+        expected_native_execution_environment_sha256: str | None = None,
+        expected_implementation_bundle_sha256: str | None = None,
     ) -> None:
         """Create the application and initialize the requested stage backend."""
+        if production_runtime_config_sha256 is not None and (
+            not isinstance(production_runtime_config_sha256, str)
+            or len(production_runtime_config_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in production_runtime_config_sha256
+            )
+        ):
+            raise ValueError(
+                "production_runtime_config_sha256 must be a lowercase SHA-256 string."
+            )
+        self.production_runtime_config_sha256 = production_runtime_config_sha256
         self.config = Geant4AppConfig.from_dict(app_config)
+        self.native_executable_sha256: str | None = None
+        self.native_execution_environment_sha256: str | None = None
+        self.implementation_bundle_sha256: str | None = None
+        for field_name, value in (
+            (
+                "expected_native_executable_sha256",
+                expected_native_executable_sha256,
+            ),
+            (
+                "expected_native_execution_environment_sha256",
+                expected_native_execution_environment_sha256,
+            ),
+            (
+                "expected_implementation_bundle_sha256",
+                expected_implementation_bundle_sha256,
+            ),
+        ):
+            if value is not None and (
+                type(value) is not str
+                or len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
+            ):
+                raise ValueError(f"{field_name} must be a lowercase SHA-256 string.")
+        expected_bundle_parts = (
+            expected_native_executable_sha256,
+            expected_native_execution_environment_sha256,
+            expected_implementation_bundle_sha256,
+        )
+        if any(value is None for value in expected_bundle_parts) and any(
+            value is not None for value in expected_bundle_parts
+        ):
+            raise ValueError(
+                "Native execution provenance requires all approved digests."
+            )
+        if self.production_runtime_config_sha256 is not None or (
+            expected_native_executable_sha256 is not None
+        ):
+            raw_executable = self.config.executable_path
+            if raw_executable is None:
+                raise RuntimeError(
+                    "Production Geant4 sidecar has no native executable."
+                )
+            executable = Path(raw_executable).expanduser()
+            if not executable.is_absolute():
+                executable = Path(__file__).resolve().parents[3] / executable
+            executable = executable.absolute()
+            if self.production_runtime_config_sha256 is not None:
+                self.native_executable_sha256 = native_executable_sha256(executable)
+                self.native_execution_environment_sha256 = (
+                    native_execution_environment_bundle_sha256(executable)
+                )
+            else:
+                self.native_executable_sha256 = expected_native_executable_sha256
+                self.native_execution_environment_sha256 = (
+                    expected_native_execution_environment_sha256
+                )
+            native_engine_executable_path = executable.as_posix()
+        else:
+            native_engine_executable_path = self.config.executable_path
+        if self.production_runtime_config_sha256 is not None:
+            from spectrum.full_spectrum_acceptance_runner import (
+                acceptance_implementation_bundle_sha256,
+            )
+
+            self.implementation_bundle_sha256 = acceptance_implementation_bundle_sha256(
+                Path(__file__).resolve().parents[3]
+            )
+        elif expected_implementation_bundle_sha256 is not None:
+            self.implementation_bundle_sha256 = expected_implementation_bundle_sha256
         self.scene = SceneDescription()
         self.asset_geometry = IsaacAssetGeometry(
             detector_height_m=self.config.detector_height_m,
@@ -2736,7 +2717,7 @@ class Geant4Application:
                 random_seed_base=self.config.random_seed_base,
                 dead_time_tau_s=self.config.dead_time_tau_s,
                 scatter_gain=self.config.scatter_gain,
-                executable_path=self.config.executable_path,
+                executable_path=native_engine_executable_path,
                 executable_args=self.config.executable_args,
                 timeout_s=self.config.timeout_s,
                 persistent_process=self.config.persistent_process,
@@ -2762,11 +2743,16 @@ class Geant4Application:
                     self.config.mean_calibration_forced_collision
                 ),
                 background_cps=self.config.background_cps,
-                sample_detector_response=(
-                    self.config.sample_detector_response
-                ),
+                sample_detector_response=(self.config.sample_detector_response),
                 validation_entry_class_spectra=(
                     self.config.validation_entry_class_spectra
+                ),
+                expected_native_executable_sha256=(self.native_executable_sha256),
+                expected_native_execution_environment_sha256=(
+                    self.native_execution_environment_sha256
+                ),
+                expected_implementation_bundle_sha256=(
+                    self.implementation_bundle_sha256
                 ),
                 radiation_visualization=self.config.radiation_visualization,
             ),
@@ -2776,16 +2762,38 @@ class Geant4Application:
 
     def reset(self, scene: SceneDescription) -> None:
         """Load a new scene description and rebuild or reuse the Geant4 world."""
-        if (
-            scene.usd_path is None
-            and scene.use_config_usd_fallback
-            and self.config.usd_path is not None
-        ):
-            scene.usd_path = self.config.usd_path
-        if self.config.author_obstacle_prims is not None:
-            scene.author_obstacle_prims = self.config.author_obstacle_prims
-        if self.config.author_room_boundary_prims is not None:
-            scene.author_room_boundary_prims = self.config.author_room_boundary_prims
+        if self.production_runtime_config_sha256 is not None:
+            if scene.use_config_usd_fallback:
+                raise ValueError("Production Geant4 reset forbids config USD fallback.")
+            if scene.usd_path != self.config.usd_path:
+                raise ValueError(
+                    "Production scene usd_path differs from its runtime config."
+                )
+            for field_name in (
+                "author_obstacle_prims",
+                "author_room_boundary_prims",
+            ):
+                if getattr(scene, field_name) is not getattr(
+                    self.config,
+                    field_name,
+                ):
+                    raise ValueError(
+                        f"Production scene {field_name} differs from its runtime "
+                        "config."
+                    )
+        else:
+            if (
+                scene.usd_path is None
+                and scene.use_config_usd_fallback
+                and self.config.usd_path is not None
+            ):
+                scene.usd_path = self.config.usd_path
+            if self.config.author_obstacle_prims is not None:
+                scene.author_obstacle_prims = self.config.author_obstacle_prims
+            if self.config.author_room_boundary_prims is not None:
+                scene.author_room_boundary_prims = (
+                    self.config.author_room_boundary_prims
+                )
         self.scene = scene
         self.scene_builder.load_scene(scene, usd_path_override=None)
         self.robot_controller = RobotController(
@@ -2815,11 +2823,7 @@ class Geant4Application:
         budget_enabled = self.config.target_sampled_primaries is not None
         expected_policy_hash = surface_emission_policy_sha256()
         active_scene = getattr(self, "scene", None)
-        scene_sources = (
-            ()
-            if active_scene is None
-            else tuple(active_scene.sources)
-        )
+        scene_sources = () if active_scene is None else tuple(active_scene.sources)
         all_sources_surface_bound = bool(scene_sources) and all(
             source.transport_position_xyz is not None
             and source.surface_chart_id is not None
@@ -2835,17 +2839,11 @@ class Geant4Application:
                     {
                         "isotope": source.isotope,
                         "position": list(source.position_xyz),
-                        "transport_position": list(
-                            source.transport_position_xyz
-                        ),
-                        "intensity_cps_1m": float(
-                            source.intensity_cps_1m
-                        ),
+                        "transport_position": list(source.transport_position_xyz),
+                        "intensity_cps_1m": float(source.intensity_cps_1m),
                         "surface_chart_id": source.surface_chart_id,
                         "surface_uv": list(source.surface_uv),
-                        "surface_normal": list(
-                            source.surface_normal_xyz
-                        ),
+                        "surface_normal": list(source.surface_normal_xyz),
                         "surface_emission_policy_sha256": (
                             source.surface_emission_policy_sha256
                         ),
@@ -2855,9 +2853,7 @@ class Geant4Application:
             )
         engine_scene = getattr(getattr(self, "engine", None), "scene", None)
         scene_hash = (
-            ""
-            if engine_scene is None
-            else str(getattr(engine_scene, "scene_hash", ""))
+            "" if engine_scene is None else str(getattr(engine_scene, "scene_hash", ""))
         )
         metadata: dict[str, object] = {
             "primary_sampling_fraction": float(self.config.primary_sampling_fraction),
@@ -2887,12 +2883,8 @@ class Geant4Application:
             ),
             "dead_time_tau_s": float(self.config.dead_time_tau_s),
             "source_rate_model": str(self.config.source_rate_model),
-            "primary_emission_model": str(
-                self.config.primary_emission_model
-            ),
-            "intensity_cps_1m_definition": (
-                "pre_dead_time_detector_pulse_rate_at_1m"
-            ),
+            "primary_emission_model": str(self.config.primary_emission_model),
+            "intensity_cps_1m_definition": ("pre_dead_time_detector_pulse_rate_at_1m"),
             "requested_threads": int(self.config.thread_count),
             "physics_profile": str(self.config.physics_profile),
             "detector_scoring_mode": str(self.config.detector_scoring_mode),
@@ -2902,29 +2894,17 @@ class Geant4Application:
                 self.config.source_bias_isotropic_fraction
             ),
             "background_cps": float(self.config.background_cps),
-            "sample_detector_response": bool(
-                self.config.sample_detector_response
-            ),
+            "sample_detector_response": bool(self.config.sample_detector_response),
             "detector_response_sampling_contract_sha256": (
                 NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
             ),
-            "spectrum_energy_min_keV": float(
-                NATIVE_GEANT4_ENERGY_MIN_KEV
-            ),
-            "spectrum_energy_max_keV": float(
-                NATIVE_GEANT4_ENERGY_MAX_KEV
-            ),
-            "spectrum_bin_width_keV": float(
-                NATIVE_GEANT4_BIN_WIDTH_KEV
-            ),
+            "spectrum_energy_min_keV": float(NATIVE_GEANT4_ENERGY_MIN_KEV),
+            "spectrum_energy_max_keV": float(NATIVE_GEANT4_ENERGY_MAX_KEV),
+            "spectrum_bin_width_keV": float(NATIVE_GEANT4_BIN_WIDTH_KEV),
             "spectrum_bin_count": int(NATIVE_GEANT4_BIN_COUNT),
-            "background_spectrum_model_id": (
-                NATIVE_GEANT4_BACKGROUND_MODEL_ID
-            ),
+            "background_spectrum_model_id": (NATIVE_GEANT4_BACKGROUND_MODEL_ID),
             "source_position_semantics": "air_side_native_emission_xyz",
-            "source_anchor_semantics": (
-                "exact_surface_chart_uv_evaluation_truth"
-            ),
+            "source_anchor_semantics": ("exact_surface_chart_uv_evaluation_truth"),
             "all_sources_surface_bound": all_sources_surface_bound,
             "surface_emission_epsilon_m": SURFACE_EMISSION_EPSILON_M,
             "surface_emission_policy_sha256": (
@@ -2935,6 +2915,15 @@ class Geant4Application:
             "shield_pose_contract_id": SHIELD_POSE_CONTRACT_ID,
             "shield_pose_contract_sha256": SHIELD_POSE_CONTRACT_SHA256,
         }
+        if self.production_runtime_config_sha256 is not None:
+            metadata["production_runtime_config_sha256"] = (
+                self.production_runtime_config_sha256
+            )
+            metadata["native_executable_sha256"] = self.native_executable_sha256
+            metadata["native_execution_environment_sha256"] = (
+                self.native_execution_environment_sha256
+            )
+            metadata["implementation_bundle_sha256"] = self.implementation_bundle_sha256
         if budget_enabled:
             metadata["history_thinning_resolution"] = "per_observation_pending"
         else:
@@ -2971,16 +2960,12 @@ class Geant4Application:
             )
         )
         metadata = dict(metadata)
-        mean_calibration_quota = (
-            self.config.mean_calibration_histories_per_source_line
-        )
+        mean_calibration_quota = self.config.mean_calibration_histories_per_source_line
         if mean_calibration_quota is not None:
             validate_mean_calibration_transport_metadata(
                 metadata,
                 expected_histories_per_source_line=mean_calibration_quota,
-                expected_angle_strata_mu=(
-                    self.config.mean_calibration_angle_strata_mu
-                ),
+                expected_angle_strata_mu=(self.config.mean_calibration_angle_strata_mu),
                 expected_angle_strata_phi=(
                     self.config.mean_calibration_angle_strata_phi
                 ),
@@ -2990,9 +2975,7 @@ class Geant4Application:
                 expected_source_rate_model=self.config.source_rate_model,
                 expected_thread_count=self.config.thread_count,
                 expected_physics_profile=self.config.physics_profile,
-                expected_detector_scoring_mode=(
-                    self.config.detector_scoring_mode
-                ),
+                expected_detector_scoring_mode=(self.config.detector_scoring_mode),
                 expected_secondary_transport_mode=(
                     self.config.secondary_transport_mode
                 ),
@@ -3016,14 +2999,10 @@ class Geant4Application:
                     self.config.accelerated_weighted_transport_enable
                 ),
                 expected_source_rate_model=self.config.source_rate_model,
-                expected_primary_emission_model=(
-                    self.config.primary_emission_model
-                ),
+                expected_primary_emission_model=(self.config.primary_emission_model),
                 expected_thread_count=self.config.thread_count,
                 expected_physics_profile=self.config.physics_profile,
-                expected_detector_scoring_mode=(
-                    self.config.detector_scoring_mode
-                ),
+                expected_detector_scoring_mode=(self.config.detector_scoring_mode),
                 expected_secondary_transport_mode=(
                     self.config.secondary_transport_mode
                 ),
@@ -3043,10 +3022,7 @@ class Geant4Application:
                 spectrum,
                 dtype=np.float64,
             ).tolist()
-        elif (
-            mean_calibration_quota is None
-            and self.config.sample_detector_response
-        ):
+        elif mean_calibration_quota is None and self.config.sample_detector_response:
             canonical_spectrum = _validate_native_sampled_event_response(
                 spectrum,
                 metadata,
@@ -3081,9 +3057,8 @@ class Geant4Application:
             "shield_thickness_pb_cm",
             float(self.config.shield_thickness.thickness_pb_cm),
         )
-        energy = (
-            np.arange(NATIVE_GEANT4_BIN_COUNT, dtype=np.float64)
-            * float(NATIVE_GEANT4_BIN_WIDTH_KEV)
+        energy = np.arange(NATIVE_GEANT4_BIN_COUNT, dtype=np.float64) * float(
+            NATIVE_GEANT4_BIN_WIDTH_KEV
         )
         bin_width_keV = float(NATIVE_GEANT4_BIN_WIDTH_KEV)
         edges = list(energy) + [float(energy[-1] + bin_width_keV)]

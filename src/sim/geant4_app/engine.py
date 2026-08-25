@@ -28,6 +28,9 @@ from sim.geant4_app.io_format import (
     write_request_file,
     write_scene_file,
 )
+from sim.geant4_app.execution_environment import (
+    require_native_execution_bundle,
+)
 from sim.geant4_app.scene_export import ExportedGeant4Scene
 from sim.radiation_visualization import (
     RadiationVisualizationConfig,
@@ -64,15 +67,11 @@ def validate_native_scene_identity(
             "surface_chart_id": source.surface_chart_id,
             "surface_uv": list(source.surface_uv),
             "surface_normal": list(source.surface_normal_xyz),
-            "surface_emission_policy_sha256": (
-                source.surface_emission_policy_sha256
-            ),
+            "surface_emission_policy_sha256": (source.surface_emission_policy_sha256),
         }
         for source in scene.sources
     ]
-    expected_source_hash = contract_function(
-        expected_entries
-    )
+    expected_source_hash = contract_function(expected_entries)
     expected = {
         "backend": "geant4",
         "engine_mode": "external",
@@ -139,32 +138,24 @@ def validate_native_scene_identity(
     }
     for source_index in range(native_source_count):
         prefix = f"native_surface_source_{source_index}_"
-        entry = {
-            field: metadata.pop(prefix + field, None)
-            for field in scalar_fields
-        }
+        entry = {field: metadata.pop(prefix + field, None) for field in scalar_fields}
         entry.update(
             {
                 field: [
-                    metadata.pop(prefix + component, None)
-                    for component in components
+                    metadata.pop(prefix + component, None) for component in components
                 ]
                 for field, components in vector_fields.items()
             }
         )
         native_entries.append(entry)
     try:
-        native_source_hash = contract_function(
-            native_entries
-        )
+        native_source_hash = contract_function(native_entries)
     except (TypeError, ValueError) as exc:
         raise RuntimeError(
             "Native Geant4 parsed-source identity payload is invalid."
         ) from exc
     unexpected_native_fields = sorted(
-        key
-        for key in metadata
-        if key.startswith("native_surface_source_")
+        key for key in metadata if key.startswith("native_surface_source_")
     )
     if unexpected_native_fields:
         raise RuntimeError(
@@ -186,10 +177,7 @@ def validate_native_shield_pose_identity(
     fe_index, pb_index = request.resolved_orientation_indices()
     if metadata.get("shield_pose_contract_id") != SHIELD_POSE_CONTRACT_ID:
         raise RuntimeError("Native Geant4 shield-pose contract is incompatible.")
-    if (
-        metadata.get("shield_pose_contract_sha256")
-        != SHIELD_POSE_CONTRACT_SHA256
-    ):
+    if metadata.get("shield_pose_contract_sha256") != SHIELD_POSE_CONTRACT_SHA256:
         raise RuntimeError("Native Geant4 shield-pose hash is incompatible.")
     for kind, index in (("fe", fe_index), ("pb", pb_index)):
         try:
@@ -252,11 +240,7 @@ class Geant4StepRequest:
                 dtype=float,
             )
             inferred_index = octant_index_from_normal(-physical_normal)
-            index = (
-                inferred_index
-                if declared_index is None
-                else int(declared_index)
-            )
+            index = inferred_index if declared_index is None else int(declared_index)
             expected = physical_shield_normal_from_orientation_index(index)
             if not np.allclose(
                 physical_normal,
@@ -320,6 +304,9 @@ class Geant4EngineConfig:
     background_cps: float = 0.0
     sample_detector_response: bool = False
     validation_entry_class_spectra: bool = False
+    expected_native_executable_sha256: str | None = None
+    expected_native_execution_environment_sha256: str | None = None
+    expected_implementation_bundle_sha256: str | None = None
     radiation_visualization: RadiationVisualizationConfig = field(
         default_factory=RadiationVisualizationConfig
     )
@@ -339,6 +326,47 @@ class Geant4Engine(ABC):
     @abstractmethod
     def close(self) -> None:
         """Release engine-owned resources."""
+
+
+def _force_stop_persistent_process(
+    process: subprocess.Popen[str],
+) -> list[BaseException]:
+    """Best-effort terminate then kill one ungraceful native child."""
+    failures: list[BaseException] = []
+    try:
+        running = process.poll() is None
+    except BaseException as failure:
+        failures.append(failure)
+        running = True
+    if running:
+        try:
+            process.terminate()
+        except BaseException as failure:
+            failures.append(failure)
+    needs_kill = False
+    try:
+        process.wait(timeout=5.0)
+    except subprocess.TimeoutExpired:
+        needs_kill = True
+    except BaseException as failure:
+        failures.append(failure)
+        needs_kill = True
+    if needs_kill:
+        try:
+            still_running = process.poll() is None
+        except BaseException as failure:
+            failures.append(failure)
+            still_running = True
+        if still_running:
+            try:
+                process.kill()
+            except BaseException as failure:
+                failures.append(failure)
+        try:
+            process.wait(timeout=5.0)
+        except BaseException as failure:
+            failures.append(failure)
+    return failures
 
 
 class ExternalCommandGeant4Engine(Geant4Engine):
@@ -400,6 +428,7 @@ class ExternalCommandGeant4Engine(Geant4Engine):
         """Run one request by launching a fresh native executable process."""
         if self.scene is None:
             raise RuntimeError("Geant4 scene was not loaded before simulate().")
+        self._require_approved_native_launch_environment()
         with tempfile.TemporaryDirectory(prefix="geant4_sidecar_") as tmp_dir:
             tmp_path = Path(tmp_dir)
             scene_path = tmp_path / "scene.txt"
@@ -446,23 +475,7 @@ class ExternalCommandGeant4Engine(Geant4Engine):
         """Run one request through a persistent native executable process."""
         if self.scene is None:
             raise RuntimeError("Geant4 scene was not loaded before simulate().")
-        restart_count = 0
-        for attempt in range(2):
-            try:
-                spectrum, metadata = self._simulate_persistent_once(request)
-                if restart_count > 0:
-                    metadata["persistent_restart_count"] = int(restart_count)
-                return spectrum, metadata
-            except RuntimeError as exc:
-                if (
-                    attempt > 0
-                    or "Persistent Geant4 executable exited unexpectedly"
-                    not in str(exc)
-                ):
-                    raise
-                restart_count += 1
-                self._close_persistent_process()
-        raise RuntimeError("Persistent Geant4 retry loop terminated unexpectedly.")
+        return self._simulate_persistent_once(request)
 
     def _simulate_persistent_once(
         self,
@@ -493,16 +506,16 @@ class ExternalCommandGeant4Engine(Geant4Engine):
 
     def _ensure_persistent_process(self) -> subprocess.Popen[str]:
         """Start the persistent native process if it is not already running."""
-        if (
-            self._persistent_process is not None
-            and self._persistent_process.poll() is None
-        ):
-            return self._persistent_process
         if self._persistent_process is not None:
-            self._persistent_process = None
-        self._persistent_tmpdir = tempfile.TemporaryDirectory(
-            prefix="geant4_persistent_"
-        )
+            returncode = self._persistent_process.poll()
+            if returncode is None:
+                return self._persistent_process
+            raise RuntimeError(
+                "Persistent Geant4 executable exited unexpectedly and cannot "
+                f"be restarted: returncode={returncode}."
+            )
+        self._require_approved_native_launch_environment()
+        persistent_tmpdir = tempfile.TemporaryDirectory(prefix="geant4_persistent_")
         command = [
             str(self.config.executable_path),
             "--persistent",
@@ -516,15 +529,57 @@ class ExternalCommandGeant4Engine(Geant4Engine):
             *self._observation_args(),
             *self.config.executable_args,
         ]
-        self._persistent_process = subprocess.Popen(
-            command,
-            text=True,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            bufsize=1,
-        )
+        try:
+            self._persistent_process = subprocess.Popen(
+                command,
+                text=True,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                bufsize=1,
+            )
+        except BaseException:
+            persistent_tmpdir.cleanup()
+            raise
+        self._persistent_tmpdir = persistent_tmpdir
         return self._persistent_process
+
+    def _require_approved_native_launch_environment(self) -> None:
+        """Reauthenticate executable, libraries, and physics data before Popen."""
+        expected_executable = self.config.expected_native_executable_sha256
+        expected_environment = self.config.expected_native_execution_environment_sha256
+        expected_implementation = self.config.expected_implementation_bundle_sha256
+        expected_digests = (
+            expected_executable,
+            expected_environment,
+            expected_implementation,
+        )
+        if all(digest is None for digest in expected_digests):
+            return
+        if any(digest is None for digest in expected_digests):
+            raise RuntimeError(
+                "Native launch provenance requires executable, execution-"
+                "environment, and Python implementation bundle digests."
+            )
+        executable_path = self.config.executable_path
+        if executable_path is None:
+            raise RuntimeError("Native launch has no executable path.")
+        require_native_execution_bundle(
+            executable_path,
+            expected_executable_sha256=expected_executable,
+            expected_environment_sha256=expected_environment,
+        )
+        from spectrum.full_spectrum_acceptance_runner import (
+            acceptance_implementation_bundle_sha256,
+        )
+
+        actual_implementation = acceptance_implementation_bundle_sha256(
+            Path(__file__).resolve().parents[3]
+        )
+        if actual_implementation != expected_implementation:
+            raise RuntimeError(
+                "Python implementation bundle changed after provenance validation."
+            )
 
     def _persistent_tmp_path(self) -> Path:
         """Return the persistent process temporary directory path."""
@@ -598,34 +653,99 @@ class ExternalCommandGeant4Engine(Geant4Engine):
 
     def close(self) -> None:
         """Release the cached scene reference."""
-        self._close_persistent_process()
-        self.scene = None
+        try:
+            self._close_persistent_process()
+        finally:
+            self.scene = None
 
     def _close_persistent_process(self) -> None:
-        """Terminate the persistent native process and remove temp files."""
+        """Require graceful native shutdown and remove every temporary handle."""
         process = self._persistent_process
         self._persistent_process = None
-        if process is not None and process.poll() is None:
+        failures: list[BaseException] = []
+        if process is not None:
             try:
-                if process.stdin is not None:
+                initial_returncode = process.poll()
+            except BaseException as poll_failure:
+                failures.append(poll_failure)
+                initial_returncode = None
+            forced_stop = False
+            shutdown_write_failed = False
+            if initial_returncode is not None:
+                failures.append(
+                    RuntimeError(
+                        "Persistent Geant4 exited before graceful shutdown: "
+                        f"returncode={initial_returncode}."
+                    )
+                )
+            else:
+                try:
+                    if process.stdin is None:
+                        raise RuntimeError(
+                            "Persistent Geant4 process does not expose stdin "
+                            "for graceful shutdown."
+                        )
                     process.stdin.write("SHUTDOWN\n")
                     process.stdin.flush()
-            except OSError:
-                pass
-            try:
-                process.wait(timeout=5.0)
-            except subprocess.TimeoutExpired:
-                process.terminate()
+                except BaseException as failure:
+                    shutdown_write_failed = True
+                    failures.append(failure)
+                if not shutdown_write_failed:
+                    try:
+                        process.wait(timeout=5.0)
+                    except subprocess.TimeoutExpired:
+                        forced_stop = True
+                    except BaseException as wait_failure:
+                        failures.append(wait_failure)
+                        forced_stop = True
+                if shutdown_write_failed or forced_stop:
+                    failures.extend(_force_stop_persistent_process(process))
+                if forced_stop:
+                    failures.append(
+                        RuntimeError(
+                            "Persistent Geant4 required forced termination after "
+                            "the shutdown deadline."
+                        )
+                    )
                 try:
-                    process.wait(timeout=5.0)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=5.0)
+                    final_returncode = process.poll()
+                except BaseException as poll_failure:
+                    failures.append(poll_failure)
+                    final_returncode = None
+                if (
+                    not shutdown_write_failed
+                    and not forced_stop
+                    and final_returncode != 0
+                ):
+                    failures.append(
+                        RuntimeError(
+                            "Persistent Geant4 exited with nonzero status after "
+                            f"shutdown: returncode={final_returncode}."
+                        )
+                    )
+            for stream in (process.stdin, process.stdout):
+                if stream is None:
+                    continue
+                try:
+                    stream.close()
+                except BaseException as cleanup_failure:
+                    failures.append(cleanup_failure)
         if self._persistent_tmpdir is not None:
-            self._persistent_tmpdir.cleanup()
+            try:
+                self._persistent_tmpdir.cleanup()
+            except BaseException as cleanup_failure:
+                failures.append(cleanup_failure)
         self._persistent_tmpdir = None
         self._persistent_scene_path = None
         self._persistent_scene_hash = None
+        if failures:
+            primary = failures[0]
+            for cleanup_failure in failures[1:]:
+                primary.add_note(
+                    "Persistent Geant4 cleanup also failed: "
+                    f"{type(cleanup_failure).__name__}: {cleanup_failure}"
+                )
+            raise primary
 
     def _source_bias_args(self) -> list[str]:
         """Return native executable arguments for the configured source bias mode."""
@@ -667,11 +787,7 @@ class ExternalCommandGeant4Engine(Geant4Engine):
             arguments.extend(
                 [
                     "--mean-calibration-histories-per-source-line",
-                    str(
-                        int(
-                            self.config.mean_calibration_histories_per_source_line
-                        )
-                    ),
+                    str(int(self.config.mean_calibration_histories_per_source_line)),
                     "--mean-calibration-angle-strata-mu",
                     str(int(self.config.mean_calibration_angle_strata_mu)),
                     "--mean-calibration-angle-strata-phi",

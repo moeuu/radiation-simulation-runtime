@@ -1,9 +1,9 @@
-"""Provide legacy provenance and strict JSON contracts for runtime artifacts."""
+"""Provide fail-closed JSON and digest contracts for runtime artifacts."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import dataclass
 import hashlib
 import json
 import math
@@ -11,9 +11,6 @@ from pathlib import Path
 import re
 import subprocess
 from typing import Any
-
-import numpy as np
-
 
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _DIGEST_ALGORITHM_PATTERN = re.compile(r"^[a-z0-9][a-z0-9.+_-]{2,127}$")
@@ -161,50 +158,6 @@ def load_strict_json(path: str | Path) -> object:
     if source.is_symlink() or not source.is_file():
         raise ValueError("Strict JSON source must be a regular non-symlink file.")
     return strict_json_loads(source.read_bytes())
-
-
-def json_safe(value: Any) -> Any:
-    """Convert values under the legacy schema-v1 provenance policy.
-
-    This compatibility function stringifies unsupported values and mapping
-    keys. New artifact schemas must use :func:`strict_canonical_json_bytes`.
-    """
-    if is_dataclass(value):
-        return json_safe(asdict(value))
-    if isinstance(value, dict):
-        return {str(key): json_safe(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [json_safe(item) for item in value]
-    if isinstance(value, np.ndarray):
-        return json_safe(value.tolist())
-    if isinstance(value, np.generic):
-        return json_safe(value.item())
-    if isinstance(value, Path):
-        return str(value)
-    if value is None or isinstance(value, (str, int, float, bool)):
-        if isinstance(value, float) and not np.isfinite(value):
-            raise ValueError(
-                "Canonical provenance JSON cannot contain NaN or infinity."
-            )
-        return value
-    return str(value)
-
-
-def canonical_json_bytes(value: Any) -> bytes:
-    """Serialize legacy schema-v1 JSON without changing existing digests."""
-    text = json.dumps(
-        json_safe(value),
-        sort_keys=True,
-        indent=2,
-        ensure_ascii=False,
-        allow_nan=False,
-    )
-    return f"{text}\n".encode("utf-8")
-
-
-def sha256_json(value: Any) -> str:
-    """Return the legacy schema-v1 canonical JSON digest."""
-    return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
 
 
 def _strict_json_value(value: Any, *, location: str) -> Any:

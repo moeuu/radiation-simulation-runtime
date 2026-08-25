@@ -36,11 +36,19 @@ from measurement.source_boundary import (
     surface_emission_policy_sha256,
     surface_source_runtime_contract_sha256,
 )
-from measurement.shielding import SHIELD_POSE_CONTRACT_SHA256
+from measurement.shielding import (
+    DEFAULT_DETECTOR_CRYSTAL_RADIUS_CM,
+    DEFAULT_FE_SHIELD_INNER_RADIUS_CM,
+    DEFAULT_FE_SHIELD_THICKNESS_CM,
+    DEFAULT_PB_SHIELD_INNER_RADIUS_CM,
+    DEFAULT_PB_SHIELD_THICKNESS_CM,
+    SHIELD_POSE_CONTRACT_SHA256,
+)
 from spectrum.additive_scatter import (
     ADDITIVE_SCATTER_FEATURE_ORDER,
     ADDITIVE_SCATTER_INCIDENT_LABEL_SEMANTICS,
     ADDITIVE_SCATTER_TARGET_SEMANTICS,
+    DETECTOR_CONE_AIR_XCOM_SINGLE_SCATTER_BASIS_SEMANTICS,
     AdditiveNoncollidedTransportResponse,
     fit_additive_noncollided_transport_response,
     scatter_basis_from_stored_geometry_numpy,
@@ -68,7 +76,7 @@ from spectrum.transport_spectral import (
 )
 
 
-ACCEPTANCE_RUN_CONTRACT_SCHEMA_VERSION = 2
+ACCEPTANCE_RUN_CONTRACT_SCHEMA_VERSION = 3
 ACCEPTANCE_PAIR_SCHEMA_VERSION = 2
 ACCEPTANCE_SCENE_CORPUS_SCHEMA_VERSION = 1
 DISCREPANCY_SELECTION_ARTIFACT_SCHEMA_VERSION = 1
@@ -199,6 +207,12 @@ _NATIVE_POSITION_VARIANTS = (
 _ACCEPTANCE_TRANSPORT_SEED_DOMAIN = (
     "full_spectrum_all64_native_transport_v1"
 )
+_ACCEPTANCE_IMPLEMENTATION_STATIC_PATHS = (
+    Path("pyproject.toml"),
+    Path("uv.lock"),
+    Path("configs/validation/full_spectrum_acceptance.json"),
+    Path("scripts/run_full_spectrum_all64_acceptance.py"),
+)
 
 
 def canonical_json_bytes(payload: object) -> bytes:
@@ -254,6 +268,37 @@ def acceptance_transport_seed(
 def file_sha256(path: str | Path) -> str:
     """Return the SHA-256 digest of one existing file."""
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def acceptance_implementation_bundle_sha256(
+    repository_root: str | Path,
+) -> str:
+    """Hash every Python implementation input shared by acceptance and live."""
+    root = Path(repository_root).resolve()
+    relative_paths = set(_ACCEPTANCE_IMPLEMENTATION_STATIC_PATHS)
+    relative_paths.update(
+        path.relative_to(root)
+        for path in (root / "src").rglob("*.py")
+        if path.is_file()
+    )
+    digest = hashlib.sha256()
+    for relative_path in sorted(
+        relative_paths,
+        key=lambda value: value.as_posix(),
+    ):
+        source = root / relative_path
+        if not source.is_file() or source.is_symlink():
+            raise FileNotFoundError(
+                "Acceptance implementation input is missing or is a symlink: "
+                f"{source}."
+            )
+        encoded_path = relative_path.as_posix().encode("utf-8")
+        raw = source.read_bytes()
+        digest.update(len(encoded_path).to_bytes(8, "big"))
+        digest.update(encoded_path)
+        digest.update(len(raw).to_bytes(8, "big"))
+        digest.update(raw)
+    return digest.hexdigest()
 
 
 def _is_sha256(value: object) -> bool:
@@ -345,6 +390,7 @@ def build_acceptance_run_contract(
     *,
     runtime_config_sha256: str,
     native_executable_sha256: str,
+    native_execution_environment_sha256: str,
     implementation_bundle_sha256: str,
 ) -> dict[str, object]:
     """Return the immutable pre-acquisition acceptance run contract."""
@@ -360,6 +406,10 @@ def build_acceptance_run_contract(
         "native_executable_sha256": _require_sha256(
             native_executable_sha256,
             field_name="native_executable_sha256",
+        ),
+        "native_execution_environment_sha256": _require_sha256(
+            native_execution_environment_sha256,
+            field_name="native_execution_environment_sha256",
         ),
         "implementation_bundle_sha256": _require_sha256(
             implementation_bundle_sha256,
@@ -410,6 +460,42 @@ def build_acceptance_run_contract(
         ),
         "transport_seed_domain": _ACCEPTANCE_TRANSPORT_SEED_DOMAIN,
     }
+
+
+def load_acceptance_run_contract(
+    path: str | Path,
+) -> tuple[dict[str, object], str]:
+    """Load one exact acceptance run contract and return its file digest."""
+    source = Path(path).resolve()
+    payload = _load_json_mapping(source)
+    required_hashes: dict[str, str] = {}
+    for field_name in (
+        "runtime_config_sha256",
+        "native_executable_sha256",
+        "native_execution_environment_sha256",
+        "implementation_bundle_sha256",
+    ):
+        required_hashes[field_name] = _require_sha256(
+            payload.get(field_name),
+            field_name=field_name,
+        )
+    expected = build_acceptance_run_contract(
+        runtime_config_sha256=required_hashes["runtime_config_sha256"],
+        native_executable_sha256=required_hashes[
+            "native_executable_sha256"
+        ],
+        native_execution_environment_sha256=required_hashes[
+            "native_execution_environment_sha256"
+        ],
+        implementation_bundle_sha256=required_hashes[
+            "implementation_bundle_sha256"
+        ],
+    )
+    if dict(payload) != expected:
+        raise ValueError(
+            "Acceptance run contract does not match the current exact schema."
+        )
+    return expected, file_sha256(source)
 
 
 def validate_surface_boundary_gate(payload: object) -> dict[str, object]:
@@ -1443,6 +1529,27 @@ def fit_training_additive_scatter(
     scene_ids: list[str] = []
     line_rows = tuple(dict(row) for row in model.line_identity)
     for record in records:
+        scatter_basis = scatter_basis_from_stored_geometry_numpy(
+            stored_basis=record.scatter_basis_vslf,
+            transport_features=record.features_vslf,
+            line_identity=line_rows,
+            target_semantics=(
+                DETECTOR_CONE_AIR_XCOM_SINGLE_SCATTER_BASIS_SEMANTICS
+            ),
+            detector_radius_m=(
+                DEFAULT_DETECTOR_CRYSTAL_RADIUS_CM / 100.0
+            ),
+            fe_scatter_distance_m=(
+                DEFAULT_FE_SHIELD_INNER_RADIUS_CM
+                + 0.5 * DEFAULT_FE_SHIELD_THICKNESS_CM
+            )
+            / 100.0,
+            pb_scatter_distance_m=(
+                DEFAULT_PB_SHIELD_INNER_RADIUS_CM
+                + 0.5 * DEFAULT_PB_SHIELD_THICKNESS_CM
+            )
+            / 100.0,
+        )
         label_rows = record.labels[
             "entry_class_totals_by_source_line"
         ]
@@ -1481,7 +1588,7 @@ def fit_training_additive_scatter(
                         + float(raw_counts["secondary"])
                     )
                     features.append(
-                        record.scatter_basis_vslf[
+                        scatter_basis[
                             0,
                             source_index,
                             global_index,
@@ -1533,6 +1640,9 @@ def fit_training_additive_scatter(
         np.asarray(weights, dtype=np.float64),
         scene_ids,
         training_manifest=training_manifest,
+        feature_basis_semantics=(
+            DETECTOR_CONE_AIR_XCOM_SINGLE_SCATTER_BASIS_SEMANTICS
+        ),
     )
     if (
         response.to_payload()["target_semantics"]
@@ -1584,21 +1694,19 @@ def _scenario_arrays(
         transport_features=features,
         line_identity=line_identity,
         target_semantics=additive_response.feature_basis_semantics,
-        detector_radius_m=getattr(
-            additive_response,
-            "detector_radius_m",
-            None,
+        detector_radius_m=(
+            DEFAULT_DETECTOR_CRYSTAL_RADIUS_CM / 100.0
         ),
-        fe_scatter_distance_m=getattr(
-            additive_response,
-            "fe_scatter_distance_m",
-            None,
-        ),
-        pb_scatter_distance_m=getattr(
-            additive_response,
-            "pb_scatter_distance_m",
-            None,
-        ),
+        fe_scatter_distance_m=(
+            DEFAULT_FE_SHIELD_INNER_RADIUS_CM
+            + 0.5 * DEFAULT_FE_SHIELD_THICKNESS_CM
+        )
+        / 100.0,
+        pb_scatter_distance_m=(
+            DEFAULT_PB_SHIELD_INNER_RADIUS_CM
+            + 0.5 * DEFAULT_PB_SHIELD_THICKNESS_CM
+        )
+        / 100.0,
     )
     total = additive_response.total_kernel_numpy(
         unattenuated,
@@ -1923,6 +2031,7 @@ __all__ = [
     "AcceptanceScenarioSession",
     "AcceptanceTransportBackend",
     "NATIVE_ACCEPTANCE_FIDELITY",
+    "acceptance_implementation_bundle_sha256",
     "acceptance_transport_seed",
     "acquire_designated_split",
     "acquire_scene_corpus",
@@ -1935,6 +2044,7 @@ __all__ = [
     "freeze_candidate_model",
     "line_identity_contract_sha256",
     "load_acceptance_pair",
+    "load_acceptance_run_contract",
     "load_frozen_candidate_model",
     "select_training_discrepancy",
     "validate_native_fidelity",

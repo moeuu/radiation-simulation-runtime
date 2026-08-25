@@ -290,11 +290,6 @@ def cebr3_efficiency(e_keV: np.ndarray | float) -> np.ndarray:
     return eff
 
 
-def energy_dependent_efficiency(e_keV: np.ndarray | float) -> np.ndarray:
-    """Backward-compatible alias."""
-    return cebr3_efficiency(e_keV)
-
-
 def build_response_matrix(
     energy_axis: NDArray[np.float64],
     library: dict[str, Nuclide],
