@@ -20,6 +20,7 @@ from measurement.obstacle_assets import (
     KnownObstacleInstance,
     obstacle_instances_from_dicts,
 )
+from measurement.obstacles import ObstacleGrid
 
 from sim.isaacsim_app.estimator_visualizer import ISOTOPE_COLORS
 from sim.isaacsim_app.stage_backend import StageBackend
@@ -116,6 +117,11 @@ class SceneDescription:
     obstacle_cells: list[tuple[int, int]] = field(default_factory=list)
     collision_boxes_m: tuple[tuple[float, float, float, float, float, float], ...] = ()
     transport_boxes_m: tuple[tuple[float, float, float, float, float, float], ...] = ()
+    absorber_transport_group: str | None = None
+    absorber_transport_boxes_m: tuple[
+        tuple[float, float, float, float, float, float], ...
+    ] = ()
+    absorber_transport_contract_sha256: str | None = None
     transport_mu_by_isotope: dict[str, tuple[float, ...]] = field(default_factory=dict)
     transport_line_mu_by_isotope: dict[str, tuple[tuple[float, ...], ...]] = field(
         default_factory=dict
@@ -478,6 +484,19 @@ def build_scene_description(payload: dict[str, Any]) -> SceneDescription:
         payload.get("transport_boxes_m", []),
         field_name="transport_boxes_m",
     )
+    absorber_transport_boxes = _as_axis_aligned_boxes(
+        payload.get("absorber_transport_boxes_m", []),
+        field_name="absorber_transport_boxes_m",
+    )
+    absorber_transport_group_raw = payload.get("absorber_transport_group")
+    absorber_transport_group = (
+        None
+        if absorber_transport_group_raw is None
+        else _nonempty_string(
+            absorber_transport_group_raw,
+            field_name="absorber_transport_group",
+        )
+    )
     transport_mu = _as_transport_mu_by_isotope(
         payload.get("transport_mu_by_isotope", {}),
         box_count=len(transport_boxes),
@@ -490,6 +509,33 @@ def build_scene_description(payload: dict[str, Any]) -> SceneDescription:
         payload.get("transport_line_compton_mu_by_isotope", {}),
         box_count=len(transport_boxes),
     )
+    absorber_contract_grid = ObstacleGrid(
+        origin=(obstacle_origin[0], obstacle_origin[1]),
+        cell_size=_finite_number(
+            payload.get("obstacle_cell_size_m", 1.0),
+            field_name="obstacle_cell_size_m",
+            strictly_positive=True,
+        ),
+        grid_shape=obstacle_grid_shape,
+        blocked_cells=tuple(obstacle_cells),
+        collision_boxes_m=collision_boxes,
+        transport_boxes_m=transport_boxes,
+        transport_mu_by_isotope=transport_mu,
+        transport_line_mu_by_isotope=transport_line_mu,
+        transport_line_compton_mu_by_isotope=transport_line_compton_mu,
+        absorber_transport_group=absorber_transport_group,
+        absorber_transport_boxes_m=absorber_transport_boxes,
+    )
+    absorber_contract_sha256 = payload.get(
+        "absorber_transport_contract_sha256"
+    )
+    if absorber_contract_sha256 != (
+        absorber_contract_grid.absorber_transport_contract_sha256
+    ):
+        raise ValueError(
+            "absorber_transport_contract_sha256 does not match the scene "
+            "absorber group and geometry."
+        )
     obstacle_instances = obstacle_instances_from_dicts(
         payload.get("obstacle_instances", [])
     )
@@ -529,6 +575,9 @@ def build_scene_description(payload: dict[str, Any]) -> SceneDescription:
         obstacle_cells=obstacle_cells,
         collision_boxes_m=collision_boxes,
         transport_boxes_m=transport_boxes,
+        absorber_transport_group=absorber_transport_group,
+        absorber_transport_boxes_m=absorber_transport_boxes,
+        absorber_transport_contract_sha256=absorber_contract_sha256,
         transport_mu_by_isotope=transport_mu,
         transport_line_mu_by_isotope=transport_line_mu,
         transport_line_compton_mu_by_isotope=transport_line_compton_mu,

@@ -16,6 +16,10 @@ from measurement.source_boundary import (
 from spectrum.response_matrix import (
     NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256,
 )
+from spectrum.detector_response_validation import (
+    detector_response_validation_manifest_sha256,
+    validate_detector_response_validation_manifest,
+)
 from spectrum.transport_spectral import (
     ACCEPTANCE_METRIC_CONTRACT,
     DESIGNATED_HOLDOUT_SCENE_SEEDS,
@@ -402,6 +406,8 @@ def load_training_scene_artifacts(
 
 def build_independent_validation_manifest(
     paths: Sequence[str | Path],
+    *,
+    detector_response_validation_manifest: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Aggregate holdout-only metrics and preserve all-scene provenance."""
     all_seeds = (
@@ -417,6 +423,28 @@ def build_independent_validation_manifest(
         raise ValueError("Validation metrics must originate from holdout scenes.")
     model_hash = artifacts[0].model_contract_sha256
     additive_hash = artifacts[0].additive_scatter_contract_sha256
+    if detector_response_validation_manifest is None:
+        raise RuntimeError(
+            "Production approval requires an independent full-detector "
+            "response validation manifest."
+        )
+    detector_response_validation = (
+        validate_detector_response_validation_manifest(
+            detector_response_validation_manifest,
+            expected_native_executable_sha256=(
+                artifacts[0].native_executable_sha256
+            ),
+            expected_native_execution_environment_sha256=(
+                artifacts[0].native_execution_environment_sha256
+            ),
+            expected_implementation_bundle_sha256=(
+                artifacts[0].implementation_bundle_sha256
+            ),
+            expected_runtime_config_sha256=(
+                artifacts[0].runtime_config_sha256
+            ),
+        )
+    )
     metrics: dict[str, dict[str, object]] = {}
     for metric_id, (comparison, threshold) in (
         ACCEPTANCE_METRIC_CONTRACT.items()
@@ -435,7 +463,7 @@ def build_independent_validation_manifest(
             "passed": bool(passed),
         }
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "validation_contract_sha256": (
             FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256
         ),
@@ -455,6 +483,12 @@ def build_independent_validation_manifest(
         ),
         "native_response_contract_sha256": (
             NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
+        ),
+        "detector_response_validation": detector_response_validation,
+        "detector_response_validation_manifest_sha256": (
+            detector_response_validation_manifest_sha256(
+                detector_response_validation
+            )
         ),
         "additive_scatter_contract_sha256": additive_hash,
         "surface_emission_policy_sha256": (
@@ -495,9 +529,16 @@ def build_independent_validation_manifest(
 def write_independent_validation_manifest(
     paths: Sequence[str | Path],
     output_path: str | Path,
+    *,
+    detector_response_validation_manifest: Mapping[str, object],
 ) -> Path:
     """Validate artifacts and write one deterministic validation manifest."""
-    manifest = build_independent_validation_manifest(paths)
+    manifest = build_independent_validation_manifest(
+        paths,
+        detector_response_validation_manifest=(
+            detector_response_validation_manifest
+        ),
+    )
     destination = Path(output_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(

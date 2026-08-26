@@ -13,6 +13,14 @@ from measurement.shielding import (
     shield_pose_contract_payload,
 )
 from runtime.provenance import strict_sha256_json
+from spectrum.air_attenuation import (
+    NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_ID,
+    NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_SHA256,
+)
+from spectrum.geant4_physics import (
+    GEANT4_PHYSICS_CONTRACT_ID,
+    GEANT4_PHYSICS_CONTRACT_SHA256,
+)
 from spectrum.physics_contracts import (
     OBSTACLE_MATERIAL_CONTRACT_ID,
     OBSTACLE_MATERIAL_CONTRACT_SHA256,
@@ -24,7 +32,7 @@ from spectrum.response_matrix import (
 )
 
 
-FORWARD_MODEL_MANIFEST_SCHEMA_VERSION = 4
+FORWARD_MODEL_MANIFEST_SCHEMA_VERSION = 5
 SOURCE_RATE_MODEL = "detector_cps_1m"
 SOURCE_RATE_SEMANTICS = {
     "quantity": "expected_pre_dead_time_detector_pulse_rate",
@@ -105,6 +113,10 @@ _NATIVE_FIELDS = {
     "line_mu_by_isotope",
     "shield_pose_contract_id",
     "shield_pose_contract_sha256",
+    "dry_air_total_attenuation_contract_id",
+    "dry_air_total_attenuation_contract_sha256",
+    "geant4_physics_contract_id",
+    "geant4_physics_contract_sha256",
     "detector_response_contract_sha256",
     "obstacle_material_contract_id",
     "obstacle_material_contract_sha256",
@@ -516,6 +528,14 @@ def build_forward_model_manifest(
         "line_mu_by_isotope": line_table,
         "shield_pose_contract_id": SHIELD_POSE_CONTRACT_ID,
         "shield_pose_contract_sha256": SHIELD_POSE_CONTRACT_SHA256,
+        "dry_air_total_attenuation_contract_id": (
+            NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_ID
+        ),
+        "dry_air_total_attenuation_contract_sha256": (
+            NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_SHA256
+        ),
+        "geant4_physics_contract_id": GEANT4_PHYSICS_CONTRACT_ID,
+        "geant4_physics_contract_sha256": GEANT4_PHYSICS_CONTRACT_SHA256,
         "detector_response_contract_sha256": (
             NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
         ),
@@ -621,6 +641,21 @@ def _validate_common(
         != SHIELD_POSE_CONTRACT_SHA256
     ):
         raise ValueError("forward-model shield-pose contract hash is incompatible.")
+    immutable_transport_contracts = {
+        "dry_air_total_attenuation_contract_id": (
+            NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_ID
+        ),
+        "dry_air_total_attenuation_contract_sha256": (
+            NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_SHA256
+        ),
+        "geant4_physics_contract_id": GEANT4_PHYSICS_CONTRACT_ID,
+        "geant4_physics_contract_sha256": GEANT4_PHYSICS_CONTRACT_SHA256,
+    }
+    for field_name, expected_value in immutable_transport_contracts.items():
+        if payload.get(field_name) != expected_value:
+            raise ValueError(
+                f"forward-model {field_name} is incompatible."
+            )
     if (
         payload.get("detector_response_contract_sha256")
         != NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256

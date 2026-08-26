@@ -31,6 +31,7 @@ from spectrum.native_metadata import (
     native_source_line_token,
     sanitize_native_metadata_token,
 )
+from spectrum.geant4_physics import GEANT4_VERSION_TAG
 from spectrum.response_matrix import NATIVE_GEANT4_BIN_COUNT
 from spectrum.transport_spectral import (
     ACCEPTANCE_GEOMETRY_DEVICE,
@@ -180,6 +181,7 @@ def _config() -> SimpleNamespace:
         accelerated_weighted_transport_enable=False,
         sample_detector_response=True,
         validation_entry_class_spectra=True,
+        absorbing_transport_groups=("wall",),
     )
 
 
@@ -198,6 +200,31 @@ def _metadata(*, source_count: int) -> dict[str, object]:
         ),
         "validation_entry_spectrum_grouping": (
             "source_token_initial_gamma_line_entry_class"
+        ),
+        "absorbing_transport_groups": "wall",
+        "geant4_version_number": 1132,
+        "geant4_version_tag": GEANT4_VERSION_TAG,
+        "reference_physics_list": "FTFP_BERT",
+        "electromagnetic_physics_constructor": (
+            "G4EmStandardPhysics_option4"
+        ),
+        "production_cut_range_mm": 0.7,
+        "gamma_process_names": "GammaGeneralProc,Transportation",
+        "gamma_em_subprocess_names": "Rayl,compt,conv,phot",
+        "geant4_physics_contract_id": NATIVE_ACCEPTANCE_FIDELITY[
+            "geant4_physics_contract_id"
+        ],
+        "geant4_physics_contract_sha256": NATIVE_ACCEPTANCE_FIDELITY[
+            "geant4_physics_contract_sha256"
+        ],
+        "material_resolution_contract_id": NATIVE_ACCEPTANCE_FIDELITY[
+            "material_resolution_contract_id"
+        ],
+        "process_count_compton": 0,
+        "process_count_rayleigh": 0,
+        "process_count_photoelectric": 0,
+        "transport_process_counts": (
+            "Rayl:0,Transportation:1,compt:0,phot:0"
         ),
         "requested_threads": 32,
         "primary_sampling_fraction": 1.0,

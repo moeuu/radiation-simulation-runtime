@@ -207,6 +207,13 @@ def build_random_surface_scenario(
         "obstacle_cells": [list(cell) for cell in grid.blocked_cells],
         "collision_boxes_m": [list(box) for box in grid.collision_boxes_m],
         "transport_boxes_m": [list(box) for box in grid.transport_boxes_m],
+        "absorber_transport_group": grid.absorber_transport_group,
+        "absorber_transport_boxes_m": [
+            list(box) for box in grid.absorber_transport_boxes_m
+        ],
+        "absorber_transport_contract_sha256": (
+            grid.absorber_transport_contract_sha256
+        ),
         "transport_mu_by_isotope": {
             isotope: [float(value) for value in values]
             for isotope, values in grid.transport_mu_by_isotope.items()

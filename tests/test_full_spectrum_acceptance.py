@@ -20,12 +20,18 @@ from spectrum.full_spectrum_acceptance import (
 from spectrum.response_matrix import (
     NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256,
 )
+from spectrum.detector_response_validation import (
+    build_detector_response_validation_manifest,
+)
 from spectrum.transport_spectral import (
     ACCEPTANCE_METRIC_CONTRACT,
     DESIGNATED_HOLDOUT_SCENE_SEEDS,
     DESIGNATED_TRAINING_SCENE_SEEDS,
     FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256,
     VALIDATION_SCENARIO_IDS,
+)
+from tests.detector_response_test_support import (
+    passing_detector_response_raw_corpus,
 )
 
 
@@ -166,10 +172,25 @@ def _all_artifacts(
     return paths
 
 
+def _detector_response_validation() -> dict[str, object]:
+    """Return a passing independent-response fixture for aggregation tests."""
+    return build_detector_response_validation_manifest(
+        passing_detector_response_raw_corpus(
+            native_executable_sha256="e" * 64,
+            native_execution_environment_sha256="1" * 64,
+            implementation_bundle_sha256="f" * 64,
+            runtime_config_sha256="d" * 64,
+        )
+    )
+
+
 def test_validation_metrics_use_holdout_scenes_only(tmp_path: Path) -> None:
     """Arbitrarily bad training metrics cannot change holdout acceptance."""
     manifest = build_independent_validation_manifest(
-        _all_artifacts(tmp_path, hostile_training=True)
+        _all_artifacts(tmp_path, hostile_training=True),
+        detector_response_validation_manifest=(
+            _detector_response_validation()
+        ),
     )
 
     assert manifest["metric_split"] == "holdout_only"
@@ -179,7 +200,7 @@ def test_validation_metrics_use_holdout_scenes_only(tmp_path: Path) -> None:
     assert manifest["metric_aggregation"] == (
         "holdout_scene_conservative_worst_case"
     )
-    assert manifest["schema_version"] == 3
+    assert manifest["schema_version"] == 4
     assert manifest["acceptance_run_contract_sha256"] == "c" * 64
     assert manifest["runtime_config_sha256"] == "d" * 64
     assert manifest["native_executable_sha256"] == "e" * 64
@@ -199,7 +220,10 @@ def test_one_failing_holdout_cannot_be_masked_by_training(
             tmp_path,
             failing_holdout=True,
             hostile_training=False,
-        )
+        ),
+        detector_response_validation_manifest=(
+            _detector_response_validation()
+        ),
     )
 
     result = manifest["metrics"][

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 import json
 import math
 from numbers import Real
@@ -14,6 +15,9 @@ import numpy as np
 
 EXPLORATION_BACKBONE_MAX_GAP_CELLS = 4
 _BOX_CONTACT_TOLERANCE_M = 1.0e-12
+ABSORBER_TRANSPORT_SCHEMA_VERSION = 1
+ABSORBER_TRANSPORT_MODE = "absorber"
+ROOM_ABSORBER_TRANSPORT_GROUP = "wall"
 
 
 def _finite_real(
@@ -168,6 +172,29 @@ def _normalize_isotope_key(value: str) -> str:
     return "".join(ch for ch in str(value).upper() if ch.isalnum())
 
 
+def _absorber_transport_contract_sha256(
+    group: str,
+    boxes_m: tuple[
+        tuple[float, float, float, float, float, float], ...
+    ],
+) -> str:
+    """Return the canonical absorber group/geometry contract hash."""
+    payload = {
+        "schema_version": ABSORBER_TRANSPORT_SCHEMA_VERSION,
+        "transport_mode": ABSORBER_TRANSPORT_MODE,
+        "transport_group": group,
+        "boxes_m": [list(box) for box in boxes_m],
+    }
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 @dataclass(frozen=True)
 class ObstacleGrid:
     """Represent blocked 1 m grid cells on the z=0 plane."""
@@ -186,6 +213,10 @@ class ObstacleGrid:
         tuple[tuple[float, ...], ...],
     ] = field(default_factory=dict)
     collision_boxes_m: tuple[tuple[float, float, float, float, float, float], ...] = ()
+    absorber_transport_group: str | None = None
+    absorber_transport_boxes_m: tuple[
+        tuple[float, float, float, float, float, float], ...
+    ] = ()
 
     def __post_init__(self) -> None:
         """Normalize exact inputs and validate physical geometry."""
@@ -242,6 +273,49 @@ class ObstacleGrid:
             self.transport_boxes_m,
             field_name="transport_boxes_m",
         )
+        absorber_boxes = _validated_boxes(
+            self.absorber_transport_boxes_m,
+            field_name="absorber_transport_boxes_m",
+        )
+        absorber_group = self.absorber_transport_group
+        if absorber_boxes:
+            if (
+                not isinstance(absorber_group, str)
+                or not absorber_group
+                or absorber_group.strip() != absorber_group
+                or absorber_group.lower() != absorber_group
+            ):
+                raise ValueError(
+                    "absorber_transport_group must be one canonical lowercase "
+                    "group when absorber boxes are present."
+                )
+        elif absorber_group is not None:
+            raise ValueError(
+                "absorber_transport_group must be None when absorber boxes "
+                "are absent."
+            )
+        if transport_boxes and absorber_boxes:
+            material_array = np.asarray(transport_boxes, dtype=float)
+            absorber_array = np.asarray(absorber_boxes, dtype=float)
+            overlap_lower = np.maximum(
+                material_array[:, None, :3],
+                absorber_array[None, :, :3],
+            )
+            overlap_upper = np.minimum(
+                material_array[:, None, 3:],
+                absorber_array[None, :, 3:],
+            )
+            if np.any(
+                np.all(
+                    overlap_upper - overlap_lower
+                    > _BOX_CONTACT_TOLERANCE_M,
+                    axis=2,
+                )
+            ):
+                raise ValueError(
+                    "Material transport boxes must not overlap absorber "
+                    "transport boxes with positive volume."
+                )
         transport_mu = _validated_isotope_table(
             self.transport_mu_by_isotope,
             field_name="transport_mu_by_isotope",
@@ -285,6 +359,16 @@ class ObstacleGrid:
         object.__setattr__(self, "blocked_cells", blocked)
         object.__setattr__(self, "collision_boxes_m", collision_boxes)
         object.__setattr__(self, "transport_boxes_m", transport_boxes)
+        object.__setattr__(
+            self,
+            "absorber_transport_group",
+            absorber_group,
+        )
+        object.__setattr__(
+            self,
+            "absorber_transport_boxes_m",
+            absorber_boxes,
+        )
         object.__setattr__(self, "transport_mu_by_isotope", transport_mu)
         object.__setattr__(
             self,
@@ -435,6 +519,17 @@ class ObstacleGrid:
         """Return True when known transport components are attached."""
         return bool(self.transport_boxes_m)
 
+    @property
+    def absorber_transport_contract_sha256(self) -> str | None:
+        """Return the exact absorber group/geometry hash, if configured."""
+        if not self.absorber_transport_boxes_m:
+            return None
+        assert self.absorber_transport_group is not None
+        return _absorber_transport_contract_sha256(
+            self.absorber_transport_group,
+            self.absorber_transport_boxes_m,
+        )
+
     def transport_boxes(self) -> list[tuple[float, float, float, float, float, float]]:
         """Return known obstacle transport boxes in meters."""
         return [tuple(box) for box in self.transport_boxes_m]
@@ -504,6 +599,8 @@ class ObstacleGrid:
         line_compton_mu_by_isotope: (
             dict[str, Sequence[Sequence[float]]] | None
         ) = None,
+        absorber_transport_group: str | None = None,
+        absorber_boxes_m: Iterable[Sequence[float]] = (),
     ) -> "ObstacleGrid":
         """Return a copy with known obstacle transport components attached."""
         return ObstacleGrid(
@@ -524,6 +621,10 @@ class ObstacleGrid:
                     line_compton_mu_by_isotope or {}
                 ).items()
             },
+            absorber_transport_group=absorber_transport_group,
+            absorber_transport_boxes_m=tuple(
+                tuple(box) for box in absorber_boxes_m
+            ),
         )
 
     def with_collision_model(
@@ -544,6 +645,8 @@ class ObstacleGrid:
             transport_line_compton_mu_by_isotope=(
                 self.transport_line_compton_mu_by_isotope
             ),
+            absorber_transport_group=self.absorber_transport_group,
+            absorber_transport_boxes_m=self.absorber_transport_boxes_m,
         )
 
     def blocked_polygons(
@@ -558,7 +661,7 @@ class ObstacleGrid:
     def to_dict(self) -> dict:
         """Return a JSON-serializable representation of the grid."""
         return {
-            "version": 1,
+            "version": 2,
             "origin": [self.origin[0], self.origin[1]],
             "cell_size": self.cell_size,
             "grid_shape": [self.grid_shape[0], self.grid_shape[1]],
@@ -566,6 +669,13 @@ class ObstacleGrid:
             "blocked_fraction": self.blocked_fraction,
             "collision_boxes_m": [list(box) for box in self.collision_boxes_m],
             "transport_boxes_m": [list(box) for box in self.transport_boxes_m],
+            "absorber_transport_group": self.absorber_transport_group,
+            "absorber_transport_boxes_m": [
+                list(box) for box in self.absorber_transport_boxes_m
+            ],
+            "absorber_transport_contract_sha256": (
+                self.absorber_transport_contract_sha256
+            ),
             "transport_mu_by_isotope": {
                 isotope: [float(value) for value in values]
                 for isotope, values in sorted(self.transport_mu_by_isotope.items())
@@ -606,6 +716,9 @@ class ObstacleGrid:
             "grid_shape",
             "blocked_cells",
             "blocked_fraction",
+            "absorber_transport_group",
+            "absorber_transport_boxes_m",
+            "absorber_transport_contract_sha256",
         }
         optional = {
             "collision_boxes_m",
@@ -627,8 +740,8 @@ class ObstacleGrid:
             field_name="version",
             minimum=1,
         )
-        if version != 1:
-            raise ValueError("Obstacle layout version must be exactly 1.")
+        if version != 2:
+            raise ValueError("Obstacle layout version must be exactly 2.")
         grid = cls(
             origin=data["origin"],
             cell_size=data["cell_size"],
@@ -636,6 +749,8 @@ class ObstacleGrid:
             blocked_cells=data["blocked_cells"],
             collision_boxes_m=data.get("collision_boxes_m", ()),
             transport_boxes_m=data.get("transport_boxes_m", ()),
+            absorber_transport_group=data["absorber_transport_group"],
+            absorber_transport_boxes_m=data["absorber_transport_boxes_m"],
             transport_mu_by_isotope=data.get("transport_mu_by_isotope", {}),
             transport_line_mu_by_isotope=data.get(
                 "transport_line_mu_by_isotope",
@@ -646,6 +761,14 @@ class ObstacleGrid:
                 {},
             ),
         )
+        if (
+            data["absorber_transport_contract_sha256"]
+            != grid.absorber_transport_contract_sha256
+        ):
+            raise ValueError(
+                "absorber_transport_contract_sha256 does not match the "
+                "declared absorber group and geometry."
+            )
         declared_fraction = _finite_real(
             data["blocked_fraction"],
             field_name="blocked_fraction",

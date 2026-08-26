@@ -151,12 +151,20 @@ def obstacle_grid_from_payload(payload: Mapping[str, Any]) -> ObstacleGrid | Non
     grid_shape = shape_payload
     collision_boxes_payload = payload.get("collision_boxes_m", [])
     transport_boxes_payload = payload.get("transport_boxes_m", [])
+    absorber_boxes_payload = payload.get("absorber_transport_boxes_m", [])
     if not isinstance(collision_boxes_payload, list):
         raise ValueError("collision_boxes_m must be a list.")
     if not isinstance(transport_boxes_payload, list):
         raise ValueError("transport_boxes_m must be a list.")
+    if not isinstance(absorber_boxes_payload, list):
+        raise ValueError("absorber_transport_boxes_m must be a list.")
     has_grid = grid_shape[0] > 0 and grid_shape[1] > 0
-    if not has_grid and not collision_boxes_payload and not transport_boxes_payload:
+    if (
+        not has_grid
+        and not collision_boxes_payload
+        and not transport_boxes_payload
+        and not absorber_boxes_payload
+    ):
         return None
     origin_payload = payload.get("obstacle_origin_xy", (0.0, 0.0))
     if not isinstance(origin_payload, (list, tuple)) or len(origin_payload) != 2:
@@ -171,6 +179,8 @@ def obstacle_grid_from_payload(payload: Mapping[str, Any]) -> ObstacleGrid | Non
         blocked_cells=cells_payload,
         collision_boxes_m=collision_boxes_payload,
         transport_boxes_m=transport_boxes_payload,
+        absorber_transport_group=payload.get("absorber_transport_group"),
+        absorber_transport_boxes_m=absorber_boxes_payload,
         transport_mu_by_isotope=payload.get(
             "transport_mu_by_isotope",
             {},

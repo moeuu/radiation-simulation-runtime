@@ -31,6 +31,11 @@ import numpy as np
 from numpy.typing import NDArray
 
 from measurement.geometry_family import validate_geometry_family_descriptor
+from measurement.obstacle_assets import room_boundary_transport_components
+from measurement.obstacles import (
+    ROOM_ABSORBER_TRANSPORT_GROUP,
+    ObstacleGrid,
+)
 from measurement.source_boundary import (
     SURFACE_EMISSION_EPSILON_M,
     canonical_surface_source_runtime_payload,
@@ -60,8 +65,24 @@ from spectrum.additive_scatter import (
     fit_additive_noncollided_transport_response,
     scatter_basis_from_stored_geometry_numpy,
 )
+from spectrum.air_attenuation import (
+    NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_ID,
+    NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_SHA256,
+)
 from spectrum.full_spectrum_acceptance import (
     SURFACE_BOUNDARY_GATE_SCHEMA_VERSION,
+)
+from spectrum.geant4_physics import (
+    GEANT4_EM_PHYSICS_CONSTRUCTOR,
+    GEANT4_GAMMA_EM_SUBPROCESS_NAMES,
+    GEANT4_GAMMA_PROCESS_NAMES,
+    GEANT4_MATERIAL_RESOLUTION_CONTRACT_ID,
+    GEANT4_PHYSICS_CONTRACT_ID,
+    GEANT4_PHYSICS_CONTRACT_SHA256,
+    GEANT4_PRODUCTION_CUT_RANGE_MM,
+    GEANT4_REFERENCE_PHYSICS_LIST,
+    GEANT4_VERSION_NUMBER,
+    GEANT4_VERSION_TAG,
 )
 from spectrum.native_metadata import native_source_line_token
 from spectrum.physics_contracts import (
@@ -94,8 +115,8 @@ from spectrum.transport_spectral import (
 )
 
 
-ACCEPTANCE_RUN_CONTRACT_SCHEMA_VERSION = 4
-ACCEPTANCE_PAIR_SCHEMA_VERSION = 2
+ACCEPTANCE_RUN_CONTRACT_SCHEMA_VERSION = 5
+ACCEPTANCE_PAIR_SCHEMA_VERSION = 3
 ACCEPTANCE_SCENE_CORPUS_SCHEMA_VERSION = 1
 DISCREPANCY_SELECTION_ARTIFACT_SCHEMA_VERSION = 1
 ACCEPTANCE_ISOTOPES = ("Co-60", "Cs-137", "Eu-154")
@@ -147,6 +168,20 @@ NATIVE_ACCEPTANCE_FIDELITY = {
         "source_token_initial_gamma_line_entry_class"
     ),
     "spectrum_bin_count": NATIVE_GEANT4_BIN_COUNT,
+    "geant4_version_number": GEANT4_VERSION_NUMBER,
+    "geant4_version_tag": GEANT4_VERSION_TAG,
+    "reference_physics_list": GEANT4_REFERENCE_PHYSICS_LIST,
+    "electromagnetic_physics_constructor": (
+        GEANT4_EM_PHYSICS_CONSTRUCTOR
+    ),
+    "production_cut_range_mm": GEANT4_PRODUCTION_CUT_RANGE_MM,
+    "gamma_process_names": GEANT4_GAMMA_PROCESS_NAMES,
+    "gamma_em_subprocess_names": GEANT4_GAMMA_EM_SUBPROCESS_NAMES,
+    "geant4_physics_contract_id": GEANT4_PHYSICS_CONTRACT_ID,
+    "geant4_physics_contract_sha256": GEANT4_PHYSICS_CONTRACT_SHA256,
+    "material_resolution_contract_id": (
+        GEANT4_MATERIAL_RESOLUTION_CONTRACT_ID
+    ),
 }
 _PAIR_KEYS = frozenset(
     {
@@ -169,6 +204,7 @@ _PAIR_KEYS = frozenset(
         "geometry_family",
         "validation_labels",
         "native_fidelity",
+        "native_process_diagnostics",
         "detector_response_contract_sha256",
         "shield_pose_contract_sha256",
         "obstacle_material_contract_sha256",
@@ -457,6 +493,29 @@ def build_acceptance_run_contract(
             "room_boundary_thickness_m": (
                 STANDARD_ROOM_BOUNDARY_THICKNESS_M
             ),
+            "absorber_transport_mode": "absorber",
+            "absorber_transport_group": ROOM_ABSORBER_TRANSPORT_GROUP,
+            "absorber_transport_contract_sha256": (
+                ObstacleGrid(
+                    origin=(0.0, 0.0),
+                    cell_size=1.0,
+                    grid_shape=(1, 1),
+                    blocked_cells=(),
+                    absorber_transport_group=(
+                        ROOM_ABSORBER_TRANSPORT_GROUP
+                    ),
+                    absorber_transport_boxes_m=tuple(
+                        component.box_m
+                        for component in room_boundary_transport_components(
+                            ACCEPTANCE_ROOM_SIZE_XYZ,
+                            thickness_m=(
+                                STANDARD_ROOM_BOUNDARY_THICKNESS_M
+                            ),
+                            material=STANDARD_OBSTACLE_MATERIAL,
+                        )
+                    ),
+                ).absorber_transport_contract_sha256
+            ),
         },
         "geometry_compute": {
             "use_gpu": ACCEPTANCE_GEOMETRY_USE_GPU,
@@ -464,6 +523,10 @@ def build_acceptance_run_contract(
             "dtype": ACCEPTANCE_GEOMETRY_DTYPE,
         },
         "native_fidelity": dict(NATIVE_ACCEPTANCE_FIDELITY),
+        "dry_air_total_attenuation_contract": {
+            "id": NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_ID,
+            "sha256": NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_SHA256,
+        },
         "surface_emission_policy_sha256": (
             surface_emission_policy_sha256()
         ),
@@ -580,6 +643,57 @@ def validate_native_fidelity(payload: object) -> dict[str, object]:
                 f"Native fidelity mismatch for {key}: {actual!r}."
             )
     return dict(payload)
+
+
+def validate_native_process_diagnostics(
+    payload: object,
+) -> dict[str, object]:
+    """Require exact nonnegative native gamma-process counter provenance."""
+    if not isinstance(payload, Mapping) or set(payload) != {
+        "process_count_compton",
+        "process_count_rayleigh",
+        "process_count_photoelectric",
+        "transport_process_counts",
+    }:
+        raise ValueError(
+            "native_process_diagnostics has an incompatible exact schema."
+        )
+    parsed: dict[str, object] = {}
+    for key in (
+        "process_count_compton",
+        "process_count_rayleigh",
+        "process_count_photoelectric",
+    ):
+        value = payload[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"native_process_diagnostics[{key!r}] is invalid.")
+        parsed[key] = value
+    counters = payload["transport_process_counts"]
+    if (
+        not isinstance(counters, Mapping)
+        or any(
+            not isinstance(name, str)
+            or not name
+            or isinstance(count, bool)
+            or not isinstance(count, int)
+            or count < 0
+            for name, count in counters.items()
+        )
+    ):
+        raise ValueError("transport_process_counts must be a nonnegative map.")
+    parsed["transport_process_counts"] = {
+        name: counters[name] for name in sorted(counters)
+    }
+    for field_name, process_name in (
+        ("process_count_compton", "compt"),
+        ("process_count_rayleigh", "Rayl"),
+        ("process_count_photoelectric", "phot"),
+    ):
+        if parsed[field_name] != counters.get(process_name, 0):
+            raise ValueError(
+                f"{field_name} disagrees with transport_process_counts."
+            )
+    return parsed
 
 
 def _validate_array_payload(
@@ -746,6 +860,9 @@ def load_acceptance_pair(
     )
     validate_surface_boundary_gate(payload["surface_boundary_gate"])
     validate_native_fidelity(payload["native_fidelity"])
+    validate_native_process_diagnostics(
+        payload["native_process_diagnostics"]
+    )
     validate_geometry_family_descriptor(
         payload["geometry_family"],
         require_in_domain=True,
@@ -2063,6 +2180,7 @@ __all__ = [
     "load_frozen_candidate_model",
     "select_training_discrepancy",
     "validate_native_fidelity",
+    "validate_native_process_diagnostics",
     "validate_scene_corpus",
     "validate_surface_boundary_gate",
 ]

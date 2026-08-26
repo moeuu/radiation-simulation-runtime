@@ -27,10 +27,15 @@ from spectrum.additive_scatter import (
     ADDITIVE_SCATTER_INCIDENT_LABEL_SEMANTICS,
     ADDITIVE_SCATTER_TARGET_SEMANTICS,
 )
+from spectrum.air_attenuation import (
+    NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_ID,
+    NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_SHA256,
+)
 from spectrum.full_spectrum_acceptance import (
     SURFACE_BOUNDARY_GATE_SCHEMA_VERSION,
 )
 from spectrum.full_spectrum_acceptance_runner import (
+    ACCEPTANCE_PAIR_SCHEMA_VERSION,
     NATIVE_ACCEPTANCE_FIDELITY,
     acceptance_transport_seed,
     build_acceptance_run_contract,
@@ -73,8 +78,16 @@ def test_acceptance_run_contract_authenticates_python_implementation() -> None:
         implementation_bundle_sha256="c" * 64,
     )
 
-    assert contract["schema_version"] == 4
+    assert contract["schema_version"] == 5
+    assert contract["environment"]["absorber_transport_group"] == "wall"
+    assert len(
+        contract["environment"]["absorber_transport_contract_sha256"]
+    ) == 64
     assert contract["dwell_time_s"] == STANDARD_ACQUISITION_LIVE_TIME_S
+    assert contract["dry_air_total_attenuation_contract"] == {
+        "id": NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_ID,
+        "sha256": NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_SHA256,
+    }
     assert contract["native_execution_environment_sha256"] == "d" * 64
     assert contract["implementation_bundle_sha256"] == "c" * 64
 
@@ -234,7 +247,7 @@ def _pair_payload(*, background_only: bool) -> dict[str, object]:
         else "single_line_source_resolved"
     )
     return {
-        "schema_version": 2,
+        "schema_version": ACCEPTANCE_PAIR_SCHEMA_VERSION,
         "acceptance_contract_sha256": (
             FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256
         ),
@@ -269,6 +282,12 @@ def _pair_payload(*, background_only: bool) -> dict[str, object]:
             "background_entry_spectrum_sha256": "8" * 64,
         },
         "native_fidelity": dict(NATIVE_ACCEPTANCE_FIDELITY),
+        "native_process_diagnostics": {
+            "process_count_compton": 0,
+            "process_count_rayleigh": 0,
+            "process_count_photoelectric": 0,
+            "transport_process_counts": {"Transportation": 1},
+        },
         "geometry_family": {
             "schema_version": GEOMETRY_FAMILY_SCHEMA_VERSION,
             "geometry_family_id": GEOMETRY_FAMILY_ID,

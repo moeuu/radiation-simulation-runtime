@@ -21,6 +21,10 @@ from runtime.measurement_log import (
 from spectrum.response_matrix import (
     NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256,
 )
+from spectrum.detector_response_validation import (
+    build_detector_response_validation_manifest,
+    detector_response_validation_manifest_sha256,
+)
 from spectrum.physics_contracts import (
     OBSTACLE_MATERIAL_CONTRACT_SHA256,
     TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256,
@@ -41,6 +45,9 @@ from spectrum.transport_spectral import (
     RATE_SCALE_HALF_WIDTH_GRID,
     VALIDATION_SCENARIO_IDS,
     rate_scale_mixture_for_half_width,
+)
+from tests.detector_response_test_support import (
+    passing_detector_response_raw_corpus,
 )
 
 
@@ -109,8 +116,18 @@ def _synthetic_validation_manifest(
             "threshold": float(threshold),
             "passed": True,
         }
+    detector_response_validation = (
+        build_detector_response_validation_manifest(
+            passing_detector_response_raw_corpus(
+                native_executable_sha256="b" * 64,
+                native_execution_environment_sha256="e" * 64,
+                implementation_bundle_sha256="c" * 64,
+                runtime_config_sha256="a" * 64,
+            )
+        )
+    )
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "validation_contract_sha256": (
             FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256
         ),
@@ -122,6 +139,12 @@ def _synthetic_validation_manifest(
         "implementation_bundle_sha256": "c" * 64,
         "native_response_contract_sha256": (
             NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
+        ),
+        "detector_response_validation": detector_response_validation,
+        "detector_response_validation_manifest_sha256": (
+            detector_response_validation_manifest_sha256(
+                detector_response_validation
+            )
         ),
         "additive_scatter_contract_sha256": str(
             additive_scatter_contract_hash

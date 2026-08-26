@@ -89,6 +89,10 @@ from spectrum.full_spectrum_acceptance_runner import (
     acceptance_transport_seed,
     canonical_json_sha256,
 )
+from spectrum.geant4_physics import (
+    GEANT4_VERSION_TAG,
+    validate_geant4_physics_metadata,
+)
 from spectrum.native_metadata import (
     native_source_line_token,
     sanitize_native_metadata_token,
@@ -161,6 +165,69 @@ def _strict_metadata_number(
     if not math.isfinite(parsed):
         raise RuntimeError(f"Native Geant4 metadata {key} must be finite.")
     return parsed
+
+
+def _native_counter_map(
+    metadata: Mapping[str, object],
+    key: str,
+) -> dict[str, int]:
+    """Parse one exact native comma-separated nonnegative counter map."""
+    raw = metadata.get(key)
+    if not isinstance(raw, str) or raw in {"", "-"}:
+        raise RuntimeError(f"Native Geant4 metadata {key} must be nonempty.")
+    parsed: dict[str, int] = {}
+    for item in raw.split(","):
+        name, separator, count_text = item.partition(":")
+        if not separator or not name or name in parsed:
+            raise RuntimeError(f"Native Geant4 metadata {key} is malformed.")
+        try:
+            count = int(count_text)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Native Geant4 metadata {key} has a non-integer count."
+            ) from exc
+        if count < 0:
+            raise RuntimeError(
+                f"Native Geant4 metadata {key} has a negative count."
+            )
+        parsed[name] = count
+    return {name: parsed[name] for name in sorted(parsed)}
+
+
+def _native_process_diagnostics(
+    metadata: Mapping[str, object],
+) -> dict[str, object]:
+    """Return exact native interaction counters for persisted audit."""
+    counters = _native_counter_map(metadata, "transport_process_counts")
+    result: dict[str, object] = {
+        key: int(_strict_metadata_number(metadata, key))
+        for key in (
+            "process_count_compton",
+            "process_count_rayleigh",
+            "process_count_photoelectric",
+        )
+    }
+    if any(
+        float(result[key]) != _strict_metadata_number(metadata, key)
+        or int(result[key]) < 0
+        for key in (
+            "process_count_compton",
+            "process_count_rayleigh",
+            "process_count_photoelectric",
+        )
+    ):
+        raise RuntimeError("Native process counters must be nonnegative integers.")
+    expected = {
+        "process_count_compton": counters.get("compt", 0),
+        "process_count_rayleigh": counters.get("Rayl", 0),
+        "process_count_photoelectric": counters.get("phot", 0),
+    }
+    if any(result[key] != value for key, value in expected.items()):
+        raise RuntimeError(
+            "Native named process counters disagree with the process map."
+        )
+    result["transport_process_counts"] = counters
+    return result
 
 
 def _integer_spectrum(
@@ -366,12 +433,21 @@ def _native_fidelity(
         "validation_entry_spectrum_grouping": (
             "source_token_initial_gamma_line_entry_class"
         ),
+        "absorbing_transport_groups": "wall",
+        "geant4_version_tag": GEANT4_VERSION_TAG,
+        "reference_physics_list": "FTFP_BERT",
+        "electromagnetic_physics_constructor": (
+            "G4EmStandardPhysics_option4"
+        ),
+        "gamma_process_names": "GammaGeneralProc,Transportation",
+        "gamma_em_subprocess_names": "Rayl,compt,conv,phot",
     }
     for key, expected in exact_strings.items():
         if metadata.get(key) != expected:
             raise RuntimeError(
                 f"Native Geant4 metadata {key} != {expected!r}."
             )
+    validate_geant4_physics_metadata(metadata)
     if (
         config.engine_mode != "external"
         or config.physics_profile != "balanced"
@@ -384,6 +460,7 @@ def _native_fidelity(
         or config.accelerated_weighted_transport_enable
         or not config.sample_detector_response
         or not config.validation_entry_class_spectra
+        or tuple(config.absorbing_transport_groups) != ("wall",)
     ):
         raise RuntimeError(
             "Acceptance backend configuration is not native full fidelity."
@@ -394,6 +471,8 @@ def _native_fidelity(
         "primary_history_weight": 1.0,
         "target_sampled_primaries": 0.0,
         "spectrum_bin_count": float(NATIVE_GEANT4_BIN_COUNT),
+        "geant4_version_number": 1132.0,
+        "production_cut_range_mm": 0.7,
     }
     for key, expected in numeric_expected.items():
         if not np.isclose(
@@ -426,6 +505,7 @@ def _native_fidelity(
         != "multinomial_marking_with_nonparalyzable_event_time"
     ):
         raise RuntimeError("Native detector-response marking is incompatible.")
+    _native_process_diagnostics(metadata)
     surface_bound = _strict_metadata_bool(
         metadata,
         "all_sources_surface_bound",
@@ -485,6 +565,13 @@ def _scene_payload(
         "transport_boxes_m": [
             list(box) for box in grid.transport_boxes_m
         ],
+        "absorber_transport_group": grid.absorber_transport_group,
+        "absorber_transport_boxes_m": [
+            list(box) for box in grid.absorber_transport_boxes_m
+        ],
+        "absorber_transport_contract_sha256": (
+            grid.absorber_transport_contract_sha256
+        ),
         "transport_mu_by_isotope": {
             str(isotope): [float(value) for value in values]
             for isotope, values in grid.transport_mu_by_isotope.items()
@@ -1212,6 +1299,7 @@ class _NativeScenarioSession(AcceptanceScenarioSession):
             config=self.app.config,
             source_count=len(self.sources),
         )
+        process_diagnostics = _native_process_diagnostics(metadata)
         labels = _validation_labels(
             metadata,
             sources=self.sources,
@@ -1300,6 +1388,7 @@ class _NativeScenarioSession(AcceptanceScenarioSession):
             "geometry_family": dict(self.geometry_family),
             "validation_labels": labels,
             "native_fidelity": fidelity,
+            "native_process_diagnostics": process_diagnostics,
             "detector_response_contract_sha256": (
                 NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
             ),
@@ -1434,6 +1523,17 @@ class ExternalGeant4AcceptanceBackend(AcceptanceTransportBackend):
         sources: Sequence[PointSource],
     ) -> Geant4Application:
         """Create one native app and load one exact generated scene."""
+        if (
+            grid.absorber_transport_group != "wall"
+            or len(grid.absorber_transport_boxes_m) != 6
+            or grid.absorber_transport_contract_sha256 is None
+            or tuple(self.app_config.absorbing_transport_groups)
+            != (grid.absorber_transport_group,)
+        ):
+            raise RuntimeError(
+                "Acceptance requires one exact six-surface wall absorber "
+                "contract shared by PF geometry and native Geant4."
+            )
         app = Geant4Application(
             app_config=dict(self.app_payload),
             expected_native_executable_sha256=(

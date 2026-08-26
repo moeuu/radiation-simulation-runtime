@@ -274,12 +274,22 @@ def test_random_runtime_environment_can_attach_room_boundary_transport(
 
     assert base.grid is not None
     assert with_boundaries.grid is not None
-    assert len(with_boundaries.grid.transport_boxes_m) == (
-        len(base.grid.transport_boxes_m) + 6
+    assert (
+        with_boundaries.grid.transport_boxes_m
+        == base.grid.transport_boxes_m
     )
     assert with_boundaries.grid.collision_boxes_m == base.grid.collision_boxes_m
-    assert any(box[2] < 0.0 for box in with_boundaries.grid.transport_boxes_m)
-    assert any(box[5] > 10.0 for box in with_boundaries.grid.transport_boxes_m)
+    assert with_boundaries.grid.absorber_transport_group == "wall"
+    assert len(with_boundaries.grid.absorber_transport_boxes_m) == 6
+    assert with_boundaries.grid.absorber_transport_contract_sha256 is not None
+    assert any(
+        box[2] < 0.0
+        for box in with_boundaries.grid.absorber_transport_boxes_m
+    )
+    assert any(
+        box[5] > 10.0
+        for box in with_boundaries.grid.absorber_transport_boxes_m
+    )
 
 
 def test_fixed_runtime_obstacle_environment_uses_layout_file(tmp_path: Path) -> None:

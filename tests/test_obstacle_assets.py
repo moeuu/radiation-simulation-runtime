@@ -230,7 +230,7 @@ def test_room_boundary_transport_components_match_authored_room() -> None:
 
 
 def test_environment_transport_model_can_include_room_boundaries() -> None:
-    """Environment transport should append room boundaries to obstacle components."""
+    """Room boundaries must be absorbers outside material coefficient tables."""
     grid = ObstacleGrid(
         origin=(0.0, 0.0),
         cell_size=1.0,
@@ -249,13 +249,17 @@ def test_environment_transport_model_can_include_room_boundaries() -> None:
         mu_by_isotope,
         line_mu_by_isotope,
         line_compton_mu_by_isotope,
+        absorber_group,
+        absorber_boxes,
     ) = environment_transport_model(
         instances,
         room_size_xyz=(1.0, 1.0, 3.0),
         include_room_boundaries=True,
     )
 
-    assert len(boxes_m) == len(obstacle_boxes) + 6
+    assert boxes_m == obstacle_boxes
+    assert absorber_group == "wall"
+    assert len(absorber_boxes) == 6
     assert set(mu_by_isotope) >= {"Cs-137", "Co-60", "Eu-154"}
     assert len(mu_by_isotope["Cs-137"]) == len(boxes_m)
     assert len(line_mu_by_isotope["Cs-137"][0]) == len(boxes_m)

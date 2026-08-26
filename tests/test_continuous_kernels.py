@@ -20,8 +20,11 @@ from measurement.shielding import (
     rotation_matrix_from_normal,
 )
 from measurement.continuous_kernels import expected_counts_single_isotope
-from spectrum.additive_scatter import PhysicsOnlyNoncollidedTransportResponse
-from spectrum.air_attenuation import dry_air_total_linear_attenuation_numpy
+from spectrum.air_attenuation import (
+    NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_ID,
+    NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_SHA256,
+    dry_air_total_linear_attenuation_numpy,
+)
 
 
 def test_obstacle_material_path_scatter_matches_torch() -> None:
@@ -523,13 +526,8 @@ def _line_resolved_inputs() -> tuple[
     )
 
 
-def test_physics_only_direct_kernel_applies_xcom_air() -> None:
-    """The production direct kernel must apply authenticated air attenuation."""
-    response = PhysicsOnlyNoncollidedTransportResponse(
-        detector_radius_m=0.025,
-        fe_scatter_distance_m=0.14,
-        pb_scatter_distance_m=0.10,
-    )
+def test_direct_kernel_applies_xcom_air_without_scatter_response() -> None:
+    """Authenticated air loss must not depend on a fitted scatter response."""
     common = {
         "mu_by_isotope": {"Cs-137": {"fe": 0.0, "pb": 0.0}},
         "shield_params": ShieldParams(
@@ -548,7 +546,13 @@ def test_physics_only_direct_kernel_applies_xcom_air() -> None:
                 },
             )
         },
-        "additive_scatter_response": response,
+        "additive_scatter_response": None,
+        "dry_air_total_attenuation_contract_id": (
+            NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_ID
+        ),
+        "dry_air_total_attenuation_contract_sha256": (
+            NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_SHA256
+        ),
         "detector_radius_m": 0.025,
         "gpu_device": "cpu",
         "gpu_dtype": "float64",
@@ -569,6 +573,66 @@ def test_physics_only_direct_kernel_applies_xcom_air() -> None:
         cpu_components.uncollided_kernel[0, 0, 0]
         / cpu_components.unattenuated_kernel[0, 0, 0]
     ) == pytest.approx(float(expected_ratio), rel=2.0e-13)
+
+
+@pytest.mark.parametrize("use_gpu", [False, True])
+def test_absorber_crossing_aborts_batched_kernel(use_gpu: bool) -> None:
+    """Material-free absorbers must abort both NumPy and Torch ray paths."""
+    if use_gpu:
+        pytest.importorskip("torch")
+    grid = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(1, 1),
+        blocked_cells=(),
+        absorber_transport_group="wall",
+        absorber_transport_boxes_m=(
+            (0.9, -1.0, -1.0, 1.1, 1.0, 1.0),
+        ),
+    )
+    kernel = ContinuousKernel(
+        mu_by_isotope={"Cs-137": {"fe": 0.0, "pb": 0.0}},
+        shield_params=ShieldParams(
+            mu_fe=0.0,
+            mu_pb=0.0,
+            thickness_fe_cm=0.0,
+            thickness_pb_cm=0.0,
+        ),
+        obstacle_grid=grid,
+        line_mu_by_isotope={
+            "Cs-137": (
+                {
+                    "weight": 1.0,
+                    "energy_keV": 662.0,
+                    "fe": 0.0,
+                    "pb": 0.0,
+                },
+            )
+        },
+        use_gpu=use_gpu,
+        gpu_device="cpu",
+        gpu_dtype="float64",
+    )
+    common = {
+        "isotope": "Cs-137",
+        "fe_indices": np.asarray([0], dtype=np.int64),
+        "pb_indices": np.asarray([0], dtype=np.int64),
+        "positive_line_indices": np.asarray([0], dtype=np.int64),
+    }
+
+    with pytest.raises(RuntimeError, match="fail-closed absorber"):
+        kernel.line_transport_components_selected_pairs_for_detectors(
+            detector_positions=np.asarray([[2.0, 0.0, 0.0]]),
+            sources=np.asarray([[0.0, 0.0, 0.0]]),
+            **common,
+        )
+
+    safe = kernel.line_transport_components_selected_pairs_for_detectors(
+        detector_positions=np.asarray([[2.0, 2.0, 0.0]]),
+        sources=np.asarray([[0.0, 2.0, 0.0]]),
+        **common,
+    )
+    assert safe.total_kernel.shape == (1, 1, 1)
 
 
 def test_matched_row_kernel_apis_match_cpu_and_torch_batches() -> None:

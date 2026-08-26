@@ -80,6 +80,8 @@ def _obstacle_grid_from_scene(scene: SceneDescription) -> ObstacleGrid | None:
         blocked_cells=tuple(scene.obstacle_cells),
         collision_boxes_m=scene.collision_boxes_m,
         transport_boxes_m=scene.transport_boxes_m,
+        absorber_transport_group=scene.absorber_transport_group,
+        absorber_transport_boxes_m=scene.absorber_transport_boxes_m,
         transport_mu_by_isotope=scene.transport_mu_by_isotope,
         transport_line_mu_by_isotope=scene.transport_line_mu_by_isotope,
         transport_line_compton_mu_by_isotope=(

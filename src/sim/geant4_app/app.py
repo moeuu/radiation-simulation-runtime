@@ -62,6 +62,7 @@ from spectrum.response_matrix import (
     NATIVE_GEANT4_ENERGY_MAX_KEV,
     NATIVE_GEANT4_ENERGY_MIN_KEV,
 )
+from spectrum.geant4_physics import validate_geant4_physics_metadata
 
 
 _MANAGED_GEANT4_EXECUTABLE_OPTIONS = frozenset(
@@ -614,6 +615,7 @@ def validate_transport_metadata(
         metadata,
         "physics_profile",
     )
+    validate_geant4_physics_metadata(metadata)
     if (
         expected_physics_profile is not None
         and physics_profile != expected_physics_profile
@@ -1303,14 +1305,23 @@ def validate_mean_calibration_transport_metadata(
     if expected_source_rate_model != "detector_cps_1m":
         raise ValueError("Mean calibration requires source_rate_model=detector_cps_1m.")
     if (
-        expected_detector_scoring_mode != "incident_gamma_energy"
+        expected_detector_scoring_mode
+        not in {"incident_gamma_energy", "full_transport"}
         or expected_secondary_transport_mode != "full_transport"
         or expected_source_bias_mode != "detector_cone"
     ):
         raise ValueError(
-            "Mean calibration requires incident-gamma scoring, full secondary "
-            "transport, and detector-cone source sampling."
+            "Fixed source-line sampling requires implemented detector scoring, "
+            "full secondary transport, and detector-cone source sampling."
         )
+    if expected_detector_scoring_mode == "full_transport" and (
+        expected_forced_collision
+    ):
+        raise ValueError(
+            "Full-detector fixed source-line validation forbids forced collision."
+        )
+
+    validate_geant4_physics_metadata(metadata)
 
     exact_strings = {
         "backend": "geant4",
@@ -1347,6 +1358,13 @@ def validate_mean_calibration_transport_metadata(
         "dead_time_scale_semantics": ("identity_zero_dead_time_mean_calibration"),
         "validation_entry_spectrum_space": (
             "pre_dead_time_raw_incident_gamma_weighted_mean"
+            if expected_detector_scoring_mode == "incident_gamma_energy"
+            else "pre_dead_time_raw_energy_deposition_weighted_mean"
+        ),
+        "validation_observed_entry_spectrum_space": (
+            "pre_dead_time_sampled_detector_response_weighted_mean"
+            if expected_detector_scoring_mode == "incident_gamma_energy"
+            else "pre_dead_time_smeared_energy_deposition_weighted_mean"
         ),
         "validation_entry_spectrum_grouping": (
             "source_token_initial_gamma_line_entry_class"
@@ -1368,7 +1386,9 @@ def validate_mean_calibration_transport_metadata(
         "delayed_decay_pulse_separation": False,
         "mean_calibration_enabled": True,
         "mean_calibration_forced_collision": expected_forced_collision,
-        "detector_response_applied_in_native": False,
+        "detector_response_applied_in_native": (
+            expected_detector_scoring_mode == "full_transport"
+        ),
         "gamma_only_secondary_transport": False,
         "theory_tvl_attenuation": False,
         "poisson_background": False,
@@ -2329,10 +2349,21 @@ class Geant4AppConfig:
             choices=frozenset({"full_transport", "gamma_only"}),
         )
         if mean_calibration_enabled:
-            if detector_scoring_mode != "incident_gamma_energy":
+            if detector_scoring_mode not in {
+                "incident_gamma_energy",
+                "full_transport",
+            }:
                 raise ValueError(
-                    "Mean calibration requires "
-                    "detector_scoring_mode=incident_gamma_energy."
+                    "Fixed source-line sampling requires an implemented "
+                    "detector scoring mode."
+                )
+            if (
+                detector_scoring_mode == "full_transport"
+                and mean_calibration_forced_collision
+            ):
+                raise ValueError(
+                    "Full-detector fixed source-line validation forbids "
+                    "forced-collision transport."
                 )
             if sample_detector_response:
                 raise ValueError(

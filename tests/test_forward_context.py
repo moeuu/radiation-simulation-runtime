@@ -20,6 +20,14 @@ from runtime.measurement_log import (
 from runtime.provenance import strict_sha256_json
 from runtime.records import RunContext
 import runtime.forward_context as forward_context_module
+from spectrum.air_attenuation import (
+    NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_ID,
+    NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_SHA256,
+)
+from spectrum.geant4_physics import (
+    GEANT4_PHYSICS_CONTRACT_ID,
+    GEANT4_PHYSICS_CONTRACT_SHA256,
+)
 from spectrum.transport_spectral import GeometryConditionedSpectralModel
 
 from tests.runtime_test_support import (
@@ -219,6 +227,52 @@ def test_file_backed_obstacle_identity_and_resolution(tmp_path: Path) -> None:
     assert identity["component"] == "obstacle"
     assert identity["path"] == obstacle_path
     assert len(identity["sha256"]) == 64
+
+
+@pytest.mark.parametrize(
+    ("field", "expected"),
+    (
+        (
+            "dry_air_total_attenuation_contract_id",
+            NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_ID,
+        ),
+        (
+            "dry_air_total_attenuation_contract_sha256",
+            NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_SHA256,
+        ),
+        ("geant4_physics_contract_id", GEANT4_PHYSICS_CONTRACT_ID),
+        ("geant4_physics_contract_sha256", GEANT4_PHYSICS_CONTRACT_SHA256),
+    ),
+)
+def test_forward_manifest_binds_transport_physics_contracts(
+    field: str,
+    expected: str,
+) -> None:
+    """Dry-air and native physics identity must be explicit and immutable."""
+    config = runtime_config()
+    env = environment()
+    config_hash = strict_sha256_json(config)
+    manifest = build_forward_model_manifest(
+        runtime_config=config,
+        environment=env,
+        obstacle_layout_path=None,
+        isotopes=TEST_ISOTOPES,
+        repository_commit=TEST_COMMIT,
+        resolved_config_sha256=config_hash,
+    )
+
+    assert manifest[field] == expected
+    manifest[field] = "0" * 64
+    with pytest.raises(ValueError, match=field):
+        validate_forward_model_manifest(
+            manifest,
+            runtime_config=config,
+            environment=env,
+            obstacle_layout_path=None,
+            isotopes=TEST_ISOTOPES,
+            repository_commit=TEST_COMMIT,
+            resolved_config_sha256=config_hash,
+        )
 
 
 @pytest.mark.parametrize(

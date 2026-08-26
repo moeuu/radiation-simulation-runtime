@@ -34,11 +34,13 @@ from spectrum.full_spectrum_acceptance import (
 )
 import spectrum.full_spectrum_acceptance_evaluator as evaluator
 from spectrum.full_spectrum_acceptance_runner import (
+    ACCEPTANCE_PAIR_SCHEMA_VERSION,
     ACCEPTANCE_ISOTOPES,
     ACCEPTANCE_SCENARIO_SOURCE_SPEC,
     NATIVE_ACCEPTANCE_FIDELITY,
     AcceptanceRunLayout,
     acceptance_transport_seed,
+    canonical_json_bytes,
     canonical_json_sha256,
     line_identity_contract_sha256,
     validate_scene_corpus,
@@ -56,6 +58,9 @@ from spectrum.transport_spectral import (
     ACCEPTANCE_METRIC_CONTRACT,
     FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256,
     GeometryConditionedSpectralModel,
+)
+from tests.detector_response_test_support import (
+    write_passing_detector_response_validation,
 )
 
 
@@ -277,7 +282,7 @@ class _FakeSession:
                     )
                 }
         return {
-            "schema_version": 2,
+            "schema_version": ACCEPTANCE_PAIR_SCHEMA_VERSION,
             "acceptance_contract_sha256": (
                 self.model.manifest_payload()[
                     "acceptance_contract_sha256"
@@ -316,6 +321,12 @@ class _FakeSession:
                 ),
             },
             "native_fidelity": dict(NATIVE_ACCEPTANCE_FIDELITY),
+            "native_process_diagnostics": {
+                "process_count_compton": 0,
+                "process_count_rayleigh": 0,
+                "process_count_photoelectric": 0,
+                "transport_process_counts": {"Transportation": 1},
+            },
             "geometry_family": {
                 "schema_version": GEOMETRY_FAMILY_SCHEMA_VERSION,
                 "geometry_family_id": GEOMETRY_FAMILY_ID,
@@ -389,6 +400,13 @@ class _FakeBackend:
         )
 
 
+def _write_detector_response_validation(path: Path) -> Path:
+    """Write a passing full-detector gate bound to the fake native build."""
+    return write_passing_detector_response_validation(
+        path.parent / path.stem
+    )
+
+
 def _passing_metrics(
     *_: object,
     **__: object,
@@ -448,7 +466,18 @@ def test_fake_backend_full_pipeline_is_resumable_and_holdout_cannot_refit(
 ) -> None:
     """Training, freeze, holdout, evaluation, and approval must be one-way."""
     root = tmp_path / "acceptance"
-    arguments = ["--output-root", root.as_posix()]
+    response_validation = _write_detector_response_validation(
+        tmp_path / "detector_response_validation.json"
+    )
+    arguments = [
+        "--output-root",
+        root.as_posix(),
+    ]
+    approval_arguments = [
+        *arguments,
+        "--detector-response-validation-manifest",
+        response_validation.as_posix(),
+    ]
     _FakeBackend.opened.clear()
     monkeypatch.setattr(
         acceptance_cli,
@@ -469,12 +498,12 @@ def test_fake_backend_full_pipeline_is_resumable_and_holdout_cannot_refit(
     assert layout.candidate_model_path.read_bytes() == frozen_before_holdout
     assert acceptance_cli.main(["evaluate", *arguments]) == 0
     assert layout.candidate_model_path.read_bytes() == frozen_before_holdout
-    assert acceptance_cli.main(["approve", *arguments]) == 0
+    assert acceptance_cli.main(["approve", *approval_arguments]) == 0
     assert layout.validation_manifest_path.is_file()
     assert layout.production_model_path.is_file()
 
     opened_before_resume = tuple(_FakeBackend.opened)
-    assert acceptance_cli.main(["all", *arguments]) == 0
+    assert acceptance_cli.main(["all", *approval_arguments]) == 0
     assert tuple(_FakeBackend.opened) == opened_before_resume
     assert layout.candidate_model_path.read_bytes() == frozen_before_holdout
 
@@ -485,7 +514,10 @@ def test_validation_labels_are_absent_from_production_projection(
 ) -> None:
     """Changing labels alone must change no production likelihood tensor."""
     root = tmp_path / "acceptance"
-    arguments = ["--output-root", root.as_posix()]
+    arguments = [
+        "--output-root",
+        root.as_posix(),
+    ]
     _FakeBackend.opened.clear()
     monkeypatch.setattr(
         acceptance_cli,

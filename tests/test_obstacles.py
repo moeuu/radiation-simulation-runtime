@@ -272,6 +272,28 @@ def test_collision_geometry_roundtrips_and_survives_transport_attachment(
     assert loaded.transport_mu_by_isotope == {"Cs-137": (0.1,)}
 
 
+def test_absorber_transport_contract_roundtrips_and_rejects_tampering() -> None:
+    """Absorber geometry/group identity must be hash-bound in schema v2."""
+    grid = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(1, 1),
+        blocked_cells=(),
+        absorber_transport_group="wall",
+        absorber_transport_boxes_m=(
+            (-0.1, 0.0, 0.0, 0.0, 1.0, 1.0),
+        ),
+    )
+    payload = grid.to_dict()
+
+    assert payload["version"] == 2
+    assert ObstacleGrid.from_dict(payload) == grid
+
+    payload["absorber_transport_group"] = "roof"
+    with pytest.raises(ValueError, match="contract_sha256"):
+        ObstacleGrid.from_dict(payload)
+
+
 def test_generate_obstacle_grid_respects_keep_free_points() -> None:
     """Keep-free points should never be blocked."""
     rng = np.random.default_rng(1)

@@ -17,6 +17,10 @@ from runtime.session import (
 from runtime.forward_model_manifest import forward_model_component_payloads
 from measurement.observation_model import build_runtime_observation_model
 from measurement.observation_model import build_nonproduction_observation_model
+from spectrum.air_attenuation import (
+    NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_ID,
+    NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_SHA256,
+)
 from sim.geant4_app.app import Geant4Application
 from sim.isaacsim_app.scene_builder import SceneDescription
 from sim.runtime import load_production_runtime_config, load_runtime_config
@@ -394,6 +398,14 @@ def test_standard_profile_reaches_shared_continuous_kernel_contract() -> None:
         PhysicsOnlyNoncollidedTransportResponse,
     )
     assert "air_xcom" in (observation.additive_scatter_response.feature_basis_semantics)
+    assert (
+        observation.dry_air_total_attenuation_contract_id
+        == NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_ID
+    )
+    assert (
+        observation.dry_air_total_attenuation_contract_sha256
+        == NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_SHA256
+    )
 
 
 def test_runtime_observation_model_requires_literal_production_approval(

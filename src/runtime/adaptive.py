@@ -116,6 +116,9 @@ _PRODUCTION_OBSTACLE_GRID_FIELDS = frozenset(
         "blocked_fraction",
         "collision_boxes_m",
         "transport_boxes_m",
+        "absorber_transport_group",
+        "absorber_transport_boxes_m",
+        "absorber_transport_contract_sha256",
         "transport_mu_by_isotope",
         "transport_line_mu_by_isotope",
         "transport_line_compton_mu_by_isotope",
@@ -132,6 +135,9 @@ _PRODUCTION_SCENE_FIELDS = frozenset(
         "obstacle_cells",
         "collision_boxes_m",
         "transport_boxes_m",
+        "absorber_transport_group",
+        "absorber_transport_boxes_m",
+        "absorber_transport_contract_sha256",
         "transport_mu_by_isotope",
         "transport_line_mu_by_isotope",
         "transport_line_compton_mu_by_isotope",
@@ -570,6 +576,12 @@ def _validate_production_scene(
         and tuple(description.obstacle_cells) == obstacle_grid.blocked_cells
         and description.collision_boxes_m == obstacle_grid.collision_boxes_m
         and description.transport_boxes_m == obstacle_grid.transport_boxes_m
+        and description.absorber_transport_group
+        == obstacle_grid.absorber_transport_group
+        and description.absorber_transport_boxes_m
+        == obstacle_grid.absorber_transport_boxes_m
+        and description.absorber_transport_contract_sha256
+        == obstacle_grid.absorber_transport_contract_sha256
         and description.transport_mu_by_isotope == obstacle_grid.transport_mu_by_isotope
         and description.transport_line_mu_by_isotope
         == obstacle_grid.transport_line_mu_by_isotope

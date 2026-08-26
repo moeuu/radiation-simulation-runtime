@@ -61,6 +61,10 @@ from spectrum.response_matrix import (
     native_geant4_background_shape,
     NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256,
 )
+from spectrum.detector_response_validation import (
+    detector_response_validation_manifest_sha256,
+    validate_detector_response_validation_manifest,
+)
 
 
 ELECTRON_REST_ENERGY_KEV = 510.99895
@@ -4058,6 +4062,8 @@ class GeometryConditionedSpectralModel:
             "native_execution_environment_sha256",
             "implementation_bundle_sha256",
             "native_response_contract_sha256",
+            "detector_response_validation",
+            "detector_response_validation_manifest_sha256",
             "additive_scatter_contract_sha256",
             "surface_emission_policy_sha256",
             "training_scene_seeds",
@@ -4077,7 +4083,7 @@ class GeometryConditionedSpectralModel:
         if set(manifest) != expected_keys:
             return False
         if (
-            manifest.get("schema_version") != 3
+            manifest.get("schema_version") != 4
             or manifest.get("validation_contract_sha256")
             != FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256
             or manifest.get("approved_model_contract_sha256")
@@ -4113,6 +4119,38 @@ class GeometryConditionedSpectralModel:
             or tuple(manifest.get("scenario_ids", ()))
             != VALIDATION_SCENARIO_IDS
             or manifest.get("all_passed") is not True
+        ):
+            return False
+        try:
+            detector_response_validation = (
+                validate_detector_response_validation_manifest(
+                    _thaw_json_value(
+                        manifest.get("detector_response_validation")
+                    ),
+                    expected_native_executable_sha256=(
+                        str(manifest["native_executable_sha256"])
+                    ),
+                    expected_native_execution_environment_sha256=(
+                        str(
+                            manifest[
+                                "native_execution_environment_sha256"
+                            ]
+                        )
+                    ),
+                    expected_implementation_bundle_sha256=(
+                        str(manifest["implementation_bundle_sha256"])
+                    ),
+                    expected_runtime_config_sha256=(
+                        str(manifest["runtime_config_sha256"])
+                    ),
+                )
+            )
+        except (TypeError, ValueError):
+            return False
+        if manifest.get(
+            "detector_response_validation_manifest_sha256"
+        ) != detector_response_validation_manifest_sha256(
+            detector_response_validation
         ):
             return False
         all_seeds = (

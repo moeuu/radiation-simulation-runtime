@@ -27,10 +27,12 @@
 #include <G4PrimaryParticle.hh>
 #include <G4PrimaryVertex.hh>
 #include <G4ProcessType.hh>
+#include <G4ProcessManager.hh>
 #include <G4RotationMatrix.hh>
 #include <G4RadioactiveDecayPhysics.hh>
 #include <G4RadioactiveDecay.hh>
 #include <G4GenericIon.hh>
+#include <G4GammaGeneralProcess.hh>
 #include <G4PhysicsListHelper.hh>
 #include <G4Triton.hh>
 #include <G4VPhysicsConstructor.hh>
@@ -64,6 +66,7 @@
 #include <G4VUserDetectorConstruction.hh>
 #include <G4VUserPrimaryGeneratorAction.hh>
 #include <G4VisAttributes.hh>
+#include <G4Version.hh>
 #include <G4ios.hh>
 #include <Randomize.hh>
 
@@ -100,6 +103,17 @@ namespace {
 constexpr double kDefaultCrystalRadiusM = 0.038;
 constexpr double kDefaultCrystalLengthM = 0.076;
 constexpr double kDefaultHousingThicknessM = 0.0015;
+constexpr double kProductionCutRangeMm = 0.7;
+constexpr const char* kReferencePhysicsListName = "FTFP_BERT";
+constexpr const char* kElectromagneticPhysicsConstructorName =
+    "G4EmStandardPhysics_option4";
+constexpr const char* kGeant4VersionTag = "geant4-11-03-patch-02";
+constexpr const char* kGeant4PhysicsContractId =
+    "geant4_11_3_2_ftfp_bert_em_option4_cut_0p7mm_v1";
+constexpr const char* kGeant4PhysicsContractSha256 =
+    "7b21112ff768478e38c798affb42ccacd7212f308397d44c1de045cc9f158550";
+constexpr const char* kMaterialResolutionContractId =
+    "exported_density_mass_composition_except_g4_air_v1";
 constexpr double kDefaultDetectorCoincidenceWindowS = 1.0e-6;
 constexpr double kDefaultShieldContactRadiusM = kDefaultCrystalRadiusM + kDefaultHousingThicknessM;
 constexpr double kDefaultShieldTransmissionScale = 0.6989700043360189;
@@ -1460,7 +1474,7 @@ double PresetDensity(const std::string& name) {
     if (name == "cebr3") {
         return 5.1;
     }
-    return 1.0;
+    return -1.0;
 }
 
 std::string NormalizeMaterialName(std::string value) {
@@ -1520,21 +1534,6 @@ G4Material* ResolveAttenuationMaterial(
     if (normalized_name == "air") {
         return nist->FindOrBuildMaterial("G4_AIR");
     }
-    if (normalized_name == "concrete") {
-        return nist->FindOrBuildMaterial("G4_CONCRETE");
-    }
-    if (normalized_name == "aluminum") {
-        return nist->FindOrBuildMaterial("G4_Al");
-    }
-    if (normalized_name == "iron") {
-        return nist->FindOrBuildMaterial("G4_Fe");
-    }
-    if (normalized_name == "lead") {
-        return nist->FindOrBuildMaterial("G4_Pb");
-    }
-    if (normalized_name == "water") {
-        return nist->FindOrBuildMaterial("G4_WATER");
-    }
 
     std::map<std::string, double> composition = material.composition_by_mass;
     if (composition.empty()) {
@@ -1545,12 +1544,41 @@ G4Material* ResolveAttenuationMaterial(
         }
     }
     if (composition.empty()) {
-        return nist->FindOrBuildMaterial("G4_AIR");
+        throw std::runtime_error(
+            "Material '" + normalized_name
+            + "' has no explicit or authenticated preset composition."
+        );
     }
 
     const double density_g_cm3 = material.density_g_cm3 > 0.0
         ? material.density_g_cm3
         : PresetDensity(normalized_name);
+    if (!std::isfinite(density_g_cm3) || density_g_cm3 <= 0.0) {
+        throw std::runtime_error(
+            "Material '" + normalized_name
+            + "' has no finite positive density."
+        );
+    }
+    double mass_fraction_sum = 0.0;
+    for (const auto& item : composition) {
+        if (
+            item.first.empty()
+            || !std::isfinite(item.second)
+            || item.second <= 0.0
+        ) {
+            throw std::runtime_error(
+                "Material '" + normalized_name
+                + "' has an invalid mass-composition entry."
+            );
+        }
+        mass_fraction_sum += item.second;
+    }
+    if (std::abs(mass_fraction_sum - 1.0) > 1.0e-9) {
+        throw std::runtime_error(
+            "Material '" + normalized_name
+            + "' mass fractions do not sum to one."
+        );
+    }
     const std::string key = normalized_name
         + "|rho=" + std::to_string(density_g_cm3)
         + "|comp=" + CompositionCacheKey(composition);
@@ -2589,6 +2617,15 @@ public:
         const auto* process = post_point == nullptr
             ? nullptr
             : post_point->GetProcessDefinedStep();
+        const auto* gamma_general = dynamic_cast<
+            const G4GammaGeneralProcess*
+        >(process);
+        if (
+            gamma_general != nullptr
+            && gamma_general->GetSelectedProcess() != nullptr
+        ) {
+            process = gamma_general->GetSelectedProcess();
+        }
         state->process_counts[process] += 1;
         const auto* secondaries = step->GetSecondaryInCurrentStep();
         if (secondaries != nullptr) {
@@ -3686,46 +3723,12 @@ private:
         std::map<std::string, double> composition_by_mass,
         const std::string& preset_name
     ) const {
-        const auto normalized_name = NormalizeMaterialName(material_name.empty() ? preset_name : material_name);
-        auto* nist = G4NistManager::Instance();
-        if (normalized_name == "air") {
-            return nist->FindOrBuildMaterial("G4_AIR");
-        }
-        if (normalized_name == "concrete") {
-            return nist->FindOrBuildMaterial("G4_CONCRETE");
-        }
-        if (normalized_name == "aluminum") {
-            return nist->FindOrBuildMaterial("G4_Al");
-        }
-        if (normalized_name == "iron") {
-            return nist->FindOrBuildMaterial("G4_Fe");
-        }
-        if (normalized_name == "lead") {
-            return nist->FindOrBuildMaterial("G4_Pb");
-        }
-        if (normalized_name == "water") {
-            return nist->FindOrBuildMaterial("G4_WATER");
-        }
-        if (composition_by_mass.empty()) {
-            const auto presets = PresetCompositionByMass();
-            const auto preset_it = presets.find(normalized_name);
-            if (preset_it != presets.end()) {
-                composition_by_mass = preset_it->second;
-            }
-        }
-        if (composition_by_mass.empty()) {
-            return nist->FindOrBuildMaterial("G4_AIR");
-        }
-        const double density = (density_g_cm3 > 0.0 ? density_g_cm3 : PresetDensity(normalized_name)) * g / cm3;
-        auto* material = new G4Material(
-            "Custom_" + normalized_name + "_" + std::to_string(reinterpret_cast<std::uintptr_t>(this)) + "_" + std::to_string(material_counter_++),
-            density,
-            static_cast<G4int>(composition_by_mass.size())
-        );
-        for (const auto& item : composition_by_mass) {
-            material->AddElement(nist->FindOrBuildElement(item.first), item.second);
-        }
-        return material;
+        MaterialSpec material;
+        material.name = material_name;
+        material.preset_name = preset_name;
+        material.density_g_cm3 = density_g_cm3;
+        material.composition_by_mass = std::move(composition_by_mass);
+        return ResolveAttenuationMaterial(material, preset_name);
     }
 
     std::unique_ptr<G4RotationMatrix> QuaternionToRotation(
@@ -3791,7 +3794,6 @@ private:
     PoseSpec current_fe_pose_;
     PoseSpec current_pb_pose_;
     bool movable_poses_initialized_ = false;
-    mutable int material_counter_ = 0;
 };
 
 struct PrimarySourceSnapshot {
@@ -5265,8 +5267,16 @@ public:
         detector_construction_ = detector.get();
         run_manager_->SetUserInitialization(detector.release());
         G4PhysListFactory factory;
-        auto* physics_list = factory.GetReferencePhysList("FTFP_BERT");
+        auto* physics_list = factory.GetReferencePhysList(
+            kReferencePhysicsListName
+        );
+        if (physics_list == nullptr) {
+            throw std::runtime_error(
+                "Geant4 did not provide the required FTFP_BERT physics list."
+            );
+        }
         physics_list->ReplacePhysics(new G4EmStandardPhysics_option4());
+        physics_list->SetDefaultCutValue(kProductionCutRangeMm * mm);
         if (primary_emission_model_ == "geant4_radioactive_decay") {
             // Parent-decay events have already been sampled from the source
             // activity for the requested dwell interval.  Geant4 11.2+
@@ -5303,6 +5313,53 @@ public:
         );
         run_manager_->SetUserInitialization(action_initialization.release());
         run_manager_->Initialize();
+        auto* gamma_process_manager = (
+            G4Gamma::GammaDefinition()->GetProcessManager()
+        );
+        if (gamma_process_manager == nullptr) {
+            throw std::runtime_error(
+                "Initialized Geant4 gamma has no process manager."
+            );
+        }
+        const auto* gamma_processes = gamma_process_manager->GetProcessList();
+        if (gamma_processes == nullptr) {
+            throw std::runtime_error(
+                "Initialized Geant4 gamma has no process list."
+            );
+        }
+        for (
+            G4int index = 0;
+            index < gamma_process_manager->GetProcessListLength();
+            ++index
+        ) {
+            auto* process = (*gamma_processes)[index];
+            if (process != nullptr) {
+                gamma_process_names_.insert(process->GetProcessName());
+            }
+            auto* general = dynamic_cast<G4GammaGeneralProcess*>(process);
+            if (general == nullptr) {
+                continue;
+            }
+            for (const auto* name : {"compt", "Rayl", "phot", "conv"}) {
+                const auto* sub_process = general->GetEmProcess(name);
+                if (sub_process != nullptr) {
+                    gamma_em_subprocess_names_.insert(
+                        sub_process->GetProcessName()
+                    );
+                }
+            }
+        }
+        for (const auto* required : {"compt", "Rayl", "phot"}) {
+            if (
+                gamma_process_names_.count(required) == 0
+                && gamma_em_subprocess_names_.count(required) == 0
+            ) {
+                throw std::runtime_error(
+                    std::string("Required option4 gamma process is absent: ")
+                    + required
+                );
+            }
+        }
     }
 
     ~TransportSession() {
@@ -5505,7 +5562,10 @@ public:
         if (mean_calibration_enabled) {
             if (
                 !detector_cps_rate_model
-                || detector_scoring_mode_ != "incident_gamma_energy"
+                || (
+                    detector_scoring_mode_ != "incident_gamma_energy"
+                    && detector_scoring_mode_ != "full_transport"
+                )
                 || secondary_transport_mode_ != "full_transport"
                 || options.sample_detector_response
                 || !options.validation_entry_class_spectra
@@ -5515,12 +5575,17 @@ public:
                 || primary_sampling_budget_enabled
                 || source_bias_weighted_transport
                 || use_theory_tvl_
+                || (
+                    detector_scoring_mode_ == "full_transport"
+                    && options.mean_calibration_forced_collision
+                )
             ) {
                 throw std::runtime_error(
-                    "Mean calibration requires detector_cps_1m, incident "
-                    "gamma scoring, full secondary transport, raw detector "
-                    "entries, zero background/dead-time, unit primary "
-                    "sampling, and non-theory Geant4 transport."
+                    "Fixed source-line sampling requires detector_cps_1m, "
+                    "implemented detector scoring, full secondary transport, "
+                    "raw detector entries, zero background/dead-time, unit "
+                    "primary sampling, and non-theory Geant4 transport; "
+                    "full-detector scoring also forbids forced collision."
                 );
             }
             if (
@@ -6107,6 +6172,8 @@ public:
         std::vector<double> spectrum_variance(num_bins, 0.0);
         std::map<std::string, std::vector<double>> validation_entry_spectra;
         std::map<std::string, std::vector<double>>
+            validation_observed_entry_spectra;
+        std::map<std::string, std::vector<double>>
             mean_calibration_entry_variance;
         std::normal_distribution<double> gaussian(0.0, 1.0);
         const bool incident_gamma_scoring = detector_scoring_mode_ == "incident_gamma_energy";
@@ -6242,6 +6309,23 @@ public:
                 );
             }
             if (index >= 0 && index < num_bins) {
+                if (options.validation_entry_class_spectra) {
+                    const std::string entry_class = DetectorEntryClassToken(
+                        deposit.entry_class
+                    );
+                    const std::string key = (
+                        deposit.line_token + "_" + entry_class
+                    );
+                    auto& classified_spectrum = (
+                        validation_observed_entry_spectra[key]
+                    );
+                    if (classified_spectrum.empty()) {
+                        classified_spectrum.assign(num_bins, 0.0);
+                    }
+                    classified_spectrum[
+                        static_cast<std::size_t>(index)
+                    ] += deposit.weight;
+                }
                 spectrum[index] += deposit.weight;
                 if (!mean_calibration_enabled) {
                     spectrum_variance[index] += (
@@ -6932,6 +7016,36 @@ public:
         );
         AddGeant4MaterialMuMetadata(result, scene_);
         result.metadata["secondary_transport_mode"] = secondary_transport_mode_;
+        result.metadata["geant4_version_number"] = std::to_string(
+            G4VERSION_NUMBER
+        );
+        result.metadata["geant4_physics_contract_id"] = (
+            kGeant4PhysicsContractId
+        );
+        result.metadata["geant4_physics_contract_sha256"] = (
+            kGeant4PhysicsContractSha256
+        );
+        result.metadata["material_resolution_contract_id"] = (
+            kMaterialResolutionContractId
+        );
+        result.metadata["geant4_version_tag"] = kGeant4VersionTag;
+        result.metadata["reference_physics_list"] = (
+            kReferencePhysicsListName
+        );
+        result.metadata["electromagnetic_physics_constructor"] = (
+            kElectromagneticPhysicsConstructorName
+        );
+        result.metadata["production_cut_range_mm"] = SerializeDouble(
+            kProductionCutRangeMm
+        );
+        result.metadata["gamma_process_names"] = JoinSet(
+            gamma_process_names_,
+            ","
+        );
+        result.metadata["gamma_em_subprocess_names"] = JoinSet(
+            gamma_em_subprocess_names_,
+            ","
+        );
         result.metadata["gamma_only_secondary_transport"] = secondary_transport_mode_ == "gamma_only" ? "true" : "false";
         result.metadata["theory_tvl_attenuation"] = use_theory_tvl_ ? "true" : "false";
         result.metadata["scene_hash"] = scene_.scene_hash;
@@ -7251,7 +7365,11 @@ public:
         if (options.validation_entry_class_spectra) {
             result.metadata["validation_entry_spectrum_space"] = (
                 mean_calibration_enabled
-                    ? "pre_dead_time_raw_incident_gamma_weighted_mean"
+                    ? (
+                        incident_gamma_scoring
+                            ? "pre_dead_time_raw_incident_gamma_weighted_mean"
+                            : "pre_dead_time_raw_energy_deposition_weighted_mean"
+                    )
                     : (
                         options.sample_detector_response
                     ? "pre_dead_time_raw_incident_gamma"
@@ -7261,6 +7379,15 @@ public:
             result.metadata["validation_entry_spectrum_grouping"] = (
                 "source_token_initial_gamma_line_entry_class"
             );
+            result.metadata["validation_observed_entry_spectrum_space"] = (
+                mean_calibration_enabled
+                    ? (
+                        incident_gamma_scoring
+                            ? "pre_dead_time_sampled_detector_response_weighted_mean"
+                            : "pre_dead_time_smeared_energy_deposition_weighted_mean"
+                    )
+                    : "observed_native_histogram"
+            );
             result.metadata[
                 options.sample_detector_response
                     ? "validation_only_background_analysis_spectrum"
@@ -7269,6 +7396,11 @@ public:
             for (const auto& item : validation_entry_spectra) {
                 result.metadata[
                     "validation_only_entry_spectrum_" + item.first
+                ] = SerializeDoubleVector(item.second);
+            }
+            for (const auto& item : validation_observed_entry_spectra) {
+                result.metadata[
+                    "validation_only_observed_entry_spectrum_" + item.first
                 ] = SerializeDoubleVector(item.second);
             }
             if (mean_calibration_enabled) {
@@ -7425,6 +7557,8 @@ private:
     G4RunManager* run_manager_ = nullptr;
     std::set<std::string> absorbing_volume_names_;
     std::set<std::string> absorbing_transport_groups_;
+    std::set<std::string> gamma_process_names_;
+    std::set<std::string> gamma_em_subprocess_names_;
 };
 
 SimulationResult RunTransport(

@@ -39,6 +39,8 @@ from spectrum.additive_scatter import (
     physical_scatter_basis_torch,
 )
 from spectrum.air_attenuation import (
+    NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_ID,
+    NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_SHA256,
     dry_air_total_linear_attenuation_numpy,
     dry_air_total_linear_attenuation_torch,
 )
@@ -1418,7 +1420,12 @@ class ContinuousKernel:
         | PhysicsOnlyNoncollidedTransportResponse
         | None
     ) = None
+    dry_air_total_attenuation_contract_id: str | None = None
+    dry_air_total_attenuation_contract_sha256: str | None = None
     _obstacle_boxes_cache: NDArray[np.float64] | None = field(
+        default=None, init=False, repr=False
+    )
+    _absorber_boxes_cache: NDArray[np.float64] | None = field(
         default=None, init=False, repr=False
     )
     _torch_octant_rotation_cache: dict[
@@ -1448,6 +1455,19 @@ class ContinuousKernel:
 
     def __post_init__(self) -> None:
         """Validate every physical and execution field without silent repair."""
+        air_contract = (
+            self.dry_air_total_attenuation_contract_id,
+            self.dry_air_total_attenuation_contract_sha256,
+        )
+        if air_contract != (None, None) and air_contract != (
+            NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_ID,
+            NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_SHA256,
+        ):
+            raise ValueError(
+                "dry-air attenuation requires the exact authenticated XCOM "
+                "contract id and hash, or both fields must be None for an "
+                "explicit non-runtime test kernel."
+            )
         for name in (
             "obstacle_height_m",
             "obstacle_buildup_coeff",
@@ -2040,11 +2060,12 @@ class ContinuousKernel:
         return tuple(energies)
 
     def _uses_xcom_air_attenuation(self) -> bool:
-        """Return whether the active response authenticates XCOM dry-air loss."""
-        return bool(
-            self.additive_scatter_response is not None
-            and self.additive_scatter_response.feature_basis_semantics
-            == DETECTOR_CONE_AIR_XCOM_SINGLE_SCATTER_BASIS_SEMANTICS
+        """Return whether the kernel authenticates universal XCOM air loss."""
+        return (
+            self.dry_air_total_attenuation_contract_id
+            == NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_ID
+            and self.dry_air_total_attenuation_contract_sha256
+            == NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_SHA256
         )
 
     def _line_air_tau_numpy(
@@ -2220,6 +2241,120 @@ class ContinuousKernel:
                 self._obstacle_boxes_cache = np.zeros((0, 6), dtype=float)
         return self._obstacle_boxes_cache.copy()
 
+    def absorber_boxes_m(self) -> NDArray[np.float64]:
+        """Return cached fail-closed absorber boxes in metres."""
+        if self.obstacle_grid is None:
+            return np.zeros((0, 6), dtype=float)
+        if self._absorber_boxes_cache is None:
+            boxes = self.obstacle_grid.absorber_transport_boxes_m
+            self._absorber_boxes_cache = (
+                np.asarray(boxes, dtype=float).reshape(-1, 6)
+                if boxes
+                else np.zeros((0, 6), dtype=float)
+            )
+        return self._absorber_boxes_cache.copy()
+
+    def _require_no_absorber_intersection_numpy(
+        self,
+        source_pos: NDArray[np.float64],
+        target_pos: NDArray[np.float64],
+        *,
+        tol: float,
+    ) -> None:
+        """Abort when any matched NumPy ray crosses an absorber volume."""
+        boxes = self.absorber_boxes_m()
+        if boxes.size == 0:
+            return
+        t_enter, t_exit, distance = _obstacle_segment_intervals_numpy(
+            source_pos=np.asarray(source_pos, dtype=float),
+            target_pos=np.asarray(target_pos, dtype=float),
+            obstacle_boxes_m=boxes,
+            tol=tol,
+        )
+        positive_length = (
+            np.maximum(t_exit - t_enter, 0.0) * distance[..., None]
+        )
+        if np.any(positive_length > float(tol)):
+            assert self.obstacle_grid is not None
+            raise RuntimeError(
+                "Source-detector transport intersects fail-closed absorber "
+                f"group {self.obstacle_grid.absorber_transport_group!r}; "
+                "the observation is outside the no-room-return contract."
+            )
+
+    def _require_no_absorber_intersection_torch(
+        self,
+        source_pos: "torch.Tensor",
+        target_pos: "torch.Tensor",
+        *,
+        tol: float,
+    ) -> None:
+        """Abort when any matched Torch ray crosses an absorber volume."""
+        if torch is None:
+            raise RuntimeError("torch is not available")
+        boxes = self.absorber_boxes_m()
+        if boxes.size == 0:
+            return
+        boxes_t = self._constant_tensor_torch(
+            "absorber-boxes",
+            boxes,
+            device=source_pos.device,
+            dtype=source_pos.dtype,
+        )
+        t_enter, t_exit, distance = _obstacle_segment_intervals_torch(
+            source_pos=source_pos,
+            target_pos=target_pos,
+            obstacle_boxes_m=boxes_t,
+            tol=tol,
+        )
+        positive_length = torch.clamp(t_exit - t_enter, min=0.0)
+        positive_length = positive_length * distance.unsqueeze(-1)
+        if bool(torch.any(positive_length > float(tol))):
+            assert self.obstacle_grid is not None
+            raise RuntimeError(
+                "Source-detector transport intersects fail-closed absorber "
+                f"group {self.obstacle_grid.absorber_transport_group!r}; "
+                "the observation is outside the no-room-return contract."
+            )
+
+    def _require_no_absorber_intersection_matrix_numpy(
+        self,
+        sources_xyz: NDArray[np.float64],
+        detector_poses_xyz: NDArray[np.float64],
+        *,
+        element_budget: int,
+    ) -> None:
+        """Check every detector/source pair in bounded vectorized chunks."""
+        boxes = self.absorber_boxes_m()
+        if boxes.size == 0:
+            return
+        sources = np.asarray(sources_xyz, dtype=float)
+        detectors = np.asarray(detector_poses_xyz, dtype=float)
+        if sources.ndim != 2 or sources.shape[1] != 3:
+            raise ValueError("sources_xyz must be shaped (N, 3).")
+        if detectors.ndim != 2 or detectors.shape[1] != 3:
+            raise ValueError("detector_poses_xyz must be shaped (M, 3).")
+        rows_per_chunk = max(
+            1,
+            int(element_budget)
+            // max(int(sources.shape[0]) * int(boxes.shape[0]) * 12, 1),
+        )
+        for start in range(0, int(detectors.shape[0]), rows_per_chunk):
+            detector_chunk = detectors[start : start + rows_per_chunk]
+            source_pairs = np.broadcast_to(
+                sources[None, :, :],
+                (int(detector_chunk.shape[0]), int(sources.shape[0]), 3),
+            )
+            detector_pairs = np.broadcast_to(
+                detector_chunk[:, None, :],
+                source_pairs.shape,
+            )
+            self._require_no_absorber_intersection_numpy(
+                source_pairs,
+                detector_pairs,
+                tol=1.0e-12,
+            )
+
     def obstacle_mu_cm_inv(self, isotope: str) -> float:
         """Return concrete obstacle attenuation coefficient in 1/cm for an isotope."""
         if self.obstacle_grid is None:
@@ -2279,6 +2414,11 @@ class ContinuousKernel:
         detector_pos: NDArray[np.float64],
     ) -> float:
         """Return total source-detector path length inside configured obstacles in centimeters."""
+        self._require_no_absorber_intersection_numpy(
+            np.asarray(source_pos, dtype=float),
+            np.asarray(detector_pos, dtype=float),
+            tol=1.0e-12,
+        )
         return obstacle_path_length_cm(
             source_pos=source_pos,
             detector_pos=detector_pos,
@@ -2291,6 +2431,11 @@ class ContinuousKernel:
         detector_pos: NDArray[np.float64],
     ) -> NDArray[np.float64]:
         """Return per-obstacle-box path lengths in centimeters."""
+        self._require_no_absorber_intersection_numpy(
+            np.asarray(source_pos, dtype=float),
+            np.asarray(detector_pos, dtype=float),
+            tol=1.0e-12,
+        )
         return obstacle_path_lengths_by_box_cm(
             source_pos=source_pos,
             detector_pos=detector_pos,
@@ -2306,6 +2451,11 @@ class ContinuousKernel:
         """Return obstacle-only optical depth for one source-detector ray."""
         if self.obstacle_grid is None:
             return 0.0
+        self._require_no_absorber_intersection_numpy(
+            np.asarray(source_pos, dtype=float),
+            np.asarray(detector_pos, dtype=float),
+            tol=1.0e-12,
+        )
         return obstacle_optical_depth(
             source_pos=source_pos,
             detector_pos=detector_pos,
@@ -2337,6 +2487,11 @@ class ContinuousKernel:
         element_budget: int = 4_000_000,
     ) -> NDArray[np.float64]:
         """Return obstacle-only log transmission for detector/source batches."""
+        self._require_no_absorber_intersection_matrix_numpy(
+            sources_xyz,
+            detector_poses_xyz,
+            element_budget=element_budget,
+        )
         return obstacle_log_attenuation_matrix(
             sources_xyz=sources_xyz,
             detector_poses_xyz=detector_poses_xyz,
@@ -2812,7 +2967,14 @@ class ContinuousKernel:
             raise RuntimeError(
                 "Ray sampling produced no rays for valid source-detector geometry."
             )
-        return np.vstack(sources), np.vstack(targets)
+        sampled_sources = np.vstack(sources)
+        sampled_targets = np.vstack(targets)
+        self._require_no_absorber_intersection_numpy(
+            sampled_sources,
+            sampled_targets,
+            tol=1.0e-12,
+        )
+        return sampled_sources, sampled_targets
 
     def _detector_aperture_targets_disk(
         self,
@@ -3166,11 +3328,18 @@ class ContinuousKernel:
             flat_sources[:, None, :],
             flat_targets.shape,
         )
-        return (
-            sampled_sources.reshape(row_count, sample_count, 3),
-            flat_targets.reshape(row_count, sample_count, 3),
+        sampled_sources = sampled_sources.reshape(
+            row_count,
             sample_count,
+            3,
         )
+        sampled_targets = flat_targets.reshape(row_count, sample_count, 3)
+        self._require_no_absorber_intersection_numpy(
+            sampled_sources,
+            sampled_targets,
+            tol=tol,
+        )
+        return sampled_sources, sampled_targets, sample_count
 
     def _detector_aperture_targets_torch(
         self,
@@ -3330,11 +3499,22 @@ class ContinuousKernel:
         )
         total_sample_count = int(source_sample_count) * int(aperture_sample_count)
         sampled_sources = flat_sources.unsqueeze(-2).expand_as(flat_targets)
-        return (
-            sampled_sources.reshape(int(sources.shape[0]), total_sample_count, 3),
-            flat_targets.reshape(int(sources.shape[0]), total_sample_count, 3),
+        sampled_sources = sampled_sources.reshape(
+            int(sources.shape[0]),
             total_sample_count,
+            3,
         )
+        sampled_targets = flat_targets.reshape(
+            int(sources.shape[0]),
+            total_sample_count,
+            3,
+        )
+        self._require_no_absorber_intersection_torch(
+            sampled_sources,
+            sampled_targets,
+            tol=tol,
+        )
+        return sampled_sources, sampled_targets, total_sample_count
 
     def _detector_aperture_targets_disk_torch(
         self,

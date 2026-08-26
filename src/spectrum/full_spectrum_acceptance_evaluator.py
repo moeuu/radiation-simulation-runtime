@@ -41,6 +41,9 @@ from spectrum.additive_scatter import scatter_basis_from_stored_geometry_numpy
 from spectrum.full_spectrum_acceptance import (
     build_independent_validation_manifest,
 )
+from spectrum.detector_response_validation import (
+    load_detector_response_validation_manifest,
+)
 from spectrum.full_spectrum_acceptance_runner import (
     ACCEPTANCE_ISOTOPES,
     ACCEPTANCE_PAIR_IDS,
@@ -1123,6 +1126,7 @@ def evaluate_all_designated_scenes(
 def approve_frozen_candidate(
     *,
     layout: AcceptanceRunLayout,
+    detector_response_validation_manifest_path: str | Path,
 ) -> tuple[Path, Path]:
     """Aggregate holdout metrics and approve only an all-pass candidate."""
     candidate = load_frozen_candidate_model(layout)
@@ -1133,7 +1137,15 @@ def approve_frozen_candidate(
             + DESIGNATED_HOLDOUT_SCENE_SEEDS
         )
     )
-    manifest = build_independent_validation_manifest(scene_paths)
+    detector_response_validation = load_detector_response_validation_manifest(
+        detector_response_validation_manifest_path
+    )
+    manifest = build_independent_validation_manifest(
+        scene_paths,
+        detector_response_validation_manifest=(
+            detector_response_validation
+        ),
+    )
     if (
         manifest["approved_model_contract_sha256"]
         != candidate.contract_hash_sha256

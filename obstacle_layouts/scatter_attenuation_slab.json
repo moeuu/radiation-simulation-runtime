@@ -15,5 +15,8 @@
     0.0,
     0.0
   ],
-  "version": 1
+  "absorber_transport_boxes_m": [],
+  "absorber_transport_contract_sha256": null,
+  "absorber_transport_group": null,
+  "version": 2
 }

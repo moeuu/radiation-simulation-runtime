@@ -14,6 +14,9 @@ from runtime.experiment_profiles import STANDARD_ACQUISITION_LIVE_TIME_S
 from spectrum.full_spectrum_acceptance import (
     write_independent_validation_manifest,
 )
+from spectrum.detector_response_validation import (
+    load_detector_response_validation_manifest,
+)
 from spectrum.full_spectrum_acceptance_runner import (
     ACCEPTANCE_ISOTOPES,
     ACCEPTANCE_PAIR_IDS,
@@ -76,6 +79,21 @@ def _common_parser(parser: argparse.ArgumentParser) -> None:
         help=(
             "Immutable/resumable artifact root "
             f"(default: {_DEFAULT_OUTPUT})."
+        ),
+    )
+
+
+def _detector_response_validation_argument(
+    parser: argparse.ArgumentParser,
+) -> None:
+    """Require the independent full-detector response gate artifact."""
+    parser.add_argument(
+        "--detector-response-validation-manifest",
+        type=Path,
+        required=True,
+        help=(
+            "Independently acquired full-detector energy-deposition response "
+            "validation manifest for this exact native executable."
         ),
     )
 
@@ -160,6 +178,7 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     _common_parser(approve)
+    _detector_response_validation_argument(approve)
 
     all_phases = subparsers.add_parser(
         "all",
@@ -169,6 +188,7 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     _common_parser(all_phases)
+    _detector_response_validation_argument(all_phases)
 
     aggregate = subparsers.add_parser(
         "aggregate",
@@ -187,6 +207,7 @@ def _parser() -> argparse.ArgumentParser:
             "and two holdout artifacts."
         ),
     )
+    _detector_response_validation_argument(aggregate)
     aggregate.add_argument(
         "--output",
         required=True,
@@ -388,9 +409,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Execute one explicitly ordered resumable acceptance phase."""
     arguments = _parser().parse_args(argv)
     if arguments.phase == "aggregate":
+        response_validation_payload = load_detector_response_validation_manifest(
+            arguments.detector_response_validation_manifest
+        )
         write_independent_validation_manifest(
             arguments.artifact,
             arguments.output,
+            detector_response_validation_manifest=(
+                response_validation_payload
+            ),
         )
         return 0
 
@@ -433,7 +460,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             _progress(f"scene acceptance: {path}")
     if arguments.phase in {"approve", "all"}:
         validation_path, production_path = approve_frozen_candidate(
-            layout=layout
+            layout=layout,
+            detector_response_validation_manifest_path=(
+                arguments.detector_response_validation_manifest
+            ),
         )
         _progress(f"independent validation: {validation_path}")
         _progress(f"approved production model: {production_path}")

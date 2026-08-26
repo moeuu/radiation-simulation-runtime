@@ -10,7 +10,10 @@ from collections.abc import Iterable, Sequence
 
 import numpy as np
 
-from measurement.obstacles import ObstacleGrid
+from measurement.obstacles import (
+    ROOM_ABSORBER_TRANSPORT_GROUP,
+    ObstacleGrid,
+)
 from sim.isaacsim_app.materials import (
     normalize_material_name,
     require_composition_mass_attenuation_at_energy,
@@ -335,9 +338,8 @@ def validate_component_transport_contract(
 
     A blocked footprint is navigation geometry, not a solid attenuation body.
     This invariant prevents hollow assets from being serialized or transported
-    as their enclosing box.  Optional room-boundary transport components may
-    follow the authored obstacle components and are intentionally not collision
-    obstacles.
+    as their enclosing box. Optional room boundaries use a separate absorber
+    contract and never enter material attenuation or scatter tables.
     """
     authored_components = tuple(
         component
@@ -356,24 +358,26 @@ def validate_component_transport_contract(
             "Obstacle collision geometry must equal the authored component "
             "boxes; footprint envelopes are not physical boxes."
         )
-    if grid.transport_boxes_m[: len(component_boxes)] != component_boxes:
+    if grid.transport_boxes_m != component_boxes:
         raise ValueError(
-            "Obstacle transport geometry must begin with the exact authored "
-            "component boxes; hollow envelopes are forbidden."
+            "Obstacle material transport geometry must equal the exact "
+            "authored component boxes; absorber and hollow-envelope boxes "
+            "are forbidden in the attenuation table."
         )
-    if len(grid.transport_boxes_m) < len(component_boxes):
-        raise ValueError(
-            "Obstacle transport geometry omitted authored material components."
-        )
-    trailing_count = len(grid.transport_boxes_m) - len(component_boxes)
-    physical_components = authored_components
-    if trailing_count:
-        if room_size_xyz is None or trailing_count != 6:
+    if grid.absorber_transport_boxes_m:
+        if room_size_xyz is None:
             raise ValueError(
-                "Transport boxes outside authored obstacles must be the six "
-                "explicit room-boundary components."
+                "Absorber transport geometry requires an explicit room size."
             )
-        floor = grid.transport_boxes_m[len(component_boxes)]
+        if (
+            grid.absorber_transport_group
+            != ROOM_ABSORBER_TRANSPORT_GROUP
+            or len(grid.absorber_transport_boxes_m) != 6
+        ):
+            raise ValueError(
+                "Room transport requires exactly six wall-group absorber boxes."
+            )
+        floor = grid.absorber_transport_boxes_m[0]
         boundary_thickness = float(floor[5] - floor[2])
         room_components = room_boundary_transport_components(
             room_size_xyz,
@@ -382,12 +386,15 @@ def validate_component_transport_contract(
         )
         if tuple(
             component.box_m for component in room_components
-        ) != grid.transport_boxes_m[len(component_boxes) :]:
+        ) != grid.absorber_transport_boxes_m:
             raise ValueError(
-                "Room-boundary transport boxes differ from their authored "
-                "floor, wall, and ceiling components."
+                "Room absorber boxes differ from the authored floor, wall, "
+                "and ceiling components."
             )
-        physical_components = (*authored_components, *room_components)
+    elif grid.absorber_transport_group is not None:
+        raise ValueError(
+            "An absorber transport group cannot exist without absorber boxes."
+        )
     transport_count = len(grid.transport_boxes_m)
     isotope_order = tuple(grid.transport_mu_by_isotope)
     if not isotope_order:
@@ -395,7 +402,7 @@ def validate_component_transport_contract(
             "Component transport requires isotope attenuation coefficients."
         )
     _, expected_mu = transport_model_from_components(
-        physical_components,
+        authored_components,
         isotopes=isotope_order,
     )
     for isotope, values in grid.transport_mu_by_isotope.items():
@@ -414,11 +421,11 @@ def validate_component_transport_contract(
                 f"component materials for {isotope}."
             )
     expected_line = line_transport_model_from_components(
-        physical_components,
+        authored_components,
         isotopes=isotope_order,
     )
     expected_compton = line_compton_transport_model_from_components(
-        physical_components,
+        authored_components,
         isotopes=isotope_order,
     )
     for table_name, table in (
@@ -653,24 +660,31 @@ def environment_transport_model(
     room_size_xyz: tuple[float, float, float] | None = None,
     include_room_boundaries: bool = False,
     room_boundary_thickness_m: float = 0.1,
-    room_boundary_material: str = "concrete",
     isotopes: Sequence[str] = DEFAULT_TRANSPORT_ISOTOPES,
 ) -> tuple[
     tuple[tuple[float, float, float, float, float, float], ...],
     dict[str, tuple[float, ...]],
     dict[str, tuple[tuple[float, ...], ...]],
     dict[str, tuple[tuple[float, ...], ...]],
+    str | None,
+    tuple[tuple[float, float, float, float, float, float], ...],
 ]:
-    """Return a complete PF/Geant4 environment transport model."""
+    """Return material transport plus explicit fail-closed absorbers."""
     components = list(_components_from_instances(instances))
+    absorber_group: str | None = None
+    absorber_boxes: tuple[
+        tuple[float, float, float, float, float, float], ...
+    ] = ()
     if include_room_boundaries:
         if room_size_xyz is None:
             raise ValueError("room_size_xyz is required for room boundary transport.")
-        components.extend(
-            room_boundary_transport_components(
+        absorber_group = ROOM_ABSORBER_TRANSPORT_GROUP
+        absorber_boxes = tuple(
+            component.box_m
+            for component in room_boundary_transport_components(
                 room_size_xyz,
                 thickness_m=room_boundary_thickness_m,
-                material=room_boundary_material,
+                material="concrete",
             )
         )
     boxes_m, mu_by_isotope = transport_model_from_components(
@@ -690,6 +704,8 @@ def environment_transport_model(
         mu_by_isotope,
         line_mu_by_isotope,
         line_compton_mu_by_isotope,
+        absorber_group,
+        absorber_boxes,
     )
 
 

@@ -28,6 +28,10 @@ from spectrum.additive_scatter import (
     AdditiveNoncollidedTransportResponse,
     PhysicsOnlyNoncollidedTransportResponse,
 )
+from spectrum.air_attenuation import (
+    NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_ID,
+    NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_SHA256,
+)
 from spectrum.transport_spectral import (
     GeometryConditionedSpectralModel,
     geometry_conditioned_model_from_runtime_config,
@@ -52,6 +56,8 @@ class RuntimeObservationModel:
     obstacle_buildup_coeff: float
     source_extent_radius_m: float
     source_extent_samples: int
+    dry_air_total_attenuation_contract_id: str
+    dry_air_total_attenuation_contract_sha256: str
 
 
 def _buildup_runtime_config(runtime_config: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -359,6 +365,12 @@ def _build_observation_model(
         obstacle_buildup_coeff=buildup_obstacle,
         source_extent_radius_m=source_extent_radius_m,
         source_extent_samples=source_extent_samples,
+        dry_air_total_attenuation_contract_id=(
+            NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_ID
+        ),
+        dry_air_total_attenuation_contract_sha256=(
+            NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_SHA256
+        ),
     )
 
 
@@ -424,6 +436,12 @@ def continuous_kernel_from_observation_model(
         source_extent_samples=model.source_extent_samples,
         line_mu_by_isotope=model.line_mu_by_isotope,
         additive_scatter_response=model.additive_scatter_response,
+        dry_air_total_attenuation_contract_id=(
+            model.dry_air_total_attenuation_contract_id
+        ),
+        dry_air_total_attenuation_contract_sha256=(
+            model.dry_air_total_attenuation_contract_sha256
+        ),
         use_gpu=use_gpu,
         gpu_device=gpu_device,
         gpu_dtype=gpu_dtype,

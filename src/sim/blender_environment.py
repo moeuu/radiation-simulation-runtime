@@ -183,6 +183,8 @@ def attach_known_obstacle_transport_model(
         mu_by_isotope,
         line_mu_by_isotope,
         line_compton_mu_by_isotope,
+        absorber_transport_group,
+        absorber_boxes_m,
     ) = environment_transport_model(
         instances,
         room_size_xyz=room_size_xyz,
@@ -195,4 +197,6 @@ def attach_known_obstacle_transport_model(
         mu_by_isotope=mu_by_isotope,
         line_mu_by_isotope=line_mu_by_isotope,
         line_compton_mu_by_isotope=line_compton_mu_by_isotope,
+        absorber_transport_group=absorber_transport_group,
+        absorber_boxes_m=absorber_boxes_m,
     )
