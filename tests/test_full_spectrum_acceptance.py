@@ -12,6 +12,7 @@ from measurement.source_boundary import (
     surface_emission_policy_sha256,
 )
 from spectrum.full_spectrum_acceptance import (
+    SURFACE_BOUNDARY_GATE_SCHEMA_VERSION,
     SURFACE_BOUNDARY_NATIVE_POSITION_VARIANTS,
     build_independent_validation_manifest,
     load_training_scene_artifacts,
@@ -114,7 +115,7 @@ def _write_artifact(
             )
         },
         "surface_boundary_gate": {
-            "schema_version": 1,
+            "schema_version": SURFACE_BOUNDARY_GATE_SCHEMA_VERSION,
             "surface_emission_policy_sha256": (
                 surface_emission_policy_sha256()
             ),

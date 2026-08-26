@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 from types import SimpleNamespace
 
 import numpy as np
@@ -20,6 +21,7 @@ from spectrum.full_spectrum_acceptance_runner import (
 )
 from spectrum.geant4_acceptance_backend import (
     ExternalGeant4AcceptanceBackend,
+    _boundary_probe_evidence_sha256,
     _geometry_batch,
     _mutated_surface_scene,
     _native_fidelity,
@@ -420,3 +422,46 @@ def test_signed_surface_scene_variants_use_exact_normal_offsets() -> None:
     assert "z=3 " in exact
     assert f"z={format(3.0 + SURFACE_EMISSION_EPSILON_M, '.17g')} " in air
     assert f"z={format(3.0 - SURFACE_EMISSION_EPSILON_M, '.17g')} " in solid
+
+
+def test_boundary_evidence_ignores_stochastic_success_output() -> None:
+    """Equivalent successful probes must have stable resumable evidence."""
+    common = {
+        "variant": "air_plus_epsilon",
+        "scene_sha256": "a" * 64,
+        "request_sha256": "b" * 64,
+        "response_contract_valid": True,
+        "native_executable_sha256": "c" * 64,
+        "native_execution_environment_sha256": "d" * 64,
+        "implementation_bundle_sha256": "e" * 64,
+    }
+    first = _boundary_probe_evidence_sha256(
+        result=subprocess.CompletedProcess(
+            args=("geant4",),
+            returncode=0,
+            stdout="sampled total=127\n",
+            stderr="worker schedule A\n",
+        ),
+        **common,
+    )
+    second = _boundary_probe_evidence_sha256(
+        result=subprocess.CompletedProcess(
+            args=("geant4",),
+            returncode=0,
+            stdout="sampled total=143\n",
+            stderr="worker schedule B\n",
+        ),
+        **common,
+    )
+    invalid = _boundary_probe_evidence_sha256(
+        result=subprocess.CompletedProcess(
+            args=("geant4",),
+            returncode=0,
+            stdout="sampled total=143\n",
+            stderr="worker schedule B\n",
+        ),
+        **{**common, "response_contract_valid": False},
+    )
+
+    assert first == second
+    assert invalid != first

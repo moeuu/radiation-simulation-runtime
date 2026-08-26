@@ -27,6 +27,9 @@ from spectrum.additive_scatter import (
     ADDITIVE_SCATTER_INCIDENT_LABEL_SEMANTICS,
     ADDITIVE_SCATTER_TARGET_SEMANTICS,
 )
+from spectrum.full_spectrum_acceptance import (
+    SURFACE_BOUNDARY_GATE_SCHEMA_VERSION,
+)
 from spectrum.full_spectrum_acceptance_runner import (
     NATIVE_ACCEPTANCE_FIDELITY,
     acceptance_transport_seed,
@@ -113,7 +116,7 @@ def test_acceptance_run_contract_loader_rejects_schema_drift(
 def _boundary_gate() -> dict[str, object]:
     """Return deterministic distinct signed-epsilon evidence."""
     return {
-        "schema_version": 1,
+        "schema_version": SURFACE_BOUNDARY_GATE_SCHEMA_VERSION,
         "surface_emission_policy_sha256": (
             surface_emission_policy_sha256()
         ),

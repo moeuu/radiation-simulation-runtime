@@ -26,7 +26,7 @@ from spectrum.transport_spectral import (
 
 
 ACCEPTANCE_SCENE_ARTIFACT_SCHEMA_VERSION = 3
-SURFACE_BOUNDARY_GATE_SCHEMA_VERSION = 1
+SURFACE_BOUNDARY_GATE_SCHEMA_VERSION = 2
 SURFACE_BOUNDARY_NATIVE_POSITION_VARIANTS = (
     "exact_surface_anchor",
     "air_plus_epsilon",

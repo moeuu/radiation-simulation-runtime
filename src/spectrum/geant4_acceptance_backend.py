@@ -58,6 +58,7 @@ from sim.geant4_app.execution_environment import (
     require_native_execution_bundle,
 )
 from sim.geant4_app.io_format import (
+    read_response_file,
     write_request_file,
     write_scene_file,
 )
@@ -72,6 +73,9 @@ from spectrum.additive_scatter import (
     ADDITIVE_SCATTER_INCIDENT_LABEL_SEMANTICS,
     ADDITIVE_SCATTER_TARGET_SEMANTICS,
     physical_scatter_basis_numpy,
+)
+from spectrum.full_spectrum_acceptance import (
+    SURFACE_BOUNDARY_GATE_SCHEMA_VERSION,
 )
 from spectrum.full_spectrum_acceptance_runner import (
     ACCEPTANCE_ISOTOPES,
@@ -920,6 +924,39 @@ def _mutated_surface_scene(
     raise RuntimeError("Exported probe scene contains no SOURCE record.")
 
 
+def _boundary_probe_evidence_sha256(
+    *,
+    variant: str,
+    scene_sha256: str,
+    request_sha256: str,
+    result: subprocess.CompletedProcess[str],
+    response_contract_valid: bool,
+    native_executable_sha256: str,
+    native_execution_environment_sha256: str,
+    implementation_bundle_sha256: str,
+) -> str:
+    """Hash deterministic boundary outcome semantics, not sampled counts."""
+    marker_seen = _BOUNDARY_ERROR_MARKER in (
+        result.stdout + result.stderr
+    )
+    return canonical_json_sha256(
+        {
+            "schema_version": SURFACE_BOUNDARY_GATE_SCHEMA_VERSION,
+            "variant": variant,
+            "scene_sha256": scene_sha256,
+            "request_sha256": request_sha256,
+            "returncode_zero": result.returncode == 0,
+            "surface_error_marker_seen": marker_seen,
+            "response_contract_valid": response_contract_valid,
+            "native_executable_sha256": native_executable_sha256,
+            "native_execution_environment_sha256": (
+                native_execution_environment_sha256
+            ),
+            "implementation_bundle_sha256": implementation_bundle_sha256,
+        }
+    )
+
+
 def _surface_boundary_gate(
     *,
     app: Geant4Application,
@@ -948,6 +985,7 @@ def _surface_boundary_gate(
     )
     results: dict[str, subprocess.CompletedProcess[str]] = {}
     evidence: dict[str, str] = {}
+    response_contract_valid_by_variant: dict[str, bool] = {}
     with tempfile.TemporaryDirectory(
         prefix="full_spectrum_boundary_gate_"
     ) as temporary:
@@ -1028,28 +1066,43 @@ def _surface_boundary_gate(
                 check=False,
             )
             results[variant] = result
-            evidence[variant] = canonical_json_sha256(
-                {
-                    "variant": variant,
-                    "scene_sha256": hashlib.sha256(
-                        scene_text.encode("utf-8")
-                    ).hexdigest(),
-                    "request_sha256": _file_sha256(request_path),
-                    "returncode": int(result.returncode),
-                    "stdout_sha256": hashlib.sha256(
-                        result.stdout.encode("utf-8")
-                    ).hexdigest(),
-                    "stderr_sha256": hashlib.sha256(
-                        result.stderr.encode("utf-8")
-                    ).hexdigest(),
-                    "response_sha256": (
-                        _file_sha256(response_path)
-                        if response_path.exists()
-                        else None
-                    ),
-                }
+            response_contract_valid = False
+            if result.returncode == 0 and response_path.is_file():
+                try:
+                    spectrum, metadata = read_response_file(response_path)
+                    response_contract_valid = bool(
+                        spectrum.shape == (NATIVE_GEANT4_BIN_COUNT,)
+                        and np.all(np.isfinite(spectrum))
+                        and np.all(spectrum >= 0.0)
+                        and np.all(spectrum == np.floor(spectrum))
+                    )
+                    if response_contract_valid:
+                        _native_fidelity(
+                            metadata,
+                            config=app.config,
+                            source_count=1,
+                        )
+                except (OSError, RuntimeError, TypeError, ValueError):
+                    response_contract_valid = False
+            response_contract_valid_by_variant[variant] = (
+                response_contract_valid
             )
-    air_ok = results["air_plus_epsilon"].returncode == 0
+            evidence[variant] = _boundary_probe_evidence_sha256(
+                variant=variant,
+                scene_sha256=hashlib.sha256(
+                    scene_text.encode("utf-8")
+                ).hexdigest(),
+                request_sha256=_file_sha256(request_path),
+                result=result,
+                response_contract_valid=response_contract_valid,
+                native_executable_sha256=expected_executable,
+                native_execution_environment_sha256=expected_environment,
+                implementation_bundle_sha256=expected_implementation,
+            )
+    air_ok = (
+        results["air_plus_epsilon"].returncode == 0
+        and response_contract_valid_by_variant["air_plus_epsilon"]
+    )
     exact_error = (
         results["exact_surface_anchor"].returncode != 0
         and _BOUNDARY_ERROR_MARKER
@@ -1072,7 +1125,7 @@ def _surface_boundary_gate(
             "Native signed-epsilon surface-boundary probes failed."
         )
     return {
-        "schema_version": 1,
+        "schema_version": SURFACE_BOUNDARY_GATE_SCHEMA_VERSION,
         "surface_emission_policy_sha256": (
             surface_emission_policy_sha256()
         ),

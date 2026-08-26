@@ -29,6 +29,9 @@ from spectrum.additive_scatter import (
     ADDITIVE_SCATTER_INCIDENT_LABEL_SEMANTICS,
     ADDITIVE_SCATTER_TARGET_SEMANTICS,
 )
+from spectrum.full_spectrum_acceptance import (
+    SURFACE_BOUNDARY_GATE_SCHEMA_VERSION,
+)
 import spectrum.full_spectrum_acceptance_evaluator as evaluator
 from spectrum.full_spectrum_acceptance_runner import (
     ACCEPTANCE_ISOTOPES,
@@ -137,7 +140,7 @@ def _boundary_gate(scene_seed: int) -> dict[str, object]:
         "solid_minus_epsilon",
     )
     return {
-        "schema_version": 1,
+        "schema_version": SURFACE_BOUNDARY_GATE_SCHEMA_VERSION,
         "surface_emission_policy_sha256": (
             surface_emission_policy_sha256()
         ),

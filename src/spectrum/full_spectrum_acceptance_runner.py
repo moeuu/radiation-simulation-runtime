@@ -60,6 +60,9 @@ from spectrum.additive_scatter import (
     fit_additive_noncollided_transport_response,
     scatter_basis_from_stored_geometry_numpy,
 )
+from spectrum.full_spectrum_acceptance import (
+    SURFACE_BOUNDARY_GATE_SCHEMA_VERSION,
+)
 from spectrum.native_metadata import native_source_line_token
 from spectrum.physics_contracts import (
     OBSTACLE_MATERIAL_CONTRACT_SHA256,
@@ -533,7 +536,7 @@ def validate_surface_boundary_gate(payload: object) -> dict[str, object]:
     evidence = payload["evidence_sha256_by_variant"]
     if (
         type(payload["schema_version"]) is not int
-        or payload["schema_version"] != 1
+        or payload["schema_version"] != SURFACE_BOUNDARY_GATE_SCHEMA_VERSION
         or payload["surface_emission_policy_sha256"]
         != surface_emission_policy_sha256()
         or _strict_finite_number(
