@@ -122,6 +122,9 @@ _FULL_SPECTRUM_RUNTIME_KEYS = frozenset(
         "full_spectrum_generative_model_path",
         "full_spectrum_generative_model_file_sha256",
         "full_spectrum_contract_hash_sha256",
+        "full_spectrum_model_registry_file_sha256",
+        "full_spectrum_model_registry_path",
+        "isotope_experiment_profile",
     }
 )
 

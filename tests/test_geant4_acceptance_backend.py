@@ -102,7 +102,16 @@ def test_acceptance_kernel_uses_predeclared_cpu_float64_contract(
 ) -> None:
     """Runtime config must not select acceptance geometry compute semantics."""
     backend = object.__new__(ExternalGeant4AcceptanceBackend)
-    backend.runtime_config = {}
+    backend.runtime_config = {
+        "benign_observation_field": "retained",
+        "full_spectrum_generative_model": {"candidate": True},
+        "full_spectrum_generative_model_path": "candidate.json",
+        "full_spectrum_generative_model_file_sha256": "a" * 64,
+        "full_spectrum_contract_hash_sha256": "b" * 64,
+        "full_spectrum_model_registry_file_sha256": "c" * 64,
+        "full_spectrum_model_registry_path": "registry.json",
+        "isotope_experiment_profile": "unapproved_candidate",
+    }
     grid = ObstacleGrid(
         origin=(0.0, 0.0),
         cell_size=1.0,
@@ -147,7 +156,9 @@ def test_acceptance_kernel_uses_predeclared_cpu_float64_contract(
 
     kernel = backend._kernel(grid)
 
-    assert captured["payload"] == {}
+    assert captured["payload"] == {
+        "benign_observation_field": "retained",
+    }
     assert captured["use_gpu"] is ACCEPTANCE_GEOMETRY_USE_GPU
     assert kernel.gpu_device == ACCEPTANCE_GEOMETRY_DEVICE
     assert kernel.gpu_dtype == ACCEPTANCE_GEOMETRY_DTYPE
