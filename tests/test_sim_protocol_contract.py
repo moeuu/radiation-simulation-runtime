@@ -6,6 +6,8 @@ from collections.abc import Callable
 
 import pytest
 
+from spectrum.detector_green_operator import DETECTOR_GREEN_SAMPLING_MODE
+
 from sim.protocol import (
     SimulationCommand,
     SimulationObservation,
@@ -149,9 +151,7 @@ def test_sampled_event_spectrum_round_trip_preserves_integer_counts() -> None:
     payload = _observation_payload()
     payload["spectrum_counts"] = [1, 2]
     payload["metadata"] = {
-        "detector_response_sampling_mode": (
-            "multinomial_marking_with_nonparalyzable_event_time"
-        ),
+        "detector_response_sampling_mode": DETECTOR_GREEN_SAMPLING_MODE,
         "transport_history_mode": "full_unit_weight",
     }
 
@@ -171,9 +171,7 @@ def test_sampled_event_spectrum_rejects_float_wire_counts() -> None:
     """A float wire payload must not masquerade as sampled event counts."""
     payload = _observation_payload()
     payload["metadata"] = {
-        "detector_response_sampling_mode": (
-            "multinomial_marking_with_nonparalyzable_event_time"
-        ),
+        "detector_response_sampling_mode": DETECTOR_GREEN_SAMPLING_MODE,
         "transport_history_mode": "full_unit_weight",
     }
 

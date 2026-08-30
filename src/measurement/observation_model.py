@@ -200,6 +200,107 @@ def require_production_model_approval(
         )
 
 
+def _effective_mu_by_isotope_from_line_table(
+    line_table: Mapping[str, Sequence[Mapping[str, float]]],
+    *,
+    isotopes: Sequence[str],
+) -> dict[str, dict[str, float]]:
+    """Derive diagnostic scalar coefficients from the exact catalog lines."""
+    expected = tuple(str(isotope) for isotope in isotopes)
+    if set(line_table) != set(expected):
+        raise ValueError(
+            "Line-resolved shield table must exactly cover the configured "
+            "isotope set."
+        )
+    result: dict[str, dict[str, float]] = {}
+    for isotope in expected:
+        rows = tuple(line_table[isotope])
+        if not rows:
+            raise ValueError(
+                f"No positive line-resolved shield rows exist for {isotope!r}."
+            )
+        weights = tuple(float(row["weight"]) for row in rows)
+        if (
+            any(set(row) != {"energy_keV", "weight", "fe", "pb"} for row in rows)
+            or any(
+                not math.isfinite(float(row[key]))
+                for row in rows
+                for key in ("energy_keV", "weight", "fe", "pb")
+            )
+            or any(float(row["energy_keV"]) <= 0.0 for row in rows)
+            or any(float(row["weight"]) <= 0.0 for row in rows)
+            or any(float(row[key]) < 0.0 for row in rows for key in ("fe", "pb"))
+            or not math.isclose(sum(weights), 1.0, rel_tol=0.0, abs_tol=1.0e-12)
+        ):
+            raise ValueError(
+                f"Line-resolved shield rows are invalid for {isotope!r}."
+            )
+        result[isotope] = {
+            material: float(
+                sum(
+                    weight * float(row[material])
+                    for weight, row in zip(weights, rows, strict=True)
+                )
+            )
+            for material in ("fe", "pb")
+        }
+    return result
+
+
+def _require_model_catalog_alignment(
+    model: GeometryConditionedSpectralModel,
+    *,
+    line_table: Mapping[str, Sequence[Mapping[str, float]]],
+    isotopes: Sequence[str],
+) -> None:
+    """Require the authenticated spectrum model to use the same catalog lines."""
+    rows_by_isotope: dict[str, list[Mapping[str, object]]] = {
+        str(isotope): [] for isotope in isotopes
+    }
+    for row in model.line_identity:
+        isotope = row.get("isotope")
+        if not isinstance(isotope, str) or isotope not in rows_by_isotope:
+            raise ValueError(
+                "Authenticated full-spectrum lines differ from the configured "
+                "isotope set."
+            )
+        rows_by_isotope[isotope].append(row)
+    for isotope in isotopes:
+        model_rows = rows_by_isotope[str(isotope)]
+        catalog_rows = tuple(line_table[str(isotope)])
+        if len(model_rows) != len(catalog_rows):
+            raise ValueError(
+                f"Authenticated model/catalog line count differs for {isotope!r}."
+            )
+        for index, (model_row, catalog_row) in enumerate(
+            zip(model_rows, catalog_rows, strict=True)
+        ):
+            if model_row.get("transport_line_index") != index:
+                raise ValueError(
+                    f"Authenticated model line indices are not contiguous for "
+                    f"{isotope!r}."
+                )
+            comparisons = (
+                ("energy_keV", "energy_keV"),
+                ("branching_weight", "weight"),
+                ("mu_fe_cm_inv", "fe"),
+                ("mu_pb_cm_inv", "pb"),
+            )
+            if any(
+                not math.isclose(
+                    float(model_row[model_key]),
+                    float(catalog_row[catalog_key]),
+                    rel_tol=0.0,
+                    abs_tol=1.0e-12,
+                )
+                for model_key, catalog_key in comparisons
+            ):
+                raise ValueError(
+                    f"Authenticated model/catalog line data differs for "
+                    f"{isotope!r} line {index}."
+                )
+
+
 def _build_observation_model(
     runtime_config: Mapping[str, Any] | None,
     *,
@@ -262,18 +363,9 @@ def _build_observation_model(
         buildup_fe_coeff=buildup_fe,
         buildup_pb_coeff=buildup_pb,
     )
-    mu_by_isotope = mu_by_isotope_from_tvl_mm(
-        HVL_TVL_TABLE_MM,
-        isotopes=isotope_order,
-    )
-    if not mu_by_isotope:
-        mu_by_isotope = {
-            str(isotope): {"fe": shield_params.mu_fe, "pb": shield_params.mu_pb}
-            for isotope in isotope_order
-        }
     line_mu_by_isotope = None
     source_rate_model = _nonempty_string(
-        payload.get("source_rate_model", "detector_cps_1m"),
+        payload.get("source_rate_model"),
         field_name="source_rate_model",
     )
     if source_rate_model != "detector_cps_1m":
@@ -281,14 +373,34 @@ def _build_observation_model(
             "Production observation model requires "
             "source_rate_model='detector_cps_1m'."
         )
-    if _strict_boolean(
-        payload.get("line_resolved_shield_attenuation", True),
+    line_resolved = _strict_boolean(
+        payload.get("line_resolved_shield_attenuation"),
         field_name="line_resolved_shield_attenuation",
-    ):
+    )
+    if production and not line_resolved:
+        raise ValueError(
+            "Production observation model requires line-resolved shield "
+            "attenuation."
+        )
+    if line_resolved:
         line_mu_by_isotope = line_resolved_shield_mu_by_isotope(
             isotopes=isotope_order,
             normalize_line_intensities=True,
         )
+        mu_by_isotope = _effective_mu_by_isotope_from_line_table(
+            line_mu_by_isotope,
+            isotopes=isotope_order,
+        )
+    else:
+        mu_by_isotope = mu_by_isotope_from_tvl_mm(
+            HVL_TVL_TABLE_MM,
+            isotopes=isotope_order,
+        )
+        if set(mu_by_isotope) != set(isotope_order):
+            raise ValueError(
+                "An explicit nonproduction scalar shield table must exactly "
+                "cover every configured isotope."
+            )
     full_spectrum_selector_keys = {
         "full_spectrum_generative_model",
         "full_spectrum_generative_model_path",
@@ -324,11 +436,26 @@ def _build_observation_model(
             if full_spectrum_selector_keys.intersection(payload)
             else None
         )
+    if production and full_spectrum_model is None:
+        raise RuntimeError(
+            "Production observation construction requires one authenticated "
+            "full-spectrum model."
+        )
     if full_spectrum_model is not None:
         if production:
             require_production_model_approval(full_spectrum_model)
         else:
             _require_training_model_approval(full_spectrum_model)
+        if line_mu_by_isotope is None:
+            raise ValueError(
+                "Full-spectrum observation construction requires exact catalog "
+                "line transport."
+            )
+        _require_model_catalog_alignment(
+            full_spectrum_model,
+            line_table=line_mu_by_isotope,
+            isotopes=isotope_order,
+        )
     obstacle_mu_by_isotope = _obstacle_mu_by_isotope_from_runtime_config(
         payload,
         isotopes=isotope_order,
@@ -350,6 +477,25 @@ def _build_observation_model(
             "Source extent must use radius=0 with samples=1, or a positive "
             "radius with at least two samples."
         )
+    if full_spectrum_model is not None:
+        detector_green_radius_m = float(
+            full_spectrum_model.detector_target_radius_m
+        )
+        if not math.isclose(
+            detector_geometry.aperture_radius_m,
+            detector_green_radius_m,
+            rel_tol=0.0,
+            abs_tol=1.0e-12,
+        ):
+            raise ValueError(
+                "The runtime detector aperture radius does not match the "
+                "authenticated detector Green boundary."
+            )
+        if source_extent_radius_m != 0.0 or source_extent_samples != 1:
+            raise ValueError(
+                "Full-spectrum detector-impact conditioning currently "
+                "requires the authenticated point-source contract."
+            )
     return RuntimeObservationModel(
         detector_geometry=detector_geometry,
         shield_params=shield_params,
@@ -435,6 +581,7 @@ def continuous_kernel_from_observation_model(
         source_extent_radius_m=model.source_extent_radius_m,
         source_extent_samples=model.source_extent_samples,
         line_mu_by_isotope=model.line_mu_by_isotope,
+        strict_catalog_line_contract=model.line_mu_by_isotope is not None,
         additive_scatter_response=model.additive_scatter_response,
         dry_air_total_attenuation_contract_id=(
             model.dry_air_total_attenuation_contract_id

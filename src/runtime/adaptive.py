@@ -23,8 +23,6 @@ from measurement.obstacle_assets import (
 )
 from measurement.obstacles import ObstacleGrid
 from runtime.adaptive_protocol import (
-    ADAPTIVE_CUI_OVERLAY_PREFIX,
-    ADAPTIVE_CUI_OVERLAY_FRAMING,
     ADAPTIVE_EVENT_PREFIX,
     ADAPTIVE_EVENT_FRAMING,
     AdaptiveBootstrap,
@@ -60,6 +58,7 @@ from runtime.provenance import (
     strict_sha256_json,
 )
 from runtime.records import RunContext, validate_truth_free_estimator_input
+from runtime.cui_truth_overlay import CUITruthOverlaySocketServer
 from runtime.session import (
     AcquisitionAction,
     ObservationSession,
@@ -91,7 +90,6 @@ _SCENARIO_FIELDS = frozenset(
         "obstacle_layout_path",
     }
 )
-_CUI_OVERLAY_FIELDS = frozenset({"type", "include_truth"})
 _PRODUCTION_ENVIRONMENT_FIELDS = frozenset(
     {
         "experiment_profile_id",
@@ -1526,22 +1524,6 @@ class AdaptiveRuntimeSession:
             candidates=self._candidate_snapshot,
         ).to_payload()
 
-    def cui_overlay(self, request: Mapping[str, Any]) -> dict[str, object]:
-        """Return private CUI overlay data outside estimator-visible events."""
-        if self._closed:
-            raise RuntimeError("Adaptive runtime session is closed.")
-        self._require_request_before_measurement_limit()
-        if set(request) != _CUI_OVERLAY_FIELDS or request.get("type") != "cui_overlay":
-            raise ValueError("CUI overlay request fields disagree with schema 1.")
-        include_truth = request["include_truth"]
-        if not isinstance(include_truth, bool):
-            raise TypeError("include_truth must be a boolean.")
-        return {
-            "type": "cui_overlay",
-            "schema_version": 1,
-            "truth": self.cui_truth_overlay if include_truth else None,
-        }
-
     def _shield_actuation_time_s(self, target_pair_id: int) -> float:
         """Return parallel Fe/Pb actuator time from physical octant angles."""
         return shield_pair_transition_time_s(
@@ -1606,20 +1588,13 @@ def _write_event(stream: TextIO, payload: Mapping[str, object]) -> None:
     stream.flush()
 
 
-def _write_cui_overlay_event(stream: TextIO, payload: Mapping[str, object]) -> None:
-    """Write one private CUI overlay event without estimator validation."""
-    stream.write(ADAPTIVE_CUI_OVERLAY_FRAMING.encode(payload))
-    stream.flush()
-
-
-def serve_adaptive_session(
-    scenario_path: str | Path,
+def _serve_adaptive_session_instance(
+    session: AdaptiveRuntimeSession,
     *,
     input_stream: TextIO,
     output_stream: TextIO,
 ) -> int:
-    """Serve one fresh acquisition over JSON lines."""
-    session = AdaptiveRuntimeSession.open(scenario_path)
+    """Serve one already-open fresh acquisition over JSON lines."""
     try:
         _write_event(output_stream, session.ready_payload())
         for line in input_stream:
@@ -1631,11 +1606,6 @@ def serve_adaptive_session(
                 _write_event(output_stream, session.step(request))
             elif request_type == "refine":
                 _write_event(output_stream, session.refine(request))
-            elif request_type == "cui_overlay":
-                _write_cui_overlay_event(
-                    output_stream,
-                    session.cui_overlay(request),
-                )
             elif request_type == "finalize":
                 if set(request) != {"type"}:
                     raise ValueError("finalize request has unknown fields.")
@@ -1656,12 +1626,28 @@ def serve_adaptive_session(
         raise
 
 
+def serve_adaptive_session(
+    scenario_path: str | Path,
+    *,
+    input_stream: TextIO,
+    output_stream: TextIO,
+) -> int:
+    """Open and serve one fresh acquisition over JSON lines."""
+    session = AdaptiveRuntimeSession.open(scenario_path)
+    return _serve_adaptive_session_instance(
+        session,
+        input_stream=input_stream,
+        output_stream=output_stream,
+    )
+
+
 def serve_adaptive_session_socket(
     scenario_path: str | Path,
     *,
     socket_path: str | Path,
+    cui_truth_overlay_socket_path: str | Path | None = None,
 ) -> int:
-    """Serve one private adaptive session over a local estimator-neutral socket."""
+    """Serve estimator events and an optional renderer-only truth socket."""
     endpoint = Path(socket_path).expanduser().resolve()
     if endpoint.exists() or endpoint.is_symlink():
         raise FileExistsError(f"Adaptive session socket already exists: {endpoint}")
@@ -1673,17 +1659,42 @@ def serve_adaptive_session_socket(
         server.listen(1)
         connection, _ = server.accept()
         with connection:
-            with connection.makefile("r", encoding="utf-8") as input_stream:
-                with connection.makefile(
-                    "w",
-                    encoding="utf-8",
-                    buffering=1,
-                ) as output_stream:
-                    return serve_adaptive_session(
-                        scenario_path,
-                        input_stream=input_stream,
-                        output_stream=output_stream,
+            session = AdaptiveRuntimeSession.open(scenario_path)
+            overlay_server: CUITruthOverlaySocketServer | None = None
+            primary_failure: BaseException | None = None
+            try:
+                if cui_truth_overlay_socket_path is not None:
+                    overlay_server = CUITruthOverlaySocketServer(
+                        cui_truth_overlay_socket_path,
+                        session.cui_truth_overlay,
                     )
+                with connection.makefile("r", encoding="utf-8") as input_stream:
+                    with connection.makefile(
+                        "w",
+                        encoding="utf-8",
+                        buffering=1,
+                    ) as output_stream:
+                        return _serve_adaptive_session_instance(
+                            session,
+                            input_stream=input_stream,
+                            output_stream=output_stream,
+                        )
+            except BaseException as exc:
+                primary_failure = exc
+                session.close()
+                raise
+            finally:
+                if overlay_server is not None:
+                    try:
+                        overlay_server.close()
+                    except BaseException as overlay_exc:
+                        if primary_failure is not None:
+                            primary_failure.add_note(
+                                "Secondary CUI truth socket cleanup failure: "
+                                f"{type(overlay_exc).__name__}: {overlay_exc}"
+                            )
+                        else:
+                            raise
     finally:
         server.close()
         try:
@@ -1693,7 +1704,6 @@ def serve_adaptive_session_socket(
 
 
 __all__ = [
-    "ADAPTIVE_CUI_OVERLAY_PREFIX",
     "ADAPTIVE_EVENT_PREFIX",
     "AdaptiveCandidateProvider",
     "AdaptiveCandidateSnapshot",

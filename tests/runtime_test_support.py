@@ -1,4 +1,4 @@
-"""Local schema-v3 full-spectrum fixtures for runtime contract tests."""
+"""Local schema-v6 physics-only fixtures for runtime contract tests."""
 
 from __future__ import annotations
 
@@ -6,295 +6,183 @@ import copy
 from functools import lru_cache
 from hashlib import sha256
 from pathlib import Path
+import tempfile
 
 import numpy as np
 
 from measurement.source_boundary import surface_emission_policy_sha256
-from measurement.shielding import SHIELD_POSE_CONTRACT_SHA256
+from measurement.shielding import (
+    DEFAULT_DETECTOR_CRYSTAL_RADIUS_CM,
+    DEFAULT_FE_SHIELD_INNER_RADIUS_CM,
+    DEFAULT_FE_SHIELD_THICKNESS_CM,
+    DEFAULT_PB_SHIELD_INNER_RADIUS_CM,
+    DEFAULT_PB_SHIELD_THICKNESS_CM,
+)
 from runtime.contracts import FULL_SPECTRUM_CONTRACT_HASH_METADATA_KEY
-from runtime.provenance import strict_sha256_json
 from runtime.measurement_log import (
     MeasurementLogRecord,
     build_forward_model_manifest,
     write_measurement_log,
 )
-from spectrum.response_matrix import (
-    NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256,
-)
-from spectrum.detector_response_validation import (
-    build_detector_response_validation_manifest,
-    detector_response_validation_manifest_sha256,
-)
-from spectrum.physics_contracts import (
-    OBSTACLE_MATERIAL_CONTRACT_SHA256,
-    TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256,
-)
+from runtime.provenance import strict_sha256_json
 from spectrum.additive_scatter import (
-    ADDITIVE_SCATTER_INCIDENT_LABEL_SEMANTICS,
-    ADDITIVE_SCATTER_RIDGE_LAMBDA_GRID,
-    DETECTOR_CONE_AIR_XCOM_SINGLE_SCATTER_BASIS_SEMANTICS,
-    AdditiveNoncollidedTransportResponse,
+    PhysicsOnlyNoncollidedTransportResponse,
 )
+from spectrum.detector_green_validation import (
+    detector_green_validation_manifest_sha256,
+)
+from spectrum.detector_green_operator import DetectorGreenOperator
 from spectrum.transport_spectral import (
     ACCEPTANCE_METRIC_CONTRACT,
-    DESIGNATED_HOLDOUT_SCENE_SEEDS,
-    DESIGNATED_TRAINING_SCENE_SEEDS,
+    DESIGNATED_VALIDATION_SCENE_SEEDS,
     FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256,
-    GeometryConditionedSpectralModel,
-    MARK_CONCENTRATION_GRID,
-    RATE_SCALE_HALF_WIDTH_GRID,
     VALIDATION_SCENARIO_IDS,
-    rate_scale_mixture_for_half_width,
+    GeometryConditionedSpectralModel,
 )
-from tests.detector_response_test_support import (
-    passing_detector_response_raw_corpus,
+from tests.green_test_support import (
+    synthetic_detector_green_validation_manifest,
+    write_synthetic_detector_green_artifact,
 )
 
 
 TEST_COMMIT = "a" * 40
 TEST_ISOTOPES = ("Co-60", "Cs-137", "Eu-154")
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
-def _synthetic_training_manifest() -> dict[str, object]:
-    """Return a structurally valid test-only training provenance manifest."""
-    width = RATE_SCALE_HALF_WIDTH_GRID[0]
-    concentration = MARK_CONCENTRATION_GRID[-1]
-    return {
-        "schema_version": 1,
-        "acceptance_contract_sha256": (
-            FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256
-        ),
-        "training_scene_seeds": list(DESIGNATED_TRAINING_SCENE_SEEDS),
-        "scenario_ids": list(VALIDATION_SCENARIO_IDS),
-        "pair_ids_by_scene": {
-            str(seed): list(range(64))
-            for seed in DESIGNATED_TRAINING_SCENE_SEEDS
-        },
-        "artifact_sha256_by_scene": {
-            str(seed): sha256(
-                f"test-training-scene-{seed}".encode("utf-8")
-            ).hexdigest()
-            for seed in DESIGNATED_TRAINING_SCENE_SEEDS
-        },
-        "rate_scale_family": (
-            "station_shared_three_node_symmetric_mean_one"
-        ),
-        "mark_family": "source_fraction_dirichlet_multinomial",
-        "selection_objective": (
-            "maximum_joint_training_log_predictive_density"
-        ),
-        "selected_rate_scale_half_width": width,
-        "selected_mark_concentration_source": concentration,
-        "candidate_count": (
-            len(RATE_SCALE_HALF_WIDTH_GRID)
-            * len(MARK_CONCENTRATION_GRID)
-        ),
-        "selected_training_log_predictive_density": -1.0,
-        "selection_artifact_sha256": sha256(
-            b"test-only-global-discrepancy-selection"
-        ).hexdigest(),
-        "selection_completed": True,
-    }
+@lru_cache(maxsize=1)
+def _test_operator_manifest_path() -> Path:
+    """Publish one process-local immutable synthetic Green artifact."""
+    results_root = _REPOSITORY_ROOT / "results"
+    results_root.mkdir(parents=True, exist_ok=True)
+    root = Path(tempfile.mkdtemp(prefix="runtime-test-green-", dir=results_root))
+    return write_synthetic_detector_green_artifact(root / "operator")
+
+
+@lru_cache(maxsize=1)
+def _test_operator() -> DetectorGreenOperator:
+    """Load the process-local file-backed synthetic Green operator."""
+    return DetectorGreenOperator.from_artifact(_test_operator_manifest_path())
+
+
+def _physics_only_response() -> PhysicsOnlyNoncollidedTransportResponse:
+    """Return the generic non-fitted transport response used in tests."""
+    return PhysicsOnlyNoncollidedTransportResponse(
+        detector_radius_m=DEFAULT_DETECTOR_CRYSTAL_RADIUS_CM / 100.0,
+        fe_scatter_distance_m=(
+            DEFAULT_FE_SHIELD_INNER_RADIUS_CM + 0.5 * DEFAULT_FE_SHIELD_THICKNESS_CM
+        )
+        / 100.0,
+        pb_scatter_distance_m=(
+            DEFAULT_PB_SHIELD_INNER_RADIUS_CM + 0.5 * DEFAULT_PB_SHIELD_THICKNESS_CM
+        )
+        / 100.0,
+    )
 
 
 def _synthetic_validation_manifest(
+    *,
     model_contract_hash: str,
     additive_scatter_contract_hash: str,
 ) -> dict[str, object]:
-    """Return a structurally valid test-only independent-gate manifest."""
-    all_seeds = (
-        DESIGNATED_TRAINING_SCENE_SEEDS
-        + DESIGNATED_HOLDOUT_SCENE_SEEDS
+    """Return a strict schema-v6 validation-only approval manifest."""
+    operator = _test_operator()
+    green_validation = synthetic_detector_green_validation_manifest(
+        operator,
+        runtime_config_sha256="7" * 64,
+        native_executable_sha256="2" * 64,
+        native_execution_environment_sha256="3" * 64,
+        detector_implementation_bundle_sha256="4" * 64,
     )
-    metrics: dict[str, dict[str, object]] = {}
-    for metric_id, (comparison, threshold) in (
-        ACCEPTANCE_METRIC_CONTRACT.items()
-    ):
-        metrics[metric_id] = {
+    metrics = {
+        metric_id: {
             "value": float(threshold),
             "comparison": comparison,
             "threshold": float(threshold),
             "passed": True,
         }
-    detector_response_validation = (
-        build_detector_response_validation_manifest(
-            passing_detector_response_raw_corpus(
-                native_executable_sha256="b" * 64,
-                native_execution_environment_sha256="e" * 64,
-                implementation_bundle_sha256="c" * 64,
-                runtime_config_sha256="a" * 64,
-            )
-        )
-    )
+        for metric_id, (comparison, threshold) in (ACCEPTANCE_METRIC_CONTRACT.items())
+    }
+    seeds = DESIGNATED_VALIDATION_SCENE_SEEDS
     return {
-        "schema_version": 4,
-        "validation_contract_sha256": (
-            FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256
-        ),
-        "approved_model_contract_sha256": str(model_contract_hash),
-        "acceptance_run_contract_sha256": "d" * 64,
-        "runtime_config_sha256": "a" * 64,
-        "native_executable_sha256": "b" * 64,
-        "native_execution_environment_sha256": "e" * 64,
-        "implementation_bundle_sha256": "c" * 64,
-        "native_response_contract_sha256": (
-            NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
-        ),
-        "detector_response_validation": detector_response_validation,
-        "detector_response_validation_manifest_sha256": (
-            detector_response_validation_manifest_sha256(
-                detector_response_validation
+        "schema_version": 6,
+        "validation_contract_sha256": (FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256),
+        "approved_model_contract_sha256": model_contract_hash,
+        "acceptance_run_contract_sha256": "6" * 64,
+        "runtime_config_sha256": "7" * 64,
+        "native_executable_sha256": "2" * 64,
+        "native_execution_environment_sha256": "3" * 64,
+        "implementation_bundle_sha256": "4" * 64,
+        "detector_green_operator_contract_sha256": (operator.contract_hash_sha256),
+        "detector_green_operator_binary_sha256": operator.binary_sha256,
+        "detector_green_validation": green_validation,
+        "detector_green_validation_manifest_sha256": (
+            detector_green_validation_manifest_sha256(
+                green_validation,
+                operator=operator,
             )
         ),
-        "additive_scatter_contract_sha256": str(
-            additive_scatter_contract_hash
-        ),
-        "surface_emission_policy_sha256": (
-            surface_emission_policy_sha256()
-        ),
-        "training_scene_seeds": list(DESIGNATED_TRAINING_SCENE_SEEDS),
-        "holdout_scene_seeds": list(DESIGNATED_HOLDOUT_SCENE_SEEDS),
-        "training_selection_scene_seeds": list(
-            DESIGNATED_TRAINING_SCENE_SEEDS
-        ),
-        "metric_scene_seeds": list(DESIGNATED_HOLDOUT_SCENE_SEEDS),
-        "metric_split": "holdout_only",
-        "metric_aggregation": "holdout_scene_conservative_worst_case",
+        "additive_scatter_contract_sha256": (additive_scatter_contract_hash),
+        "surface_emission_policy_sha256": (surface_emission_policy_sha256()),
+        "validation_scene_seeds": list(seeds),
+        "candidate_selection": "none_predeclared_physics_only",
+        "scene_calibration_count": 0,
+        "metric_scene_seeds": list(seeds),
+        "metric_split": "independent_validation_only",
+        "metric_aggregation": ("validation_scene_conservative_worst_case"),
         "scenario_ids": list(VALIDATION_SCENARIO_IDS),
-        "pair_ids_by_scene": {
-            str(seed): list(range(64)) for seed in all_seeds
-        },
+        "pair_ids_by_scene": {str(seed): list(range(64)) for seed in seeds},
         "artifact_sha256_by_scene": {
             str(seed): sha256(
                 f"test-validation-scene-{seed}".encode("utf-8")
             ).hexdigest()
-            for seed in all_seeds
+            for seed in seeds
         },
         "scene_hash_by_scene_and_scenario": {
             str(seed): {
                 scenario: sha256(
-                    (
-                        "test-validation-scene-geometry-"
-                        f"{seed}-{scenario}"
-                    ).encode("utf-8")
+                    f"test-scene-{seed}-{scenario}".encode("utf-8")
                 ).hexdigest()
                 for scenario in VALIDATION_SCENARIO_IDS
             }
-            for seed in all_seeds
+            for seed in seeds
         },
         "surface_source_contract_sha256_by_scene_and_scenario": {
             str(seed): {
                 scenario: sha256(
-                    (
-                        "test-validation-source-contract-"
-                        f"{seed}-{scenario}"
-                    ).encode("utf-8")
+                    f"test-source-{seed}-{scenario}".encode("utf-8")
                 ).hexdigest()
                 for scenario in VALIDATION_SCENARIO_IDS
             }
-            for seed in all_seeds
+            for seed in seeds
         },
         "metrics": metrics,
         "all_passed": True,
     }
 
 
-def _synthetic_additive_scatter_response(
-) -> AdditiveNoncollidedTransportResponse:
-    """Return a nonzero authenticated test-only additive scatter response."""
-    artifact_contracts = {
-        str(seed): sha256(
-            f"test-additive-contract-{seed}".encode("utf-8")
-        ).hexdigest()
-        for seed in DESIGNATED_TRAINING_SCENE_SEEDS
-    }
-    return AdditiveNoncollidedTransportResponse(
-        coefficients=(0.8, 0.5, 0.4, 0.2, 0.1, 0.05, 0.025),
-        ridge_lambda=0.1,
-        feature_basis_semantics=(
-            DETECTOR_CONE_AIR_XCOM_SINGLE_SCATTER_BASIS_SEMANTICS
-        ),
-        training_manifest={
-            "schema_version": 2,
-            "acceptance_contract_sha256": (
-                FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256
-            ),
-            "training_scene_seeds": list(DESIGNATED_TRAINING_SCENE_SEEDS),
-            "scenario_ids": list(VALIDATION_SCENARIO_IDS),
-            "pair_ids_by_scene": {
-                str(seed): list(range(64))
-                for seed in DESIGNATED_TRAINING_SCENE_SEEDS
-            },
-            "artifact_sha256_by_scene": {
-                str(seed): sha256(
-                    f"test-additive-scatter-{seed}".encode("utf-8")
-                ).hexdigest()
-                for seed in DESIGNATED_TRAINING_SCENE_SEEDS
-            },
-            "artifact_contract_sha256_by_scene": artifact_contracts,
-            "shield_pose_contract_sha256": SHIELD_POSE_CONTRACT_SHA256,
-            "detector_response_contract_sha256": (
-                NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
-            ),
-            "obstacle_material_contract_sha256": (
-                OBSTACLE_MATERIAL_CONTRACT_SHA256
-            ),
-            "transport_physics_table_contract_sha256": (
-                TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256
-            ),
-            "label_space": ADDITIVE_SCATTER_INCIDENT_LABEL_SEMANTICS,
-            "selection_objective": (
-                "leave_one_training_scene_out_weighted_log1p_mse"
-            ),
-            "fit_sample_count": 256,
-            "loso_scene_ids": [
-                str(seed) for seed in DESIGNATED_TRAINING_SCENE_SEEDS
-            ],
-            "candidate_validation_scores": {
-                format(value, ".12g"): (
-                    0.5 if value == 0.1 else 1.0 + float(value)
-                )
-                for value in ADDITIVE_SCATTER_RIDGE_LAMBDA_GRID
-            },
-            "selected_validation_score": 0.5,
-            "selected_ridge_lambda": 0.1,
-            "selection_completed": True,
-        },
-    )
-
-
 @lru_cache(maxsize=1)
 def approved_full_spectrum_model() -> GeometryConditionedSpectralModel:
-    """Return an approved model using explicit synthetic test provenance."""
-    training = _synthetic_training_manifest()
-    width = float(training["selected_rate_scale_half_width"])
-    concentration = float(training["selected_mark_concentration_source"])
-    nodes, weights = rate_scale_mixture_for_half_width(width)
-    additive_scatter = _synthetic_additive_scatter_response()
-    unvalidated = GeometryConditionedSpectralModel.standard_native(
+    """Return an approved physics-only model with synthetic unit evidence."""
+    operator = _test_operator()
+    unvalidated = GeometryConditionedSpectralModel.physics_only_native(
         TEST_ISOTOPES,
         dead_time_tau_s=5.813e-9,
         background_rate_cps=5.0,
-        rate_scale_nodes_j=nodes,
-        rate_scale_weights_j=weights,
-        mark_concentration_source=concentration,
-        discrepancy_training_manifest=training,
-        additive_scatter_response=additive_scatter,
+        detector_green_operator=operator,
     )
+    response = unvalidated.additive_scatter_response
+    assert response is not None
     validation = _synthetic_validation_manifest(
-        unvalidated.contract_hash_sha256,
-        additive_scatter.contract_hash_sha256,
+        model_contract_hash=unvalidated.contract_hash_sha256,
+        additive_scatter_contract_hash=response.contract_hash_sha256,
     )
-    model = GeometryConditionedSpectralModel.standard_native(
+    model = GeometryConditionedSpectralModel.physics_only_native(
         TEST_ISOTOPES,
         dead_time_tau_s=5.813e-9,
         background_rate_cps=5.0,
-        rate_scale_nodes_j=nodes,
-        rate_scale_weights_j=weights,
-        mark_concentration_source=concentration,
-        discrepancy_training_manifest=training,
         validation_manifest=validation,
-        additive_scatter_response=additive_scatter,
+        detector_green_operator=operator,
     )
     assert model.production_ready
     return model
@@ -302,18 +190,22 @@ def approved_full_spectrum_model() -> GeometryConditionedSpectralModel:
 
 @lru_cache(maxsize=1)
 def _runtime_config_template() -> dict[str, object]:
-    """Build one immutable schema-v3 runtime fixture template."""
+    """Build one immutable schema-v6 runtime fixture template."""
     model = approved_full_spectrum_model()
     payload = model.manifest_payload()
     return {
         "simulation_runtime_schema_version": 1,
         "sim_backend": "analytic_test_fixture",
         "source_rate_model": "detector_cps_1m",
+        "detector_green_operator_manifest": (
+            _test_operator_manifest_path().relative_to(_REPOSITORY_ROOT).as_posix()
+        ),
         "candidate_isotopes": list(TEST_ISOTOPES),
         "line_resolved_shield_attenuation": True,
-        "detector_count_radius_m": 0.025,
-        "detector_aperture_radius_m": 0.0,
-        "detector_aperture_samples": 1,
+        "detector_count_radius_m": 0.038,
+        "detector_aperture_radius_m": 0.0395,
+        "detector_aperture_samples": 33,
+        "detector_aperture_sampling": "solid_angle_cone",
         "obstacle_attenuation_enabled": True,
         "obstacle_height_m": 1.0,
         "energy_min_keV": 0.0,
@@ -321,16 +213,14 @@ def _runtime_config_template() -> dict[str, object]:
         "bin_width_keV": 2.0,
         "energy_bin_count": 851,
         "dead_time_tau_s": 5.813e-9,
-        "background_rate_cps": 5.0,
+        "background_cps": 5.0,
         "full_spectrum_generative_model": payload,
-        "full_spectrum_contract_hash_sha256": (
-            model.contract_hash_sha256
-        ),
+        "full_spectrum_contract_hash_sha256": (model.contract_hash_sha256),
     }
 
 
 def runtime_config() -> dict[str, object]:
-    """Return a fresh resolved schema-v3 physical test configuration."""
+    """Return a fresh resolved schema-v6 physical test configuration."""
     return copy.deepcopy(_runtime_config_template())
 
 
@@ -363,10 +253,7 @@ def records(
             [15 + index, 10, 8, 4],
             dtype=np.int64,
         )
-        station_end = (
-            index + 1 == int(record_count)
-            or (index + 1) // 2 != station
-        )
+        station_end = index + 1 == int(record_count) or (index + 1) // 2 != station
         metadata: dict[str, object] = {
             "fixture_record": index,
             FULL_SPECTRUM_CONTRACT_HASH_METADATA_KEY: contract_hash,

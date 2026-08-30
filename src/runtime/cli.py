@@ -8,10 +8,7 @@ from pathlib import Path
 
 from runtime.adaptive import serve_adaptive_session
 from runtime.discrepancy_calibrator import calibrate_discrepancy
-from runtime.experiment_profiles import (
-    DEFAULT_EXPERIMENT_PROFILE_ID,
-    available_experiment_profiles,
-)
+from runtime.experiment_profiles import available_experiment_profiles
 from runtime.measurement_log import load_measurement_log
 from runtime.scenarios import (
     build_private_truth_manifest,
@@ -41,6 +38,11 @@ def _build_parser() -> argparse.ArgumentParser:
     serve_adaptive_socket = subparsers.add_parser("serve-adaptive-session-socket")
     serve_adaptive_socket.add_argument("scenario", type=Path)
     serve_adaptive_socket.add_argument("--socket-path", type=Path, required=True)
+    serve_adaptive_socket.add_argument(
+        "--cui-truth-overlay-socket-path",
+        type=Path,
+        default=None,
+    )
     generate_scenario = subparsers.add_parser("generate-scenario")
     generate_scenario.add_argument("output", type=Path)
     generate_scenario.add_argument(
@@ -64,9 +66,9 @@ def _build_parser() -> argparse.ArgumentParser:
     generate_scenario.add_argument(
         "--experiment-profile",
         choices=available_experiment_profiles(),
-        default=DEFAULT_EXPERIMENT_PROFILE_ID,
+        required=True,
     )
-    generate_scenario.add_argument("--scene-variant", default=None)
+    generate_scenario.add_argument("--scene-variant", required=True)
     calibrate = subparsers.add_parser("calibrate-discrepancy")
     calibrate.add_argument("input", type=Path)
     calibrate.add_argument("output", type=Path)
@@ -99,6 +101,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return serve_adaptive_session_socket(
             args.scenario,
             socket_path=args.socket_path,
+            cui_truth_overlay_socket_path=args.cui_truth_overlay_socket_path,
         )
     if args.command == "generate-scenario":
         scene_seed = (
@@ -146,9 +149,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             host=config["host"],
             port=config["port"],
             app_config=config,
-            production_runtime_config_sha256=(
-                production_runtime_config_sha256(config)
-            ),
+            production_runtime_config_sha256=(production_runtime_config_sha256(config)),
         )
     )
     return 0

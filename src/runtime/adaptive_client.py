@@ -16,7 +16,6 @@ import numpy as np
 
 from runtime.adaptive_protocol import (
     ADAPTIVE_CUI_OVERLAY_PREFIX,
-    ADAPTIVE_CUI_OVERLAY_FRAMING,
     ADAPTIVE_EVENT_PREFIX,
     ADAPTIVE_EVENT_FRAMING,
     AdaptiveAbortedEvent,
@@ -68,24 +67,6 @@ def parse_run_context(payload: object) -> RunContext:
     if not isinstance(payload, dict):
         raise TypeError("Adaptive runtime context must be an object.")
     return RunContext.from_payload(payload)
-
-
-def _parse_truth_free_cui_overlay_payload(payload: object) -> dict[str, object]:
-    """Parse a CUI overlay only when it contains no realized truth."""
-    if not isinstance(payload, dict):
-        raise TypeError("CUI overlay payload must be an object.")
-    _strict_fields(
-        payload,
-        {"type", "schema_version", "truth"},
-        name="adaptive CUI overlay",
-    )
-    if payload.get("type") != "cui_overlay" or payload.get("schema_version") != 1:
-        raise ValueError("Adaptive CUI overlay schema is incompatible.")
-    if payload.get("truth") is not None:
-        raise ValueError(
-            "Estimator-facing AdaptiveRuntimeClient cannot receive realized truth."
-        )
-    return dict(payload)
 
 
 def adaptive_step_request(
@@ -368,39 +349,6 @@ class AdaptiveRuntimeClient:
     ) -> AdaptiveCandidatesEvent:
         """Refine runtime-owned candidates through the concise public API."""
         return self.request_refinement(request)
-
-    def request_cui_overlay(self, *, include_truth: bool) -> dict[str, object]:
-        """Request only a truth-free CUI overlay for estimator-owned rendering."""
-        if self.input is None:
-            raise RuntimeError("Adaptive runtime input is closed.")
-        if not isinstance(include_truth, bool):
-            raise TypeError("include_truth must be a boolean.")
-        if include_truth:
-            raise ValueError(
-                "AdaptiveRuntimeClient is estimator-facing and cannot request "
-                "realized truth."
-            )
-        payload = {
-            "type": "cui_overlay",
-            "include_truth": False,
-        }
-        self.input.write(json.dumps(payload, allow_nan=False) + "\n")
-        self.input.flush()
-        assert self.output is not None
-        for raw_line in self.output:
-            line = raw_line.rstrip("\n")
-            if line.startswith(ADAPTIVE_CUI_OVERLAY_PREFIX):
-                payload = ADAPTIVE_CUI_OVERLAY_FRAMING.parse(line)
-                return _parse_truth_free_cui_overlay_payload(payload)
-            if line.startswith(ADAPTIVE_EVENT_PREFIX):
-                raise RuntimeError(
-                    "Shared runtime emitted an estimator event during a CUI "
-                    "overlay request."
-                )
-            self.output_hook(line)
-        raise RuntimeError(
-            "Shared adaptive runtime closed before its CUI overlay event."
-        )
 
     def finalize(self) -> dict[str, Any]:
         """Finalize the runtime log and close the opaque session socket."""

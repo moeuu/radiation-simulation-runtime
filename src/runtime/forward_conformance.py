@@ -7,7 +7,12 @@ from dataclasses import dataclass
 import math
 from pathlib import Path
 
-from measurement.obstacle_assets import material_mu_cm_inv
+from measurement.obstacle_assets import (
+    ObstacleComponent,
+    line_compton_transport_model_from_components,
+    line_transport_model_from_components,
+    material_mu_cm_inv,
+)
 from measurement.obstacles import ObstacleGrid
 
 from runtime.provenance import load_strict_json
@@ -211,6 +216,29 @@ class ForwardConformanceFixture:
             for box in boxes
         )
         materials = tuple(box.material for box in boxes)
+        components = tuple(
+            ObstacleComponent(
+                name=f"ForwardConformance_{index:04d}",
+                center_xyz=tuple(
+                    0.5 * (lower + upper)
+                    for lower, upper in zip(
+                        box.min_xyz,
+                        box.max_xyz,
+                        strict=True,
+                    )
+                ),
+                size_xyz=tuple(
+                    upper - lower
+                    for lower, upper in zip(
+                        box.min_xyz,
+                        box.max_xyz,
+                        strict=True,
+                    )
+                ),
+                material=box.material,
+            )
+            for index, box in enumerate(boxes)
+        )
         return ObstacleGrid(
             origin=(0.0, 0.0),
             cell_size=1.0,
@@ -224,6 +252,18 @@ class ForwardConformanceFixture:
                 )
                 for isotope in self.isotopes
             },
+            transport_line_mu_by_isotope=(
+                line_transport_model_from_components(
+                    components,
+                    isotopes=self.isotopes,
+                )
+            ),
+            transport_line_compton_mu_by_isotope=(
+                line_compton_transport_model_from_components(
+                    components,
+                    isotopes=self.isotopes,
+                )
+            ),
             collision_boxes_m=transport_boxes,
         )
 

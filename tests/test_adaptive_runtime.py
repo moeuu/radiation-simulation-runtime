@@ -15,7 +15,6 @@ import pytest
 
 from measurement.obstacles import ObstacleGrid
 from runtime.adaptive import (
-    ADAPTIVE_CUI_OVERLAY_PREFIX,
     ADAPTIVE_EVENT_PREFIX,
     AdaptiveCandidateProvider,
     AdaptiveRuntimeSession,
@@ -26,17 +25,20 @@ from runtime.adaptive import (
     serve_adaptive_session_socket,
 )
 from runtime.adaptive_client import AdaptiveRuntimeClient
+from runtime.cui_truth_overlay import load_cui_truth_overlay
 from runtime.experiment_profiles import (
-    DEFAULT_EXPERIMENT_PROFILE_ID,
-    STANDARD_EXPERIMENT_PROFILE,
     AcquisitionContract,
+    CS_CO_SURFACE_SEARCH_PROFILE_ID,
     ExperimentProfile,
+    MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE,
+    MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE_ID,
 )
 from runtime.measurement_log import MeasurementLogRecord
 from runtime.records import RunContext
 from runtime.scenarios import build_random_surface_scenario, write_private_scenario
 from sim.protocol import SimulationCommand, SimulationObservation
 from sim.runtime import SimulationRuntime
+from spectrum.detector_green_operator import DETECTOR_GREEN_SAMPLING_MODE
 from tests.runtime_test_support import runtime_config
 
 
@@ -290,8 +292,8 @@ def test_local_refinement_is_runtime_filtered_and_adds_candidates() -> None:
     assert set(coarse.candidate_poses_xyz).issubset(refined.candidate_poses_xyz)
 
 
-def test_default_scene_variant_is_checked_only_inside_private_runtime() -> None:
-    """Source cardinality should be enforced without entering estimator data."""
+def test_explicit_mix9_variant_is_checked_only_inside_private_runtime() -> None:
+    """Explicit source cardinality is enforced without entering estimator data."""
     sources = [SimpleNamespace(isotope="Cs-137") for _ in range(4)]
     sources.extend(SimpleNamespace(isotope="Co-60") for _ in range(3))
     sources.extend(SimpleNamespace(isotope="Eu-154") for _ in range(2))
@@ -299,7 +301,7 @@ def test_default_scene_variant_is_checked_only_inside_private_runtime() -> None:
 
     _validate_private_scene_variant(
         scene,
-        DEFAULT_EXPERIMENT_PROFILE_ID,
+        MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE_ID,
         "mix9",
     )
 
@@ -307,29 +309,29 @@ def test_default_scene_variant_is_checked_only_inside_private_runtime() -> None:
     with pytest.raises(ValueError, match="exactly"):
         _validate_private_scene_variant(
             scene,
-            DEFAULT_EXPERIMENT_PROFILE_ID,
+            MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE_ID,
             "mix9",
         )
 
 
-def test_cs4_co3_eu0_variant_accepts_explicit_absence() -> None:
-    """The Eu-zero profile must validate without exposing truth downstream."""
+def test_cs4_co3_variant_uses_the_explicit_cs_co_profile() -> None:
+    """The Cs/Co profile enforces exactly four Cs and three Co sources."""
     sources = [SimpleNamespace(isotope="Cs-137") for _ in range(4)]
     sources.extend(SimpleNamespace(isotope="Co-60") for _ in range(3))
     scene = SimpleNamespace(sources=sources)
 
     _validate_private_scene_variant(
         scene,
-        DEFAULT_EXPERIMENT_PROFILE_ID,
-        "cs4-co3-eu0",
+        CS_CO_SURFACE_SEARCH_PROFILE_ID,
+        "cs4-co3",
     )
 
     scene.sources.append(SimpleNamespace(isotope="Eu-154"))
     with pytest.raises(ValueError, match="exactly"):
         _validate_private_scene_variant(
             scene,
-            DEFAULT_EXPERIMENT_PROFILE_ID,
-            "cs4-co3-eu0",
+            CS_CO_SURFACE_SEARCH_PROFILE_ID,
+            "cs4-co3",
         )
 
 
@@ -412,9 +414,7 @@ class _DurableFakeRuntime(SimulationRuntime):
             spectrum_counts=np.ones(851, dtype=np.int64).tolist(),
             energy_bin_edges_keV=np.linspace(0.0, 1702.0, 852).tolist(),
             metadata={
-                "detector_response_sampling_mode": (
-                    "multinomial_marking_with_nonparalyzable_event_time"
-                ),
+                "detector_response_sampling_mode": DETECTOR_GREEN_SAMPLING_MODE,
                 "dwell_time_s": command.dwell_time_s,
             },
         )
@@ -452,7 +452,7 @@ def _experiment_profile(
 ) -> ExperimentProfile:
     """Return one valid compact acquisition profile for live-session tests."""
     return replace(
-        STANDARD_EXPERIMENT_PROFILE,
+        MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE,
         acquisition=AcquisitionContract(
             max_stations=max_stations,
             views_per_station=views_per_station,
@@ -712,9 +712,7 @@ def test_live_session_requires_exact_views_and_one_pose_per_station() -> None:
     )
     moved_index = next(
         index
-        for index, pose in enumerate(
-            session._candidate_snapshot.candidate_poses_xyz
-        )
+        for index, pose in enumerate(session._candidate_snapshot.candidate_poses_xyz)
         if pose != session.current_pose
     )
     with pytest.raises(ValueError, match="station's first detector pose"):
@@ -817,9 +815,6 @@ def test_live_session_allows_only_finalize_or_abort_after_exact_limit() -> None:
         session.step({**request, "action_id": 1, "station_id": 1})
     with pytest.raises(RuntimeError, match="measurement limit"):
         session.refine({"type": "refine", "candidate_indices": [0]})
-    with pytest.raises(RuntimeError, match="measurement limit"):
-        session.cui_overlay({"type": "cui_overlay", "include_truth": False})
-
     _, published = session.finalize()
     assert published["record_count"] == 1
     assert observation.finalized is True
@@ -834,6 +829,8 @@ def test_unapproved_model_fails_before_simulator_creation(
         scene_seed=27182,
         measurement_log_output_dir=tmp_path / "measurement-log",
         run_id="adaptive-production-gate-test",
+        experiment_profile_id=MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE_ID,
+        scene_variant_id="mix9",
     )
     scenario_path = write_private_scenario(tmp_path / "scenario.json", scenario)
     simulator_created = False
@@ -846,7 +843,7 @@ def test_unapproved_model_fails_before_simulator_creation(
 
     monkeypatch.setattr("runtime.adaptive.create_simulation_runtime", create_runtime)
 
-    with pytest.raises(RuntimeError, match="independent all-64 holdout"):
+    with pytest.raises(RuntimeError, match="independent all-64 validation"):
         AdaptiveRuntimeSession.open(scenario_path)
 
     assert simulator_created is False
@@ -861,6 +858,8 @@ def test_analytic_scenario_backend_fails_before_runtime_or_writer(
         scene_seed=16180,
         measurement_log_output_dir=tmp_path / "measurement-log",
         run_id="adaptive-analytic-backend-test",
+        experiment_profile_id=MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE_ID,
+        scene_variant_id="mix9",
     )
     scenario["backend"] = "analytic"
     scenario_path = write_private_scenario(tmp_path / "scenario.json", scenario)
@@ -890,6 +889,8 @@ def test_adaptive_runtime_startup_failure_precedes_wal_creation(
         scene_seed=16181,
         measurement_log_output_dir=tmp_path / "measurement-log",
         run_id="adaptive-startup-failure-test",
+        experiment_profile_id=MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE_ID,
+        scene_variant_id="mix9",
     )
     scenario_path = write_private_scenario(tmp_path / "scenario.json", scenario)
     isotope_names = tuple(sorted(scenario["isotopes"]))
@@ -992,6 +993,8 @@ def test_production_scenario_rejects_nested_defaults_and_schema_drift(
         scene_seed=17320,
         measurement_log_output_dir=tmp_path / "measurement-log",
         run_id=f"adaptive-strict-scenario-{mutation}",
+        experiment_profile_id=MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE_ID,
+        scene_variant_id="mix9",
     )
     environment = scenario["environment"]
     scene = scenario["scene"]
@@ -1056,6 +1059,8 @@ def test_production_scenario_rejects_top_level_type_coercion(
         scene_seed=34120,
         measurement_log_output_dir=tmp_path / "measurement-log",
         run_id=f"adaptive-strict-envelope-{mutation}",
+        experiment_profile_id=MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE_ID,
+        scene_variant_id="mix9",
     )
     if mutation == "boolean_schema":
         scenario["schema_version"] = True
@@ -1102,6 +1107,8 @@ def test_production_scenario_rejects_non_json_metadata_values(
         scene_seed=51230,
         measurement_log_output_dir=tmp_path / "measurement-log",
         run_id="adaptive-strict-private-metadata",
+        experiment_profile_id=MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE_ID,
+        scene_variant_id="mix9",
         metadata={"invalid": invalid_value},
     )
 
@@ -1117,6 +1124,8 @@ def test_copied_production_config_resolves_assets_from_runtime_repository(
         scene_seed=14142,
         measurement_log_output_dir=tmp_path / "measurement-log",
         run_id="adaptive-moved-config-test",
+        experiment_profile_id=MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE_ID,
+        scene_variant_id="mix9",
     )
     source = Path(str(scenario["runtime_config_path"]))
     copied = tmp_path / "private_runs/ral_ablation/runtime_configs/runtime.json"
@@ -1125,7 +1134,7 @@ def test_copied_production_config_resolves_assets_from_runtime_repository(
     scenario["runtime_config_path"] = copied.as_posix()
     scenario_path = write_private_scenario(tmp_path / "scenario.json", scenario)
 
-    with pytest.raises(RuntimeError, match="independent all-64 holdout"):
+    with pytest.raises(RuntimeError, match="independent all-64 validation"):
         AdaptiveRuntimeSession.open(scenario_path)
 
 
@@ -1136,6 +1145,12 @@ class _FakeAdaptiveSession:
         """Initialize request capture and close state."""
         self.requests: list[dict[str, Any]] = []
         self.closed = False
+        self.cui_truth_overlay = {
+            "schema_version": 1,
+            "semantics": "evaluation_cui_overlay_only_not_estimator_input",
+            "true_sources": {"Cs-137": [[1.0, 1.0, 1.0]]},
+            "true_strengths": {"Cs-137": [300000.0]},
+        }
 
     def ready_payload(self) -> dict[str, object]:
         """Return a minimal truth-free handshake."""
@@ -1160,20 +1175,6 @@ class _FakeAdaptiveSession:
         """Capture one estimator-ranked local-refinement request."""
         self.requests.append(dict(request))
         return {"type": "candidates", "candidates": {}}
-
-    def cui_overlay(self, request: dict[str, Any]) -> dict[str, object]:
-        """Return private CUI overlay data without entering normal events."""
-        self.requests.append(dict(request))
-        return {
-            "type": "cui_overlay",
-            "schema_version": 1,
-            "truth": {
-                "schema_version": 1,
-                "semantics": "evaluation_cui_overlay_only_not_estimator_input",
-                "true_sources": {"Cs-137": [[1.0, 1.0, 1.0]]},
-                "true_strengths": {"Cs-137": [300000.0]},
-            },
-        }
 
     def finalize(self) -> tuple[object, dict[str, object]]:
         """Return a published-log event."""
@@ -1300,6 +1301,7 @@ def test_adaptive_socket_hides_private_scenario_from_client_arguments(
         classmethod(lambda cls, path: fake),
     )
     endpoint = tmp_path / "adaptive.sock"
+    overlay_endpoint = tmp_path / "cui-truth.sock"
     outcomes: list[int] = []
     failures: list[BaseException] = []
 
@@ -1310,6 +1312,7 @@ def test_adaptive_socket_hides_private_scenario_from_client_arguments(
                 serve_adaptive_session_socket(
                     tmp_path / "private-scenario.json",
                     socket_path=endpoint,
+                    cui_truth_overlay_socket_path=overlay_endpoint,
                 )
             )
         except BaseException as exc:  # pragma: no cover - surfaced below
@@ -1319,15 +1322,19 @@ def test_adaptive_socket_hides_private_scenario_from_client_arguments(
     thread.start()
     client = AdaptiveRuntimeClient.connect(endpoint, connect_timeout_s=2.0)
     ready = client.read_event()
+    overlay = load_cui_truth_overlay(overlay_endpoint, connect_timeout_s=2.0)
     client.abort()
     thread.join(timeout=2.0)
 
     assert ready["context"]["run_id"] == "test"
     assert client.command == ["adaptive-session-socket", endpoint.as_posix()]
     assert "private-scenario" not in " ".join(client.command)
+    assert overlay.true_sources["Cs-137"].tolist() == [[1.0, 1.0, 1.0]]
+    assert overlay_endpoint.as_posix() not in " ".join(client.command)
     assert outcomes == [0]
     assert failures == []
     assert not endpoint.exists()
+    assert not overlay_endpoint.exists()
 
 
 def test_adaptive_client_cannot_open_a_private_scenario() -> None:
@@ -1364,11 +1371,11 @@ def test_adaptive_client_abort_surfaces_missing_cleanup_acknowledgement(
     assert client.output is None
 
 
-def test_adaptive_protocol_uses_private_prefix_for_cui_overlay(
+def test_estimator_protocol_rejects_retired_cui_overlay_request(
     monkeypatch: Any,
     tmp_path: Path,
 ) -> None:
-    """Evaluation truth must not be emitted as an estimator-visible event."""
+    """The estimator socket must have no path to the private truth channel."""
     fake = _FakeAdaptiveSession()
     monkeypatch.setattr(
         AdaptiveRuntimeSession,
@@ -1376,16 +1383,15 @@ def test_adaptive_protocol_uses_private_prefix_for_cui_overlay(
         classmethod(lambda cls, path: fake),
     )
     overlay = {"type": "cui_overlay", "include_truth": True}
-    input_stream = StringIO(
-        json.dumps(overlay) + "\n" + json.dumps({"type": "abort"}) + "\n"
-    )
+    input_stream = StringIO(json.dumps(overlay) + "\n")
     output_stream = StringIO()
 
-    status = serve_adaptive_session(
-        tmp_path / "private-scenario.json",
-        input_stream=input_stream,
-        output_stream=output_stream,
-    )
+    with pytest.raises(ValueError, match="Unknown adaptive request type"):
+        serve_adaptive_session(
+            tmp_path / "private-scenario.json",
+            input_stream=input_stream,
+            output_stream=output_stream,
+        )
 
     lines = output_stream.getvalue().splitlines()
     normal_events = [
@@ -1393,73 +1399,13 @@ def test_adaptive_protocol_uses_private_prefix_for_cui_overlay(
         for line in lines
         if line.startswith(ADAPTIVE_EVENT_PREFIX)
     ]
-    private_events = [
-        json.loads(line.removeprefix(ADAPTIVE_CUI_OVERLAY_PREFIX))
-        for line in lines
-        if line.startswith(ADAPTIVE_CUI_OVERLAY_PREFIX)
-    ]
-    assert status == 0
-    assert fake.requests == [overlay]
-    assert [event["type"] for event in normal_events] == ["ready", "aborted"]
-    assert len(private_events) == 1
-    assert private_events[0]["truth"]["true_sources"]["Cs-137"] == [[1.0, 1.0, 1.0]]
+    assert fake.requests == []
+    assert fake.closed
+    assert [event["type"] for event in normal_events] == ["ready"]
+    assert "true_sources" not in output_stream.getvalue()
 
 
-def test_adaptive_client_rejects_truth_before_writing_cui_request() -> None:
-    """The estimator-facing client must not open the runtime truth channel."""
-    response = {
-        "type": "cui_overlay",
-        "schema_version": 1,
-        "truth": None,
-    }
+def test_adaptive_client_has_no_cui_truth_request_method() -> None:
+    """The estimator client surface must not expose the private overlay API."""
     client = AdaptiveRuntimeClient.__new__(AdaptiveRuntimeClient)
-    client.input = StringIO()
-    client.output = StringIO(ADAPTIVE_CUI_OVERLAY_PREFIX + json.dumps(response) + "\n")
-    client.output_hook = lambda message: None
-
-    with pytest.raises(ValueError, match="cannot request realized truth"):
-        client.request_cui_overlay(include_truth=True)
-
-    assert client.input.getvalue() == ""
-
-
-def test_adaptive_client_accepts_only_truth_free_cui_response() -> None:
-    """The estimator-facing CUI channel must require a null truth member."""
-    response = {
-        "type": "cui_overlay",
-        "schema_version": 1,
-        "truth": None,
-    }
-    client = AdaptiveRuntimeClient.__new__(AdaptiveRuntimeClient)
-    client.input = StringIO()
-    client.output = StringIO(ADAPTIVE_CUI_OVERLAY_PREFIX + json.dumps(response) + "\n")
-    client.output_hook = lambda message: None
-
-    payload = client.request_cui_overlay(include_truth=False)
-
-    assert json.loads(client.input.getvalue()) == {
-        "type": "cui_overlay",
-        "include_truth": False,
-    }
-    assert payload == response
-
-
-def test_adaptive_client_rejects_unexpected_truth_cui_response() -> None:
-    """A runtime response cannot inject realized truth into the client."""
-    response = {
-        "type": "cui_overlay",
-        "schema_version": 1,
-        "truth": {
-            "schema_version": 1,
-            "semantics": "evaluation_cui_overlay_only_not_estimator_input",
-            "true_sources": {"Cs-137": [[1.0, 1.0, 1.0]]},
-            "true_strengths": {"Cs-137": [300000.0]},
-        },
-    }
-    client = AdaptiveRuntimeClient.__new__(AdaptiveRuntimeClient)
-    client.input = StringIO()
-    client.output = StringIO(ADAPTIVE_CUI_OVERLAY_PREFIX + json.dumps(response) + "\n")
-    client.output_hook = lambda message: None
-
-    with pytest.raises(ValueError, match="cannot receive realized truth"):
-        client.request_cui_overlay(include_truth=False)
+    assert not hasattr(client, "request_cui_overlay")

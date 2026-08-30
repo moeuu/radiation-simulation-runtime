@@ -27,12 +27,9 @@ from spectrum.physics_contracts import (
     TRANSPORT_PHYSICS_TABLE_CONTRACT_ID,
     TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256,
 )
-from spectrum.response_matrix import (
-    NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256,
-)
 
 
-FORWARD_MODEL_MANIFEST_SCHEMA_VERSION = 5
+FORWARD_MODEL_MANIFEST_SCHEMA_VERSION = 6
 SOURCE_RATE_MODEL = "detector_cps_1m"
 SOURCE_RATE_SEMANTICS = {
     "quantity": "expected_pre_dead_time_detector_pulse_rate",
@@ -51,15 +48,9 @@ RESPONSE_SEMANTICS = {
     "detector_geometry": "model_identifier_bound",
     "shield_attenuation": "fe_pb_orientation_pair_8x8",
     "obstacle_attenuation": "line_segment_material_attenuation",
-    "live_time_scaling": (
-        "incident_rate_linear_then_nonparalyzable_renewal_detection"
-    ),
-    "line_resolved_response": (
-        "source_resolved_geometry_conditioned_full_spectrum"
-    ),
-    "observation_distribution": (
-        "joint_renewal_total_and_conditional_energy_marks"
-    ),
+    "live_time_scaling": ("incident_rate_linear_then_nonparalyzable_renewal_detection"),
+    "line_resolved_response": ("source_resolved_geometry_conditioned_full_spectrum"),
+    "observation_distribution": ("joint_renewal_total_and_conditional_energy_marks"),
 }
 REQUIRED_MODEL_NAMES = (
     "detector",
@@ -117,7 +108,9 @@ _NATIVE_FIELDS = {
     "dry_air_total_attenuation_contract_sha256",
     "geant4_physics_contract_id",
     "geant4_physics_contract_sha256",
-    "detector_response_contract_sha256",
+    "detector_green_operator_model",
+    "detector_green_operator_contract_sha256",
+    "detector_green_operator_binary_sha256",
     "obstacle_material_contract_id",
     "obstacle_material_contract_sha256",
     "transport_physics_table_contract_id",
@@ -368,9 +361,7 @@ def _runtime_file_asset_identities(
                 runtime_config.get("full_spectrum_generative_model"),
                 Mapping,
             )
-            and runtime_config.get(
-                "full_spectrum_model_registry_file_sha256"
-            )
+            and runtime_config.get("full_spectrum_model_registry_file_sha256")
             is not None
         ):
             relative = _safe_relative_asset_path(
@@ -380,13 +371,8 @@ def _runtime_file_asset_identities(
             grouped[component][field_path] = {
                 "path": relative.as_posix(),
                 "sha256": _sha256(
-                    runtime_config[
-                        "full_spectrum_model_registry_file_sha256"
-                    ],
-                    name=(
-                        "runtime_config."
-                        "full_spectrum_model_registry_file_sha256"
-                    ),
+                    runtime_config["full_spectrum_model_registry_file_sha256"],
+                    name=("runtime_config.full_spectrum_model_registry_file_sha256"),
                 ),
             }
         else:
@@ -514,6 +500,15 @@ def build_forward_model_manifest(
     runtime = dict(runtime_config)
     environment_payload = dict(environment)
     identifiers = _production_model_identifiers(runtime, environment_payload)
+    from spectrum.transport_spectral import (
+        geometry_conditioned_model_from_runtime_config,
+    )
+
+    spectrum_model = geometry_conditioned_model_from_runtime_config(
+        runtime_config,
+        run_root=run_root,
+    )
+    operator = spectrum_model.detector_green_operator
     return {
         "schema_version": FORWARD_MODEL_MANIFEST_SCHEMA_VERSION,
         "repository_commit": repository_commit,
@@ -528,24 +523,20 @@ def build_forward_model_manifest(
         "line_mu_by_isotope": line_table,
         "shield_pose_contract_id": SHIELD_POSE_CONTRACT_ID,
         "shield_pose_contract_sha256": SHIELD_POSE_CONTRACT_SHA256,
-        "dry_air_total_attenuation_contract_id": (
-            NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_ID
-        ),
+        "dry_air_total_attenuation_contract_id": (NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_ID),
         "dry_air_total_attenuation_contract_sha256": (
             NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_SHA256
         ),
         "geant4_physics_contract_id": GEANT4_PHYSICS_CONTRACT_ID,
         "geant4_physics_contract_sha256": GEANT4_PHYSICS_CONTRACT_SHA256,
-        "detector_response_contract_sha256": (
-            NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
+        "detector_green_operator_model": (
+            "isotope_independent_full_detector_green_operator_v3"
         ),
+        "detector_green_operator_contract_sha256": (operator.contract_hash_sha256),
+        "detector_green_operator_binary_sha256": operator.binary_sha256,
         "obstacle_material_contract_id": OBSTACLE_MATERIAL_CONTRACT_ID,
-        "obstacle_material_contract_sha256": (
-            OBSTACLE_MATERIAL_CONTRACT_SHA256
-        ),
-        "transport_physics_table_contract_id": (
-            TRANSPORT_PHYSICS_TABLE_CONTRACT_ID
-        ),
+        "obstacle_material_contract_sha256": (OBSTACLE_MATERIAL_CONTRACT_SHA256),
+        "transport_physics_table_contract_id": (TRANSPORT_PHYSICS_TABLE_CONTRACT_ID),
         "transport_physics_table_contract_sha256": (
             TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256
         ),
@@ -561,8 +552,10 @@ def build_forward_model_manifest(
 
 def _sha256(value: object, *, name: str) -> str:
     """Return one exact lowercase SHA-256 string without coercion."""
-    if not isinstance(value, str) or len(value) != 64 or any(
-        character not in "0123456789abcdef" for character in value
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
     ):
         raise ValueError(f"{name} must be a lowercase 64-character SHA-256 digest.")
     return value
@@ -636,15 +629,10 @@ def _validate_common(
         raise ValueError("forward-model response_semantics are incompatible.")
     if payload.get("shield_pose_contract_id") != SHIELD_POSE_CONTRACT_ID:
         raise ValueError("forward-model shield-pose contract ID is incompatible.")
-    if (
-        payload.get("shield_pose_contract_sha256")
-        != SHIELD_POSE_CONTRACT_SHA256
-    ):
+    if payload.get("shield_pose_contract_sha256") != SHIELD_POSE_CONTRACT_SHA256:
         raise ValueError("forward-model shield-pose contract hash is incompatible.")
     immutable_transport_contracts = {
-        "dry_air_total_attenuation_contract_id": (
-            NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_ID
-        ),
+        "dry_air_total_attenuation_contract_id": (NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_ID),
         "dry_air_total_attenuation_contract_sha256": (
             NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_SHA256
         ),
@@ -653,33 +641,18 @@ def _validate_common(
     }
     for field_name, expected_value in immutable_transport_contracts.items():
         if payload.get(field_name) != expected_value:
-            raise ValueError(
-                f"forward-model {field_name} is incompatible."
-            )
-    if (
-        payload.get("detector_response_contract_sha256")
-        != NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
-    ):
-        raise ValueError(
-            "forward-model detector-response contract hash is incompatible."
-        )
+            raise ValueError(f"forward-model {field_name} is incompatible.")
     physics_contracts = {
         "obstacle_material_contract_id": OBSTACLE_MATERIAL_CONTRACT_ID,
-        "obstacle_material_contract_sha256": (
-            OBSTACLE_MATERIAL_CONTRACT_SHA256
-        ),
-        "transport_physics_table_contract_id": (
-            TRANSPORT_PHYSICS_TABLE_CONTRACT_ID
-        ),
+        "obstacle_material_contract_sha256": (OBSTACLE_MATERIAL_CONTRACT_SHA256),
+        "transport_physics_table_contract_id": (TRANSPORT_PHYSICS_TABLE_CONTRACT_ID),
         "transport_physics_table_contract_sha256": (
             TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256
         ),
     }
     for field_name, expected_value in physics_contracts.items():
         if payload.get(field_name) != expected_value:
-            raise ValueError(
-                f"forward-model {field_name} is incompatible."
-            )
+            raise ValueError(f"forward-model {field_name} is incompatible.")
 
 
 def validate_forward_model_manifest(
@@ -729,6 +702,13 @@ def validate_forward_model_manifest(
         raise ValueError(
             "forward_model_manifest line_mu_by_isotope differs from production."
         )
+    for field_name in (
+        "detector_green_operator_model",
+        "detector_green_operator_contract_sha256",
+        "detector_green_operator_binary_sha256",
+    ):
+        if payload.get(field_name) != expected[field_name]:
+            raise ValueError("forward-model detector Green identity is incompatible.")
     payload["model_identifiers"] = _validate_model_identifiers(
         payload.get("model_identifiers"),
         expected=expected["model_identifiers"],

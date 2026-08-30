@@ -239,7 +239,7 @@ def test_generate_surface_sources_rejects_coerced_strengths(
         )
 
 
-def test_generate_surface_sources_matches_physical_surface_area_ratios() -> None:
+def test_batched_surface_sampler_matches_physical_surface_area_ratios() -> None:
     """Truth surface-kind frequencies should follow physical area alone."""
     env = EnvironmentConfig(size_x=4.0, size_y=5.0, size_z=3.0)
     grid = ObstacleGrid(
@@ -250,23 +250,18 @@ def test_generate_surface_sources_matches_physical_surface_area_ratios() -> None
         transport_boxes_m=((1.0, 1.0, 0.0, 2.0, 2.0, 1.5),),
     )
     sample_count = 40_000
-    sources = generate_surface_sources(
-        env=env,
-        obstacle_grid=grid,
-        isotopes=("Cs-137", "Co-60", "Eu-154"),
-        intensity_cps_1m=30000.0,
-        rng=np.random.default_rng(2026072701),
-        count=sample_count,
-        obstacle_height_m=1.5,
-    )
-    positions = np.asarray([source.position for source in sources], dtype=float)
-    kinds = source_surface_kinds(
-        positions,
+    atlas = _build_source_surface_atlas(
         env,
         grid,
         obstacle_height_m=1.5,
     )
-    atlas = _build_source_surface_atlas(
+    positions, _ = sample_continuous_surface_positions(
+        atlas,
+        sample_count,
+        np.random.default_rng(2026072701),
+    )
+    kinds = source_surface_kinds(
+        positions,
         env,
         grid,
         obstacle_height_m=1.5,

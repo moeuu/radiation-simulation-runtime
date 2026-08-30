@@ -28,7 +28,10 @@ from runtime.provenance import (
     strict_canonical_json_bytes,
     strict_json_loads,
 )
-from runtime.contracts import FULL_SPECTRUM_CONTRACT_HASH_METADATA_KEY
+from runtime.contracts import (
+    FULL_SPECTRUM_CONTRACT_HASH_METADATA_KEY,
+    FULL_SPECTRUM_MODEL_SCHEMA_VERSION,
+)
 from runtime.forward_model_manifest import (
     CANONICAL_UNITS,
     FORWARD_MODEL_MANIFEST_SCHEMA_VERSION,
@@ -44,7 +47,6 @@ if TYPE_CHECKING:
     from runtime.records import RunContext
 
 MEASUREMENT_LOG_SCHEMA_VERSION = 2
-FULL_SPECTRUM_MODEL_SCHEMA_VERSION = 3
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _GIT_COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 _CANONICAL_REQUIRED_FILES = (

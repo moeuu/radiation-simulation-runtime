@@ -114,12 +114,8 @@ DETECTOR_CONE_SCATTER_BASIS_SEMANTICS = frozenset(
 LEGACY_PHYSICS_ONLY_TRANSPORT_RESPONSE_ID = (
     "physics_only_detector_cone_transport_response_v1"
 )
-PHYSICS_ONLY_TRANSPORT_RESPONSE_ID = (
-    "physics_only_detector_cone_transport_response_v2"
-)
-_CONE_QUADRATURE_NODES, _CONE_QUADRATURE_WEIGHTS = (
-    np.polynomial.legendre.leggauss(16)
-)
+PHYSICS_ONLY_TRANSPORT_RESPONSE_ID = "physics_only_detector_cone_transport_response_v2"
+_CONE_QUADRATURE_NODES, _CONE_QUADRATURE_WEIGHTS = np.polynomial.legendre.leggauss(16)
 _TORCH_CONE_QUADRATURE_CACHE: dict[tuple[str, str], tuple[object, object]] = {}
 
 
@@ -148,6 +144,8 @@ def _torch_cone_quadrature_constants(
     result = (nodes, weights)
     _TORCH_CONE_QUADRATURE_CACHE[key] = result
     return result
+
+
 DIRECT_TRANSPORT_TARGET_SEMANTICS = (
     "log_native_uncollided_primary_counts_divided_by_"
     "analytic_uncollided_detector_entry_counts"
@@ -203,9 +201,7 @@ def _is_lower_sha256(value: object) -> bool:
     return (
         isinstance(value, str)
         and len(value) == 64
-        and all(
-            character in "0123456789abcdef" for character in value
-        )
+        and all(character in "0123456789abcdef" for character in value)
     )
 
 
@@ -237,12 +233,8 @@ def _training_manifest_base_ready(
     schema_version = manifest.get("schema_version")
     expected_base = _ADDITIVE_SCATTER_TRAINING_BASE_KEYS
     if schema_version == 2:
-        expected_base = (
-            expected_base | _ADDITIVE_SCATTER_TRAINING_CONTRACT_KEYS
-        )
-    if set(manifest).difference(
-        _ADDITIVE_SCATTER_TRAINING_FIT_KEYS
-    ) != expected_base:
+        expected_base = expected_base | _ADDITIVE_SCATTER_TRAINING_CONTRACT_KEYS
+    if set(manifest).difference(_ADDITIVE_SCATTER_TRAINING_FIT_KEYS) != expected_base:
         return False
     training_seeds = manifest.get("training_scene_seeds")
     scenarios = manifest.get("scenario_ids")
@@ -258,13 +250,11 @@ def _training_manifest_base_ready(
         or not isinstance(scenarios, list)
         or not scenarios
         or any(
-            type(scenario) is not str
-            or scenario not in VALIDATION_SCENARIO_IDS
+            type(scenario) is not str or scenario not in VALIDATION_SCENARIO_IDS
             for scenario in scenarios
         )
         or len(set(scenarios)) != len(scenarios)
-        or manifest.get("label_space")
-        != ADDITIVE_SCATTER_INCIDENT_LABEL_SEMANTICS
+        or manifest.get("label_space") != ADDITIVE_SCATTER_INCIDENT_LABEL_SEMANTICS
         or manifest.get("selection_objective")
         != "leave_one_training_scene_out_weighted_log1p_mse"
     ):
@@ -273,9 +263,7 @@ def _training_manifest_base_ready(
     pair_ids = manifest.get("pair_ids_by_scene")
     artifact_hashes = manifest.get("artifact_sha256_by_scene")
     declared_pair_ids = (
-        pair_ids.get(str(training_seeds[0]))
-        if isinstance(pair_ids, Mapping)
-        else None
+        pair_ids.get(str(training_seeds[0])) if isinstance(pair_ids, Mapping) else None
     )
     base_ready = bool(
         isinstance(pair_ids, Mapping)
@@ -285,8 +273,7 @@ def _training_manifest_base_ready(
             isinstance(pair_ids[str(seed)], list)
             and bool(pair_ids[str(seed)])
             and all(
-                type(pair_id) is int
-                and 0 <= pair_id < 64
+                type(pair_id) is int and 0 <= pair_id < 64
                 for pair_id in pair_ids[str(seed)]
             )
             and len(set(pair_ids[str(seed)])) == len(pair_ids[str(seed)])
@@ -295,24 +282,20 @@ def _training_manifest_base_ready(
         )
         and isinstance(artifact_hashes, Mapping)
         and set(artifact_hashes) == seed_keys
-        and all(
-            _is_lower_sha256(artifact_hashes[str(seed)])
-            for seed in training_seeds
-        )
+        and all(_is_lower_sha256(artifact_hashes[str(seed)]) for seed in training_seeds)
     )
     if not base_ready or schema_version == 1:
         return base_ready
     from measurement.shielding import SHIELD_POSE_CONTRACT_SHA256
     from spectrum.response_matrix import (
-        NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256,
+        LEGACY_ANALYTIC_DETECTOR_RESPONSE_CONTRACT_SHA256,
     )
 
     artifact_contracts = manifest.get("artifact_contract_sha256_by_scene")
     return bool(
-        manifest.get("shield_pose_contract_sha256")
-        == SHIELD_POSE_CONTRACT_SHA256
+        manifest.get("shield_pose_contract_sha256") == SHIELD_POSE_CONTRACT_SHA256
         and manifest.get("detector_response_contract_sha256")
-        == NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
+        == LEGACY_ANALYTIC_DETECTOR_RESPONSE_CONTRACT_SHA256
         and manifest.get("obstacle_material_contract_sha256")
         == OBSTACLE_MATERIAL_CONTRACT_SHA256
         and manifest.get("transport_physics_table_contract_sha256")
@@ -320,8 +303,7 @@ def _training_manifest_base_ready(
         and isinstance(artifact_contracts, Mapping)
         and set(artifact_contracts) == seed_keys
         and all(
-            _is_lower_sha256(artifact_contracts[str(seed)])
-            for seed in training_seeds
+            _is_lower_sha256(artifact_contracts[str(seed)]) for seed in training_seeds
         )
     )
 
@@ -333,8 +315,7 @@ def _training_manifest_fit_ready(
 ) -> bool:
     """Validate LOSO selection outputs without accepting holdout provenance."""
     expected_keys = (
-        _ADDITIVE_SCATTER_TRAINING_BASE_KEYS
-        | _ADDITIVE_SCATTER_TRAINING_FIT_KEYS
+        _ADDITIVE_SCATTER_TRAINING_BASE_KEYS | _ADDITIVE_SCATTER_TRAINING_FIT_KEYS
     )
     if manifest.get("schema_version") == 2:
         expected_keys |= _ADDITIVE_SCATTER_TRAINING_CONTRACT_KEYS
@@ -344,8 +325,7 @@ def _training_manifest_fit_ready(
         return False
     scores = manifest.get("candidate_validation_scores")
     expected_score_keys = {
-        format(value, ".12g")
-        for value in ADDITIVE_SCATTER_RIDGE_LAMBDA_GRID
+        format(value, ".12g") for value in ADDITIVE_SCATTER_RIDGE_LAMBDA_GRID
     }
     raw_fit_sample_count = manifest.get("fit_sample_count")
     raw_selected_score = manifest.get("selected_validation_score")
@@ -383,8 +363,7 @@ def _training_manifest_fit_ready(
     tied_ridges = [
         ridge
         for ridge in ADDITIVE_SCATTER_RIDGE_LAMBDA_GRID
-        if float(scores[format(ridge, ".12g")])
-        <= minimum_score + 1.0e-12
+        if float(scores[format(ridge, ".12g")]) <= minimum_score + 1.0e-12
     ]
     return bool(
         np.isclose(selected_score, minimum_score, rtol=0.0, atol=0.0)
@@ -404,19 +383,11 @@ def klein_nishina_total_cross_section_cm2(
     bracket = (
         (1.0 + alpha)
         / np.square(alpha)
-        * (
-            2.0 * (1.0 + alpha) / (1.0 + 2.0 * alpha)
-            - log_term / alpha
-        )
+        * (2.0 * (1.0 + alpha) / (1.0 + 2.0 * alpha) - log_term / alpha)
         + log_term / (2.0 * alpha)
         - (1.0 + 3.0 * alpha) / np.square(1.0 + 2.0 * alpha)
     )
-    return (
-        2.0
-        * np.pi
-        * CLASSICAL_ELECTRON_RADIUS_CM**2
-        * np.maximum(bracket, 0.0)
-    )
+    return 2.0 * np.pi * CLASSICAL_ELECTRON_RADIUS_CM**2 * np.maximum(bracket, 0.0)
 
 
 def material_compton_fraction_numpy(
@@ -468,9 +439,7 @@ def composition_effective_z_over_a(
     for element, raw_weight in composition_by_mass.items():
         symbol = str(element)
         if symbol not in ELEMENT_Z_AND_ATOMIC_MASS:
-            raise KeyError(
-                f"No atomic-number contract exists for element {symbol!r}."
-            )
+            raise KeyError(f"No atomic-number contract exists for element {symbol!r}.")
         weight = float(raw_weight)
         if not np.isfinite(weight) or weight < 0.0:
             raise ValueError("Material mass fractions must be nonnegative.")
@@ -529,12 +498,8 @@ def klein_nishina_forward_cone_fraction_numpy(
         raise ValueError("Klein-Nishina detector-cone inputs are invalid.")
     ratio = np.clip(radius / np.maximum(distance, radius), 0.0, 1.0)
     mu_min = np.sqrt(np.maximum(1.0 - np.square(ratio), 0.0))
-    nodes = _CONE_QUADRATURE_NODES.reshape(
-        (1,) * energy.ndim + (-1,)
-    )
-    weights = _CONE_QUADRATURE_WEIGHTS.reshape(
-        (1,) * energy.ndim + (-1,)
-    )
+    nodes = _CONE_QUADRATURE_NODES.reshape((1,) * energy.ndim + (-1,))
+    weights = _CONE_QUADRATURE_WEIGHTS.reshape((1,) * energy.ndim + (-1,))
     midpoint = 0.5 * (1.0 + mu_min)[..., None]
     half_width = 0.5 * (1.0 - mu_min)[..., None]
     cosine = midpoint + half_width * nodes
@@ -626,20 +591,14 @@ def klein_nishina_forward_cone_fraction_torch(
         (1.0 + alpha_total)
         / torch.square(alpha_total)
         * (
-            2.0
-            * (1.0 + alpha_total)
-            / (1.0 + 2.0 * alpha_total)
+            2.0 * (1.0 + alpha_total) / (1.0 + 2.0 * alpha_total)
             - log_term / alpha_total
         )
         + log_term / (2.0 * alpha_total)
-        - (1.0 + 3.0 * alpha_total)
-        / torch.square(1.0 + 2.0 * alpha_total)
+        - (1.0 + 3.0 * alpha_total) / torch.square(1.0 + 2.0 * alpha_total)
     )
     denominator = (
-        2.0
-        * np.pi
-        * CLASSICAL_ELECTRON_RADIUS_CM**2
-        * torch.clamp(bracket, min=0.0)
+        2.0 * np.pi * CLASSICAL_ELECTRON_RADIUS_CM**2 * torch.clamp(bracket, min=0.0)
     )
     return torch.clamp(
         numerator
@@ -767,9 +726,7 @@ def physical_scatter_basis_numpy(
             p_material * p_air,
         )
     else:
-        survival = np.exp(
-            -(fe_tau + pb_tau + obstacle_tau + air_survival_tau)
-        )
+        survival = np.exp(-(fe_tau + pb_tau + obstacle_tau + air_survival_tau))
         fe_compton_tau = fe_tau * fe_fraction
         pb_compton_tau = pb_tau * pb_fraction
         obstacle_compton = obstacle_tau * obstacle_fraction
@@ -845,9 +802,7 @@ def physical_scatter_basis_numpy(
                     or np.any(~np.isfinite(obstacle_probability))
                     or np.any(obstacle_probability < 0.0)
                 ):
-                    raise ValueError(
-                        "Obstacle single-scatter probability is invalid."
-                    )
+                    raise ValueError("Obstacle single-scatter probability is invalid.")
                 interactions = (
                     interactions[0],
                     interactions[1],
@@ -930,11 +885,7 @@ def physical_scatter_basis_torch(
             torch.any(energy <= 0.0),
             torch.any(
                 obstacle_compton_tau
-                > obstacle_tau
-                * (
-                    1.0
-                    + 64.0 * torch.finfo(fe_tau.dtype).eps
-                )
+                > obstacle_tau * (1.0 + 64.0 * torch.finfo(fe_tau.dtype).eps)
             ),
         )
     )
@@ -973,10 +924,7 @@ def physical_scatter_basis_torch(
         bracket = (
             (1.0 + alpha)
             / torch.square(alpha)
-            * (
-                2.0 * (1.0 + alpha) / (1.0 + 2.0 * alpha)
-                - log_term / alpha
-            )
+            * (2.0 * (1.0 + alpha) / (1.0 + 2.0 * alpha) - log_term / alpha)
             + log_term / (2.0 * alpha)
             - (1.0 + 3.0 * alpha) / torch.square(1.0 + 2.0 * alpha)
         )
@@ -987,10 +935,7 @@ def physical_scatter_basis_torch(
             * torch.clamp(bracket, min=0.0)
         )
         compton_mu = (
-            float(density_g_cm3)
-            * AVOGADRO_CONSTANT_MOL_INV
-            * float(z_over_a)
-            * sigma
+            float(density_g_cm3) * AVOGADRO_CONSTANT_MOL_INV * float(z_over_a) * sigma
         )
         return torch.clamp(
             compton_mu
@@ -1044,9 +989,7 @@ def physical_scatter_basis_torch(
         )
         air_compton_tau = distance * 100.0 * air_compton_mu
         air_survival_tau = (
-            distance
-            * 100.0
-            * dry_air_total_linear_attenuation_torch(energy)
+            distance * 100.0 * dry_air_total_linear_attenuation_torch(energy)
         )
     if semantics == LEGACY_SCATTER_BASIS_SEMANTICS:
         p_fe = -torch.expm1(-fe_tau) * fe_fraction
@@ -1065,9 +1008,7 @@ def physical_scatter_basis_torch(
             p_material * p_air,
         )
     else:
-        survival = torch.exp(
-            -(fe_tau + pb_tau + obstacle_tau + air_survival_tau)
-        )
+        survival = torch.exp(-(fe_tau + pb_tau + obstacle_tau + air_survival_tau))
         fe_compton_tau = fe_tau * fe_fraction
         pb_compton_tau = pb_tau * pb_fraction
         obstacle_compton = obstacle_tau * obstacle_fraction
@@ -1109,12 +1050,10 @@ def physical_scatter_basis_torch(
                 0.5 * distance,
                 min=radius,
             )
-            variable_distance_acceptance = (
-                klein_nishina_forward_cone_fraction_torch(
-                    energy,
-                    detector_radius_m=radius,
-                    scatter_distance_m=obstacle_distance,
-                )
+            variable_distance_acceptance = klein_nishina_forward_cone_fraction_torch(
+                energy,
+                detector_radius_m=radius,
+                scatter_distance_m=obstacle_distance,
             )
             acceptance = (
                 klein_nishina_forward_cone_fraction_torch(
@@ -1148,13 +1087,10 @@ def physical_scatter_basis_torch(
                         torch.any(obstacle_probability < 0.0),
                     )
                 )
-                if (
-                    obstacle_probability.shape != obstacle_tau.shape
-                    or bool(torch.any(invalid_obstacle_probability))
+                if obstacle_probability.shape != obstacle_tau.shape or bool(
+                    torch.any(invalid_obstacle_probability)
                 ):
-                    raise ValueError(
-                        "Obstacle single-scatter probability is invalid."
-                    )
+                    raise ValueError("Obstacle single-scatter probability is invalid.")
                 interactions = (
                     interactions[0],
                     interactions[1],
@@ -1171,6 +1107,7 @@ def scatter_basis_from_stored_geometry_numpy(
     *,
     stored_basis: NDArray[np.float64],
     transport_features: NDArray[np.float64],
+    transport_feature_order: Sequence[str],
     line_identity: Sequence[Mapping[str, object]],
     target_semantics: str,
     detector_radius_m: float | None = None,
@@ -1179,21 +1116,33 @@ def scatter_basis_from_stored_geometry_numpy(
 ) -> NDArray[np.float64]:
     """Return a versioned basis reconstructed from stored ray geometry.
 
-    Mean-calibration and acceptance artifacts store the original seven-feature
-    basis together with the four lossless ray features ``tau_fe``, ``tau_pb``,
-    ``tau_obstacle``, and ``distance_m``.  The original obstacle feature also
-    preserves the obstacle Compton fraction, so newer feature semantics can be
-    reconstructed without rerunning or approximating Geant4 transport.
+    Mean-calibration and acceptance artifacts store the seven-feature basis
+    together with lossless ray features, including the material-integrated
+    obstacle Compton optical depth and detector-impact phase fractions.
     """
     basis = np.asarray(stored_basis, dtype=np.float64)
     features = np.asarray(transport_features, dtype=np.float64)
     line_rows = tuple(line_identity)
+    feature_order = tuple(transport_feature_order)
+    base_order = (
+        "tau_fe",
+        "tau_pb",
+        "tau_obstacle",
+        "tau_obstacle_compton",
+        "distance_m",
+    )
+    phase_order = feature_order[len(base_order) :]
+    expected_phase_order = tuple(
+        f"uncollided_impact_fraction_{index}"
+        for index in range(len(phase_order))
+    )
     if (
         target_semantics not in SCATTER_BASIS_SEMANTICS
+        or feature_order[: len(base_order)] != base_order
+        or phase_order != expected_phase_order
         or features.ndim < 2
-        or features.shape[-1] != 4
-        or basis.shape
-        != features.shape[:-1] + (len(ADDITIVE_SCATTER_FEATURE_ORDER),)
+        or features.shape[-1] != len(feature_order)
+        or basis.shape != features.shape[:-1] + (len(ADDITIVE_SCATTER_FEATURE_ORDER),)
         or features.shape[-2] != len(line_rows)
         or np.any(~np.isfinite(features))
         or np.any(features < 0.0)
@@ -1201,6 +1150,20 @@ def scatter_basis_from_stored_geometry_numpy(
         or np.any(basis < 0.0)
     ):
         raise ValueError("Stored scatter geometry is invalid.")
+    if phase_order:
+        phase_values = features[..., len(base_order) :]
+        phase_sum = np.sum(phase_values, axis=-1)
+        tolerance = 1.0e-10
+        if (
+            np.any(phase_values > 1.0)
+            or np.any(
+                (np.abs(phase_sum) > tolerance)
+                & (np.abs(phase_sum - 1.0) > tolerance)
+            )
+        ):
+            raise ValueError(
+                "Stored detector-impact fractions must sum to zero or one."
+            )
     if target_semantics == LEGACY_SCATTER_BASIS_SEMANTICS:
         return basis.copy()
     energies = np.asarray(
@@ -1226,29 +1189,17 @@ def scatter_basis_from_stored_geometry_numpy(
         raise ValueError("Stored scatter line identity is invalid.")
     line_shape = (1,) * (features.ndim - 2) + (len(line_rows),)
     obstacle_tau = features[..., 2]
-    legacy_obstacle_probability = -np.expm1(-obstacle_tau)
-    obstacle_fraction = np.divide(
-        basis[..., 2],
-        legacy_obstacle_probability,
-        out=np.zeros_like(obstacle_tau),
-        where=legacy_obstacle_probability > np.finfo(np.float64).tiny,
-    )
-    tolerance = 256.0 * np.finfo(np.float64).eps
-    if np.any(obstacle_fraction > 1.0 + tolerance):
+    obstacle_compton_tau = features[..., 3]
+    if np.any(obstacle_compton_tau > obstacle_tau + 1.0e-12):
         raise ValueError(
-            "Stored obstacle scatter feature exceeds its interaction bound."
+            "Stored obstacle Compton depth exceeds total optical depth."
         )
-    obstacle_compton_tau = obstacle_tau * np.clip(
-        obstacle_fraction,
-        0.0,
-        1.0,
-    )
     return physical_scatter_basis_numpy(
         tau_fe=features[..., 0],
         tau_pb=features[..., 1],
         tau_obstacle=obstacle_tau,
         tau_obstacle_compton=obstacle_compton_tau,
-        distance_m=features[..., 3],
+        distance_m=features[..., 4],
         energy_keV=energies.reshape(line_shape),
         mu_fe_cm_inv=mu_fe.reshape(line_shape),
         mu_pb_cm_inv=mu_pb.reshape(line_shape),
@@ -1280,38 +1231,27 @@ def _validate_direct_training_manifest(
         "selected_ridge_lambda",
         "selection_completed",
     }
-    score_keys = {
-        format(value, ".12g")
-        for value in ADDITIVE_SCATTER_RIDGE_LAMBDA_GRID
-    }
+    score_keys = {format(value, ".12g") for value in ADDITIVE_SCATTER_RIDGE_LAMBDA_GRID}
     scores = manifest.get("candidate_validation_scores")
     base_keys = _ADDITIVE_SCATTER_TRAINING_BASE_KEYS
     if scatter_manifest.get("schema_version") == 2:
         base_keys |= _ADDITIVE_SCATTER_TRAINING_CONTRACT_KEYS
-    base_manifest = {
-        key: scatter_manifest[key]
-        for key in base_keys
-    }
+    base_manifest = {key: scatter_manifest[key] for key in base_keys}
     if (
         set(manifest) != expected_keys
         or manifest.get("schema_version") != 1
         or manifest.get("base_training_manifest_sha256")
         != _canonical_json_sha256(base_manifest)
-        or manifest.get("target_semantics")
-        != DIRECT_TRANSPORT_TARGET_SEMANTICS
-        or manifest.get("fit_sample_count")
-        != scatter_manifest.get("fit_sample_count")
-        or manifest.get("loso_scene_ids")
-        != scatter_manifest.get("loso_scene_ids")
+        or manifest.get("target_semantics") != DIRECT_TRANSPORT_TARGET_SEMANTICS
+        or manifest.get("fit_sample_count") != scatter_manifest.get("fit_sample_count")
+        or manifest.get("loso_scene_ids") != scatter_manifest.get("loso_scene_ids")
         or not isinstance(scores, Mapping)
         or set(scores) != score_keys
         or any(
             not _is_finite_json_number(value) or float(value) < 0.0
             for value in scores.values()
         )
-        or not _is_finite_json_number(
-            manifest.get("selected_validation_score")
-        )
+        or not _is_finite_json_number(manifest.get("selected_validation_score"))
         or not _is_finite_json_number(manifest.get("selected_ridge_lambda"))
         or manifest.get("selection_completed") is not True
     ):
@@ -1320,8 +1260,7 @@ def _validate_direct_training_manifest(
     tied = [
         value
         for value in ADDITIVE_SCATTER_RIDGE_LAMBDA_GRID
-        if float(scores[format(value, ".12g")])
-        <= minimum_score + 1.0e-12
+        if float(scores[format(value, ".12g")]) <= minimum_score + 1.0e-12
     ]
     if (
         float(manifest["selected_validation_score"]) != minimum_score
@@ -1387,8 +1326,7 @@ class AdditiveNoncollidedTransportResponse:
             self.direct_training_manifest is not None
         ):
             raise ValueError(
-                "Direct coefficients, ridge, and provenance must be declared "
-                "together."
+                "Direct coefficients, ridge, and provenance must be declared together."
             )
         direct_manifest = None
         if has_direct:
@@ -1438,16 +1376,12 @@ class AdditiveNoncollidedTransportResponse:
             "fit_family": "nonnegative_ridge_nnls",
             "ridge_lambda_grid": list(ADDITIVE_SCATTER_RIDGE_LAMBDA_GRID),
             "selected_ridge_lambda": float(self.ridge_lambda),
-            "selection_objective": (
-                "leave_one_training_scene_out_weighted_log1p_mse"
-            ),
+            "selection_objective": ("leave_one_training_scene_out_weighted_log1p_mse"),
             "tie_break": "largest_ridge_lambda_within_1e-12",
             "coefficient_scope": (
                 "one_global_vector_all_scenes_pairs_sources_isotopes_lines"
             ),
-            "incident_label_semantics": (
-                ADDITIVE_SCATTER_INCIDENT_LABEL_SEMANTICS
-            ),
+            "incident_label_semantics": (ADDITIVE_SCATTER_INCIDENT_LABEL_SEMANTICS),
             "target_semantics": ADDITIVE_SCATTER_TARGET_SEMANTICS,
             "kernel_equation": (
                 "total=uncollided+unattenuated_geometric*max(0,basis@coefficients)"
@@ -1457,18 +1391,12 @@ class AdditiveNoncollidedTransportResponse:
         if self.direct_log_coefficients:
             payload.update(
                 {
-                    "direct_log_coefficients": list(
-                        self.direct_log_coefficients
-                    ),
-                    "direct_selected_ridge_lambda": float(
-                        self.direct_ridge_lambda
-                    ),
+                    "direct_log_coefficients": list(self.direct_log_coefficients),
+                    "direct_selected_ridge_lambda": float(self.direct_ridge_lambda),
                     "direct_maximum_abs_log_correction": (
                         DIRECT_TRANSPORT_MAXIMUM_ABS_LOG_CORRECTION
                     ),
-                    "direct_target_semantics": (
-                        DIRECT_TRANSPORT_TARGET_SEMANTICS
-                    ),
+                    "direct_target_semantics": (DIRECT_TRANSPORT_TARGET_SEMANTICS),
                     "direct_training": dict(self.direct_training_manifest),
                     "kernel_equation": (
                         "corrected_uncollided=uncollided*exp(clip(basis@"
@@ -1507,9 +1435,10 @@ class AdditiveNoncollidedTransportResponse:
         payload = {
             "schema_version": (
                 3
-                if self.feature_basis_semantics
-                != LEGACY_SCATTER_BASIS_SEMANTICS
-                else 2 if self.direct_log_coefficients else 1
+                if self.feature_basis_semantics != LEGACY_SCATTER_BASIS_SEMANTICS
+                else 2
+                if self.direct_log_coefficients
+                else 1
             ),
             **self._contract_payload(),
             "contract_hash_sha256": self.contract_hash_sha256,
@@ -1523,9 +1452,7 @@ class AdditiveNoncollidedTransportResponse:
     ) -> "AdditiveNoncollidedTransportResponse":
         """Reconstruct and byte-authenticate one additive response payload."""
         raw_coefficients = (
-            payload.get("coefficients")
-            if isinstance(payload, Mapping)
-            else None
+            payload.get("coefficients") if isinstance(payload, Mapping) else None
         )
         raw_ridge = (
             payload.get("selected_ridge_lambda")
@@ -1533,9 +1460,7 @@ class AdditiveNoncollidedTransportResponse:
             else None
         )
         raw_ridge_grid = (
-            payload.get("ridge_lambda_grid")
-            if isinstance(payload, Mapping)
-            else None
+            payload.get("ridge_lambda_grid") if isinstance(payload, Mapping) else None
         )
         has_direct_payload = isinstance(payload, Mapping) and (
             "direct_log_coefficients" in payload
@@ -1545,26 +1470,17 @@ class AdditiveNoncollidedTransportResponse:
             or type(payload.get("schema_version")) is not int
             or payload.get("schema_version") not in (1, 2, 3)
             or payload.get("model") != ADDITIVE_SCATTER_MODEL_ID
-            or tuple(payload.get("feature_order", ()))
-            != ADDITIVE_SCATTER_FEATURE_ORDER
+            or tuple(payload.get("feature_order", ())) != ADDITIVE_SCATTER_FEATURE_ORDER
             or payload.get("fit_family") != "nonnegative_ridge_nnls"
             or not isinstance(raw_ridge_grid, list)
-            or any(
-                not _is_finite_json_number(value)
-                for value in raw_ridge_grid
-            )
-            or tuple(raw_ridge_grid)
-            != ADDITIVE_SCATTER_RIDGE_LAMBDA_GRID
+            or any(not _is_finite_json_number(value) for value in raw_ridge_grid)
+            or tuple(raw_ridge_grid) != ADDITIVE_SCATTER_RIDGE_LAMBDA_GRID
             or not isinstance(raw_coefficients, list)
-            or any(
-                not _is_finite_json_number(value)
-                for value in raw_coefficients
-            )
+            or any(not _is_finite_json_number(value) for value in raw_coefficients)
             or not _is_finite_json_number(raw_ridge)
             or payload.get("incident_label_semantics")
             != ADDITIVE_SCATTER_INCIDENT_LABEL_SEMANTICS
-            or payload.get("target_semantics")
-            != ADDITIVE_SCATTER_TARGET_SEMANTICS
+            or payload.get("target_semantics") != ADDITIVE_SCATTER_TARGET_SEMANTICS
             or not isinstance(payload.get("training"), Mapping)
             or not _is_lower_sha256(payload.get("contract_hash_sha256"))
         ):
@@ -1685,9 +1601,7 @@ class AdditiveNoncollidedTransportResponse:
             uncollided,
             feature_basis,
         )
-        return corrected + unattenuated * self.scatter_fraction_numpy(
-            feature_basis
-        )
+        return corrected + unattenuated * self.scatter_fraction_numpy(feature_basis)
 
     def corrected_uncollided_kernel_numpy(
         self,
@@ -1698,8 +1612,7 @@ class AdditiveNoncollidedTransportResponse:
         uncollided = np.asarray(uncollided_kernel, dtype=np.float64)
         basis = np.asarray(feature_basis, dtype=np.float64)
         if (
-            basis.shape
-            != uncollided.shape + (len(ADDITIVE_SCATTER_FEATURE_ORDER),)
+            basis.shape != uncollided.shape + (len(ADDITIVE_SCATTER_FEATURE_ORDER),)
             or np.any(~np.isfinite(uncollided))
             or np.any(uncollided < 0.0)
             or np.any(~np.isfinite(basis))
@@ -1750,8 +1663,7 @@ class AdditiveNoncollidedTransportResponse:
         )
         if (
             unattenuated.shape != uncollided.shape
-            or basis.shape
-            != unattenuated.shape + (len(self.coefficients),)
+            or basis.shape != unattenuated.shape + (len(self.coefficients),)
             or bool(torch.any(~torch.isfinite(unattenuated)))
             or bool(torch.any(unattenuated < 0.0))
             or bool(torch.any(~torch.isfinite(uncollided)))
@@ -1762,10 +1674,7 @@ class AdditiveNoncollidedTransportResponse:
             uncollided,
             basis,
         )
-        return (
-            corrected
-            + unattenuated * self.scatter_fraction_torch(basis)
-        )
+        return corrected + unattenuated * self.scatter_fraction_torch(basis)
 
     def corrected_uncollided_kernel_torch(
         self,
@@ -1783,8 +1692,7 @@ class AdditiveNoncollidedTransportResponse:
         )
         if (
             uncollided.dtype != torch.float64
-            or basis.shape
-            != uncollided.shape + (len(ADDITIVE_SCATTER_FEATURE_ORDER),)
+            or basis.shape != uncollided.shape + (len(ADDITIVE_SCATTER_FEATURE_ORDER),)
             or bool(torch.any(~torch.isfinite(uncollided)))
             or bool(torch.any(uncollided < 0.0))
             or bool(torch.any(~torch.isfinite(basis)))
@@ -1815,9 +1723,7 @@ class PhysicsOnlyNoncollidedTransportResponse:
     detector_radius_m: float
     fe_scatter_distance_m: float
     pb_scatter_distance_m: float
-    feature_basis_semantics: str = (
-        DETECTOR_CONE_AIR_XCOM_SINGLE_SCATTER_BASIS_SEMANTICS
-    )
+    feature_basis_semantics: str = DETECTOR_CONE_AIR_XCOM_SINGLE_SCATTER_BASIS_SEMANTICS
 
     def __post_init__(self) -> None:
         """Validate immutable detector-cone integration geometry."""
@@ -1865,15 +1771,11 @@ class PhysicsOnlyNoncollidedTransportResponse:
             "detector_radius_m": float(self.detector_radius_m),
             "fe_scatter_distance_m": float(self.fe_scatter_distance_m),
             "pb_scatter_distance_m": float(self.pb_scatter_distance_m),
-            "angular_quadrature_order": int(
-                _CONE_QUADRATURE_NODES.size
-            ),
+            "angular_quadrature_order": int(_CONE_QUADRATURE_NODES.size),
             "material_path_quadrature_order": 2,
             "higher_order_mean": "excluded_positive_nuisance_owned_by_likelihood",
             "obstacle_material_contract_id": OBSTACLE_MATERIAL_CONTRACT_ID,
-            "obstacle_material_contract_sha256": (
-                OBSTACLE_MATERIAL_CONTRACT_SHA256
-            ),
+            "obstacle_material_contract_sha256": (OBSTACLE_MATERIAL_CONTRACT_SHA256),
             "transport_physics_table_contract_id": (
                 TRANSPORT_PHYSICS_TABLE_CONTRACT_ID
             ),
@@ -1932,15 +1834,14 @@ class PhysicsOnlyNoncollidedTransportResponse:
             raise ValueError("Physics-only transport response is invalid.")
         model_id = payload.get("model")
         schema_version = payload.get("schema_version")
-        if (
-            (model_id, schema_version)
-            not in (
-                (LEGACY_PHYSICS_ONLY_TRANSPORT_RESPONSE_ID, 1),
-                (PHYSICS_ONLY_TRANSPORT_RESPONSE_ID, 2),
+        if (model_id, schema_version) != (
+            PHYSICS_ONLY_TRANSPORT_RESPONSE_ID,
+            2,
+        ) or not _is_lower_sha256(payload.get("contract_hash_sha256")):
+            raise ValueError(
+                "Runtime requires the XCOM-air physics-only transport "
+                "response-v2 contract."
             )
-            or not _is_lower_sha256(payload.get("contract_hash_sha256"))
-        ):
-            raise ValueError("Physics-only transport response is invalid.")
         model = cls(
             detector_radius_m=_strict_json_number(
                 payload.get("detector_radius_m"),
@@ -2001,8 +1902,7 @@ class PhysicsOnlyNoncollidedTransportResponse:
         uncollided = np.asarray(uncollided_kernel, dtype=np.float64)
         basis = np.asarray(feature_basis, dtype=np.float64)
         if (
-            basis.shape
-            != uncollided.shape + (len(ADDITIVE_SCATTER_FEATURE_ORDER),)
+            basis.shape != uncollided.shape + (len(ADDITIVE_SCATTER_FEATURE_ORDER),)
             or np.any(~np.isfinite(uncollided))
             or np.any(uncollided < 0.0)
         ):
@@ -2025,8 +1925,7 @@ class PhysicsOnlyNoncollidedTransportResponse:
         )
         if (
             uncollided.dtype != torch.float64
-            or basis.shape
-            != uncollided.shape + (len(ADDITIVE_SCATTER_FEATURE_ORDER),)
+            or basis.shape != uncollided.shape + (len(ADDITIVE_SCATTER_FEATURE_ORDER),)
             or bool(torch.any(~torch.isfinite(uncollided)))
             or bool(torch.any(uncollided < 0.0))
         ):
@@ -2050,9 +1949,7 @@ class PhysicsOnlyNoncollidedTransportResponse:
         )
         if unattenuated.shape != uncollided.shape:
             raise ValueError("Physics-only total kernel shapes disagree.")
-        return uncollided + unattenuated * self.scatter_fraction_numpy(
-            feature_basis
-        )
+        return uncollided + unattenuated * self.scatter_fraction_numpy(feature_basis)
 
     def total_kernel_torch(
         self,
@@ -2070,9 +1967,7 @@ class PhysicsOnlyNoncollidedTransportResponse:
         )
         if unattenuated.shape != uncollided.shape:
             raise ValueError("Torch physics-only total kernel shapes disagree.")
-        return uncollided + unattenuated * self.scatter_fraction_torch(
-            feature_basis
-        )
+        return uncollided + unattenuated * self.scatter_fraction_torch(feature_basis)
 
 
 def _fit_nonnegative_ridge(
@@ -2094,8 +1989,7 @@ def _fit_nonnegative_ridge(
         weighted_features = np.concatenate(
             (
                 weighted_features,
-                np.sqrt(ridge)
-                * np.eye(features.shape[1], dtype=np.float64),
+                np.sqrt(ridge) * np.eye(features.shape[1], dtype=np.float64),
             ),
             axis=0,
         )
@@ -2205,12 +2099,8 @@ def fit_additive_noncollided_transport_response(
                 features[validation_mask] @ coefficients,
                 0.0,
             )
-            errors = np.square(
-                np.log1p(predictions) - log_targets[validation_mask]
-            )
-            squared_error_sum += float(
-                np.sum(weights[validation_mask] * errors)
-            )
+            errors = np.square(np.log1p(predictions) - log_targets[validation_mask])
+            squared_error_sum += float(np.sum(weights[validation_mask] * errors))
             weight_sum += float(np.sum(weights[validation_mask]))
         candidate_scores.append(
             (
@@ -2219,11 +2109,7 @@ def fit_additive_noncollided_transport_response(
             )
         )
     best_score = min(score for score, _ in candidate_scores)
-    tied = [
-        ridge
-        for score, ridge in candidate_scores
-        if score <= best_score + 1.0e-12
-    ]
+    tied = [ridge for score, ridge in candidate_scores if score <= best_score + 1.0e-12]
     selected_lambda = max(tied)
     coefficients = _fit_nonnegative_ridge(
         features,
@@ -2240,12 +2126,9 @@ def fit_additive_noncollided_transport_response(
     provenance.update(
         {
             "fit_sample_count": int(features.shape[0]),
-            "loso_scene_ids": [
-                str(value) for value in unique_scenes.tolist()
-            ],
+            "loso_scene_ids": [str(value) for value in unique_scenes.tolist()],
             "candidate_validation_scores": {
-                format(ridge, ".12g"): float(score)
-                for score, ridge in candidate_scores
+                format(ridge, ".12g"): float(score) for score, ridge in candidate_scores
             },
             "selected_validation_score": float(best_score),
             "selected_ridge_lambda": float(selected_lambda),
@@ -2260,9 +2143,8 @@ def fit_additive_noncollided_transport_response(
             direct_log_ratio_n,
             dtype=np.float64,
         ).reshape(-1)
-        if (
-            direct_targets.shape != targets.shape
-            or np.any(~np.isfinite(direct_targets))
+        if direct_targets.shape != targets.shape or np.any(
+            ~np.isfinite(direct_targets)
         ):
             raise ValueError("Direct transport log-ratio targets are invalid.")
         direct_scores: list[tuple[float, float]] = []
@@ -2283,25 +2165,18 @@ def fit_additive_noncollided_transport_response(
                     -DIRECT_TRANSPORT_MAXIMUM_ABS_LOG_CORRECTION,
                     DIRECT_TRANSPORT_MAXIMUM_ABS_LOG_CORRECTION,
                 )
-                errors = np.square(
-                    prediction - direct_targets[validation_mask]
-                )
-                squared_error_sum += float(
-                    np.sum(weights[validation_mask] * errors)
-                )
+                errors = np.square(prediction - direct_targets[validation_mask])
+                squared_error_sum += float(np.sum(weights[validation_mask] * errors))
                 weight_sum += float(np.sum(weights[validation_mask]))
             direct_scores.append(
                 (
-                    squared_error_sum
-                    / max(weight_sum, np.finfo(np.float64).tiny),
+                    squared_error_sum / max(weight_sum, np.finfo(np.float64).tiny),
                     float(ridge_lambda),
                 )
             )
         direct_best = min(score for score, _ in direct_scores)
         direct_tied = [
-            ridge
-            for score, ridge in direct_scores
-            if score <= direct_best + 1.0e-12
+            ridge for score, ridge in direct_scores if score <= direct_best + 1.0e-12
         ]
         direct_ridge = max(direct_tied)
         fitted_direct = _fit_signed_ridge(
@@ -2318,12 +2193,9 @@ def fit_additive_noncollided_transport_response(
             ),
             "target_semantics": DIRECT_TRANSPORT_TARGET_SEMANTICS,
             "fit_sample_count": int(features.shape[0]),
-            "loso_scene_ids": [
-                str(value) for value in unique_scenes.tolist()
-            ],
+            "loso_scene_ids": [str(value) for value in unique_scenes.tolist()],
             "candidate_validation_scores": {
-                format(ridge, ".12g"): float(score)
-                for score, ridge in direct_scores
+                format(ridge, ".12g"): float(score) for score, ridge in direct_scores
             },
             "selected_validation_score": float(direct_best),
             "selected_ridge_lambda": float(direct_ridge),

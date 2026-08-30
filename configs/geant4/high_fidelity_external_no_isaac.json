@@ -3,7 +3,6 @@
   "auto_start_sidecar": true,
   "backend": "geant4",
   "background_cps": 12.0,
-  "background_rate_cps": 12.0,
   "background_spectrum_model_id": "native_geant4_background_shape_v1_bin_centres",
   "bin_width_keV": 2.0,
   "dead_time_tau_s": 5.813e-09,
@@ -14,7 +13,8 @@
     "crystal_radius_m": 0.038,
     "crystal_shape": "sphere",
     "housing_material": "aluminum",
-    "housing_thickness_m": 0.0015
+    "housing_thickness_m": 0.0015,
+    "coincidence_window_s": 0.000001
   },
   "detector_scoring_mode": "full_transport",
   "energy_bin_count": 851,
@@ -30,6 +30,7 @@
   "persistent_process": true,
   "physics_profile": "balanced",
   "port": 5559,
+  "primary_emission_model": "independent_gamma_lines",
   "primary_sampling_fraction": 1.0,
   "random_seed_base": 9027,
   "random_source_intensity_max_cps_1m": 2000000.0,
@@ -40,7 +41,9 @@
   "sample_detector_response": false,
   "secondary_transport_mode": "full_transport",
   "simulation_runtime_schema_version": 1,
-  "source_bias_cone_half_angle_deg": 0.0,
+  "source_bias_cone_policy": "detector_covering",
+  "source_bias_isotropic_fraction": 1.0,
+  "source_bias_mode": "detector_cone",
   "source_rate_model": "detector_cps_1m",
   "stage_material_rules": [
     {

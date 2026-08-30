@@ -8,7 +8,11 @@ from measurement.shielding import (
     SHIELD_POSE_CONTRACT_SHA256,
     physical_shield_normal_from_orientation_index,
 )
-from sim.geant4_app.engine import Geant4StepRequest
+from sim.geant4_app.engine import (
+    Geant4StepRequest,
+    validate_native_action_identity,
+)
+from sim.geant4_app.io_format import NATIVE_ACTION_IDENTITY_CONTRACT_ID
 from sim.isaacsim_app.robot_controller import (
     RobotController,
     _movement_yaw_rad,
@@ -160,3 +164,71 @@ def test_geant4_request_rejects_wrong_contract_hash() -> None:
     )
     with pytest.raises(ValueError, match="hash"):
         request.resolved_orientation_indices()
+
+
+def _native_action_metadata(request: Geant4StepRequest) -> dict[str, object]:
+    """Return one complete native action echo for validator tests."""
+    fe_index, pb_index = request.resolved_orientation_indices()
+    metadata: dict[str, object] = {
+        "native_action_contract_id": NATIVE_ACTION_IDENTITY_CONTRACT_ID,
+        "native_action_sha256": request.action_identity_sha256(),
+        "native_action_step_id": request.step_id,
+        "native_action_seed": request.seed,
+        "native_action_dwell_time_s": request.dwell_time_s,
+        "native_action_fe_orientation_index": fe_index,
+        "native_action_pb_orientation_index": pb_index,
+    }
+    for prefix, position, quaternion in (
+        ("detector", request.detector_pose_xyz, request.detector_quat_wxyz),
+        ("fe_shield", request.fe_shield_pose_xyz, request.fe_shield_quat_wxyz),
+        ("pb_shield", request.pb_shield_pose_xyz, request.pb_shield_quat_wxyz),
+    ):
+        metadata.update(
+            {
+                f"native_action_{prefix}_pose_{axis}": value
+                for axis, value in zip("xyz", position, strict=True)
+            }
+        )
+        metadata.update(
+            {
+                f"native_action_{prefix}_quat_{axis}": value
+                for axis, value in zip("wxyz", quaternion, strict=True)
+            }
+        )
+    return metadata
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    (
+        ("native_action_sha256", "0" * 64),
+        ("native_action_step_id", 8),
+        ("native_action_detector_pose_x", 9.0),
+        ("native_action_fe_shield_quat_w", None),
+    ),
+)
+def test_native_action_identity_rejects_every_mismatch(
+    field: str,
+    replacement: object,
+) -> None:
+    """A response cannot be rebound to another step, pose, or action digest."""
+    request = Geant4StepRequest(
+        step_id=7,
+        dwell_time_s=20.0,
+        seed=(1 << 62) + 91,
+        detector_pose_xyz=(1.0, 2.0, 3.0),
+        detector_quat_wxyz=(1.0, 0.0, 0.0, 0.0),
+        fe_shield_pose_xyz=(1.0, 2.0, 3.0),
+        fe_shield_quat_wxyz=(1.0, 0.0, 0.0, 0.0),
+        pb_shield_pose_xyz=(1.0, 2.0, 3.0),
+        pb_shield_quat_wxyz=(1.0, 0.0, 0.0, 0.0),
+    )
+    metadata = _native_action_metadata(request)
+    validate_native_action_identity(metadata, request)
+    if replacement is None:
+        metadata.pop(field)
+    else:
+        metadata[field] = replacement
+
+    with pytest.raises(RuntimeError, match="Native Geant4 .*action"):
+        validate_native_action_identity(metadata, request)

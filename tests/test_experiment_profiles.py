@@ -6,11 +6,13 @@ import pytest
 
 from runtime.experiment_profiles import (
     AcquisitionContract,
-    DEFAULT_EXPERIMENT_PROFILE_ID,
+    MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE,
+    MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE_ID,
     STANDARD_ACQUISITION_LIVE_TIME_S,
-    STANDARD_EXPERIMENT_PROFILE,
     acquisition_contract_from_environment,
     experiment_profile_from_environment,
+    require_experiment_profile,
+    require_private_scene_variant,
 )
 
 
@@ -31,18 +33,18 @@ def test_acquisition_contract_rejects_coerced_wire_scalars(
     invalid: object,
 ) -> None:
     """The public acquisition contract must accept exact JSON scalar types only."""
-    payload = STANDARD_EXPERIMENT_PROFILE.acquisition.to_payload()
+    payload = MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE.acquisition.to_payload()
     payload[field] = invalid
 
     with pytest.raises((TypeError, ValueError)):
         AcquisitionContract.from_payload(payload)
 
 
-def test_standard_profile_owns_every_shared_acquisition_value() -> None:
-    """The standard experiment must expose the requested acquisition contract."""
-    profile = STANDARD_EXPERIMENT_PROFILE
+def test_named_profile_owns_every_shared_acquisition_value() -> None:
+    """The named experiment must expose its exact acquisition contract."""
+    profile = MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE
 
-    assert profile.profile_id == DEFAULT_EXPERIMENT_PROFILE_ID
+    assert profile.profile_id == MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE_ID
     assert STANDARD_ACQUISITION_LIVE_TIME_S == 20.0
     assert (
         profile.environment.size_x,
@@ -62,7 +64,7 @@ def test_standard_profile_owns_every_shared_acquisition_value() -> None:
 
 def test_environment_contract_round_trip_rejects_profile_drift() -> None:
     """Consumers must fail when a declared profile carries altered limits."""
-    profile = STANDARD_EXPERIMENT_PROFILE
+    profile = MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE
     environment = profile.public_environment_fields()
 
     assert acquisition_contract_from_environment(environment) == profile.acquisition
@@ -74,3 +76,15 @@ def test_environment_contract_round_trip_rejects_profile_drift() -> None:
     changed["acquisition_contract"] = contract
     with pytest.raises(ValueError, match="differs"):
         experiment_profile_from_environment(changed)
+
+
+@pytest.mark.parametrize("value", (None, 7, ""))
+def test_profile_selection_rejects_implicit_or_coerced_ids(value: object) -> None:
+    """Profile and variant lookup must accept explicit nonempty strings only."""
+    with pytest.raises(TypeError):
+        require_experiment_profile(value)  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        require_private_scene_variant(
+            MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE_ID,
+            value,  # type: ignore[arg-type]
+        )

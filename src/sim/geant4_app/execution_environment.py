@@ -13,7 +13,7 @@ import stat
 import subprocess
 
 
-NATIVE_EXECUTION_ENVIRONMENT_SCHEMA_VERSION = 1
+NATIVE_EXECUTION_ENVIRONMENT_SCHEMA_VERSION = 2
 _DYNAMIC_LOADER_ENVIRONMENT_KEYS = frozenset(
     {
         "GLIBC_TUNABLES",
@@ -167,10 +167,47 @@ def _is_geant4_data_environment_key(name: str) -> bool:
     )
 
 
+def _canonical_library_search_path(raw_value: str) -> str:
+    """Return one strict ordered search path with duplicate entries removed."""
+    raw_entries = raw_value.split(os.pathsep)
+    if not raw_entries or any(not entry for entry in raw_entries):
+        raise ValueError(
+            "LD_LIBRARY_PATH cannot contain empty entries or an implicit "
+            "working-directory search."
+        )
+    canonical_entries: list[str] = []
+    seen: set[str] = set()
+    for raw_entry in raw_entries:
+        candidate = Path(raw_entry)
+        if not candidate.is_absolute():
+            raise ValueError("LD_LIBRARY_PATH entries must be absolute directories.")
+        absolute = candidate.absolute()
+        if absolute.is_symlink():
+            raise ValueError(
+                f"LD_LIBRARY_PATH entries cannot be symlinks: {absolute}."
+            )
+        try:
+            resolved = absolute.resolve(strict=True)
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(
+                f"LD_LIBRARY_PATH directory is missing: {absolute}."
+            ) from exc
+        if resolved != absolute or not absolute.is_dir():
+            raise ValueError(
+                "LD_LIBRARY_PATH entries must name exact nonsymlinked "
+                f"directories: {absolute}."
+            )
+        normalized = absolute.as_posix()
+        if normalized not in seen:
+            seen.add(normalized)
+            canonical_entries.append(normalized)
+    return os.pathsep.join(canonical_entries)
+
+
 def _relevant_environment(
     environment: Mapping[str, str],
 ) -> dict[str, str]:
-    """Return the process settings that can affect native physics execution."""
+    """Return canonical settings that can affect native physics execution."""
     relevant: dict[str, str] = {}
     for name, value in environment.items():
         if type(name) is not str or type(value) is not str:
@@ -181,7 +218,20 @@ def _relevant_environment(
             or name in _DYNAMIC_LOADER_ENVIRONMENT_KEYS
             or name in _NUMERIC_LOCALE_ENVIRONMENT_KEYS
         ):
-            relevant[name] = value
+            relevant[name] = (
+                _canonical_library_search_path(value)
+                if name == "LD_LIBRARY_PATH"
+                else value
+            )
+    effective_numeric_locale = (
+        relevant.get("LC_ALL")
+        or relevant.get("LC_NUMERIC")
+        or relevant.get("LANG")
+    )
+    if effective_numeric_locale is not None:
+        for shadowed_name in ("LANG", "LC_NUMERIC"):
+            if shadowed_name in relevant:
+                relevant[shadowed_name] = effective_numeric_locale
     return dict(sorted(relevant.items()))
 
 

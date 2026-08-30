@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+import hashlib
 import math
 from numbers import Real
 from pathlib import Path
@@ -54,15 +55,28 @@ from spectrum.mean_calibration import (
     MEAN_CALIBRATION_FORCED_COLLISION_COVARIANCE_SEMANTICS,
     parse_mean_calibration_metadata,
 )
+from spectrum.detector_green_construction import (
+    DETECTOR_ENERGY_RESOLUTION_CONTRACT_SHA256,
+)
+from spectrum.detector_green_operator import (
+    DETECTOR_GREEN_BINARY_BASENAME,
+    DETECTOR_GREEN_COINCIDENCE_SEMANTICS,
+    DETECTOR_GREEN_SAMPLING_MODE,
+    DetectorGreenOperator,
+    canonical_json_bytes,
+)
+from spectrum.library import Nuclide
 from spectrum.response_matrix import (
     NATIVE_GEANT4_BACKGROUND_MODEL_ID,
     NATIVE_GEANT4_BIN_COUNT,
     NATIVE_GEANT4_BIN_WIDTH_KEV,
-    NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256,
     NATIVE_GEANT4_ENERGY_MAX_KEV,
     NATIVE_GEANT4_ENERGY_MIN_KEV,
 )
-from spectrum.geant4_physics import validate_geant4_physics_metadata
+from spectrum.geant4_physics import (
+    GEANT4_PHYSICS_CONTRACT_SHA256,
+    validate_geant4_physics_metadata,
+)
 
 
 _MANAGED_GEANT4_EXECUTABLE_OPTIONS = frozenset(
@@ -70,6 +84,9 @@ _MANAGED_GEANT4_EXECUTABLE_OPTIONS = frozenset(
         "--background-cps",
         "--dead-time-tau-s",
         "--detector-scoring-mode",
+        "--detector-green-operator-path",
+        "--detector-green-operator-binary-sha256",
+        "--detector-green-operator-contract-sha256",
         "--physics-profile",
         "--persistent",
         "--primary-emission-model",
@@ -84,7 +101,7 @@ _MANAGED_GEANT4_EXECUTABLE_OPTIONS = frozenset(
         "--sample-detector-response",
         "--scene",
         "--secondary-transport-mode",
-        "--source-bias-cone-half-angle-deg",
+        "--source-bias-cone-policy",
         "--source-bias-isotropic-fraction",
         "--source-bias-mode",
         "--source-rate-model",
@@ -416,12 +433,31 @@ def validate_transport_metadata(
     expected_background_cps: float | None = None,
     expected_dead_time_tau_s: float | None = None,
     expected_detector_response_sampling: bool = False,
+    expected_detector_green_operator_contract_sha256: str | None = None,
+    expected_detector_green_operator_binary_sha256: str | None = None,
     expected_surface_source_contract_sha256: str | None = None,
     expected_scene_hash: str | None = None,
 ) -> None:
     """Fail when native transport provenance disagrees with configured semantics."""
     if not isinstance(expected_detector_response_sampling, bool):
         raise ValueError("expected_detector_response_sampling must be a JSON boolean.")
+    green_hashes = (
+        expected_detector_green_operator_contract_sha256,
+        expected_detector_green_operator_binary_sha256,
+    )
+    if expected_detector_response_sampling != all(
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+        for value in green_hashes
+    ) or (
+        not expected_detector_response_sampling
+        and any(value is not None for value in green_hashes)
+    ):
+        raise ValueError(
+            "Expected detector Green hashes are required exactly when "
+            "response sampling is enabled."
+        )
     if expected_primary_emission_model not in {
         "independent_gamma_lines",
         "geant4_radioactive_decay",
@@ -563,6 +599,19 @@ def validate_transport_metadata(
         raise RuntimeError(
             "Native Geant4 response has invalid intensity_cps_1m semantics."
         )
+    expected_green_rate_normalization = (
+        "catalog_branching_weighted_absolute_detection_efficiency_at_1m_v1"
+        if expected_detector_response_sampling
+        else "disabled"
+    )
+    if (
+        _required_metadata_string(
+            metadata,
+            "detector_cps_green_reference_normalization",
+        )
+        != expected_green_rate_normalization
+    ):
+        raise RuntimeError("Native Geant4 detector-cps Green normalization is invalid.")
     if (
         _required_metadata_string(metadata, "source_position_semantics")
         != "air_side_native_emission_xyz"
@@ -645,9 +694,7 @@ def validate_transport_metadata(
         metadata,
         "detector_response_sampling_mode",
     )
-    response_sampling_enabled = (
-        response_sampling_mode == "multinomial_marking_with_nonparalyzable_event_time"
-    )
+    response_sampling_enabled = response_sampling_mode == DETECTOR_GREEN_SAMPLING_MODE
     if response_sampling_enabled != bool(expected_detector_response_sampling):
         raise RuntimeError(
             "Native Geant4 detector-response sampling disagrees with runtime "
@@ -657,18 +704,56 @@ def validate_transport_metadata(
         raise RuntimeError(
             "Native detector-response marking requires incident-gamma scoring."
         )
-    if (
-        response_sampling_enabled
-        and _required_metadata_string(
-            metadata,
-            "detector_response_sampling_contract_sha256",
-        )
-        != NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
-    ):
-        raise RuntimeError(
-            "Native detector-response sampling contract differs from the "
-            "shared full-spectrum model."
-        )
+    if response_sampling_enabled:
+        expected_green_metadata = {
+            "detector_response_sampling_model": (
+                "isotope_independent_full_detector_green_operator_v3"
+            ),
+            "detector_response_sampling_contract_sha256": (
+                expected_detector_green_operator_contract_sha256
+            ),
+            "detector_response_operator_binary_sha256": (
+                expected_detector_green_operator_binary_sha256
+            ),
+            "detector_response_boundary_state": (
+                "normalized_impact_parameter_at_detector_housing_entry_v1"
+            ),
+            "detector_response_conditioning": (
+                "registered_pulse_subprobability_given_housing_incident_gamma_v1"
+            ),
+            "detector_response_coincidence_semantics": (
+                DETECTOR_GREEN_COINCIDENCE_SEMANTICS
+            ),
+        }
+        for field_name, expected_value in expected_green_metadata.items():
+            if _required_metadata_string(metadata, field_name) != expected_value:
+                raise RuntimeError(
+                    "Native detector Green provenance differs from the "
+                    f"configured operator for {field_name}."
+                )
+        response_counts = {
+            field_name: _required_metadata_integer(metadata, field_name)
+            for field_name in (
+                "detector_response_incident_entry_count",
+                "detector_response_registered_entry_count",
+                "detector_response_coincidence_pulse_count",
+                "detector_response_multi_entry_pulse_count",
+            )
+        }
+        incident_count = response_counts["detector_response_incident_entry_count"]
+        registered_count = response_counts["detector_response_registered_entry_count"]
+        pulse_count = response_counts["detector_response_coincidence_pulse_count"]
+        multi_entry_count = response_counts["detector_response_multi_entry_pulse_count"]
+        if (
+            any(value < 0 for value in response_counts.values())
+            or incident_count < registered_count
+            or registered_count < pulse_count
+            or multi_entry_count > pulse_count
+            or registered_count - pulse_count < multi_entry_count
+        ):
+            raise RuntimeError(
+                "Native detector-response coincidence counters are inconsistent."
+            )
     if detector_response_applied != (
         detector_scoring_mode != "incident_gamma_energy" or response_sampling_enabled
     ):
@@ -1872,6 +1957,8 @@ def validate_full_history_transport_metadata(
     expected_background_cps: float | None = None,
     expected_dead_time_tau_s: float | None = None,
     expected_detector_response_sampling: bool = False,
+    expected_detector_green_operator_contract_sha256: str | None = None,
+    expected_detector_green_operator_binary_sha256: str | None = None,
     expected_surface_source_contract_sha256: str | None = None,
     expected_scene_hash: str | None = None,
 ) -> None:
@@ -1889,6 +1976,12 @@ def validate_full_history_transport_metadata(
         expected_background_cps=expected_background_cps,
         expected_dead_time_tau_s=expected_dead_time_tau_s,
         expected_detector_response_sampling=(expected_detector_response_sampling),
+        expected_detector_green_operator_contract_sha256=(
+            expected_detector_green_operator_contract_sha256
+        ),
+        expected_detector_green_operator_binary_sha256=(
+            expected_detector_green_operator_binary_sha256
+        ),
         expected_surface_source_contract_sha256=(
             expected_surface_source_contract_sha256
         ),
@@ -2039,7 +2132,7 @@ class Geant4AppConfig:
     source_rate_model: str = "detector_cps_1m"
     primary_emission_model: str = "independent_gamma_lines"
     source_bias_mode: str = "detector_cone"
-    source_bias_cone_half_angle_deg: float = 0.0
+    source_bias_cone_policy: str = "detector_covering"
     source_bias_isotropic_fraction: float = 1.0
     detector_scoring_mode: str = "full_transport"
     secondary_transport_mode: str = "full_transport"
@@ -2052,6 +2145,7 @@ class Geant4AppConfig:
     accelerated_weighted_transport_enable: bool = False
     background_cps: float = 0.0
     sample_detector_response: bool = False
+    detector_green_operator_manifest: str | None = None
     validation_entry_class_spectra: bool = False
     detector_model: ExportedDetectorModel = field(default_factory=ExportedDetectorModel)
     shield_thickness: ShieldThicknessConfig = field(
@@ -2113,6 +2207,7 @@ class Geant4AppConfig:
             "crystal_shape",
             "crystal_material",
             "housing_material",
+            "coincidence_window_s",
         }
         unknown_detector_keys = sorted(set(detector_payload) - detector_keys)
         if unknown_detector_keys:
@@ -2168,6 +2263,21 @@ class Geant4AppConfig:
         )
         if not isinstance(sample_detector_response, bool):
             raise ValueError("sample_detector_response must be a JSON boolean.")
+        detector_green_operator_manifest = payload.get(
+            "detector_green_operator_manifest"
+        )
+        if detector_green_operator_manifest is not None and (
+            not isinstance(detector_green_operator_manifest, str)
+            or not detector_green_operator_manifest.strip()
+        ):
+            raise ValueError(
+                "detector_green_operator_manifest must be a nonempty path."
+            )
+        if sample_detector_response != (detector_green_operator_manifest is not None):
+            raise ValueError(
+                "detector_green_operator_manifest is required exactly when "
+                "sample_detector_response=true."
+            )
         if not isinstance(validation_entry_class_spectra, bool):
             raise ValueError("validation_entry_class_spectra must be a JSON boolean.")
         use_mock_stage = _json_boolean(
@@ -2292,14 +2402,12 @@ class Geant4AppConfig:
             default="detector_cone",
             choices=frozenset({"analog", "detector_cone", "mixture_cone_isotropic"}),
         )
-        source_bias_cone_half_angle_deg = _json_number(
+        source_bias_cone_policy = _json_string(
             payload,
-            "source_bias_cone_half_angle_deg",
-            default=0.0,
-            minimum=0.0,
+            "source_bias_cone_policy",
+            default="detector_covering",
+            choices=frozenset({"detector_covering"}),
         )
-        if source_bias_cone_half_angle_deg > 180.0:
-            raise ValueError("source_bias_cone_half_angle_deg must not exceed 180.")
         source_bias_isotropic_fraction = _json_number(
             payload,
             "source_bias_isotropic_fraction",
@@ -2550,7 +2658,7 @@ class Geant4AppConfig:
             source_rate_model=source_rate_model,
             primary_emission_model=primary_emission_model,
             source_bias_mode=source_bias_mode,
-            source_bias_cone_half_angle_deg=source_bias_cone_half_angle_deg,
+            source_bias_cone_policy=source_bias_cone_policy,
             source_bias_isotropic_fraction=source_bias_isotropic_fraction,
             detector_scoring_mode=detector_scoring_mode,
             secondary_transport_mode=secondary_transport_mode,
@@ -2567,6 +2675,7 @@ class Geant4AppConfig:
             ),
             background_cps=background_cps,
             sample_detector_response=sample_detector_response,
+            detector_green_operator_manifest=(detector_green_operator_manifest),
             validation_entry_class_spectra=(validation_entry_class_spectra),
             detector_model=ExportedDetectorModel(
                 crystal_radius_m=_json_number(
@@ -2618,6 +2727,7 @@ class Geant4Application:
         expected_native_executable_sha256: str | None = None,
         expected_native_execution_environment_sha256: str | None = None,
         expected_implementation_bundle_sha256: str | None = None,
+        offline_nuclide_library: Mapping[str, Nuclide] | None = None,
     ) -> None:
         """Create the application and initialize the requested stage backend."""
         if production_runtime_config_sha256 is not None and (
@@ -2633,6 +2743,18 @@ class Geant4Application:
             )
         self.production_runtime_config_sha256 = production_runtime_config_sha256
         self.config = Geant4AppConfig.from_dict(app_config)
+        if offline_nuclide_library is not None and (
+            not isinstance(offline_nuclide_library, Mapping)
+            or not offline_nuclide_library
+            or self.config.mean_calibration_histories_per_source_line is None
+            or self.config.detector_scoring_mode != "full_transport"
+            or self.config.sample_detector_response
+            or not self.config.validation_entry_class_spectra
+        ):
+            raise ValueError(
+                "An offline nuclide library is restricted to fixed-quota "
+                "full-detector corpus acquisition."
+            )
         self.native_executable_sha256: str | None = None
         self.native_execution_environment_sha256: str | None = None
         self.implementation_bundle_sha256: str | None = None
@@ -2702,6 +2824,50 @@ class Geant4Application:
             )
         elif expected_implementation_bundle_sha256 is not None:
             self.implementation_bundle_sha256 = expected_implementation_bundle_sha256
+        self.detector_green_operator: DetectorGreenOperator | None = None
+        detector_green_binary_path: str | None = None
+        manifest_value = self.config.detector_green_operator_manifest
+        if manifest_value is not None:
+            manifest_path = Path(manifest_value).expanduser()
+            if not manifest_path.is_absolute():
+                manifest_path = Path(__file__).resolve().parents[3] / manifest_path
+            operator = DetectorGreenOperator.from_artifact(manifest_path)
+            operator.require_runtime_ready()
+            construction = operator.construction
+            if construction is None:
+                raise RuntimeError("Detector Green construction provenance is absent.")
+            detector_model_sha256 = hashlib.sha256(
+                canonical_json_bytes(self.config.detector_model.to_dict())
+            ).hexdigest()
+            required_contracts = {
+                "detector_model_sha256": detector_model_sha256,
+                "geant4_physics_contract_sha256": (GEANT4_PHYSICS_CONTRACT_SHA256),
+                "energy_resolution_contract_sha256": (
+                    DETECTOR_ENERGY_RESOLUTION_CONTRACT_SHA256
+                ),
+            }
+            # The construction source digest remains historical audit metadata.
+            # Live validity is bound to the immutable operator binary plus the
+            # detector, native executable/environment, and physics contracts;
+            # unrelated Python edits must not expire an unchanged operator.
+            if self.native_executable_sha256 is not None:
+                required_contracts["native_executable_sha256"] = (
+                    self.native_executable_sha256
+                )
+            if self.native_execution_environment_sha256 is not None:
+                required_contracts["native_execution_environment_sha256"] = (
+                    self.native_execution_environment_sha256
+                )
+            for field_name, expected_value in required_contracts.items():
+                if construction.get(field_name) != expected_value:
+                    raise RuntimeError(
+                        "Detector Green construction provenance is stale for "
+                        f"{field_name}."
+                    )
+            detector_green_binary_path = (
+                manifest_path.resolve().parent / DETECTOR_GREEN_BINARY_BASENAME
+            ).as_posix()
+            self.detector_green_operator = operator
         self.scene = SceneDescription()
         self.asset_geometry = IsaacAssetGeometry(
             detector_height_m=self.config.detector_height_m,
@@ -2755,7 +2921,7 @@ class Geant4Application:
                 source_rate_model=self.config.source_rate_model,
                 primary_emission_model=self.config.primary_emission_model,
                 source_bias_mode=self.config.source_bias_mode,
-                source_bias_cone_half_angle_deg=self.config.source_bias_cone_half_angle_deg,
+                source_bias_cone_policy=self.config.source_bias_cone_policy,
                 source_bias_isotropic_fraction=self.config.source_bias_isotropic_fraction,
                 detector_scoring_mode=self.config.detector_scoring_mode,
                 secondary_transport_mode=self.config.secondary_transport_mode,
@@ -2775,6 +2941,17 @@ class Geant4Application:
                 ),
                 background_cps=self.config.background_cps,
                 sample_detector_response=(self.config.sample_detector_response),
+                detector_green_operator_path=detector_green_binary_path,
+                detector_green_operator_binary_sha256=(
+                    None
+                    if self.detector_green_operator is None
+                    else self.detector_green_operator.binary_sha256
+                ),
+                detector_green_operator_contract_sha256=(
+                    None
+                    if self.detector_green_operator is None
+                    else self.detector_green_operator.contract_hash_sha256
+                ),
                 validation_entry_class_spectra=(
                     self.config.validation_entry_class_spectra
                 ),
@@ -2788,6 +2965,8 @@ class Geant4Application:
                 radiation_visualization=self.config.radiation_visualization,
             ),
             engine_mode=self.config.engine_mode,
+            nuclide_library=offline_nuclide_library,
+            detector_green_operator=self.detector_green_operator,
         )
         self._last_cache_hit = False
 
@@ -2916,6 +3095,11 @@ class Geant4Application:
             "source_rate_model": str(self.config.source_rate_model),
             "primary_emission_model": str(self.config.primary_emission_model),
             "intensity_cps_1m_definition": ("pre_dead_time_detector_pulse_rate_at_1m"),
+            "detector_cps_green_reference_normalization": (
+                "catalog_branching_weighted_absolute_detection_efficiency_at_1m_v1"
+                if self.config.sample_detector_response
+                else "disabled"
+            ),
             "requested_threads": int(self.config.thread_count),
             "physics_profile": str(self.config.physics_profile),
             "detector_scoring_mode": str(self.config.detector_scoring_mode),
@@ -2927,7 +3111,39 @@ class Geant4Application:
             "background_cps": float(self.config.background_cps),
             "sample_detector_response": bool(self.config.sample_detector_response),
             "detector_response_sampling_contract_sha256": (
-                NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
+                ""
+                if self.detector_green_operator is None
+                else str(self.detector_green_operator.contract_hash_sha256)
+            ),
+            "detector_response_operator_binary_sha256": (
+                ""
+                if self.detector_green_operator is None
+                else str(self.detector_green_operator.binary_sha256)
+            ),
+            "detector_response_sampling_model": (
+                ""
+                if self.detector_green_operator is None
+                else "isotope_independent_full_detector_green_operator_v3"
+            ),
+            "detector_response_sampling_mode": (
+                ""
+                if self.detector_green_operator is None
+                else DETECTOR_GREEN_SAMPLING_MODE
+            ),
+            "detector_response_boundary_state": (
+                ""
+                if self.detector_green_operator is None
+                else "normalized_impact_parameter_at_detector_housing_entry_v1"
+            ),
+            "detector_response_conditioning": (
+                ""
+                if self.detector_green_operator is None
+                else "registered_pulse_subprobability_given_housing_incident_gamma_v1"
+            ),
+            "detector_response_coincidence_semantics": (
+                ""
+                if self.detector_green_operator is None
+                else DETECTOR_GREEN_COINCIDENCE_SEMANTICS
             ),
             "spectrum_energy_min_keV": float(NATIVE_GEANT4_ENERGY_MIN_KEV),
             "spectrum_energy_max_keV": float(NATIVE_GEANT4_ENERGY_MAX_KEV),
@@ -3043,6 +3259,16 @@ class Geant4Application:
                 expected_detector_response_sampling=(
                     self.config.sample_detector_response
                 ),
+                expected_detector_green_operator_contract_sha256=(
+                    None
+                    if self.detector_green_operator is None
+                    else self.detector_green_operator.contract_hash_sha256
+                ),
+                expected_detector_green_operator_binary_sha256=(
+                    None
+                    if self.detector_green_operator is None
+                    else self.detector_green_operator.binary_sha256
+                ),
             )
         if (
             mean_calibration_quota is None
@@ -3066,27 +3292,48 @@ class Geant4Application:
         metadata["accelerated_weighted_transport_enable"] = bool(
             self.config.accelerated_weighted_transport_enable
         )
-        metadata["shield_pose_contract_id"] = SHIELD_POSE_CONTRACT_ID
-        metadata["shield_pose_contract_sha256"] = SHIELD_POSE_CONTRACT_SHA256
-        metadata.setdefault("cache_hit", self._last_cache_hit)
-        metadata.setdefault("fe_orientation_index", int(command.fe_orientation_index))
-        metadata.setdefault("pb_orientation_index", int(command.pb_orientation_index))
-        metadata.setdefault("shield_num_orientations", 8)
-        metadata.setdefault(
-            "shield_pair_id",
-            int(command.fe_orientation_index) * 8 + int(command.pb_orientation_index),
+        native_step_id = int(
+            _required_metadata_number(
+                metadata,
+                "native_action_step_id",
+            )
         )
-        metadata.setdefault(
-            "shield_thickness_scale",
-            float(self.config.shield_thickness.thickness_scale),
+        native_fe_index = int(
+            _required_metadata_number(
+                metadata,
+                "native_action_fe_orientation_index",
+            )
         )
-        metadata.setdefault(
-            "shield_thickness_fe_cm",
-            float(self.config.shield_thickness.thickness_fe_cm),
+        native_pb_index = int(
+            _required_metadata_number(
+                metadata,
+                "native_action_pb_orientation_index",
+            )
         )
-        metadata.setdefault(
-            "shield_thickness_pb_cm",
-            float(self.config.shield_thickness.thickness_pb_cm),
+        native_detector_pose = tuple(
+            _required_metadata_number(
+                metadata,
+                f"native_action_detector_pose_{axis}",
+            )
+            for axis in "xyz"
+        )
+        native_detector_quaternion = tuple(
+            _required_metadata_number(
+                metadata,
+                f"native_action_detector_quat_{axis}",
+            )
+            for axis in "wxyz"
+        )
+        metadata["shield_num_orientations"] = 8
+        metadata["shield_pair_id"] = native_fe_index * 8 + native_pb_index
+        metadata["shield_thickness_scale"] = float(
+            self.config.shield_thickness.thickness_scale
+        )
+        metadata["shield_thickness_fe_cm"] = float(
+            self.config.shield_thickness.thickness_fe_cm
+        )
+        metadata["shield_thickness_pb_cm"] = float(
+            self.config.shield_thickness.thickness_pb_cm
         )
         energy = np.arange(NATIVE_GEANT4_BIN_COUNT, dtype=np.float64) * float(
             NATIVE_GEANT4_BIN_WIDTH_KEV
@@ -3094,11 +3341,11 @@ class Geant4Application:
         bin_width_keV = float(NATIVE_GEANT4_BIN_WIDTH_KEV)
         edges = list(energy) + [float(energy[-1] + bin_width_keV)]
         return SimulationObservation(
-            step_id=command.step_id,
-            detector_pose_xyz=detector_pose.translation_xyz,
-            detector_quat_wxyz=detector_pose.orientation_wxyz,
-            fe_orientation_index=command.fe_orientation_index,
-            pb_orientation_index=command.pb_orientation_index,
+            step_id=native_step_id,
+            detector_pose_xyz=native_detector_pose,
+            detector_quat_wxyz=native_detector_quaternion,
+            fe_orientation_index=native_fe_index,
+            pb_orientation_index=native_pb_index,
             spectrum_counts=canonical_spectrum,
             energy_bin_edges_keV=[float(v) for v in edges],
             metadata=metadata,

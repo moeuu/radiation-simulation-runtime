@@ -14,8 +14,8 @@ from runtime.experiment_profiles import STANDARD_ACQUISITION_LIVE_TIME_S
 from spectrum.full_spectrum_acceptance import (
     write_independent_validation_manifest,
 )
-from spectrum.detector_response_validation import (
-    load_detector_response_validation_manifest,
+from spectrum.detector_green_validation import (
+    load_detector_green_validation_manifest,
 )
 from spectrum.full_spectrum_acceptance_runner import (
     ACCEPTANCE_ISOTOPES,
@@ -23,13 +23,11 @@ from spectrum.full_spectrum_acceptance_runner import (
     AcceptanceRunLayout,
     acquire_designated_split,
     build_acceptance_run_contract,
-    build_complete_training_manifest,
     canonical_json_bytes,
-    fit_training_additive_scatter,
     freeze_candidate_model,
     line_identity_contract_sha256,
     load_acceptance_pair,
-    select_training_discrepancy,
+    canonical_detector_green_operator,
 )
 from spectrum.full_spectrum_acceptance_evaluator import (
     approve_frozen_candidate,
@@ -39,8 +37,7 @@ from spectrum.geant4_acceptance_backend import (
     ExternalGeant4AcceptanceBackend,
 )
 from spectrum.transport_spectral import (
-    DESIGNATED_HOLDOUT_SCENE_SEEDS,
-    DESIGNATED_TRAINING_SCENE_SEEDS,
+    DESIGNATED_VALIDATION_SCENE_SEEDS,
     FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256,
     GeometryConditionedSpectralModel,
 )
@@ -67,33 +64,27 @@ def _common_parser(parser: argparse.ArgumentParser) -> None:
         "--config",
         type=Path,
         default=_DEFAULT_CONFIG,
-        help=(
-            "Standard external-Geant4 runtime config "
-            f"(default: {_DEFAULT_CONFIG})."
-        ),
+        help=(f"Standard external-Geant4 runtime config (default: {_DEFAULT_CONFIG})."),
     )
     parser.add_argument(
         "--output-root",
         type=Path,
         default=_DEFAULT_OUTPUT,
-        help=(
-            "Immutable/resumable artifact root "
-            f"(default: {_DEFAULT_OUTPUT})."
-        ),
+        help=(f"Immutable/resumable artifact root (default: {_DEFAULT_OUTPUT})."),
     )
 
 
-def _detector_response_validation_argument(
+def _detector_green_validation_argument(
     parser: argparse.ArgumentParser,
 ) -> None:
     """Require the independent full-detector response gate artifact."""
     parser.add_argument(
-        "--detector-response-validation-manifest",
+        "--detector-green-validation-manifest",
         type=Path,
         required=True,
         help=(
-            "Independently acquired full-detector energy-deposition response "
-            "validation manifest for this exact native executable."
+            "Independent catalog-excluded monoenergetic validation for the "
+            "exact detector Green operator."
         ),
     )
 
@@ -102,8 +93,8 @@ def _parser() -> argparse.ArgumentParser:
     """Return the fail-closed phase-oriented command-line parser."""
     parser = argparse.ArgumentParser(
         description=(
-            "Acquire the fixed full-spectrum training/holdout corpus with "
-            "real external Geant4. Pair files are immutable checkpoints, so "
+            "Validate one predeclared physics-only Cs/Co model with five new "
+            "real-Geant4 environments. Pair files are immutable checkpoints, so "
             "an interrupted phase can be rerun safely."
         )
     )
@@ -120,15 +111,15 @@ def _parser() -> argparse.ArgumentParser:
         help=(
             f"Acquire one real {STANDARD_ACQUISITION_LIVE_TIME_S:g} s "
             "background pair plus the native signed-"
-            "epsilon gate; the checkpoint is reusable by the training phase."
+            "epsilon gate; the checkpoint is reusable by validation."
         ),
     )
     _common_parser(smoke)
     smoke.add_argument(
         "--scene-seed",
         type=int,
-        choices=DESIGNATED_TRAINING_SCENE_SEEDS,
-        default=DESIGNATED_TRAINING_SCENE_SEEDS[0],
+        choices=DESIGNATED_VALIDATION_SCENE_SEEDS,
+        default=DESIGNATED_VALIDATION_SCENE_SEEDS[0],
     )
     smoke.add_argument(
         "--pair-id",
@@ -137,29 +128,17 @@ def _parser() -> argparse.ArgumentParser:
         default=0,
     )
 
-    training = subparsers.add_parser(
-        "training",
-        help="Acquire all designated training scenes, scenarios, and 64 pairs.",
+    freeze = subparsers.add_parser(
+        "freeze",
+        help="Freeze the predeclared physics-only candidate before validation.",
     )
-    _common_parser(training)
+    _common_parser(freeze)
 
-    fit = subparsers.add_parser(
-        "fit-freeze",
-        help=(
-            "Require the complete training corpus, fit/select on training "
-            "only, and immutably freeze the pre-holdout candidate."
-        ),
+    validation = subparsers.add_parser(
+        "validation",
+        help="Acquire all five new Cs/Co validation scenes and all 64 pairs.",
     )
-    _common_parser(fit)
-
-    holdout = subparsers.add_parser(
-        "holdout",
-        help=(
-            "Require a frozen candidate, then acquire every designated "
-            "holdout scene/scenario/pair without feedback or tuning."
-        ),
-    )
-    _common_parser(holdout)
+    _common_parser(validation)
 
     evaluate = subparsers.add_parser(
         "evaluate",
@@ -173,22 +152,22 @@ def _parser() -> argparse.ArgumentParser:
     approve = subparsers.add_parser(
         "approve",
         help=(
-            "Conservatively aggregate holdout-only metrics and create a "
+            "Conservatively aggregate validation-only metrics and create a "
             "production model only when every fixed threshold passes."
         ),
     )
     _common_parser(approve)
-    _detector_response_validation_argument(approve)
+    _detector_green_validation_argument(approve)
 
     all_phases = subparsers.add_parser(
         "all",
         help=(
-            "Run training acquisition, training-only fit/freeze, then "
-            "holdout acquisition, fixed evaluation, and approval in order."
+            "Freeze the physics-only model, acquire all validation scenes, "
+            "evaluate fixed metrics, and approve in order."
         ),
     )
     _common_parser(all_phases)
-    _detector_response_validation_argument(all_phases)
+    _detector_green_validation_argument(all_phases)
 
     aggregate = subparsers.add_parser(
         "aggregate",
@@ -202,12 +181,9 @@ def _parser() -> argparse.ArgumentParser:
         action="append",
         required=True,
         type=Path,
-        help=(
-            "One evaluated scene artifact; pass exactly the three training "
-            "and two holdout artifacts."
-        ),
+        help=("One evaluated scene artifact; pass all five validation artifacts."),
     )
-    _detector_response_validation_argument(aggregate)
+    _detector_green_validation_argument(aggregate)
     aggregate.add_argument(
         "--output",
         required=True,
@@ -228,9 +204,7 @@ def _write_immutable_json(path: Path, payload: object) -> Path:
             )
         return destination
     destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name(
-        f".{destination.name}.{os.getpid()}.tmp"
-    )
+    temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
     temporary.write_bytes(encoded)
     os.replace(temporary, destination)
     return destination
@@ -264,76 +238,42 @@ def _native_context(
         implementation_bundle_sha256=backend.implementation_bundle_sha256,
     )
     _write_immutable_json(layout.run_contract_path, run_contract)
-    base_model = GeometryConditionedSpectralModel.standard_native(
+    base_model = GeometryConditionedSpectralModel.physics_only_native(
         ACCEPTANCE_ISOTOPES,
         dead_time_tau_s=float(backend.app_config.dead_time_tau_s),
         background_rate_cps=float(backend.app_config.background_cps),
+        detector_green_operator=backend.detector_green_operator,
     )
+    base_model.require_runtime_ready()
     line_hash = line_identity_contract_sha256(base_model)
     return layout, backend, base_model, line_hash
 
 
-def _run_training(
-    *,
-    layout: AcceptanceRunLayout,
-    backend: ExternalGeant4AcceptanceBackend,
-    line_hash: str,
-) -> None:
-    """Acquire all training checkpoints and freeze the completion manifest."""
-    acquire_designated_split(
-        layout=layout,
-        backend=backend,
-        seeds=DESIGNATED_TRAINING_SCENE_SEEDS,
-        split="training",
-        line_identity_sha256=line_hash,
-        progress=_progress,
-    )
-    completion = build_complete_training_manifest(
-        layout=layout,
-        line_identity_sha256=line_hash,
-    )
-    _write_immutable_json(layout.training_complete_path, completion)
-
-
-def _fit_and_freeze(
+def _freeze_physics_candidate(
     *,
     layout: AcceptanceRunLayout,
     base_model: GeometryConditionedSpectralModel,
 ) -> None:
-    """Fit physical training components and freeze one candidate contract."""
-    additive_response = fit_training_additive_scatter(
-        layout=layout,
-        model=base_model,
-    )
-    _write_immutable_json(
-        layout.additive_model_path,
-        additive_response.to_payload(),
-    )
-    selection, candidate = select_training_discrepancy(
-        layout=layout,
-        base_model=base_model,
-        additive_response=additive_response,
-    )
-    _write_immutable_json(layout.discrepancy_selection_path, selection)
-    freeze_candidate_model(layout=layout, model=candidate)
+    """Freeze the generic no-scene-fit candidate before any validation."""
+    freeze_candidate_model(layout=layout, model=base_model)
     _progress(
-        "candidate frozen before holdout: "
-        f"{candidate.contract_hash_sha256}"
+        "physics-only candidate frozen before validation: "
+        f"{base_model.contract_hash_sha256}"
     )
 
 
-def _run_holdout(
+def _run_validation(
     *,
     layout: AcceptanceRunLayout,
     backend: ExternalGeant4AcceptanceBackend,
     line_hash: str,
 ) -> None:
-    """Acquire all holdout checkpoints only after candidate freezing."""
+    """Acquire all new application validation scenes after candidate freeze."""
     acquire_designated_split(
         layout=layout,
         backend=backend,
-        seeds=DESIGNATED_HOLDOUT_SCENE_SEEDS,
-        split="holdout",
+        seeds=DESIGNATED_VALIDATION_SCENE_SEEDS,
+        split="validation",
         line_identity_sha256=line_hash,
         progress=_progress,
     )
@@ -342,10 +282,7 @@ def _run_holdout(
 def _status_payload(layout: AcceptanceRunLayout) -> Mapping[str, object]:
     """Return a compact, deterministic checkpoint summary."""
     split_payload: dict[str, object] = {}
-    for split, seeds in (
-        ("training", DESIGNATED_TRAINING_SCENE_SEEDS),
-        ("holdout", DESIGNATED_HOLDOUT_SCENE_SEEDS),
-    ):
+    for split, seeds in (("validation", DESIGNATED_VALIDATION_SCENE_SEEDS),):
         pair_count = len(tuple((layout.root / split).glob("scene_*/*/pair_*.json")))
         corpus_count = sum(
             layout.scene_corpus_path(split=split, scene_seed=seed).is_file()
@@ -360,9 +297,6 @@ def _status_payload(layout: AcceptanceRunLayout) -> Mapping[str, object]:
     return {
         "output_root": layout.root.as_posix(),
         "run_contract": layout.run_contract_path.is_file(),
-        "training_complete": layout.training_complete_path.is_file(),
-        "additive_model": layout.additive_model_path.is_file(),
-        "discrepancy_selection": layout.discrepancy_selection_path.is_file(),
         "candidate_model": layout.candidate_model_path.is_file(),
         "independent_validation": layout.validation_manifest_path.is_file(),
         "production_model": layout.production_model_path.is_file(),
@@ -380,7 +314,7 @@ def _run_smoke(
 ) -> None:
     """Acquire one resumable real-native background observation."""
     destination = layout.pair_path(
-        split="training",
+        split="validation",
         scene_seed=scene_seed,
         scenario_id="background_only",
         shield_pair_id=pair_id,
@@ -388,7 +322,7 @@ def _run_smoke(
     if not destination.exists():
         with backend.open_scenario(
             scene_seed=scene_seed,
-            split="training",
+            split="validation",
             scenario_id="background_only",
             line_identity_sha256=line_hash,
         ) as session:
@@ -409,15 +343,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Execute one explicitly ordered resumable acceptance phase."""
     arguments = _parser().parse_args(argv)
     if arguments.phase == "aggregate":
-        response_validation_payload = load_detector_response_validation_manifest(
-            arguments.detector_response_validation_manifest
+        operator = canonical_detector_green_operator()
+        green_validation_payload = load_detector_green_validation_manifest(
+            arguments.detector_green_validation_manifest,
+            operator=operator,
         )
         write_independent_validation_manifest(
             arguments.artifact,
             arguments.output,
-            detector_response_validation_manifest=(
-                response_validation_payload
-            ),
+            detector_green_validation_manifest=(green_validation_payload),
         )
         return 0
 
@@ -433,6 +367,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 0
     if arguments.phase == "smoke":
+        _freeze_physics_candidate(layout=layout, base_model=base_model)
         _run_smoke(
             layout=layout,
             backend=backend,
@@ -441,16 +376,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             pair_id=int(arguments.pair_id),
         )
         return 0
-    if arguments.phase in {"training", "all"}:
-        _run_training(
-            layout=layout,
-            backend=backend,
-            line_hash=line_hash,
-        )
-    if arguments.phase in {"fit-freeze", "all"}:
-        _fit_and_freeze(layout=layout, base_model=base_model)
-    if arguments.phase in {"holdout", "all"}:
-        _run_holdout(
+    if arguments.phase in {"freeze", "all"}:
+        _freeze_physics_candidate(layout=layout, base_model=base_model)
+    if arguments.phase in {"validation", "all"}:
+        _run_validation(
             layout=layout,
             backend=backend,
             line_hash=line_hash,
@@ -461,8 +390,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if arguments.phase in {"approve", "all"}:
         validation_path, production_path = approve_frozen_candidate(
             layout=layout,
-            detector_response_validation_manifest_path=(
-                arguments.detector_response_validation_manifest
+            detector_green_validation_manifest_path=(
+                arguments.detector_green_validation_manifest
             ),
         )
         _progress(f"independent validation: {validation_path}")

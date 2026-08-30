@@ -30,7 +30,6 @@ from measurement.shielding import (
 )
 from spectrum.additive_scatter import (
     AdditiveNoncollidedTransportResponse,
-    DETECTOR_CONE_AIR_XCOM_SINGLE_SCATTER_BASIS_SEMANTICS,
     DETECTOR_CONE_SCATTER_BASIS_SEMANTICS,
     PhysicsOnlyNoncollidedTransportResponse,
     klein_nishina_forward_cone_fraction_numpy,
@@ -113,9 +112,7 @@ def validate_orientation_pair_indices(
         if expected < 0:
             raise ValueError("expected_count must be nonnegative.")
         if fe_raw.size != expected:
-            raise ValueError(
-                "Fe/Pb index arrays must match the expected row count."
-            )
+            raise ValueError("Fe/Pb index arrays must match the expected row count.")
     fe_arr = fe_raw.astype(np.int64, copy=False)
     pb_arr = pb_raw.astype(np.int64, copy=False)
     if (
@@ -124,9 +121,7 @@ def validate_orientation_pair_indices(
         or np.any(pb_arr < 0)
         or np.any(pb_arr >= count)
     ):
-        raise IndexError(
-            f"Fe/Pb orientation index values must lie in [0, {count})."
-        )
+        raise IndexError(f"Fe/Pb orientation index values must lie in [0, {count}).")
     return fe_arr, pb_arr
 
 
@@ -270,9 +265,7 @@ def _require_valid_source_detector_distances_numpy(
         raise ValueError(
             "Source-detector distance must be finite and strictly positive."
         )
-    if exclusion_radius_m > 0.0 and np.any(
-        distances <= float(exclusion_radius_m)
-    ):
+    if exclusion_radius_m > 0.0 and np.any(distances <= float(exclusion_radius_m)):
         raise ValueError(
             "Every source must lie strictly outside the detector aperture."
         )
@@ -895,13 +888,7 @@ def _finite_sphere_geometric_term_numpy(
     reference = max(1.0, radius)
     reference_ratio = min(radius / reference, 1.0)
     reference_fraction = max(
-        0.5
-        * (
-            1.0
-            - float(
-                np.sqrt(max(1.0 - reference_ratio * reference_ratio, 0.0))
-            )
-        ),
+        0.5 * (1.0 - float(np.sqrt(max(1.0 - reference_ratio * reference_ratio, 0.0)))),
         1.0e-12,
     )
     return fraction / reference_fraction
@@ -977,14 +964,10 @@ def _segment_rotated_octant_shell_path_length_cm_numpy(
     right = ordered[..., 1:]
     width = np.maximum(right - left, 0.0)
     midpoint = 0.5 * (left + right)
-    points = (
-        source_local[..., None, :]
-        + midpoint[..., None] * delta[..., None, :]
-    )
+    points = source_local[..., None, :] + midpoint[..., None] * delta[..., None, :]
     radius_sq = np.sum(points * points, axis=-1)
-    inside_shell = (
-        (radius_sq >= inner_m * inner_m - float(tol))
-        & (radius_sq <= outer_m * outer_m + float(tol))
+    inside_shell = (radius_sq >= inner_m * inner_m - float(tol)) & (
+        radius_sq <= outer_m * outer_m + float(tol)
     )
     inside_octant = np.all(points >= -float(tol), axis=-1)
     length_m = (
@@ -1083,19 +1066,11 @@ def _obstacle_single_scatter_probability_numpy(
     energy = np.asarray(energy_keV_l, dtype=np.float64)
     if mu.shape != (energy.size, t_enter.shape[-1]):
         raise ValueError("Obstacle Compton coefficients are not line/box aligned.")
-    valid_interval = (
-        np.isfinite(t_enter)
-        & np.isfinite(t_exit)
-        & (t_exit > t_enter)
-    )
+    valid_interval = np.isfinite(t_enter) & np.isfinite(t_exit) & (t_exit > t_enter)
     span = np.zeros_like(t_enter)
     midpoint = np.full_like(t_enter, 0.5)
-    span[valid_interval] = (
-        t_exit[valid_interval] - t_enter[valid_interval]
-    )
-    midpoint[valid_interval] = 0.5 * (
-        t_enter[valid_interval] + t_exit[valid_interval]
-    )
+    span[valid_interval] = t_exit[valid_interval] - t_enter[valid_interval]
+    midpoint[valid_interval] = 0.5 * (t_enter[valid_interval] + t_exit[valid_interval])
     half_span = 0.5 * span
     nodes = np.asarray(
         (-1.0 / np.sqrt(3.0), 1.0 / np.sqrt(3.0)),
@@ -1178,9 +1153,7 @@ def _obstacle_single_scatter_probability_torch(
     if box_count == 0:
         return torch.zeros_like(total_survival)
     valid_interval = (
-        torch.isfinite(t_enter)
-        & torch.isfinite(t_exit)
-        & (t_exit > t_enter)
+        torch.isfinite(t_enter) & torch.isfinite(t_exit) & (t_exit > t_enter)
     )
     ray_shape = tuple(int(value) for value in t_enter.shape[:-1])
     ray_count = int(t_enter.numel()) // box_count
@@ -1281,7 +1254,13 @@ def _resolve_dtype(dtype: str) -> "torch.dtype":
 
 @dataclass(frozen=True)
 class LineTransportComponents:
-    """Store physical transport components with one trailing line axis."""
+    """Store physical transport components with a trailing line axis.
+
+    ``uncollided_impact_fractions`` has one additional trailing detector-impact
+    phase axis.  The axis is empty for callers that do not request a detector
+    Green conditioning contract.  Full-spectrum callers must request and
+    validate a nonempty phase axis before evaluating detector response.
+    """
 
     total_kernel: NDArray[np.float64]
     unattenuated_kernel: NDArray[np.float64]
@@ -1291,6 +1270,7 @@ class LineTransportComponents:
     tau_obstacle: NDArray[np.float64]
     tau_obstacle_compton: NDArray[np.float64]
     distance_m: NDArray[np.float64]
+    uncollided_impact_fractions: NDArray[np.float64]
 
     def __post_init__(self) -> None:
         """Require one common finite nonnegative shape ending in lines."""
@@ -1307,6 +1287,10 @@ class LineTransportComponents:
                 "distance_m",
             )
         )
+        impact = np.asarray(
+            self.uncollided_impact_fractions,
+            dtype=np.float64,
+        )
         shape = arrays[0].shape
         if (
             len(shape) < 2
@@ -1318,6 +1302,28 @@ class LineTransportComponents:
                 "Line transport components must be finite nonnegative "
                 "arrays with one common shape and a trailing line axis."
             )
+        if (
+            impact.ndim != len(shape) + 1
+            or impact.shape[:-1] != shape
+            or np.any(~np.isfinite(impact))
+            or np.any(impact < 0.0)
+            or np.any(impact > 1.0)
+        ):
+            raise ValueError(
+                "Uncollided detector-impact fractions must be finite, "
+                "bounded probabilities aligned with the line components."
+            )
+        if impact.shape[-1] > 0:
+            phase_sum = np.sum(impact, axis=-1)
+            active = arrays[2] > 0.0
+            if (
+                np.any(np.abs(phase_sum[active] - 1.0) > 1.0e-10)
+                or np.any(np.abs(phase_sum[~active]) > 1.0e-10)
+            ):
+                raise ValueError(
+                    "Detector-impact fractions must sum to one exactly for "
+                    "positive uncollided transport and zero otherwise."
+                )
         for name, array in zip(
             (
                 "total_kernel",
@@ -1333,6 +1339,11 @@ class LineTransportComponents:
             strict=True,
         ):
             object.__setattr__(self, name, array)
+        object.__setattr__(
+            self,
+            "uncollided_impact_fractions",
+            impact,
+        )
 
 
 @dataclass(frozen=True)
@@ -1353,6 +1364,7 @@ class DeviceLineTransportComponents:
     tau_obstacle: "torch.Tensor"
     tau_obstacle_compton: "torch.Tensor"
     distance_m: "torch.Tensor"
+    uncollided_impact_fractions: "torch.Tensor"
 
     def __post_init__(self) -> None:
         """Require aligned floating-point Torch tensors on one device."""
@@ -1371,6 +1383,7 @@ class DeviceLineTransportComponents:
                 "distance_m",
             )
         )
+        impact = self.uncollided_impact_fractions
         first = tensors[0]
         if (
             any(not isinstance(value, torch.Tensor) for value in tensors)
@@ -1384,6 +1397,31 @@ class DeviceLineTransportComponents:
                 "Device line transport components must be aligned floating-"
                 "point Torch tensors on one device."
             )
+        if (
+            not isinstance(impact, torch.Tensor)
+            or impact.ndim != first.ndim + 1
+            or tuple(impact.shape[:-1]) != tuple(first.shape)
+            or impact.device != first.device
+            or impact.dtype != first.dtype
+            or not impact.dtype.is_floating_point
+            or not bool(torch.all(torch.isfinite(impact)))
+            or bool(torch.any(impact < 0.0))
+            or bool(torch.any(impact > 1.0))
+        ):
+            raise ValueError(
+                "Device detector-impact fractions must be finite, "
+                "bounded probabilities aligned with the line components."
+            )
+        if int(impact.shape[-1]) > 0:
+            phase_sum = torch.sum(impact, dim=-1)
+            active = tensors[2] > 0.0
+            if bool(torch.any(torch.abs(phase_sum[active] - 1.0) > 1.0e-10)) or bool(
+                torch.any(torch.abs(phase_sum[~active]) > 1.0e-10)
+            ):
+                raise ValueError(
+                    "Device detector-impact fractions must sum to one exactly "
+                    "for positive uncollided transport and zero otherwise."
+                )
 
 
 @dataclass
@@ -1415,6 +1453,7 @@ class ContinuousKernel:
     source_extent_radius_m: float = 0.0
     source_extent_samples: int = 1
     line_mu_by_isotope: dict[str, object] | None = None
+    strict_catalog_line_contract: bool = False
     additive_scatter_response: (
         AdditiveNoncollidedTransportResponse
         | PhysicsOnlyNoncollidedTransportResponse
@@ -1455,6 +1494,8 @@ class ContinuousKernel:
 
     def __post_init__(self) -> None:
         """Validate every physical and execution field without silent repair."""
+        if not isinstance(self.strict_catalog_line_contract, bool):
+            raise TypeError("strict_catalog_line_contract must be a boolean.")
         air_contract = (
             self.dry_air_total_attenuation_contract_id,
             self.dry_air_total_attenuation_contract_sha256,
@@ -1490,9 +1531,7 @@ class ContinuousKernel:
             aperture_radius,
             Real,
         ):
-            raise TypeError(
-                "detector_aperture_radius_m must be a real number or None."
-            )
+            raise TypeError("detector_aperture_radius_m must be a real number or None.")
         self.detector_aperture_radius_m = float(aperture_radius)
         if (
             not np.isfinite(self.detector_aperture_radius_m)
@@ -1512,9 +1551,7 @@ class ContinuousKernel:
         self.detector_aperture_sampling = normalize_detector_aperture_sampling(
             self.detector_aperture_sampling
         )
-        if (self.source_extent_radius_m == 0.0) != (
-            self.source_extent_samples == 1
-        ):
+        if (self.source_extent_radius_m == 0.0) != (self.source_extent_samples == 1):
             raise ValueError(
                 "Source extent requires radius=0 with one sample, or a "
                 "positive radius with at least two samples."
@@ -1537,6 +1574,68 @@ class ContinuousKernel:
                 "orientations must be a nonempty finite array shaped N x 3."
             )
         self.orientations = np.ascontiguousarray(orientations)
+        if self.strict_catalog_line_contract:
+            if not isinstance(self.line_mu_by_isotope, dict) or not (
+                self.line_mu_by_isotope
+            ):
+                raise ValueError(
+                    "Strict catalog transport requires a nonempty exact line table."
+                )
+            if any(
+                not isinstance(isotope, str) or not isotope
+                for isotope in self.line_mu_by_isotope
+            ):
+                raise ValueError(
+                    "Strict catalog transport requires nonempty isotope keys."
+                )
+            for isotope in self.line_mu_by_isotope:
+                self._line_mu_values(isotope)
+                self._line_energy_values_keV(isotope)
+            self._require_strict_obstacle_line_contract()
+
+    def _require_strict_obstacle_line_contract(self) -> None:
+        """Require exact total and Compton rows for every material box."""
+        boxes = self.obstacle_boxes_m()
+        if boxes.shape[0] == 0:
+            return
+        if self.obstacle_grid is None or not isinstance(
+            self.line_mu_by_isotope,
+            dict,
+        ):
+            raise ValueError(
+                "Strict obstacle transport requires an explicit obstacle grid "
+                "and catalog line table."
+            )
+        expected = set(self.line_mu_by_isotope)
+        total_table = self.obstacle_grid.transport_line_mu_by_isotope
+        compton_table = self.obstacle_grid.transport_line_compton_mu_by_isotope
+        if set(total_table) != expected or set(compton_table) != expected:
+            raise ValueError(
+                "Strict obstacle transport total and Compton isotope keys "
+                "must exactly match the catalog line table."
+            )
+        box_count = int(boxes.shape[0])
+        for isotope in sorted(expected):
+            line_count = len(self._line_mu_values(isotope))
+            expected_shape = (line_count, box_count)
+            total = np.asarray(total_table[isotope], dtype=np.float64)
+            compton = np.asarray(compton_table[isotope], dtype=np.float64)
+            if total.shape != expected_shape or compton.shape != expected_shape:
+                raise ValueError(
+                    "Strict obstacle line attenuation must be shaped "
+                    f"{expected_shape} for {isotope!r}."
+                )
+            if (
+                np.any(~np.isfinite(total))
+                or np.any(~np.isfinite(compton))
+                or np.any(total < 0.0)
+                or np.any(compton < 0.0)
+                or np.any(compton > total * (1.0 + 1.0e-12))
+            ):
+                raise ValueError(
+                    "Strict obstacle total and Compton attenuation values "
+                    f"are invalid for {isotope!r}."
+                )
 
     def _rotated_octant_rotation_torch(
         self,
@@ -1696,15 +1795,11 @@ class ContinuousKernel:
             or not isinstance(working_memory_budget_bytes, (int, np.integer))
             or int(working_memory_budget_bytes) <= 0
         ):
-            raise ValueError(
-                "working_memory_budget_bytes must be a positive integer."
-            )
+            raise ValueError("working_memory_budget_bytes must be a positive integer.")
 
         dtype_name = str(dtype if dtype is not None else self.gpu_dtype).lower()
         bytes_per_element = 8 if "64" in dtype_name else 4
-        legacy_element_budget = (
-            4_000_000 if bytes_per_element == 8 else 8_000_000
-        )
+        legacy_element_budget = 4_000_000 if bytes_per_element == 8 else 8_000_000
         legacy_denom = max(1, sample_count * line_count)
         if obstacle_count > 0:
             legacy_denom = max(
@@ -1777,8 +1872,7 @@ class ContinuousKernel:
         cuda_safe_chunk = max(
             1,
             int(
-                working_bytes
-                // max(1, bytes_per_element * working_elements_per_source)
+                working_bytes // max(1, bytes_per_element * working_elements_per_source)
             ),
         )
         if explicit_safe_chunk is not None:
@@ -1806,9 +1900,7 @@ class ContinuousKernel:
             "source_row_count": source_row_count,
             "dtype_bytes": dtype_bytes,
         }
-        if isotope is not None and (
-            not isinstance(isotope, str) or not isotope
-        ):
+        if isotope is not None and (not isinstance(isotope, str) or not isotope):
             raise ValueError("isotope must be None or a nonempty string.")
         for name, value in counts.items():
             if (
@@ -1849,9 +1941,7 @@ class ContinuousKernel:
             1,
             obstacle_elements + pair_elements + line_elements + ray_elements,
         )
-        return int(
-            int(source_row_count) * elements_per_source * int(dtype_bytes)
-        )
+        return int(int(source_row_count) * elements_per_source * int(dtype_bytes))
 
     def minimum_line_transport_working_memory_budget_bytes(
         self,
@@ -1995,6 +2085,54 @@ class ContinuousKernel:
         existing isotope-effective coefficients.
         """
         table = self.line_mu_by_isotope
+        if self.strict_catalog_line_contract:
+            if not isinstance(table, dict) or isotope not in table:
+                raise ValueError(
+                    f"No exact catalog line transport exists for {isotope!r}."
+                )
+            entry = table[isotope]
+            if not isinstance(entry, (list, tuple)) or not entry:
+                raise ValueError(
+                    f"Exact catalog line transport is empty for {isotope!r}."
+                )
+            rows: list[tuple[float, float, float]] = []
+            for index, item in enumerate(entry):
+                if not isinstance(item, dict) or set(item) != {
+                    "energy_keV",
+                    "weight",
+                    "fe",
+                    "pb",
+                }:
+                    raise ValueError(
+                        "Exact catalog lines require only energy_keV, weight, "
+                        f"fe, and pb; invalid {isotope!r} row {index}."
+                    )
+                energy = float(item["energy_keV"])
+                weight = float(item["weight"])
+                mu_fe = float(item["fe"])
+                mu_pb = float(item["pb"])
+                if (
+                    not np.isfinite(energy)
+                    or energy <= 0.0
+                    or not np.isfinite(weight)
+                    or weight <= 0.0
+                    or not np.isfinite(mu_fe)
+                    or mu_fe < 0.0
+                    or not np.isfinite(mu_pb)
+                    or mu_pb < 0.0
+                ):
+                    raise ValueError(
+                        f"Exact catalog line values are invalid for {isotope!r} "
+                        f"row {index}."
+                    )
+                rows.append((weight, mu_fe, mu_pb))
+            total_weight = sum(weight for weight, _, _ in rows)
+            if not np.isclose(total_weight, 1.0, rtol=0.0, atol=1.0e-12):
+                raise ValueError(
+                    f"Exact catalog branching weights do not sum to one for "
+                    f"{isotope!r}."
+                )
+            return tuple(rows)
         if not isinstance(table, dict):
             return ()
         entry = table.get(isotope)
@@ -2038,13 +2176,24 @@ class ContinuousKernel:
     def _line_energy_values_keV(self, isotope: str) -> tuple[float, ...]:
         """Return positive-line energies in the shared attenuation-table order."""
         table = self.line_mu_by_isotope
+        if self.strict_catalog_line_contract:
+            self._line_mu_values(isotope)
+            if not isinstance(table, dict) or isotope not in table:
+                raise ValueError(
+                    f"No exact catalog line energies exist for {isotope!r}."
+                )
+            entry = table[isotope]
+            if not isinstance(entry, (list, tuple)):
+                raise ValueError(
+                    f"Exact catalog line energies are invalid for {isotope!r}."
+                )
+            return tuple(float(item["energy_keV"]) for item in entry)
         if not isinstance(table, dict):
             return ()
         entry = table.get(isotope)
         if entry is None:
             normalized = {
-                _normalize_isotope_key(key): value
-                for key, value in table.items()
+                _normalize_isotope_key(key): value for key, value in table.items()
             }
             entry = normalized.get(_normalize_isotope_key(isotope))
         energies: list[float] = []
@@ -2130,11 +2279,7 @@ class ContinuousKernel:
         if air_mu is None:
             air_mu = dry_air_total_linear_attenuation_torch(energies)
             self._torch_constant_cache[air_mu_key] = air_mu
-        return (
-            distance.unsqueeze(-1)
-            * 100.0
-            * air_mu
-        )
+        return distance.unsqueeze(-1) * 100.0 * air_mu
 
     def _validated_positive_line_indices(
         self,
@@ -2169,9 +2314,7 @@ class ContinuousKernel:
                 )
             indices = raw.astype(np.int64)
         else:
-            raise ValueError(
-                "positive_line_indices must contain exact integer values."
-            )
+            raise ValueError("positive_line_indices must contain exact integer values.")
         if np.unique(indices).size != indices.size:
             raise ValueError("positive_line_indices must not contain duplicates.")
         if np.any(indices < 0) or np.any(indices >= len(entries)):
@@ -2194,13 +2337,51 @@ class ContinuousKernel:
         entries = np.asarray(self._line_mu_values(str(isotope)), dtype=np.float64)
         return np.asarray(entries[indices, 0], dtype=np.float64)
 
+    def line_transport_contract(
+        self,
+        isotope: str,
+        positive_line_indices: object,
+    ) -> tuple[
+        NDArray[np.float64],
+        NDArray[np.float64],
+        NDArray[np.float64],
+        NDArray[np.float64],
+    ]:
+        """Return catalog weights, energies, Fe mu, and Pb mu for line indices."""
+        indices = self._validated_positive_line_indices(
+            isotope,
+            positive_line_indices,
+        )
+        entries = np.asarray(self._line_mu_values(str(isotope)), dtype=np.float64)
+        energies = np.asarray(
+            self._line_energy_values_keV(str(isotope)),
+            dtype=np.float64,
+        )
+        if (
+            entries.ndim != 2
+            or entries.shape[1] != 3
+            or energies.shape != (entries.shape[0],)
+        ):
+            raise RuntimeError(
+                "Line transport requires one authenticated energy and "
+                "weight/Fe/Pb row per catalog line."
+            )
+        return tuple(
+            np.ascontiguousarray(values[indices], dtype=np.float64)
+            for values in (
+                entries[:, 0],
+                energies,
+                entries[:, 1],
+                entries[:, 2],
+            )
+        )
+
     def positive_line_indices(self, isotope: str) -> NDArray[np.int64]:
         """Return every configured positive transport-line index."""
         entries = self._line_mu_values(str(isotope))
         if not entries:
             raise ValueError(
-                f"No positive line-resolved transport basis exists for "
-                f"{isotope!r}."
+                f"No positive line-resolved transport basis exists for {isotope!r}."
             )
         return np.arange(len(entries), dtype=np.int64)
 
@@ -2214,7 +2395,11 @@ class ContinuousKernel:
     def _line_response_array_key(values: NDArray[np.generic]) -> tuple[object, ...]:
         """Return an exact dtype/shape/byte key for one response input array."""
         array = np.ascontiguousarray(values)
-        return (str(array.dtype), tuple(int(value) for value in array.shape), array.tobytes())
+        return (
+            str(array.dtype),
+            tuple(int(value) for value in array.shape),
+            array.tobytes(),
+        )
 
     def _max_line_count(self) -> int:
         """Return the maximum configured line count used by attenuation batching."""
@@ -2271,9 +2456,7 @@ class ContinuousKernel:
             obstacle_boxes_m=boxes,
             tol=tol,
         )
-        positive_length = (
-            np.maximum(t_exit - t_enter, 0.0) * distance[..., None]
-        )
+        positive_length = np.maximum(t_exit - t_enter, 0.0) * distance[..., None]
         if np.any(positive_length > float(tol)):
             assert self.obstacle_grid is not None
             raise RuntimeError(
@@ -2377,11 +2560,25 @@ class ContinuousKernel:
         boxes = self.obstacle_boxes_m()
         if boxes.size == 0 or self.obstacle_grid is None:
             return np.zeros((0, 0), dtype=float)
-        values = self.obstacle_grid.transport_line_mu_values(isotope)
+        values = (
+            self.obstacle_grid.transport_line_mu_by_isotope.get(isotope)
+            if self.strict_catalog_line_contract
+            else self.obstacle_grid.transport_line_mu_values(isotope)
+        )
         if values is None:
+            if self.strict_catalog_line_contract:
+                raise ValueError(
+                    f"Strict obstacle total line transport is missing for "
+                    f"{isotope!r}."
+                )
             return np.zeros((0, boxes.shape[0]), dtype=float)
         array = np.asarray(values, dtype=float)
         if array.ndim != 2 or array.shape[1] != boxes.shape[0]:
+            if self.strict_catalog_line_contract:
+                raise ValueError(
+                    f"Strict obstacle total line transport has the wrong "
+                    f"shape for {isotope!r}."
+                )
             return np.zeros((0, boxes.shape[0]), dtype=float)
         return array
 
@@ -2393,16 +2590,28 @@ class ContinuousKernel:
         boxes = self.obstacle_boxes_m()
         if boxes.size == 0 or self.obstacle_grid is None:
             return np.zeros((0, 0), dtype=float)
-        values = self.obstacle_grid.transport_line_compton_mu_values(isotope)
+        values = (
+            self.obstacle_grid.transport_line_compton_mu_by_isotope.get(isotope)
+            if self.strict_catalog_line_contract
+            else self.obstacle_grid.transport_line_compton_mu_values(isotope)
+        )
         if values is None:
+            if self.strict_catalog_line_contract:
+                raise ValueError(
+                    f"Strict obstacle Compton line transport is missing for "
+                    f"{isotope!r}."
+                )
             return np.zeros((0, boxes.shape[0]), dtype=float)
         array = np.asarray(values, dtype=float)
         if array.ndim != 2 or array.shape[1] != boxes.shape[0]:
+            if self.strict_catalog_line_contract:
+                raise ValueError(
+                    f"Strict obstacle Compton line transport has the wrong "
+                    f"shape for {isotope!r}."
+                )
             return np.zeros((0, boxes.shape[0]), dtype=float)
         total = self.obstacle_line_mu_values_cm_inv(isotope)
-        if array.shape != total.shape or np.any(
-            array > total * (1.0 + 1.0e-12)
-        ):
+        if array.shape != total.shape or np.any(array > total * (1.0 + 1.0e-12)):
             raise ValueError(
                 "Obstacle Compton and total line attenuation contracts disagree."
             )
@@ -2616,6 +2825,11 @@ class ContinuousKernel:
         """Return line-resolved obstacle optical depths for one ray."""
         mu_values = self.obstacle_line_mu_values_cm_inv(isotope)
         if mu_values.shape != (int(line_count), path_by_box_cm.shape[0]):
+            if self.strict_catalog_line_contract:
+                raise RuntimeError(
+                    "Strict obstacle line transport changed after kernel "
+                    "construction."
+                )
             return None
         return tuple(float(np.sum(row * path_by_box_cm)) for row in mu_values)
 
@@ -2648,11 +2862,14 @@ class ContinuousKernel:
         fe_arr = np.asarray(tau_fe, dtype=float)
         pb_arr = np.asarray(tau_pb, dtype=float)
         obstacle_arr = np.asarray(tau_obstacle, dtype=float)
-        factor = np.ones(np.broadcast_shapes(
-            fe_arr.shape,
-            pb_arr.shape,
-            obstacle_arr.shape,
-        ), dtype=float)
+        factor = np.ones(
+            np.broadcast_shapes(
+                fe_arr.shape,
+                pb_arr.shape,
+                obstacle_arr.shape,
+            ),
+            dtype=float,
+        )
         factor = factor + self.shield_params.buildup_fe_coeff * (
             1.0 - np.exp(-np.maximum(fe_arr, 0.0))
         )
@@ -2726,6 +2943,11 @@ class ContinuousKernel:
             )
         mu_values = self.obstacle_line_mu_values_cm_inv(isotope)
         if mu_values.shape != (int(line_count), int(path_by_box_cm.shape[-1])):
+            if self.strict_catalog_line_contract:
+                raise RuntimeError(
+                    "Strict obstacle line transport changed after kernel "
+                    "construction."
+                )
             return None
         mu_t = self._constant_tensor_torch(
             f"obstacle-line-mu:{isotope}",
@@ -2758,6 +2980,11 @@ class ContinuousKernel:
             int(line_count),
             int(path_by_box_cm.shape[-1]),
         ):
+            if self.strict_catalog_line_contract:
+                raise RuntimeError(
+                    "Strict obstacle Compton transport changed after kernel "
+                    "construction."
+                )
             return None
         mu_t = self._constant_tensor_torch(
             f"obstacle-line-compton-mu:{isotope}",
@@ -3127,15 +3354,13 @@ class ContinuousKernel:
         l_fe = spherical_shell_path_length_cm_torch(
             direction,
             self.shield_params.inner_radius_fe_cm,
-            self.shield_params.inner_radius_fe_cm
-            + self.shield_params.thickness_fe_cm,
+            self.shield_params.inner_radius_fe_cm + self.shield_params.thickness_fe_cm,
             blocked_fe,
         )
         l_pb = spherical_shell_path_length_cm_torch(
             direction,
             self.shield_params.inner_radius_pb_cm,
-            self.shield_params.inner_radius_pb_cm
-            + self.shield_params.thickness_pb_cm,
+            self.shield_params.inner_radius_pb_cm + self.shield_params.thickness_pb_cm,
             blocked_pb,
         )
         return l_fe, l_pb
@@ -3253,12 +3478,8 @@ class ContinuousKernel:
                 np.clip(1.0 - sin_theta_max * sin_theta_max, 0.0, None)
             )
             fractions = (indices + 0.5) / float(sample_count)
-            cos_theta = 1.0 - fractions[None, :] * (
-                1.0 - cos_theta_max[:, None]
-            )
-            sin_theta = np.sqrt(
-                np.clip(1.0 - cos_theta * cos_theta, 0.0, None)
-            )
+            cos_theta = 1.0 - fractions[None, :] * (1.0 - cos_theta_max[:, None])
+            sin_theta = np.sqrt(np.clip(1.0 - cos_theta * cos_theta, 0.0, None))
             direction = (
                 cos_theta[..., None] * axis[:, None, :]
                 + sin_theta[..., None] * angular_basis
@@ -3268,10 +3489,7 @@ class ContinuousKernel:
                 np.clip(aperture_radius * aperture_radius - radial_sq, 0.0, None)
             )
             path_length = distance[:, None] * cos_theta - chord
-            targets = (
-                source_arr[:, None, :]
-                + path_length[..., None] * direction
-            )
+            targets = source_arr[:, None, :] + path_length[..., None] * direction
             return targets
 
         fractions = np.clip(
@@ -3281,11 +3499,7 @@ class ContinuousKernel:
         )
         radii = np.sqrt(fractions)
         radii[0] = 0.0
-        offsets = (
-            aperture_radius
-            * radii[None, :, None]
-            * angular_basis
-        )
+        offsets = aperture_radius * radii[None, :, None] * angular_basis
         return detector_arr[:, None, :] + offsets
 
     def _ray_sample_points_numpy(
@@ -3515,6 +3729,276 @@ class ContinuousKernel:
             tol=tol,
         )
         return sampled_sources, sampled_targets, total_sample_count
+
+    def _validated_detector_impact_edges(
+        self,
+        impact_parameter_edges_fraction: object,
+    ) -> NDArray[np.float64]:
+        """Return a strict detector-impact partition for Green conditioning."""
+        edges = np.asarray(impact_parameter_edges_fraction, dtype=np.float64)
+        aperture_radius = float(self.detector_aperture_radius_m or 0.0)
+        if (
+            edges.ndim != 1
+            or edges.size < 2
+            or np.any(~np.isfinite(edges))
+            or edges[0] != 0.0
+            or edges[-1] != 1.0
+            or np.any(np.diff(edges) <= 0.0)
+        ):
+            raise ValueError(
+                "Detector-impact edges must be a finite, strictly increasing "
+                "partition from exactly zero to one."
+            )
+        if (
+            self.detector_aperture_sampling != "solid_angle_cone"
+            or aperture_radius <= 0.0
+            or int(self.detector_aperture_samples) < int(edges.size - 1)
+            or float(self.source_extent_radius_m or 0.0) != 0.0
+            or int(self.source_extent_samples) != 1
+        ):
+            raise ValueError(
+                "Detector Green impact conditioning requires point sources, "
+                "a positive solid-angle-cone aperture, and at least one ray "
+                "per impact phase."
+            )
+        return np.ascontiguousarray(edges)
+
+    def _detector_impact_geometry_numpy(
+        self,
+        *,
+        sampled_sources: NDArray[np.float64],
+        sampled_targets: NDArray[np.float64],
+        detector_positions: NDArray[np.float64],
+        impact_parameter_edges_fraction: object,
+    ) -> tuple[NDArray[np.bool_], NDArray[np.float64]]:
+        """Return batched ray membership and exact solid-angle phase weights."""
+        edges = self._validated_detector_impact_edges(
+            impact_parameter_edges_fraction
+        )
+        sources = np.asarray(sampled_sources, dtype=np.float64)
+        targets = np.asarray(sampled_targets, dtype=np.float64)
+        detectors = np.asarray(detector_positions, dtype=np.float64)
+        if (
+            sources.ndim != 3
+            or sources.shape != targets.shape
+            or sources.shape[0] != detectors.shape[0]
+            or sources.shape[2] != 3
+            or detectors.ndim != 2
+            or detectors.shape[1] != 3
+        ):
+            raise ValueError("Detector-impact ray geometry is misaligned.")
+        aperture_radius = float(self.detector_aperture_radius_m or 0.0)
+        directions = targets - sources
+        ray_lengths = np.linalg.norm(directions, axis=-1)
+        center_vectors = detectors[:, None, :] - sources
+        impact = np.linalg.norm(
+            np.cross(center_vectors, directions),
+            axis=-1,
+        ) / ray_lengths
+        fractions = impact / aperture_radius
+        tolerance = 64.0 * np.finfo(np.float64).eps
+        if (
+            np.any(~np.isfinite(fractions))
+            or np.any(fractions < -tolerance)
+            or np.any(fractions > 1.0 + tolerance)
+        ):
+            raise RuntimeError(
+                "A detector-aperture ray lies outside the authenticated "
+                "impact-parameter domain."
+            )
+        fractions = np.clip(fractions, 0.0, 1.0)
+        phase_count = int(edges.size - 1)
+        phase_index = np.searchsorted(edges, fractions, side="right") - 1
+        phase_index = np.clip(phase_index, 0, phase_count - 1)
+        membership = phase_index[..., None] == np.arange(phase_count)[None, None, :]
+        phase_ray_counts = np.sum(membership, axis=1)
+        if np.any(phase_ray_counts <= 0):
+            raise RuntimeError(
+                "Detector-aperture quadrature leaves an impact phase unsampled."
+            )
+        center_distance = np.linalg.norm(
+            detectors - sources[:, 0, :],
+            axis=-1,
+        )
+        ratio = aperture_radius / center_distance
+        lower = edges[:-1][None, :]
+        upper = edges[1:][None, :]
+        lower_cosine = np.sqrt(
+            np.maximum(1.0 - np.square(ratio[:, None] * lower), 0.0)
+        )
+        upper_cosine = np.sqrt(
+            np.maximum(1.0 - np.square(ratio[:, None] * upper), 0.0)
+        )
+        phase_weights = lower_cosine - upper_cosine
+        phase_weights /= np.sum(phase_weights, axis=-1, keepdims=True)
+        if (
+            np.any(~np.isfinite(phase_weights))
+            or np.any(phase_weights <= 0.0)
+        ):
+            raise RuntimeError("Exact detector-impact phase weights are invalid.")
+        return membership, phase_weights
+
+    def _detector_impact_geometry_torch(
+        self,
+        *,
+        sampled_sources: "torch.Tensor",
+        sampled_targets: "torch.Tensor",
+        detector_positions: "torch.Tensor",
+        impact_parameter_edges_fraction: object,
+    ) -> tuple["torch.Tensor", "torch.Tensor"]:
+        """Return Torch ray membership and exact solid-angle phase weights."""
+        if torch is None:
+            raise RuntimeError("torch is not available")
+        edges_np = self._validated_detector_impact_edges(
+            impact_parameter_edges_fraction
+        )
+        if (
+            sampled_sources.ndim != 3
+            or tuple(sampled_sources.shape) != tuple(sampled_targets.shape)
+            or int(sampled_sources.shape[0]) != int(detector_positions.shape[0])
+            or int(sampled_sources.shape[2]) != 3
+            or detector_positions.ndim != 2
+            or int(detector_positions.shape[1]) != 3
+        ):
+            raise ValueError("Detector-impact Torch ray geometry is misaligned.")
+        edges = torch.as_tensor(
+            edges_np,
+            device=sampled_sources.device,
+            dtype=sampled_sources.dtype,
+        )
+        aperture_radius = float(self.detector_aperture_radius_m or 0.0)
+        directions = sampled_targets - sampled_sources
+        ray_lengths = torch.linalg.norm(directions, dim=-1)
+        center_vectors = detector_positions.unsqueeze(1) - sampled_sources
+        impact = torch.linalg.norm(
+            torch.linalg.cross(center_vectors, directions, dim=-1),
+            dim=-1,
+        ) / ray_lengths
+        fractions = impact / aperture_radius
+        tolerance = 64.0 * torch.finfo(sampled_sources.dtype).eps
+        if (
+            not bool(torch.all(torch.isfinite(fractions)))
+            or bool(torch.any(fractions < -tolerance))
+            or bool(torch.any(fractions > 1.0 + tolerance))
+        ):
+            raise RuntimeError(
+                "A detector-aperture ray lies outside the authenticated "
+                "impact-parameter domain."
+            )
+        fractions = torch.clamp(fractions, min=0.0, max=1.0)
+        phase_count = int(edges.numel() - 1)
+        phase_index = torch.bucketize(fractions, edges, right=True) - 1
+        phase_index = torch.clamp(phase_index, min=0, max=phase_count - 1)
+        membership = phase_index.unsqueeze(-1) == torch.arange(
+            phase_count,
+            device=sampled_sources.device,
+        ).view(1, 1, -1)
+        phase_ray_counts = torch.sum(membership, dim=1)
+        if bool(torch.any(phase_ray_counts <= 0)):
+            raise RuntimeError(
+                "Detector-aperture quadrature leaves an impact phase unsampled."
+            )
+        center_distance = torch.linalg.norm(
+            detector_positions - sampled_sources[:, 0, :],
+            dim=-1,
+        )
+        ratio = aperture_radius / center_distance
+        lower_cosine = torch.sqrt(
+            torch.clamp(
+                1.0 - torch.square(ratio[:, None] * edges[:-1][None, :]),
+                min=0.0,
+            )
+        )
+        upper_cosine = torch.sqrt(
+            torch.clamp(
+                1.0 - torch.square(ratio[:, None] * edges[1:][None, :]),
+                min=0.0,
+            )
+        )
+        phase_weights = lower_cosine - upper_cosine
+        phase_weights = phase_weights / torch.sum(
+            phase_weights,
+            dim=-1,
+            keepdim=True,
+        )
+        if (
+            not bool(torch.all(torch.isfinite(phase_weights)))
+            or bool(torch.any(phase_weights <= 0.0))
+        ):
+            raise RuntimeError("Exact detector-impact phase weights are invalid.")
+        return membership, phase_weights
+
+    @staticmethod
+    def _uncollided_impact_fractions_numpy(
+        direct_attenuation: NDArray[np.float64],
+        membership_nrc: NDArray[np.bool_],
+        phase_weights_nc: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Reduce ray-resolved direct attenuation into normalized phases."""
+        attenuation = np.asarray(direct_attenuation, dtype=np.float64)
+        membership = np.asarray(membership_nrc, dtype=np.float64)
+        weights = np.asarray(phase_weights_nc, dtype=np.float64)
+        counts = np.sum(membership, axis=1)
+        if attenuation.ndim == 3:
+            conditional = np.einsum(
+                "nrl,nrc->nlc",
+                attenuation,
+                membership,
+                optimize=True,
+            ) / counts[:, None, :]
+            scores = conditional * weights[:, None, :]
+        elif attenuation.ndim == 4:
+            conditional = np.einsum(
+                "qnrl,nrc->qnlc",
+                attenuation,
+                membership,
+                optimize=True,
+            ) / counts[None, :, None, :]
+            scores = conditional * weights[None, :, None, :]
+        else:
+            raise ValueError("Direct attenuation must have three or four axes.")
+        totals = np.sum(scores, axis=-1, keepdims=True)
+        fractions = np.divide(
+            scores,
+            totals,
+            out=np.zeros_like(scores),
+            where=totals > 0.0,
+        )
+        return np.maximum(fractions, 0.0)
+
+    @staticmethod
+    def _uncollided_impact_fractions_torch(
+        direct_attenuation: "torch.Tensor",
+        membership_nrc: "torch.Tensor",
+        phase_weights_nc: "torch.Tensor",
+    ) -> "torch.Tensor":
+        """Reduce Torch ray-resolved direct attenuation into phases."""
+        if torch is None:
+            raise RuntimeError("torch is not available")
+        membership = membership_nrc.to(dtype=direct_attenuation.dtype)
+        counts = torch.sum(membership, dim=1)
+        if direct_attenuation.ndim == 3:
+            conditional = torch.einsum(
+                "nrl,nrc->nlc",
+                direct_attenuation,
+                membership,
+            ) / counts[:, None, :]
+            scores = conditional * phase_weights_nc[:, None, :]
+        elif direct_attenuation.ndim == 4:
+            conditional = torch.einsum(
+                "qnrl,nrc->qnlc",
+                direct_attenuation,
+                membership,
+            ) / counts[None, :, None, :]
+            scores = conditional * phase_weights_nc[None, :, None, :]
+        else:
+            raise ValueError("Direct attenuation must have three or four axes.")
+        totals = torch.sum(scores, dim=-1, keepdim=True)
+        return torch.where(
+            totals > 0.0,
+            scores / torch.clamp(totals, min=torch.finfo(scores.dtype).tiny),
+            torch.zeros_like(scores),
+        )
 
     def _detector_aperture_targets_disk_torch(
         self,
@@ -4112,11 +4596,8 @@ class ContinuousKernel:
         return_device_components: bool = False,
         fe_indices_by_row: NDArray[np.int64] | None = None,
         pb_indices_by_row: NDArray[np.int64] | None = None,
-    ) -> (
-        NDArray[np.float64]
-        | LineTransportComponents
-        | DeviceLineTransportComponents
-    ):
+        impact_parameter_edges_fraction: object | None = None,
+    ) -> NDArray[np.float64] | LineTransportComponents | DeviceLineTransportComponents:
         """Return shared-geometry Fe/Pb kernels for matched source rows.
 
         With no row-wise pair arrays this evaluates all orientation pairs.
@@ -4134,14 +4615,18 @@ class ContinuousKernel:
                 positive_line_indices,
             )
         )
+        impact_edges = (
+            None
+            if impact_parameter_edges_fraction is None
+            else self._validated_detector_impact_edges(
+                impact_parameter_edges_fraction
+            )
+        )
+        impact_phase_count = 0 if impact_edges is None else int(impact_edges.size - 1)
         if return_line_transport_components and line_selection is None:
-            raise ValueError(
-                "Line transport components require positive_line_indices."
-            )
+            raise ValueError("Line transport components require positive_line_indices.")
         if return_device_components and not return_line_transport_components:
-            raise ValueError(
-                "Device components require line transport components."
-            )
+            raise ValueError("Device components require line transport components.")
         device = _resolve_device(self.gpu_device)
         dtype = _resolve_dtype(self.gpu_dtype)
         detectors_t = torch.as_tensor(detector_positions, device=device, dtype=dtype)
@@ -4210,6 +4695,11 @@ class ContinuousKernel:
                         tau_obstacle=empty_device.clone(),
                         tau_obstacle_compton=empty_device.clone(),
                         distance_m=empty_device.clone(),
+                        uncollided_impact_fractions=torch.zeros(
+                            empty_shape + (impact_phase_count,),
+                            device=device,
+                            dtype=dtype,
+                        ),
                     )
                 empty_host = np.zeros(empty_shape, dtype=np.float64)
                 return LineTransportComponents(
@@ -4221,6 +4711,10 @@ class ContinuousKernel:
                     tau_obstacle=empty_host.copy(),
                     tau_obstacle_compton=empty_host.copy(),
                     distance_m=empty_host.copy(),
+                    uncollided_impact_fractions=np.zeros(
+                        empty_shape + (impact_phase_count,),
+                        dtype=np.float64,
+                    ),
                 )
             return np.zeros((0, num_pairs), dtype=float)
         with torch.no_grad():
@@ -4234,6 +4728,16 @@ class ContinuousKernel:
                 sources=sources_t,
                 detector=detectors_t,
                 tol=tol,
+            )
+            impact_geometry = (
+                None
+                if impact_edges is None
+                else self._detector_impact_geometry_torch(
+                    sampled_sources=sampled_sources,
+                    sampled_targets=targets,
+                    detector_positions=detectors_t,
+                    impact_parameter_edges_fraction=impact_edges,
+                )
             )
             sampled_direction = targets - sampled_sources
             sampled_dist = torch.linalg.norm(sampled_direction, dim=-1)
@@ -4259,12 +4763,8 @@ class ContinuousKernel:
                     selected_pb,
                     return_inverse=True,
                 )
-                compact_fe_selection = compact_fe_flat.reshape(
-                    selected_fe.shape
-                )
-                compact_pb_selection = compact_pb_flat.reshape(
-                    selected_pb.shape
-                )
+                compact_fe_selection = compact_fe_flat.reshape(selected_fe.shape)
+                compact_pb_selection = compact_pb_flat.reshape(selected_pb.shape)
 
             l_fe_by_orient: list[torch.Tensor] = []
             for orient_idx_raw in fe_orientations:
@@ -4398,8 +4898,7 @@ class ContinuousKernel:
                 )
                 obstacle_path_cm = 100.0 * torch.where(
                     obstacle_exit > obstacle_enter,
-                    (obstacle_exit - obstacle_enter)
-                    * obstacle_distance.unsqueeze(-1),
+                    (obstacle_exit - obstacle_enter) * obstacle_distance.unsqueeze(-1),
                     torch.zeros_like(obstacle_exit),
                 )
                 tau_obstacle = self._obstacle_tau_from_lengths_torch(
@@ -4446,8 +4945,7 @@ class ContinuousKernel:
                     if candidate_tau is not None:
                         line_tau_obstacle = candidate_tau.unsqueeze(0)
                     candidate_compton_tau = (
-                        self
-                        ._obstacle_line_compton_tau_from_lengths_torch(
+                        self._obstacle_line_compton_tau_from_lengths_torch(
                             isotope,
                             obstacle_path_cm,
                             line_count=len(line_entries),
@@ -4456,36 +4954,29 @@ class ContinuousKernel:
                         )
                     )
                     if candidate_compton_tau is not None:
-                        line_tau_obstacle_compton = (
-                            candidate_compton_tau.unsqueeze(0)
-                        )
+                        line_tau_obstacle_compton = candidate_compton_tau.unsqueeze(0)
                 line_total_tau = (
                     line_tau_fe
                     + line_tau_pb
                     + line_tau_obstacle
-                    + self._line_air_tau_torch(isotope, response_distance)
-                    .unsqueeze(0)
+                    + self._line_air_tau_torch(isotope, response_distance).unsqueeze(0)
                 )
                 uncollided_line_att = torch.exp(-line_total_tau)
                 if self.additive_scatter_response is not None:
                     line_energies = self._line_energy_values_keV(isotope)
                     if len(line_energies) != len(line_entries):
                         raise RuntimeError(
-                            "Additive scatter requires exact positive-line "
-                            "energies."
+                            "Additive scatter requires exact positive-line energies."
                         )
                     obstacle_single_scatter = None
                     if (
                         obstacle_path_cm is not None
-                        and self.additive_scatter_response
-                        .feature_basis_semantics
+                        and self.additive_scatter_response.feature_basis_semantics
                         in DETECTOR_CONE_SCATTER_BASIS_SEMANTICS
                     ):
                         obstacle_compton_mu = self._constant_tensor_torch(
                             f"obstacle-compton-mu:{isotope}",
-                            self.obstacle_line_compton_mu_values_cm_inv(
-                                isotope
-                            ),
+                            self.obstacle_line_compton_mu_values_cm_inv(isotope),
                             device=device,
                             dtype=dtype,
                         )
@@ -4530,8 +5021,7 @@ class ContinuousKernel:
                         mu_fe_cm_inv=mu_fe_t.view(1, 1, 1, -1),
                         mu_pb_cm_inv=mu_pb_t.view(1, 1, 1, -1),
                         semantics=(
-                            self.additive_scatter_response
-                            .feature_basis_semantics
+                            self.additive_scatter_response.feature_basis_semantics
                         ),
                         detector_radius_m=self.detector_radius_m,
                         fe_scatter_distance_m=(
@@ -4544,23 +5034,16 @@ class ContinuousKernel:
                             + 0.5 * self.shield_params.thickness_pb_cm
                         )
                         / 100.0,
-                        obstacle_single_scatter_probability=(
-                            obstacle_single_scatter
-                        ),
+                        obstacle_single_scatter_probability=(obstacle_single_scatter),
                     )
-                    line_base_att = (
-                        self.additive_scatter_response.total_kernel_torch(
-                            torch.ones_like(uncollided_line_att),
-                            uncollided_line_att,
-                            scatter_basis,
-                        )
+                    line_base_att = self.additive_scatter_response.total_kernel_torch(
+                        torch.ones_like(uncollided_line_att),
+                        uncollided_line_att,
+                        scatter_basis,
                     )
-                    corrected_uncollided_line_att = (
-                        self.additive_scatter_response
-                        .corrected_uncollided_kernel_torch(
-                            uncollided_line_att,
-                            scatter_basis,
-                        )
+                    corrected_uncollided_line_att = self.additive_scatter_response.corrected_uncollided_kernel_torch(
+                        uncollided_line_att,
+                        scatter_basis,
                     )
                 else:
                     line_buildup = self._buildup_factor_torch(
@@ -4571,8 +5054,7 @@ class ContinuousKernel:
                     line_base_att = uncollided_line_att * line_buildup
                     corrected_uncollided_line_att = uncollided_line_att
                 base_att = torch.sum(
-                    line_base_att
-                    * weights_t.view(1, 1, 1, -1),
+                    line_base_att * weights_t.view(1, 1, 1, -1),
                     dim=-1,
                 )
                 if line_selection is not None:
@@ -4605,6 +5087,22 @@ class ContinuousKernel:
                     ) -> "torch.Tensor | NDArray[np.float64]":
                         """Return row/pair/line components on the requested side."""
                         ordered = value.permute(1, 0, 2).detach()
+                        if return_device_components:
+                            return ordered
+                        return (
+                            ordered.cpu()
+                            .numpy()
+                            .astype(
+                                np.float64,
+                                copy=False,
+                            )
+                        )
+
+                    def _impact_component_output(
+                        value: "torch.Tensor",
+                    ) -> "torch.Tensor | NDArray[np.float64]":
+                        """Return row/pair/line/phase values on the requested side."""
+                        ordered = value.permute(1, 0, 2, 3).detach()
                         if return_device_components:
                             return ordered
                         return ordered.cpu().numpy().astype(
@@ -4690,12 +5188,8 @@ class ContinuousKernel:
                         )
                         return component_type(
                             total_kernel=_component_output(total_kernel),
-                            unattenuated_kernel=_component_output(
-                                unattenuated_kernel
-                            ),
-                            uncollided_kernel=_component_output(
-                                uncollided_kernel
-                            ),
+                            unattenuated_kernel=_component_output(unattenuated_kernel),
+                            uncollided_kernel=_component_output(uncollided_kernel),
                             tau_fe=_component_output(
                                 _weighted_feature(
                                     line_tau_fe.index_select(-1, selected)
@@ -4724,6 +5218,19 @@ class ContinuousKernel:
                             ),
                             distance_m=_component_output(
                                 _weighted_feature(response_feature)
+                            ),
+                            uncollided_impact_fractions=_impact_component_output(
+                                torch.zeros(
+                                    total_kernel.shape + (0,),
+                                    device=total_kernel.device,
+                                    dtype=total_kernel.dtype,
+                                )
+                                if impact_geometry is None
+                                else self._uncollided_impact_fractions_torch(
+                                    direct_attenuation,
+                                    impact_geometry[0],
+                                    impact_geometry[1],
+                                )
                             ),
                         )
                     selected_values = geom.view(1, -1, 1) * torch.mean(
@@ -4770,10 +5277,7 @@ class ContinuousKernel:
             raise ValueError(
                 "detector_positions and sources must have the same row count."
             )
-        if (
-            not np.all(np.isfinite(detectors))
-            or not np.all(np.isfinite(source_arr))
-        ):
+        if not np.all(np.isfinite(detectors)) or not np.all(np.isfinite(source_arr)):
             raise ValueError(
                 "detector_positions and sources must contain finite values."
             )
@@ -4795,13 +5299,11 @@ class ContinuousKernel:
         tau_obstacle = np.zeros(sampled_sources.shape[:-1], dtype=float)
         boxes = self.obstacle_boxes_m()
         if boxes.size:
-            obstacle_path_cm = (
-                _obstacle_path_lengths_between_points_by_box_cm_numpy(
-                    sampled_sources,
-                    targets,
-                    boxes,
-                    tol=tol,
-                )
+            obstacle_path_cm = _obstacle_path_lengths_between_points_by_box_cm_numpy(
+                sampled_sources,
+                targets,
+                boxes,
+                tol=tol,
             )
             obstacle_mu = self.obstacle_mu_values_cm_inv(isotope)
             tau_obstacle = np.sum(
@@ -4833,9 +5335,7 @@ class ContinuousKernel:
                 line_tau_obstacle,
             )
             attenuation = np.sum(
-                np.exp(-line_tau_obstacle)
-                * line_buildup
-                * weights.reshape(1, 1, -1),
+                np.exp(-line_tau_obstacle) * line_buildup * weights.reshape(1, 1, -1),
                 axis=-1,
             )
         else:
@@ -4864,6 +5364,7 @@ class ContinuousKernel:
         tol: float = 1.0e-12,
         positive_line_indices: object | None = None,
         return_line_transport_components: bool = False,
+        impact_parameter_edges_fraction: object | None = None,
     ) -> NDArray[np.float64] | LineTransportComponents:
         """Return selected-pair kernels for matched rows via batched NumPy."""
         line_selection = (
@@ -4874,6 +5375,14 @@ class ContinuousKernel:
                 positive_line_indices,
             )
         )
+        impact_edges = (
+            None
+            if impact_parameter_edges_fraction is None
+            else self._validated_detector_impact_edges(
+                impact_parameter_edges_fraction
+            )
+        )
+        impact_phase_count = 0 if impact_edges is None else int(impact_edges.size - 1)
         detectors = np.asarray(detector_positions, dtype=float)
         source_arr = np.asarray(sources, dtype=float)
         if detectors.ndim != 2 or detectors.shape[1] != 3:
@@ -4902,12 +5411,14 @@ class ContinuousKernel:
                     tau_obstacle=empty.copy(),
                     tau_obstacle_compton=empty.copy(),
                     distance_m=empty.copy(),
+                    uncollided_impact_fractions=np.zeros(
+                        empty.shape + (impact_phase_count,),
+                        dtype=np.float64,
+                    ),
                 )
             return np.zeros((0, line_selection.size), dtype=float)
         if return_line_transport_components and line_selection is None:
-            raise ValueError(
-                "Line transport components require positive_line_indices."
-            )
+            raise ValueError("Line transport components require positive_line_indices.")
         num_orients = int(len(self.orientations))
         fe_arr, pb_arr = validate_orientation_pair_indices(
             fe_indices,
@@ -4926,6 +5437,16 @@ class ContinuousKernel:
             source_arr,
             detectors,
             tol=tol,
+        )
+        impact_geometry = (
+            None
+            if impact_edges is None
+            else self._detector_impact_geometry_numpy(
+                sampled_sources=sampled_sources,
+                sampled_targets=targets,
+                detector_positions=detectors,
+                impact_parameter_edges_fraction=impact_edges,
+            )
         )
         response_distance = np.linalg.norm(
             sampled_sources - detectors[:, None, :],
@@ -4967,13 +5488,11 @@ class ContinuousKernel:
         tau_obstacle = np.zeros_like(tau_fe)
         boxes = self.obstacle_boxes_m()
         if boxes.size:
-            obstacle_path_cm = (
-                _obstacle_path_lengths_between_points_by_box_cm_numpy(
-                    sampled_sources,
-                    targets,
-                    boxes,
-                    tol=tol,
-                )
+            obstacle_path_cm = _obstacle_path_lengths_between_points_by_box_cm_numpy(
+                sampled_sources,
+                targets,
+                boxes,
+                tol=tol,
             )
             obstacle_mu = self.obstacle_mu_values_cm_inv(isotope)
             tau_obstacle = np.sum(
@@ -5006,8 +5525,8 @@ class ContinuousKernel:
                         obstacle_line_mu,
                         optimize=True,
                     )
-                obstacle_compton_mu = (
-                    self.obstacle_line_compton_mu_values_cm_inv(isotope)
+                obstacle_compton_mu = self.obstacle_line_compton_mu_values_cm_inv(
+                    isotope
                 )
                 if obstacle_compton_mu.shape == (
                     len(line_entries),
@@ -5047,10 +5566,7 @@ class ContinuousKernel:
                             target_pos=targets,
                             obstacle_boxes_m=boxes,
                             compton_mu_cm_inv_lb=(
-                                self
-                                .obstacle_line_compton_mu_values_cm_inv(
-                                    isotope
-                                )
+                                self.obstacle_line_compton_mu_values_cm_inv(isotope)
                             ),
                             energy_keV_l=line_energies,
                             detector_radius_m=self.detector_radius_m,
@@ -5070,10 +5586,7 @@ class ContinuousKernel:
                     energy_keV=line_energies.reshape(1, 1, -1),
                     mu_fe_cm_inv=line_mu_fe.reshape(1, 1, -1),
                     mu_pb_cm_inv=line_mu_pb.reshape(1, 1, -1),
-                    semantics=(
-                        self.additive_scatter_response
-                        .feature_basis_semantics
-                    ),
+                    semantics=(self.additive_scatter_response.feature_basis_semantics),
                     detector_radius_m=self.detector_radius_m,
                     fe_scatter_distance_m=(
                         self.shield_params.inner_radius_fe_cm
@@ -5085,9 +5598,7 @@ class ContinuousKernel:
                         + 0.5 * self.shield_params.thickness_pb_cm
                     )
                     / 100.0,
-                    obstacle_single_scatter_probability=(
-                        obstacle_single_scatter
-                    ),
+                    obstacle_single_scatter_probability=(obstacle_single_scatter),
                 )
                 line_base_attenuation = (
                     self.additive_scatter_response.total_kernel_numpy(
@@ -5097,8 +5608,7 @@ class ContinuousKernel:
                     )
                 )
                 corrected_uncollided_line_attenuation = (
-                    self.additive_scatter_response
-                    .corrected_uncollided_kernel_numpy(
+                    self.additive_scatter_response.corrected_uncollided_kernel_numpy(
                         uncollided_line_attenuation,
                         scatter_basis,
                     )
@@ -5109,12 +5619,8 @@ class ContinuousKernel:
                     line_tau_pb,
                     line_tau_obstacle,
                 )
-                line_base_attenuation = (
-                    uncollided_line_attenuation * line_buildup
-                )
-                corrected_uncollided_line_attenuation = (
-                    uncollided_line_attenuation
-                )
+                line_base_attenuation = uncollided_line_attenuation * line_buildup
+                corrected_uncollided_line_attenuation = uncollided_line_attenuation
             weight_view = weights.reshape(1, 1, -1)
             base_attenuation = np.sum(
                 line_base_attenuation * weight_view,
@@ -5145,21 +5651,16 @@ class ContinuousKernel:
             else:
                 aggregate_scale = np.ones_like(base_attenuation)
             selected_attenuation = (
-                line_base_attenuation[..., line_selection]
-                * aggregate_scale[..., None]
+                line_base_attenuation[..., line_selection] * aggregate_scale[..., None]
             )
             if return_line_transport_components:
                 selected = np.asarray(line_selection, dtype=np.int64)
-                uncollided_attenuation = (
-                    corrected_uncollided_line_attenuation[..., selected]
-                )
-                total_kernel = (
-                    geom[:, None]
-                    * np.mean(selected_attenuation, axis=1)
-                )
-                uncollided_kernel = (
-                    geom[:, None]
-                    * np.mean(uncollided_attenuation, axis=1)
+                uncollided_attenuation = corrected_uncollided_line_attenuation[
+                    ..., selected
+                ]
+                total_kernel = geom[:, None] * np.mean(selected_attenuation, axis=1)
+                uncollided_kernel = geom[:, None] * np.mean(
+                    uncollided_attenuation, axis=1
                 )
                 unattenuated_kernel = np.broadcast_to(
                     geom[:, None],
@@ -5196,10 +5697,13 @@ class ContinuousKernel:
                     values: NDArray[np.float64],
                 ) -> NDArray[np.float64]:
                     """Average one ray feature by its spectral contribution."""
-                    return np.sum(
-                        values * feature_weights,
-                        axis=1,
-                    ) / feature_weight_sum
+                    return (
+                        np.sum(
+                            values * feature_weights,
+                            axis=1,
+                        )
+                        / feature_weight_sum
+                    )
 
                 return LineTransportComponents(
                     total_kernel=np.asarray(
@@ -5232,14 +5736,24 @@ class ContinuousKernel:
                             selected_attenuation.shape,
                         )
                     ),
+                    uncollided_impact_fractions=(
+                        np.zeros(
+                            total_kernel.shape + (0,),
+                            dtype=np.float64,
+                        )
+                        if impact_geometry is None
+                        else self._uncollided_impact_fractions_numpy(
+                            direct_attenuation,
+                            impact_geometry[0],
+                            impact_geometry[1],
+                        )
+                    ),
                 )
             mean_selected_attenuation = np.mean(
                 selected_attenuation,
                 axis=1,
             )
-            return (
-                geom[:, None] * mean_selected_attenuation
-            ).astype(float, copy=False)
+            return (geom[:, None] * mean_selected_attenuation).astype(float, copy=False)
 
         attenuation = (
             np.maximum(base_attenuation, 0.0)
@@ -5368,13 +5882,11 @@ class ContinuousKernel:
                     device=device,
                     dtype=dtype,
                 )
-                obstacle_path_cm = (
-                    obstacle_path_lengths_between_points_by_box_cm_torch(
-                        source_pos=sampled_sources,
-                        target_pos=targets,
-                        obstacle_boxes_m=boxes_t,
-                        tol=tol,
-                    )
+                obstacle_path_cm = obstacle_path_lengths_between_points_by_box_cm_torch(
+                    source_pos=sampled_sources,
+                    target_pos=targets,
+                    obstacle_boxes_m=boxes_t,
+                    tol=tol,
                 )
                 tau_obstacle = self._obstacle_tau_from_lengths_torch(
                     isotope,
@@ -5441,6 +5953,7 @@ class ContinuousKernel:
         tol: float = 1e-6,
         positive_line_indices: object | None = None,
         return_line_transport_components: bool = False,
+        impact_parameter_edges_fraction: object | None = None,
     ) -> NDArray[np.float64] | LineTransportComponents:
         """Return selected Fe/Pb-pair kernels for matched detector-source rows."""
         if torch is None:
@@ -5453,6 +5966,14 @@ class ContinuousKernel:
                 positive_line_indices,
             )
         )
+        impact_edges = (
+            None
+            if impact_parameter_edges_fraction is None
+            else self._validated_detector_impact_edges(
+                impact_parameter_edges_fraction
+            )
+        )
+        impact_phase_count = 0 if impact_edges is None else int(impact_edges.size - 1)
         device = _resolve_device(self.gpu_device)
         dtype = _resolve_dtype(self.gpu_dtype)
         detectors_t = torch.as_tensor(detector_positions, device=device, dtype=dtype)
@@ -5483,12 +6004,14 @@ class ContinuousKernel:
                     tau_obstacle=empty.copy(),
                     tau_obstacle_compton=empty.copy(),
                     distance_m=empty.copy(),
+                    uncollided_impact_fractions=np.zeros(
+                        empty.shape + (impact_phase_count,),
+                        dtype=np.float64,
+                    ),
                 )
             return np.zeros((0, line_selection.size), dtype=float)
         if return_line_transport_components and line_selection is None:
-            raise ValueError(
-                "Line transport components require positive_line_indices."
-            )
+            raise ValueError("Line transport components require positive_line_indices.")
         num_orients = int(len(self.orientations))
         fe_arr, pb_arr = validate_orientation_pair_indices(
             fe_indices,
@@ -5520,6 +6043,16 @@ class ContinuousKernel:
                 sources=sources_t,
                 detector=detectors_t,
                 tol=tol,
+            )
+            impact_geometry = (
+                None
+                if impact_edges is None
+                else self._detector_impact_geometry_torch(
+                    sampled_sources=sampled_sources,
+                    sampled_targets=targets,
+                    detector_positions=detectors_t,
+                    impact_parameter_edges_fraction=impact_edges,
+                )
             )
             sampled_direction = targets - sampled_sources
             sampled_dist = torch.linalg.norm(sampled_direction, dim=-1)
@@ -5635,8 +6168,7 @@ class ContinuousKernel:
                     if candidate_tau is not None:
                         line_tau_obstacle = candidate_tau
                     candidate_compton_tau = (
-                        self
-                        ._obstacle_line_compton_tau_from_lengths_torch(
+                        self._obstacle_line_compton_tau_from_lengths_torch(
                             isotope,
                             obstacle_path_cm,
                             line_count=len(line_entries),
@@ -5657,20 +6189,16 @@ class ContinuousKernel:
                     line_energies = self._line_energy_values_keV(isotope)
                     if len(line_energies) != len(line_entries):
                         raise RuntimeError(
-                            "Additive scatter requires exact positive-line "
-                            "energies."
+                            "Additive scatter requires exact positive-line energies."
                         )
                     obstacle_single_scatter = None
                     if (
                         obstacle_path_cm is not None
-                        and self.additive_scatter_response
-                        .feature_basis_semantics
+                        and self.additive_scatter_response.feature_basis_semantics
                         in DETECTOR_CONE_SCATTER_BASIS_SEMANTICS
                     ):
                         obstacle_compton_mu = torch.as_tensor(
-                            self.obstacle_line_compton_mu_values_cm_inv(
-                                isotope
-                            ),
+                            self.obstacle_line_compton_mu_values_cm_inv(isotope),
                             device=device,
                             dtype=dtype,
                         )
@@ -5694,9 +6222,7 @@ class ContinuousKernel:
                         tau_fe=line_tau_fe,
                         tau_pb=line_tau_pb,
                         tau_obstacle=line_tau_obstacle,
-                        tau_obstacle_compton=(
-                            line_tau_obstacle_compton
-                        ),
+                        tau_obstacle_compton=(line_tau_obstacle_compton),
                         distance_m=torch.broadcast_to(
                             response_distance.unsqueeze(-1),
                             line_total_tau.shape,
@@ -5709,8 +6235,7 @@ class ContinuousKernel:
                         mu_fe_cm_inv=mu_fe_t.view(1, 1, -1),
                         mu_pb_cm_inv=mu_pb_t.view(1, 1, -1),
                         semantics=(
-                            self.additive_scatter_response
-                            .feature_basis_semantics
+                            self.additive_scatter_response.feature_basis_semantics
                         ),
                         detector_radius_m=self.detector_radius_m,
                         fe_scatter_distance_m=(
@@ -5723,23 +6248,16 @@ class ContinuousKernel:
                             + 0.5 * self.shield_params.thickness_pb_cm
                         )
                         / 100.0,
-                        obstacle_single_scatter_probability=(
-                            obstacle_single_scatter
-                        ),
+                        obstacle_single_scatter_probability=(obstacle_single_scatter),
                     )
-                    line_base_att = (
-                        self.additive_scatter_response.total_kernel_torch(
-                            torch.ones_like(uncollided_line_att),
-                            uncollided_line_att,
-                            scatter_basis,
-                        )
+                    line_base_att = self.additive_scatter_response.total_kernel_torch(
+                        torch.ones_like(uncollided_line_att),
+                        uncollided_line_att,
+                        scatter_basis,
                     )
-                    corrected_uncollided_line_att = (
-                        self.additive_scatter_response
-                        .corrected_uncollided_kernel_torch(
-                            uncollided_line_att,
-                            scatter_basis,
-                        )
+                    corrected_uncollided_line_att = self.additive_scatter_response.corrected_uncollided_kernel_torch(
+                        uncollided_line_att,
+                        scatter_basis,
                     )
                 else:
                     line_buildup = self._buildup_factor_torch(
@@ -5747,9 +6265,7 @@ class ContinuousKernel:
                         line_tau_pb,
                         line_tau_obstacle,
                     )
-                    line_base_att = (
-                        uncollided_line_att * line_buildup
-                    )
+                    line_base_att = uncollided_line_att * line_buildup
                     corrected_uncollided_line_att = uncollided_line_att
                 base_att = torch.sum(
                     line_base_att * weights_t.view(1, 1, -1),
@@ -5792,11 +6308,9 @@ class ContinuousKernel:
                         device=device,
                         dtype=torch.long,
                     )
-                    uncollided_attenuation = (
-                        corrected_uncollided_line_att.index_select(
-                            -1,
-                            selected,
-                        )
+                    uncollided_attenuation = corrected_uncollided_line_att.index_select(
+                        -1,
+                        selected,
                     )
                     total_kernel = geom.unsqueeze(-1) * torch.mean(
                         selected_attenuation,
@@ -5828,8 +6342,7 @@ class ContinuousKernel:
                         keepdim=True,
                     )
                     feature_weights = torch.where(
-                        scatter_weight_sum
-                        > torch.finfo(dtype).tiny,
+                        scatter_weight_sum > torch.finfo(dtype).tiny,
                         scatter_weights,
                         fallback_weights,
                     )
@@ -5850,29 +6363,18 @@ class ContinuousKernel:
                     def _as_numpy(value: "torch.Tensor") -> NDArray[np.float64]:
                         """Return one detached float64 component array."""
                         return (
-                            value.detach()
-                            .cpu()
-                            .numpy()
-                            .astype(np.float64, copy=False)
+                            value.detach().cpu().numpy().astype(np.float64, copy=False)
                         )
 
                     return LineTransportComponents(
                         total_kernel=_as_numpy(total_kernel),
-                        unattenuated_kernel=_as_numpy(
-                            unattenuated_kernel
-                        ),
-                        uncollided_kernel=_as_numpy(
-                            uncollided_kernel
-                        ),
+                        unattenuated_kernel=_as_numpy(unattenuated_kernel),
+                        uncollided_kernel=_as_numpy(uncollided_kernel),
                         tau_fe=_as_numpy(
-                            _weighted_feature(
-                                line_tau_fe.index_select(-1, selected)
-                            )
+                            _weighted_feature(line_tau_fe.index_select(-1, selected))
                         ),
                         tau_pb=_as_numpy(
-                            _weighted_feature(
-                                line_tau_pb.index_select(-1, selected)
-                            )
+                            _weighted_feature(line_tau_pb.index_select(-1, selected))
                         ),
                         tau_obstacle=_as_numpy(
                             _weighted_feature(
@@ -5898,18 +6400,26 @@ class ContinuousKernel:
                                 )
                             )
                         ),
+                        uncollided_impact_fractions=_as_numpy(
+                            torch.zeros(
+                                total_kernel.shape + (0,),
+                                device=total_kernel.device,
+                                dtype=total_kernel.dtype,
+                            )
+                            if impact_geometry is None
+                            else self._uncollided_impact_fractions_torch(
+                                direct_attenuation,
+                                impact_geometry[0],
+                                impact_geometry[1],
+                            )
+                        ),
                     )
                 selected_attenuation = torch.mean(
                     selected_attenuation,
                     dim=1,
                 )
                 selected_values = geom.unsqueeze(-1) * selected_attenuation
-                return (
-                    selected_values.detach()
-                    .cpu()
-                    .numpy()
-                    .astype(float, copy=False)
-                )
+                return selected_values.detach().cpu().numpy().astype(float, copy=False)
             att = torch.mean(att, dim=-1)
             values = geom * att
         return values.detach().cpu().numpy().astype(float, copy=False)
@@ -6019,8 +6529,7 @@ class ContinuousKernel:
             )
             return np.concatenate(
                 [
-                    self
-                    ._kernel_values_selected_pairs_for_detector_source_numpy_chunk(
+                    self._kernel_values_selected_pairs_for_detector_source_numpy_chunk(
                         isotope=isotope,
                         detector_positions=detectors[start:stop],
                         sources=source_rows[start:stop],
@@ -6045,15 +6554,12 @@ class ContinuousKernel:
 
         def _evaluate(start: int, stop: int) -> NDArray[np.float64]:
             """Evaluate one matched selected-pair Torch chunk."""
-            return (
-                self
-                ._kernel_values_selected_pairs_for_detector_source_torch_chunk(
-                    isotope=isotope,
-                    detector_positions=detectors[start:stop],
-                    sources=source_rows[start:stop],
-                    fe_indices=fe_arr[start:stop],
-                    pb_indices=pb_arr[start:stop],
-                )
+            return self._kernel_values_selected_pairs_for_detector_source_torch_chunk(
+                isotope=isotope,
+                detector_positions=detectors[start:stop],
+                sources=source_rows[start:stop],
+                fe_indices=fe_arr[start:stop],
+                pb_indices=pb_arr[start:stop],
             )
 
         parts, _ = self._evaluate_torch_chunks_with_oom_retry(
@@ -6112,9 +6618,7 @@ class ContinuousKernel:
                         sources=sources_arr[source_indices],
                     )
                 )
-            flat_values = (
-                np.concatenate(parts) if parts else np.zeros(0, dtype=float)
-            )
+            flat_values = np.concatenate(parts) if parts else np.zeros(0, dtype=float)
             return flat_values.reshape(pose_count, source_count)
 
         self._gpu_enabled()
@@ -6149,9 +6653,7 @@ class ContinuousKernel:
             device=device,
             evaluator=_evaluate_unshielded_detector_source_chunk,
         )
-        flat_values = (
-            np.concatenate(parts) if parts else np.zeros(0, dtype=float)
-        )
+        flat_values = np.concatenate(parts) if parts else np.zeros(0, dtype=float)
         return flat_values.reshape(pose_count, source_count)
 
     def kernel_values_all_pairs(
@@ -6410,9 +6912,7 @@ class ContinuousKernel:
             or sources_arr.shape[1] != 3
             or np.any(~np.isfinite(sources_arr))
         ):
-            raise ValueError(
-                "sources must contain finite values with shape (S, 3)."
-        )
+            raise ValueError("sources must contain finite values with shape (S, 3).")
         pose_count = int(detectors_arr.shape[0])
         source_count = int(sources_arr.shape[0])
         orientation_count = int(len(self.orientations))
@@ -6487,8 +6987,7 @@ class ContinuousKernel:
             ) -> NDArray[np.float64]:
                 """Return matched-row line kernels for one Torch chunk."""
                 return (
-                    self
-                    ._kernel_values_selected_pairs_for_detector_source_torch_chunk(
+                    self._kernel_values_selected_pairs_for_detector_source_torch_chunk(
                         isotope=isotope,
                         detector_positions=detectors_flat[start:stop],
                         sources=sources_flat[start:stop],
@@ -6518,10 +7017,7 @@ class ContinuousKernel:
         self._line_response_cache[cache_key] = cached_result
         while (
             len(self._line_response_cache) > _LINE_RESPONSE_CACHE_MAX_ENTRIES
-            or sum(
-                int(values.nbytes)
-                for values in self._line_response_cache.values()
-            )
+            or sum(int(values.nbytes) for values in self._line_response_cache.values())
             > _LINE_RESPONSE_CACHE_MAX_BYTES
         ):
             self._line_response_cache.pop(next(iter(self._line_response_cache)))
@@ -6536,6 +7032,8 @@ class ContinuousKernel:
         pb_indices: NDArray[np.int64],
         positive_line_indices: object,
         chunk_size: int = 262144,
+        *,
+        impact_parameter_edges_fraction: object | None = None,
     ) -> LineTransportComponents:
         """Return view-by-source-by-line spectral transport components.
 
@@ -6551,6 +7049,14 @@ class ContinuousKernel:
             isotope,
             positive_line_indices,
         )
+        impact_edges = (
+            None
+            if impact_parameter_edges_fraction is None
+            else self._validated_detector_impact_edges(
+                impact_parameter_edges_fraction
+            )
+        )
+        impact_phase_count = 0 if impact_edges is None else int(impact_edges.size - 1)
         detectors_arr = np.asarray(detector_positions, dtype=np.float64)
         sources_arr = np.asarray(sources, dtype=np.float64)
         if (
@@ -6566,9 +7072,7 @@ class ContinuousKernel:
             or sources_arr.shape[1] != 3
             or np.any(~np.isfinite(sources_arr))
         ):
-            raise ValueError(
-                "sources must contain finite values with shape (S, 3)."
-            )
+            raise ValueError("sources must contain finite values with shape (S, 3).")
         view_count = int(detectors_arr.shape[0])
         source_count = int(sources_arr.shape[0])
         orientation_count = int(len(self.orientations))
@@ -6594,6 +7098,10 @@ class ContinuousKernel:
                 tau_obstacle=empty.copy(),
                 tau_obstacle_compton=empty.copy(),
                 distance_m=empty.copy(),
+                uncollided_impact_fractions=np.zeros(
+                    output_shape + (impact_phase_count,),
+                    dtype=np.float64,
+                ),
             )
         detectors_flat = np.repeat(detectors_arr, source_count, axis=0)
         sources_flat = np.tile(sources_arr, (view_count, 1))
@@ -6613,6 +7121,7 @@ class ContinuousKernel:
                     pb_indices=pb_flat[start:stop],
                     positive_line_indices=line_selection,
                     return_line_transport_components=True,
+                    impact_parameter_edges_fraction=impact_edges,
                 )
                 for start in range(0, sources_flat.shape[0], chunk)
                 for stop in [min(start + chunk, sources_flat.shape[0])]
@@ -6636,8 +7145,7 @@ class ContinuousKernel:
             ) -> LineTransportComponents:
                 """Return physical line components for one Torch chunk."""
                 result = (
-                    self
-                    ._kernel_values_selected_pairs_for_detector_source_torch_chunk(
+                    self._kernel_values_selected_pairs_for_detector_source_torch_chunk(
                         isotope=isotope,
                         detector_positions=detectors_flat[start:stop],
                         sources=sources_flat[start:stop],
@@ -6645,6 +7153,7 @@ class ContinuousKernel:
                         pb_indices=pb_flat[start:stop],
                         positive_line_indices=line_selection,
                         return_line_transport_components=True,
+                        impact_parameter_edges_fraction=impact_edges,
                     )
                 )
                 if not isinstance(result, LineTransportComponents):
@@ -6684,6 +7193,26 @@ class ContinuousKernel:
             )
             return flat.reshape(output_shape)
 
+        def _joined_impact() -> NDArray[np.float64]:
+            """Concatenate and reshape detector-impact phase fractions."""
+            values = [
+                np.asarray(
+                    part.uncollided_impact_fractions,
+                    dtype=np.float64,
+                )
+                for part in parts
+                if isinstance(part, LineTransportComponents)
+            ]
+            flat = (
+                np.concatenate(values, axis=0)
+                if values
+                else np.zeros(
+                    (0, int(line_selection.size), impact_phase_count),
+                    dtype=np.float64,
+                )
+            )
+            return flat.reshape(output_shape + (impact_phase_count,))
+
         return LineTransportComponents(
             total_kernel=_joined("total_kernel"),
             unattenuated_kernel=_joined("unattenuated_kernel"),
@@ -6693,6 +7222,7 @@ class ContinuousKernel:
             tau_obstacle=_joined("tau_obstacle"),
             tau_obstacle_compton=_joined("tau_obstacle_compton"),
             distance_m=_joined("distance_m"),
+            uncollided_impact_fractions=_joined_impact(),
         )
 
     def line_transport_components_all_pairs_for_detectors(
@@ -6704,6 +7234,7 @@ class ContinuousKernel:
         chunk_size: int = 262144,
         *,
         working_memory_budget_bytes: int | None = None,
+        impact_parameter_edges_fraction: object | None = None,
     ) -> LineTransportComponents:
         """Return transport components for every detector and shield pair.
 
@@ -6720,13 +7251,19 @@ class ContinuousKernel:
             or not isinstance(working_memory_budget_bytes, (int, np.integer))
             or int(working_memory_budget_bytes) <= 0
         ):
-            raise ValueError(
-                "working_memory_budget_bytes must be a positive integer."
-            )
+            raise ValueError("working_memory_budget_bytes must be a positive integer.")
         line_selection = self._validated_positive_line_indices(
             isotope,
             positive_line_indices,
         )
+        impact_edges = (
+            None
+            if impact_parameter_edges_fraction is None
+            else self._validated_detector_impact_edges(
+                impact_parameter_edges_fraction
+            )
+        )
+        impact_phase_count = 0 if impact_edges is None else int(impact_edges.size - 1)
         detectors_arr = np.asarray(detector_positions, dtype=np.float64)
         sources_arr = np.asarray(sources, dtype=np.float64)
         if (
@@ -6742,9 +7279,7 @@ class ContinuousKernel:
             or sources_arr.shape[1] != 3
             or np.any(~np.isfinite(sources_arr))
         ):
-            raise ValueError(
-                "sources must contain finite values with shape (S, 3)."
-            )
+            raise ValueError("sources must contain finite values with shape (S, 3).")
         detector_count = int(detectors_arr.shape[0])
         source_count = int(sources_arr.shape[0])
         orientation_count = int(len(self.orientations))
@@ -6767,6 +7302,10 @@ class ContinuousKernel:
                 tau_obstacle=empty.copy(),
                 tau_obstacle_compton=empty.copy(),
                 distance_m=empty.copy(),
+                uncollided_impact_fractions=np.zeros(
+                    output_shape + (impact_phase_count,),
+                    dtype=np.float64,
+                ),
             )
         if not self.use_gpu:
             cpu_chunk_size = int(chunk_size)
@@ -6776,9 +7315,7 @@ class ContinuousKernel:
                     isotope=isotope,
                     orientation_pair_count=pair_count,
                     dtype_bytes=np.dtype(np.float64).itemsize,
-                    working_memory_budget_bytes=int(
-                        working_memory_budget_bytes
-                    ),
+                    working_memory_budget_bytes=int(working_memory_budget_bytes),
                 )
             pair_ids = np.arange(pair_count, dtype=np.int64)
             repeated_detectors = np.repeat(
@@ -6802,6 +7339,7 @@ class ContinuousKernel:
                 pb_indices=pb_indices,
                 positive_line_indices=line_selection,
                 chunk_size=cpu_chunk_size,
+                impact_parameter_edges_fraction=impact_edges,
             )
 
             def _cpu_field(field_name: str) -> NDArray[np.float64]:
@@ -6811,6 +7349,13 @@ class ContinuousKernel:
                     dtype=np.float64,
                 ).reshape(output_shape)
 
+            def _cpu_impact_field() -> NDArray[np.float64]:
+                """Reshape selected-pair detector-impact fractions."""
+                return np.asarray(
+                    selected.uncollided_impact_fractions,
+                    dtype=np.float64,
+                ).reshape(output_shape + (impact_phase_count,))
+
             return LineTransportComponents(
                 total_kernel=_cpu_field("total_kernel"),
                 unattenuated_kernel=_cpu_field("unattenuated_kernel"),
@@ -6818,10 +7363,9 @@ class ContinuousKernel:
                 tau_fe=_cpu_field("tau_fe"),
                 tau_pb=_cpu_field("tau_pb"),
                 tau_obstacle=_cpu_field("tau_obstacle"),
-                tau_obstacle_compton=_cpu_field(
-                    "tau_obstacle_compton"
-                ),
+                tau_obstacle_compton=_cpu_field("tau_obstacle_compton"),
                 distance_m=_cpu_field("distance_m"),
+                uncollided_impact_fractions=_cpu_impact_field(),
             )
 
         self._gpu_enabled()
@@ -6854,6 +7398,7 @@ class ContinuousKernel:
                 sources=sources_flat[start:stop],
                 positive_line_indices=line_selection,
                 return_line_transport_components=True,
+                impact_parameter_edges_fraction=impact_edges,
             )
             if not isinstance(result, LineTransportComponents):
                 raise RuntimeError(
@@ -6897,6 +7442,32 @@ class ContinuousKernel:
                 line_count,
             ).transpose(0, 2, 1, 3)
 
+        def _gpu_impact_field() -> NDArray[np.float64]:
+            """Concatenate and order all-pair detector-impact fractions."""
+            rows = [
+                np.asarray(
+                    part.uncollided_impact_fractions,
+                    dtype=np.float64,
+                )
+                for part in parts
+                if isinstance(part, LineTransportComponents)
+            ]
+            flat = (
+                np.concatenate(rows, axis=0)
+                if rows
+                else np.zeros(
+                    (0, pair_count, line_count, impact_phase_count),
+                    dtype=np.float64,
+                )
+            )
+            return flat.reshape(
+                detector_count,
+                source_count,
+                pair_count,
+                line_count,
+                impact_phase_count,
+            ).transpose(0, 2, 1, 3, 4)
+
         return LineTransportComponents(
             total_kernel=_gpu_field("total_kernel"),
             unattenuated_kernel=_gpu_field("unattenuated_kernel"),
@@ -6904,10 +7475,9 @@ class ContinuousKernel:
             tau_fe=_gpu_field("tau_fe"),
             tau_pb=_gpu_field("tau_pb"),
             tau_obstacle=_gpu_field("tau_obstacle"),
-            tau_obstacle_compton=_gpu_field(
-                "tau_obstacle_compton"
-            ),
+            tau_obstacle_compton=_gpu_field("tau_obstacle_compton"),
             distance_m=_gpu_field("distance_m"),
+            uncollided_impact_fractions=_gpu_impact_field(),
         )
 
     def line_transport_components_pair_program_for_detectors(
@@ -6922,6 +7492,7 @@ class ContinuousKernel:
         *,
         device_resident: bool = False,
         working_memory_budget_bytes: int | None = None,
+        impact_parameter_edges_fraction: object | None = None,
     ) -> LineTransportComponents | DeviceLineTransportComponents:
         """Return components for one shield program at every detector.
 
@@ -6938,13 +7509,19 @@ class ContinuousKernel:
             or not isinstance(working_memory_budget_bytes, (int, np.integer))
             or int(working_memory_budget_bytes) <= 0
         ):
-            raise ValueError(
-                "working_memory_budget_bytes must be a positive integer."
-            )
+            raise ValueError("working_memory_budget_bytes must be a positive integer.")
         line_selection = self._validated_positive_line_indices(
             isotope,
             positive_line_indices,
         )
+        impact_edges = (
+            None
+            if impact_parameter_edges_fraction is None
+            else self._validated_detector_impact_edges(
+                impact_parameter_edges_fraction
+            )
+        )
+        impact_phase_count = 0 if impact_edges is None else int(impact_edges.size - 1)
         detectors_arr = np.asarray(detector_positions, dtype=np.float64)
         sources_arr = np.asarray(sources, dtype=np.float64)
         raw_fe = np.asarray(fe_indices)
@@ -6962,9 +7539,7 @@ class ContinuousKernel:
             or sources_arr.shape[1] != 3
             or np.any(~np.isfinite(sources_arr))
         ):
-            raise ValueError(
-                "sources must contain finite values with shape (S, 3)."
-            )
+            raise ValueError("sources must contain finite values with shape (S, 3).")
         if (
             raw_fe.ndim != 2
             or raw_pb.shape != raw_fe.shape
@@ -6998,9 +7573,7 @@ class ContinuousKernel:
         if detector_count == 0 or source_count == 0:
             if device_resident:
                 if not self.use_gpu:
-                    raise ValueError(
-                        "Device-resident components require the GPU path."
-                    )
+                    raise ValueError("Device-resident components require the GPU path.")
                 self._gpu_enabled()
                 empty_device = torch.zeros(
                     output_shape,
@@ -7016,6 +7589,11 @@ class ContinuousKernel:
                     tau_obstacle=empty_device.clone(),
                     tau_obstacle_compton=empty_device.clone(),
                     distance_m=empty_device.clone(),
+                    uncollided_impact_fractions=torch.zeros(
+                        output_shape + (impact_phase_count,),
+                        device=empty_device.device,
+                        dtype=empty_device.dtype,
+                    ),
                 )
             empty = np.zeros(output_shape, dtype=np.float64)
             return LineTransportComponents(
@@ -7027,12 +7605,14 @@ class ContinuousKernel:
                 tau_obstacle=empty.copy(),
                 tau_obstacle_compton=empty.copy(),
                 distance_m=empty.copy(),
+                uncollided_impact_fractions=np.zeros(
+                    output_shape + (impact_phase_count,),
+                    dtype=np.float64,
+                ),
             )
         if not self.use_gpu:
             if device_resident:
-                raise ValueError(
-                    "Device-resident components require the GPU path."
-                )
+                raise ValueError("Device-resident components require the GPU path.")
             cpu_chunk_size = int(chunk_size)
             if working_memory_budget_bytes is not None:
                 cpu_chunk_size = self._explicit_line_transport_source_chunk_size(
@@ -7040,25 +7620,22 @@ class ContinuousKernel:
                     isotope=isotope,
                     orientation_pair_count=view_count,
                     dtype_bytes=np.dtype(np.float64).itemsize,
-                    working_memory_budget_bytes=int(
-                        working_memory_budget_bytes
-                    ),
+                    working_memory_budget_bytes=int(working_memory_budget_bytes),
                 )
             repeated_detectors = np.repeat(
                 detectors_arr,
                 view_count,
                 axis=0,
             )
-            selected = (
-                self.line_transport_components_selected_pairs_for_detectors(
-                    isotope=isotope,
-                    detector_positions=repeated_detectors,
-                    sources=sources_arr,
-                    fe_indices=fe_program.reshape(-1),
-                    pb_indices=pb_program.reshape(-1),
-                    positive_line_indices=line_selection,
-                    chunk_size=cpu_chunk_size,
-                )
+            selected = self.line_transport_components_selected_pairs_for_detectors(
+                isotope=isotope,
+                detector_positions=repeated_detectors,
+                sources=sources_arr,
+                fe_indices=fe_program.reshape(-1),
+                pb_indices=pb_program.reshape(-1),
+                positive_line_indices=line_selection,
+                chunk_size=cpu_chunk_size,
+                impact_parameter_edges_fraction=impact_edges,
             )
 
             def _cpu_field(field_name: str) -> NDArray[np.float64]:
@@ -7068,6 +7645,13 @@ class ContinuousKernel:
                     dtype=np.float64,
                 ).reshape(output_shape)
 
+            def _cpu_impact_field() -> NDArray[np.float64]:
+                """Reshape selected-program detector-impact fractions."""
+                return np.asarray(
+                    selected.uncollided_impact_fractions,
+                    dtype=np.float64,
+                ).reshape(output_shape + (impact_phase_count,))
+
             return LineTransportComponents(
                 total_kernel=_cpu_field("total_kernel"),
                 unattenuated_kernel=_cpu_field("unattenuated_kernel"),
@@ -7075,10 +7659,9 @@ class ContinuousKernel:
                 tau_fe=_cpu_field("tau_fe"),
                 tau_pb=_cpu_field("tau_pb"),
                 tau_obstacle=_cpu_field("tau_obstacle"),
-                tau_obstacle_compton=_cpu_field(
-                    "tau_obstacle_compton"
-                ),
+                tau_obstacle_compton=_cpu_field("tau_obstacle_compton"),
                 distance_m=_cpu_field("distance_m"),
+                uncollided_impact_fractions=_cpu_impact_field(),
             )
 
         self._gpu_enabled()
@@ -7115,17 +7698,16 @@ class ContinuousKernel:
             stop: int,
         ) -> LineTransportComponents | DeviceLineTransportComponents:
             """Return selected-program components for one geometry chunk."""
-            result = (
-                self._kernel_values_all_pairs_for_detector_source_torch_chunk(
-                    isotope=isotope,
-                    detector_positions=detectors_flat[start:stop],
-                    sources=sources_flat[start:stop],
-                    positive_line_indices=line_selection,
-                    return_line_transport_components=True,
-                    return_device_components=device_resident,
-                    fe_indices_by_row=fe_by_row[start:stop],
-                    pb_indices_by_row=pb_by_row[start:stop],
-                )
+            result = self._kernel_values_all_pairs_for_detector_source_torch_chunk(
+                isotope=isotope,
+                detector_positions=detectors_flat[start:stop],
+                sources=sources_flat[start:stop],
+                positive_line_indices=line_selection,
+                return_line_transport_components=True,
+                return_device_components=device_resident,
+                fe_indices_by_row=fe_by_row[start:stop],
+                pb_indices_by_row=pb_by_row[start:stop],
+                impact_parameter_edges_fraction=impact_edges,
             )
             expected_type = (
                 DeviceLineTransportComponents
@@ -7133,9 +7715,7 @@ class ContinuousKernel:
                 else LineTransportComponents
             )
             if not isinstance(result, expected_type):
-                raise RuntimeError(
-                    "Torch pair-program path returned scalar kernels."
-                )
+                raise RuntimeError("Torch pair-program path returned scalar kernels.")
             return result
 
         if device_resident:
@@ -7162,6 +7742,11 @@ class ContinuousKernel:
                 )
                 for field_name in field_names
             }
+            impact_buffer = torch.empty(
+                flat_shape + (impact_phase_count,),
+                device=device,
+                dtype=dtype,
+            )
             active_chunk = max(
                 1,
                 min(int(chunk), int(sources_flat.shape[0])),
@@ -7189,16 +7774,21 @@ class ContinuousKernel:
                         values = getattr(part, field_name)
                         if tuple(values.shape) != expected_chunk_shape:
                             raise RuntimeError(
-                                "Pair-program component chunk has an invalid "
-                                "shape."
+                                "Pair-program component chunk has an invalid shape."
                             )
                         buffers[field_name][start:stop].copy_(values)
+                    impact_values = part.uncollided_impact_fractions
+                    expected_impact_shape = expected_chunk_shape + (
+                        impact_phase_count,
+                    )
+                    if tuple(impact_values.shape) != expected_impact_shape:
+                        raise RuntimeError(
+                            "Pair-program detector-impact chunk has an invalid shape."
+                        )
+                    impact_buffer[start:stop].copy_(impact_values)
                 except RuntimeError as error:
                     part = None
-                    if (
-                        not self._is_cuda_out_of_memory(error)
-                        or active_chunk <= 1
-                    ):
+                    if not self._is_cuda_out_of_memory(error) or active_chunk <= 1:
                         raise
                     active_chunk = max(1, active_chunk // 2)
                     retry_after_oom = True
@@ -7210,12 +7800,28 @@ class ContinuousKernel:
 
             def _device_field(field_name: str) -> "torch.Tensor":
                 """Return one preallocated component in public layout."""
-                return buffers[field_name].reshape(
-                    detector_count,
-                    source_count,
-                    view_count,
-                    line_count,
-                ).permute(0, 2, 1, 3)
+                return (
+                    buffers[field_name]
+                    .reshape(
+                        detector_count,
+                        source_count,
+                        view_count,
+                        line_count,
+                    )
+                    .permute(0, 2, 1, 3)
+                )
+
+            def _device_impact_field() -> "torch.Tensor":
+                """Return detector-impact fractions in public layout."""
+                return (
+                    impact_buffer.reshape(
+                        detector_count,
+                        source_count,
+                        view_count,
+                        line_count,
+                        impact_phase_count,
+                    ).permute(0, 2, 1, 3, 4)
+                )
 
             return DeviceLineTransportComponents(
                 total_kernel=_device_field("total_kernel"),
@@ -7224,10 +7830,9 @@ class ContinuousKernel:
                 tau_fe=_device_field("tau_fe"),
                 tau_pb=_device_field("tau_pb"),
                 tau_obstacle=_device_field("tau_obstacle"),
-                tau_obstacle_compton=_device_field(
-                    "tau_obstacle_compton"
-                ),
+                tau_obstacle_compton=_device_field("tau_obstacle_compton"),
                 distance_m=_device_field("distance_m"),
+                uncollided_impact_fractions=_device_impact_field(),
             )
 
         parts, _ = self._evaluate_torch_chunks_with_oom_retry(
@@ -7237,9 +7842,7 @@ class ContinuousKernel:
             evaluator=_evaluate_component_chunk,
         )
         if any(not isinstance(part, LineTransportComponents) for part in parts):
-            raise RuntimeError(
-                "Pair-program component chunks returned device arrays."
-            )
+            raise RuntimeError("Pair-program component chunks returned device arrays.")
 
         def _gpu_field(field_name: str) -> NDArray[np.float64]:
             """Concatenate one selected-program GPU component field."""
@@ -7266,6 +7869,32 @@ class ContinuousKernel:
                 line_count,
             ).transpose(0, 2, 1, 3)
 
+        def _gpu_impact_field() -> NDArray[np.float64]:
+            """Concatenate selected-program detector-impact fractions."""
+            rows = [
+                np.asarray(
+                    part.uncollided_impact_fractions,
+                    dtype=np.float64,
+                )
+                for part in parts
+                if isinstance(part, LineTransportComponents)
+            ]
+            flat = (
+                np.concatenate(rows, axis=0)
+                if rows
+                else np.zeros(
+                    (0, view_count, line_count, impact_phase_count),
+                    dtype=np.float64,
+                )
+            )
+            return flat.reshape(
+                detector_count,
+                source_count,
+                view_count,
+                line_count,
+                impact_phase_count,
+            ).transpose(0, 2, 1, 3, 4)
+
         return LineTransportComponents(
             total_kernel=_gpu_field("total_kernel"),
             unattenuated_kernel=_gpu_field("unattenuated_kernel"),
@@ -7273,10 +7902,9 @@ class ContinuousKernel:
             tau_fe=_gpu_field("tau_fe"),
             tau_pb=_gpu_field("tau_pb"),
             tau_obstacle=_gpu_field("tau_obstacle"),
-            tau_obstacle_compton=_gpu_field(
-                "tau_obstacle_compton"
-            ),
+            tau_obstacle_compton=_gpu_field("tau_obstacle_compton"),
             distance_m=_gpu_field("distance_m"),
+            uncollided_impact_fractions=_gpu_impact_field(),
         )
 
     def _kernel_values_pair_scalar_oracle(

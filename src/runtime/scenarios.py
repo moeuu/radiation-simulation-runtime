@@ -21,8 +21,6 @@ from runtime.randomness import (
     normalize_random_seed,
 )
 from runtime.experiment_profiles import (
-    DEFAULT_EXPERIMENT_PROFILE_ID,
-    default_private_scene_variant_id,
     require_experiment_profile,
     require_private_scene_variant,
 )
@@ -97,9 +95,9 @@ def build_random_surface_scenario(
     scene_seed: int,
     measurement_log_output_dir: str | Path,
     run_id: str,
+    experiment_profile_id: str,
+    scene_variant_id: str,
     runtime_config_path: str | Path | None = None,
-    experiment_profile_id: str = DEFAULT_EXPERIMENT_PROFILE_ID,
-    scene_variant_id: str | None = None,
     metadata: Mapping[str, object] | None = None,
 ) -> dict[str, Any]:
     """Build one action-free private scenario from a runtime experiment.
@@ -110,14 +108,9 @@ def build_random_surface_scenario(
     """
     seed = normalize_random_seed(scene_seed)
     profile = require_experiment_profile(experiment_profile_id)
-    selected_variant_id = (
-        default_private_scene_variant_id(profile.profile_id)
-        if scene_variant_id is None
-        else str(scene_variant_id)
-    )
     scene_variant = require_private_scene_variant(
         profile.profile_id,
-        selected_variant_id,
+        scene_variant_id,
     )
     isotope_sequence = scene_variant.isotope_sequence
     candidate_isotopes = profile.candidate_isotopes
@@ -211,9 +204,7 @@ def build_random_surface_scenario(
         "absorber_transport_boxes_m": [
             list(box) for box in grid.absorber_transport_boxes_m
         ],
-        "absorber_transport_contract_sha256": (
-            grid.absorber_transport_contract_sha256
-        ),
+        "absorber_transport_contract_sha256": (grid.absorber_transport_contract_sha256),
         "transport_mu_by_isotope": {
             isotope: [float(value) for value in values]
             for isotope, values in grid.transport_mu_by_isotope.items()
@@ -237,10 +228,11 @@ def build_random_surface_scenario(
     run_metadata.update(
         {
             "scenario_family": (
-                f"random_physical_surface_v1:{profile.profile_id}:{selected_variant_id}"
+                "random_physical_surface_v1:"
+                f"{profile.profile_id}:{scene_variant.variant_id}"
             ),
             "experiment_profile_id": profile.profile_id,
-            "private_scene_variant_id": selected_variant_id,
+            "private_scene_variant_id": scene_variant.variant_id,
             "scene_seed": int(seed),
             "scene_rng_provenance": named_rng_provenance(
                 seed,

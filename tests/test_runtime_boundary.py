@@ -17,6 +17,7 @@ from runtime.session import (
 )
 from sim.protocol import SimulationCommand, SimulationObservation
 from sim.runtime import SimulationRuntime
+from spectrum.detector_green_operator import DETECTOR_GREEN_SAMPLING_MODE
 
 
 def test_observation_model_import_is_independent_of_sim_import_order() -> None:
@@ -62,9 +63,7 @@ class _FakeRuntime(SimulationRuntime):
             "spectrum_counts": [2, 3],
             "energy_bin_edges_keV": [0.0, 1.0, 2.0],
             "metadata": {
-                "detector_response_sampling_mode": (
-                    "multinomial_marking_with_nonparalyzable_event_time"
-                ),
+                "detector_response_sampling_mode": DETECTOR_GREEN_SAMPLING_MODE,
                 "physics_profile": "em_option4",
                 "dwell_time_s": command.dwell_time_s,
             },

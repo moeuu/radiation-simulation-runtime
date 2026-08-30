@@ -240,6 +240,31 @@ def _outward_tangent_axes(
     )
 
 
+def _outward_tangent_axes_torch(
+    sides: object,
+    u_axes_xyz: object,
+    v_axes_xyz: object,
+) -> object:
+    """Return rectangle-side outward tangent axes for Torch batches."""
+    import torch
+
+    if not all(torch.is_tensor(value) for value in (sides, u_axes_xyz, v_axes_xyz)):
+        raise TypeError("Torch outward tangent axes require tensor inputs.")
+    return torch.where(
+        (sides == _U_LOWER)[:, None],
+        -u_axes_xyz,
+        torch.where(
+            (sides == _U_UPPER)[:, None],
+            u_axes_xyz,
+            torch.where(
+                (sides == _V_LOWER)[:, None],
+                -v_axes_xyz,
+                v_axes_xyz,
+            ),
+        ),
+    )
+
+
 @dataclass
 class ContinuousSurfaceAtlas:
     """Map continuous chart coordinates to the shared exposed surface geometry."""
@@ -471,6 +496,100 @@ class ContinuousSurfaceAtlas:
             + flat_uv[:, 1:] * self._v_edges_xyz[flat_ids]
         )
         return positions.reshape(ids.shape + (3,))
+
+    def positions_xyz_torch(
+        self,
+        chart_ids: object,
+        uv: object,
+    ) -> object:
+        """Map chart coordinates to XYZ on the input Torch device."""
+        import torch
+
+        if not torch.is_tensor(chart_ids) or not torch.is_tensor(uv):
+            raise TypeError("Torch surface coordinates must be tensors.")
+        if chart_ids.dtype != torch.long:
+            raise TypeError("Torch surface chart IDs must use torch.long.")
+        if uv.shape != tuple(chart_ids.shape) + (2,):
+            raise ValueError("Torch surface UV has an invalid shape.")
+        invalid = (
+            (chart_ids < 0)
+            | (chart_ids >= self.chart_count)
+            | torch.any(~torch.isfinite(uv) | (uv < 0.0) | (uv > 1.0), dim=-1)
+        )
+        if bool(torch.any(invalid).item()):
+            raise ValueError("Torch surface coordinates lie outside the atlas.")
+        vertices = torch.tensor(
+            self.geometry.vertices_xyz,
+            device=uv.device,
+            dtype=uv.dtype,
+        )
+        origins = vertices[:, 0]
+        u_edges = vertices[:, 1] - origins
+        v_edges = vertices[:, 3] - origins
+        flat_ids = chart_ids.reshape(-1)
+        flat_uv = uv.reshape(-1, 2)
+        positions = (
+            origins[flat_ids]
+            + flat_uv[:, :1] * u_edges[flat_ids]
+            + flat_uv[:, 1:] * v_edges[flat_ids]
+        )
+        return positions.reshape(tuple(chart_ids.shape) + (3,))
+
+    def sample_torch(
+        self,
+        sample_count: int,
+        *,
+        generator: object,
+        reference: object,
+        chart_probabilities: object | None = None,
+    ) -> tuple[object, object, object]:
+        """Draw the same full-support surface proposal on a Torch device."""
+        import torch
+
+        if not torch.is_tensor(reference):
+            raise TypeError("Torch surface sampling requires a tensor reference.")
+        if not isinstance(generator, torch.Generator):
+            raise TypeError("Torch surface sampling requires a Torch generator.")
+        count = int(sample_count)
+        if count < 0:
+            raise ValueError("sample_count must be non-negative.")
+        probabilities = torch.tensor(
+            self.chart_probabilities
+            if chart_probabilities is None
+            else chart_probabilities,
+            device=reference.device,
+            dtype=reference.dtype,
+        )
+        if tuple(probabilities.shape) != (self.chart_count,) or bool(
+            torch.any(~torch.isfinite(probabilities) | (probabilities <= 0.0)).item()
+        ):
+            raise ValueError("Torch chart probabilities are invalid.")
+        probabilities = probabilities / torch.sum(probabilities)
+        if count == 0:
+            chart_ids = torch.zeros(
+                0,
+                device=reference.device,
+                dtype=torch.long,
+            )
+            uv = torch.zeros(
+                (0, 2),
+                device=reference.device,
+                dtype=reference.dtype,
+            )
+        else:
+            chart_ids = torch.multinomial(
+                probabilities,
+                count,
+                replacement=True,
+                generator=generator,
+            )
+            uv = torch.rand(
+                (count, 2),
+                device=reference.device,
+                dtype=reference.dtype,
+                generator=generator,
+            )
+        return chart_ids, uv, self.positions_xyz_torch(chart_ids, uv)
 
     def air_facing_normals_xyz(
         self,
@@ -960,6 +1079,466 @@ class ContinuousSurfaceAtlas:
             crossing_counts.reshape(ids.shape),
         )
 
+    def trace_tangent_displacements_torch(
+        self,
+        chart_ids: object,
+        uv: object,
+        displacement_m: object,
+        *,
+        max_crossings: int = 128,
+    ) -> tuple[object, object, object, object, object]:
+        """Trace tangent displacements through portals entirely with Torch."""
+        import torch
+
+        if not all(
+            torch.is_tensor(value)
+            for value in (chart_ids, uv, displacement_m)
+        ):
+            raise TypeError("Torch portal tracing requires tensor inputs.")
+        if chart_ids.dtype != torch.long:
+            raise TypeError("Torch portal chart IDs must use torch.long.")
+        if uv.shape != tuple(chart_ids.shape) + (2,) or displacement_m.shape != uv.shape:
+            raise ValueError("Torch portal coordinates and displacements are misaligned.")
+        if isinstance(max_crossings, bool) or not isinstance(
+            max_crossings,
+            (int, np.integer),
+        ):
+            raise TypeError("max_crossings must be an integer.")
+        crossing_limit = int(max_crossings)
+        if crossing_limit < 0:
+            raise ValueError("max_crossings must be non-negative.")
+        invalid = (
+            (chart_ids < 0)
+            | (chart_ids >= self.chart_count)
+            | torch.any(~torch.isfinite(uv) | (uv < 0.0) | (uv > 1.0), dim=-1)
+            | torch.any(~torch.isfinite(displacement_m), dim=-1)
+        )
+        if bool(torch.any(invalid).item()):
+            raise ValueError("Torch portal inputs lie outside finite support.")
+
+        original_shape = tuple(chart_ids.shape)
+        original_ids = chart_ids.reshape(-1).clone()
+        original_uv = uv.reshape(-1, 2).clone()
+        original_displacements = displacement_m.reshape(-1, 2)
+        row_count = int(original_ids.numel())
+        if row_count == 0:
+            return (
+                original_ids.reshape(original_shape),
+                original_uv.reshape(tuple(uv.shape)),
+                original_displacements.reshape(tuple(displacement_m.shape)),
+                torch.ones(original_shape, device=uv.device, dtype=torch.bool),
+                torch.zeros(original_shape, device=uv.device, dtype=torch.long),
+            )
+
+        vertices = torch.tensor(
+            self.geometry.vertices_xyz,
+            device=uv.device,
+            dtype=uv.dtype,
+        )
+        origins = vertices[:, 0]
+        u_edges = vertices[:, 1] - origins
+        v_edges = vertices[:, 3] - origins
+        u_lengths = torch.linalg.vector_norm(u_edges, dim=1)
+        v_lengths = torch.linalg.vector_norm(v_edges, dim=1)
+        u_axes = u_edges / u_lengths[:, None]
+        v_axes = v_edges / v_lengths[:, None]
+        portal_neighbor_ids = torch.tensor(
+            self._portal_neighbor_ids,
+            device=uv.device,
+            dtype=torch.long,
+        )
+        portal_source_sides = torch.tensor(
+            self._portal_source_sides,
+            device=uv.device,
+            dtype=torch.long,
+        )
+        portal_destination_sides = torch.tensor(
+            self._portal_destination_sides,
+            device=uv.device,
+            dtype=torch.long,
+        )
+        portal_starts = torch.tensor(
+            self._portal_starts_xyz,
+            device=uv.device,
+            dtype=uv.dtype,
+        )
+        portal_ends = torch.tensor(
+            self._portal_ends_xyz,
+            device=uv.device,
+            dtype=uv.dtype,
+        )
+
+        displacement_lengths = torch.linalg.vector_norm(
+            original_displacements,
+            dim=1,
+        )
+        displacement_xyz = (
+            original_displacements[:, :1] * u_axes[original_ids]
+            + original_displacements[:, 1:] * v_axes[original_ids]
+        )
+        moving = displacement_lengths > 0.0
+        directions = torch.zeros(
+            (row_count, 3),
+            device=uv.device,
+            dtype=uv.dtype,
+        )
+        directions[moving] = (
+            displacement_xyz[moving] / displacement_lengths[moving, None]
+        )
+        current_ids = original_ids.clone()
+        current_uv = original_uv.clone()
+        remaining = displacement_lengths.clone()
+        active = moving.clone()
+        valid = torch.ones(row_count, device=uv.device, dtype=torch.bool)
+        crossing_counts = torch.zeros(row_count, device=uv.device, dtype=torch.long)
+
+        for _ in range(crossing_limit + 1):
+            if not bool(torch.any(active).item()):
+                break
+            active_rows = torch.nonzero(active, as_tuple=False).reshape(-1)
+            active_ids = current_ids[active_rows]
+            active_uv = current_uv[active_rows]
+            active_directions = directions[active_rows]
+            active_remaining = remaining[active_rows]
+            active_u_axes = u_axes[active_ids]
+            active_v_axes = v_axes[active_ids]
+            u_rates = (
+                torch.sum(active_directions * active_u_axes, dim=1)
+                / u_lengths[active_ids]
+            )
+            v_rates = (
+                torch.sum(active_directions * active_v_axes, dim=1)
+                / v_lengths[active_ids]
+            )
+            infinity = torch.full_like(u_rates, float("inf"))
+            u_distance = infinity.clone()
+            v_distance = infinity.clone()
+            positive_u = u_rates > _DIRECTION_TOLERANCE
+            negative_u = u_rates < -_DIRECTION_TOLERANCE
+            positive_v = v_rates > _DIRECTION_TOLERANCE
+            negative_v = v_rates < -_DIRECTION_TOLERANCE
+            u_distance[positive_u] = (
+                1.0 - active_uv[positive_u, 0]
+            ) / u_rates[positive_u]
+            u_distance[negative_u] = (
+                -active_uv[negative_u, 0] / u_rates[negative_u]
+            )
+            v_distance[positive_v] = (
+                1.0 - active_uv[positive_v, 1]
+            ) / v_rates[positive_v]
+            v_distance[negative_v] = (
+                -active_uv[negative_v, 1] / v_rates[negative_v]
+            )
+            u_distance = torch.clamp(u_distance, min=0.0)
+            v_distance = torch.clamp(v_distance, min=0.0)
+            boundary_distance = torch.minimum(u_distance, v_distance)
+
+            finishes = active_remaining < (
+                boundary_distance - _SURFACE_TOLERANCE_M
+            )
+            if bool(torch.any(finishes).item()):
+                rows = active_rows[finishes]
+                ending_uv = active_uv[finishes].clone()
+                ending_uv[:, 0] += active_remaining[finishes] * u_rates[finishes]
+                ending_uv[:, 1] += active_remaining[finishes] * v_rates[finishes]
+                current_uv[rows] = torch.clamp(ending_uv, min=0.0, max=1.0)
+                remaining[rows] = 0.0
+                active[rows] = False
+
+            ends_on_boundary = torch.abs(
+                active_remaining - boundary_distance
+            ) <= _SURFACE_TOLERANCE_M
+            invalid_direction = ~torch.isfinite(boundary_distance)
+            invalid_now = (~finishes) & (ends_on_boundary | invalid_direction)
+            if bool(torch.any(invalid_now).item()):
+                rows = active_rows[invalid_now]
+                valid[rows] = False
+                active[rows] = False
+            crosses = (
+                (~finishes)
+                & (~invalid_now)
+                & (
+                    active_remaining
+                    > boundary_distance + _SURFACE_TOLERANCE_M
+                )
+            )
+            unclassified = ~(finishes | invalid_now | crosses)
+            if bool(torch.any(unclassified).item()):
+                rows = active_rows[unclassified]
+                valid[rows] = False
+                active[rows] = False
+            if not bool(torch.any(crosses).item()):
+                continue
+
+            crossing_rows = active_rows[crosses]
+            crossing_u_distance = u_distance[crosses]
+            crossing_v_distance = v_distance[crosses]
+            crossing_distance = boundary_distance[crosses]
+            crossing_u_rates = u_rates[crosses]
+            crossing_v_rates = v_rates[crosses]
+            vertex_hit = torch.abs(
+                crossing_u_distance - crossing_v_distance
+            ) <= _SURFACE_TOLERANCE_M
+            exceeds_limit = crossing_counts[crossing_rows] >= crossing_limit
+            rejected = vertex_hit | exceeds_limit
+            if bool(torch.any(rejected).item()):
+                rows = crossing_rows[rejected]
+                valid[rows] = False
+                active[rows] = False
+            portal_candidates = ~rejected
+            if not bool(torch.any(portal_candidates).item()):
+                continue
+
+            portal_rows = crossing_rows[portal_candidates]
+            portal_ids = current_ids[portal_rows]
+            portal_directions = directions[portal_rows]
+            portal_uv = current_uv[portal_rows].clone()
+            portal_distance = crossing_distance[portal_candidates]
+            portal_u_rates = crossing_u_rates[portal_candidates]
+            portal_v_rates = crossing_v_rates[portal_candidates]
+            crosses_u = (
+                crossing_u_distance[portal_candidates]
+                < crossing_v_distance[portal_candidates]
+            )
+            source_sides = torch.where(
+                crosses_u,
+                torch.where(
+                    portal_u_rates > 0.0,
+                    torch.full_like(portal_ids, _U_UPPER),
+                    torch.full_like(portal_ids, _U_LOWER),
+                ),
+                torch.where(
+                    portal_v_rates > 0.0,
+                    torch.full_like(portal_ids, _V_UPPER),
+                    torch.full_like(portal_ids, _V_LOWER),
+                ),
+            )
+            portal_uv[:, 0] += portal_distance * portal_u_rates
+            portal_uv[:, 1] += portal_distance * portal_v_rates
+            portal_uv[crosses_u, 0] = torch.where(
+                source_sides[crosses_u] == _U_UPPER,
+                torch.ones_like(portal_uv[crosses_u, 0]),
+                torch.zeros_like(portal_uv[crosses_u, 0]),
+            )
+            portal_uv[~crosses_u, 1] = torch.where(
+                source_sides[~crosses_u] == _V_UPPER,
+                torch.ones_like(portal_uv[~crosses_u, 1]),
+                torch.zeros_like(portal_uv[~crosses_u, 1]),
+            )
+            crossing_xyz = (
+                origins[portal_ids]
+                + portal_uv[:, :1] * u_edges[portal_ids]
+                + portal_uv[:, 1:] * v_edges[portal_ids]
+            )
+            if int(portal_neighbor_ids.shape[1]) == 0:
+                valid[portal_rows] = False
+                active[portal_rows] = False
+                continue
+            candidate_neighbors = portal_neighbor_ids[portal_ids]
+            candidate_source_sides = portal_source_sides[portal_ids]
+            candidate_starts = portal_starts[portal_ids]
+            candidate_ends = portal_ends[portal_ids]
+            candidate_segments = candidate_ends - candidate_starts
+            length_sq = torch.sum(candidate_segments.square(), dim=2)
+            relative = crossing_xyz[:, None, :] - candidate_starts
+            along = torch.where(
+                length_sq > 0.0,
+                torch.sum(relative * candidate_segments, dim=2)
+                / torch.clamp(length_sq, min=torch.finfo(uv.dtype).tiny),
+                torch.zeros_like(length_sq),
+            )
+            closest = candidate_starts + along[:, :, None] * candidate_segments
+            line_distance = torch.linalg.vector_norm(
+                crossing_xyz[:, None, :] - closest,
+                dim=2,
+            )
+            portal_lengths = torch.sqrt(length_sq)
+            endpoint_margin = torch.where(
+                portal_lengths > 0.0,
+                _SURFACE_TOLERANCE_M / portal_lengths,
+                torch.full_like(portal_lengths, float("inf")),
+            )
+            matches = (
+                (candidate_neighbors >= 0)
+                & (candidate_source_sides == source_sides[:, None])
+                & (line_distance <= _SURFACE_TOLERANCE_M)
+                & (along > endpoint_margin)
+                & (along < 1.0 - endpoint_margin)
+            )
+            match_counts = torch.sum(matches, dim=1, dtype=torch.long)
+            unique_match = match_counts == 1
+            if bool(torch.any(~unique_match).item()):
+                rows = portal_rows[~unique_match]
+                valid[rows] = False
+                active[rows] = False
+            if not bool(torch.any(unique_match).item()):
+                continue
+
+            traversing_rows = portal_rows[unique_match]
+            match_slots = torch.argmax(matches[unique_match].to(torch.int8), dim=1)
+            source_ids = current_ids[traversing_rows]
+            destination_ids = candidate_neighbors[
+                unique_match,
+                match_slots,
+            ]
+            destination_sides = portal_destination_sides[source_ids][
+                torch.arange(
+                    int(traversing_rows.numel()),
+                    device=uv.device,
+                    dtype=torch.long,
+                ),
+                match_slots,
+            ]
+            selected_starts = candidate_starts[unique_match, match_slots]
+            selected_ends = candidate_ends[unique_match, match_slots]
+            edge_axes = selected_ends - selected_starts
+            edge_axes = edge_axes / torch.linalg.vector_norm(
+                edge_axes,
+                dim=1,
+            )[:, None]
+            source_outward = _outward_tangent_axes_torch(
+                source_sides[unique_match],
+                u_axes[source_ids],
+                v_axes[source_ids],
+            )
+            destination_outward = _outward_tangent_axes_torch(
+                destination_sides,
+                u_axes[destination_ids],
+                v_axes[destination_ids],
+            )
+            selected_directions = portal_directions[unique_match]
+            along_edge = torch.sum(selected_directions * edge_axes, dim=1)
+            across_edge = torch.sum(selected_directions * source_outward, dim=1)
+            transported = (
+                along_edge[:, None] * edge_axes
+                - across_edge[:, None] * destination_outward
+            )
+            transported_norm = torch.linalg.vector_norm(transported, dim=1)
+            transport_valid = (
+                (across_edge > _DIRECTION_TOLERANCE)
+                & torch.isfinite(transported_norm)
+                & (transported_norm > _DIRECTION_TOLERANCE)
+            )
+            if bool(torch.any(~transport_valid).item()):
+                rows = traversing_rows[~transport_valid]
+                valid[rows] = False
+                active[rows] = False
+            if not bool(torch.any(transport_valid).item()):
+                continue
+
+            accepted_rows = traversing_rows[transport_valid]
+            accepted_destinations = destination_ids[transport_valid]
+            accepted_xyz = crossing_xyz[unique_match][transport_valid]
+            accepted_delta = accepted_xyz - origins[accepted_destinations]
+            accepted_uv = torch.stack(
+                (
+                    torch.sum(
+                        accepted_delta * u_edges[accepted_destinations],
+                        dim=1,
+                    )
+                    / u_lengths[accepted_destinations].square(),
+                    torch.sum(
+                        accepted_delta * v_edges[accepted_destinations],
+                        dim=1,
+                    )
+                    / v_lengths[accepted_destinations].square(),
+                ),
+                dim=1,
+            )
+            accepted_sides = destination_sides[transport_valid]
+            accepted_uv[accepted_sides == _U_LOWER, 0] = 0.0
+            accepted_uv[accepted_sides == _U_UPPER, 0] = 1.0
+            accepted_uv[accepted_sides == _V_LOWER, 1] = 0.0
+            accepted_uv[accepted_sides == _V_UPPER, 1] = 1.0
+            current_ids[accepted_rows] = accepted_destinations
+            current_uv[accepted_rows] = torch.clamp(
+                accepted_uv,
+                min=0.0,
+                max=1.0,
+            )
+            directions[accepted_rows] = (
+                transported[transport_valid]
+                / transported_norm[transport_valid, None]
+            )
+            remaining[accepted_rows] -= portal_distance[unique_match][
+                transport_valid
+            ]
+            crossing_counts[accepted_rows] += 1
+
+        if bool(torch.any(active).item()):
+            valid[active] = False
+        proposed_ids = torch.where(valid, current_ids, original_ids)
+        proposed_uv = torch.where(valid[:, None], current_uv, original_uv)
+        reverse_xyz = -directions * displacement_lengths[:, None]
+        reverse_displacements = torch.stack(
+            (
+                torch.sum(reverse_xyz * u_axes[proposed_ids], dim=1),
+                torch.sum(reverse_xyz * v_axes[proposed_ids], dim=1),
+            ),
+            dim=1,
+        )
+        reverse_displacements = torch.where(
+            valid[:, None],
+            reverse_displacements,
+            -original_displacements,
+        )
+        crossing_counts = torch.where(
+            valid,
+            crossing_counts,
+            torch.zeros_like(crossing_counts),
+        )
+        return (
+            proposed_ids.reshape(original_shape),
+            proposed_uv.reshape(tuple(uv.shape)),
+            reverse_displacements.reshape(tuple(displacement_m.shape)),
+            valid.reshape(original_shape),
+            crossing_counts.reshape(original_shape),
+        )
+
+    def tangent_geodesic_portal_proposal_torch(
+        self,
+        chart_ids: object,
+        uv: object,
+        *,
+        sigma_m: float,
+        generator: object,
+        max_crossings: int = 128,
+    ) -> tuple[object, object, object]:
+        """Draw and trace the exact symmetric Gaussian portal move on Torch."""
+        import torch
+
+        if not torch.is_tensor(chart_ids) or not torch.is_tensor(uv):
+            raise TypeError("Torch portal proposals require tensor coordinates.")
+        if not isinstance(generator, torch.Generator):
+            raise TypeError("Torch portal proposals require a Torch generator.")
+        sigma = float(sigma_m)
+        if not np.isfinite(sigma) or sigma <= 0.0:
+            raise ValueError("sigma_m must be finite and positive.")
+        displacement = torch.randn(
+            uv.shape,
+            device=uv.device,
+            dtype=uv.dtype,
+            generator=generator,
+        ) * sigma
+        proposed_ids, proposed_uv, _, _, _ = (
+            self.trace_tangent_displacements_torch(
+                chart_ids,
+                uv,
+                displacement,
+                max_crossings=max_crossings,
+            )
+        )
+        log_probabilities = torch.tensor(
+            self.log_chart_probabilities,
+            device=uv.device,
+            dtype=uv.dtype,
+        )
+        return (
+            proposed_ids,
+            proposed_uv,
+            log_probabilities[chart_ids] - log_probabilities[proposed_ids],
+        )
+
     def tangent_geodesic_portal_proposal(
         self,
         chart_ids: ArrayLike,
@@ -1186,6 +1765,195 @@ class ContinuousSurfaceAtlas:
         )
         return reshaped_ids, reshaped_uv, positions, log_density
 
+    def local_chart_mixture_log_density_torch(
+        self,
+        parent_chart_ids: object,
+        destination_chart_ids: object,
+        *,
+        global_component_probability: float,
+        reference: object,
+    ) -> object:
+        """Evaluate the full-support local chart mixture on Torch."""
+        import torch
+
+        if not all(
+            torch.is_tensor(value)
+            for value in (parent_chart_ids, destination_chart_ids, reference)
+        ):
+            raise TypeError("Torch local chart density requires tensor inputs.")
+        parent, destination = torch.broadcast_tensors(
+            parent_chart_ids.to(dtype=torch.long),
+            destination_chart_ids.to(dtype=torch.long),
+        )
+        invalid = (
+            (parent < 0)
+            | (parent >= self.chart_count)
+            | (destination < 0)
+            | (destination >= self.chart_count)
+        )
+        if bool(torch.any(invalid).item()):
+            raise ValueError("Torch local chart IDs lie outside the atlas.")
+        global_probability = float(global_component_probability)
+        if (
+            not np.isfinite(global_probability)
+            or global_probability <= 0.0
+            or global_probability > 1.0
+        ):
+            raise ValueError(
+                "global_component_probability must lie in (0, 1]."
+            )
+        probabilities = torch.tensor(
+            self.chart_probabilities,
+            device=reference.device,
+            dtype=reference.dtype,
+        )
+        neighbors = torch.tensor(
+            self._portal_neighbor_ids,
+            device=reference.device,
+            dtype=torch.long,
+        )
+        flat_parent = parent.reshape(-1)
+        flat_destination = destination.reshape(-1)
+        candidates = torch.cat(
+            (flat_parent[:, None], neighbors[flat_parent]),
+            dim=1,
+        )
+        valid = candidates >= 0
+        safe = torch.where(valid, candidates, torch.zeros_like(candidates))
+        candidate_mass = torch.where(
+            valid,
+            probabilities[safe],
+            torch.zeros_like(safe, dtype=reference.dtype),
+        )
+        normalizer = torch.sum(candidate_mass, dim=1)
+        destination_local = torch.any(
+            valid & (candidates == flat_destination[:, None]),
+            dim=1,
+        )
+        local_density = torch.where(
+            destination_local,
+            probabilities[flat_destination] / normalizer,
+            torch.zeros_like(normalizer),
+        )
+        density = (
+            global_probability * probabilities[flat_destination]
+            + (1.0 - global_probability) * local_density
+        )
+        if bool(torch.any(~torch.isfinite(density) | (density <= 0.0)).item()):
+            raise RuntimeError("Torch local chart mixture lost full support.")
+        return torch.log(density).reshape(parent.shape)
+
+    def sample_local_chart_mixture_torch(
+        self,
+        parent_chart_ids: object,
+        *,
+        global_component_probability: float,
+        generator: object,
+        reference: object,
+    ) -> tuple[object, object, object, object]:
+        """Sample the local-plus-global surface proposal entirely on Torch."""
+        import torch
+
+        if not torch.is_tensor(parent_chart_ids) or not torch.is_tensor(reference):
+            raise TypeError("Torch local chart sampling requires tensor inputs.")
+        if not isinstance(generator, torch.Generator):
+            raise TypeError("Torch local chart sampling requires a Torch generator.")
+        parent = parent_chart_ids.to(dtype=torch.long)
+        if bool(
+            torch.any((parent < 0) | (parent >= self.chart_count)).item()
+        ):
+            raise ValueError("Torch local parent chart IDs lie outside the atlas.")
+        global_probability = float(global_component_probability)
+        if (
+            not np.isfinite(global_probability)
+            or global_probability <= 0.0
+            or global_probability > 1.0
+        ):
+            raise ValueError(
+                "global_component_probability must lie in (0, 1]."
+            )
+        flat_parent = parent.reshape(-1)
+        sample_count = int(flat_parent.numel())
+        if sample_count == 0:
+            empty_ids = torch.zeros_like(parent)
+            empty_uv = torch.zeros(
+                tuple(parent.shape) + (2,),
+                device=reference.device,
+                dtype=reference.dtype,
+            )
+            return (
+                empty_ids,
+                empty_uv,
+                self.positions_xyz_torch(empty_ids, empty_uv),
+                torch.zeros_like(parent, dtype=reference.dtype),
+            )
+        probabilities = torch.tensor(
+            self.chart_probabilities,
+            device=reference.device,
+            dtype=reference.dtype,
+        )
+        neighbors = torch.tensor(
+            self._portal_neighbor_ids,
+            device=reference.device,
+            dtype=torch.long,
+        )
+        draws = torch.rand(
+            (sample_count, 4),
+            device=reference.device,
+            dtype=reference.dtype,
+            generator=generator,
+        )
+        global_cdf = torch.cumsum(probabilities, dim=0)
+        global_cdf[-1] = 1.0
+        global_ids = torch.searchsorted(
+            global_cdf,
+            draws[:, 1].contiguous(),
+            right=True,
+        )
+        candidates = torch.cat(
+            (flat_parent[:, None], neighbors[flat_parent]),
+            dim=1,
+        )
+        valid = candidates >= 0
+        safe = torch.where(valid, candidates, torch.zeros_like(candidates))
+        local_mass = torch.where(
+            valid,
+            probabilities[safe],
+            torch.zeros(
+                (),
+                device=reference.device,
+                dtype=reference.dtype,
+            ),
+        )
+        local_mass = local_mass / torch.sum(local_mass, dim=1, keepdim=True)
+        local_cdf = torch.cumsum(local_mass, dim=1)
+        local_cdf[:, -1] = 1.0
+        local_columns = torch.sum(
+            draws[:, 1, None] > local_cdf,
+            dim=1,
+            dtype=torch.long,
+        )
+        local_ids = candidates[
+            torch.arange(sample_count, device=reference.device),
+            local_columns,
+        ]
+        destination_ids = torch.where(
+            draws[:, 0] < global_probability,
+            global_ids,
+            local_ids,
+        )
+        destination_uv = draws[:, 2:4]
+        reshaped_ids = destination_ids.reshape(parent.shape)
+        reshaped_uv = destination_uv.reshape(tuple(parent.shape) + (2,))
+        positions = self.positions_xyz_torch(reshaped_ids, reshaped_uv)
+        log_density = self.local_chart_mixture_log_density_torch(
+            parent,
+            reshaped_ids,
+            global_component_probability=global_probability,
+            reference=reference,
+        )
+        return reshaped_ids, reshaped_uv, positions, log_density
+
     def surface_path_distance_upper_bound_m(
         self,
         first_positions_xyz: ArrayLike,
@@ -1337,6 +2105,121 @@ class ContinuousSurfaceAtlas:
             second,
             second_ids,
         ).reshape(first_ids.shape)
+
+    def local_surface_coordinate_path_distance_m_torch(
+        self,
+        first_chart_ids: object,
+        first_uv: object,
+        second_chart_ids: object,
+        second_uv: object,
+    ) -> object:
+        """Return exact same-or-one-portal path distances with Torch."""
+        import torch
+
+        if not all(
+            torch.is_tensor(value)
+            for value in (
+                first_chart_ids,
+                first_uv,
+                second_chart_ids,
+                second_uv,
+            )
+        ):
+            raise TypeError("Torch local surface paths require tensor inputs.")
+        first_ids, second_ids = torch.broadcast_tensors(
+            first_chart_ids.to(dtype=torch.long),
+            second_chart_ids.to(dtype=torch.long),
+        )
+        if first_uv.shape != tuple(first_chart_ids.shape) + (2,) or (
+            second_uv.shape != tuple(second_chart_ids.shape) + (2,)
+        ):
+            raise ValueError("Torch local surface path coordinates are misaligned.")
+        first_coordinates = torch.broadcast_to(
+            first_uv,
+            tuple(first_ids.shape) + (2,),
+        )
+        second_coordinates = torch.broadcast_to(
+            second_uv,
+            tuple(second_ids.shape) + (2,),
+        )
+        first = self.positions_xyz_torch(first_ids, first_coordinates).reshape(-1, 3)
+        second = self.positions_xyz_torch(second_ids, second_coordinates).reshape(-1, 3)
+        flat_first_ids = first_ids.reshape(-1)
+        flat_second_ids = second_ids.reshape(-1)
+        direct = torch.linalg.vector_norm(first - second, dim=1)
+        result = torch.full_like(direct, float("inf"))
+        same = flat_first_ids == flat_second_ids
+        result = torch.where(same, direct, result)
+        if int(first.shape[0]) == 0:
+            return result.reshape(first_ids.shape)
+        neighbors = torch.tensor(
+            self._portal_neighbor_ids,
+            device=first.device,
+            dtype=torch.long,
+        )
+        matches = neighbors[flat_first_ids] == flat_second_ids[:, None]
+        pair_portals = torch.nonzero(matches, as_tuple=False)
+        if int(pair_portals.shape[0]) == 0:
+            return result.reshape(first_ids.shape)
+        pair_indices = pair_portals[:, 0]
+        portal_indices = pair_portals[:, 1]
+        starts_table = torch.tensor(
+            self._portal_starts_xyz,
+            device=first.device,
+            dtype=first.dtype,
+        )
+        ends_table = torch.tensor(
+            self._portal_ends_xyz,
+            device=first.device,
+            dtype=first.dtype,
+        )
+        starts = starts_table[flat_first_ids[pair_indices], portal_indices]
+        deltas = (
+            ends_table[flat_first_ids[pair_indices], portal_indices] - starts
+        )
+        lower = torch.zeros(pair_indices.shape, device=first.device, dtype=first.dtype)
+        upper = torch.ones_like(lower)
+        first_expanded = first[pair_indices]
+        second_expanded = second[pair_indices]
+        for _ in range(48):
+            first_fraction = (2.0 * lower + upper) / 3.0
+            second_fraction = (lower + 2.0 * upper) / 3.0
+            first_points = starts + first_fraction[:, None] * deltas
+            second_points = starts + second_fraction[:, None] * deltas
+            first_cost = torch.linalg.vector_norm(
+                first_expanded - first_points,
+                dim=1,
+            ) + torch.linalg.vector_norm(
+                second_expanded - first_points,
+                dim=1,
+            )
+            second_cost = torch.linalg.vector_norm(
+                first_expanded - second_points,
+                dim=1,
+            ) + torch.linalg.vector_norm(
+                second_expanded - second_points,
+                dim=1,
+            )
+            choose_left = first_cost <= second_cost
+            upper = torch.where(choose_left, second_fraction, upper)
+            lower = torch.where(choose_left, lower, first_fraction)
+        optimum = starts + (0.5 * (lower + upper))[:, None] * deltas
+        portal_costs = torch.linalg.vector_norm(
+            first_expanded - optimum,
+            dim=1,
+        ) + torch.linalg.vector_norm(
+            second_expanded - optimum,
+            dim=1,
+        )
+        best = torch.full_like(result, float("inf"))
+        best.scatter_reduce_(
+            0,
+            pair_indices,
+            portal_costs,
+            reduce="amin",
+            include_self=True,
+        )
+        return torch.minimum(result, best).reshape(first_ids.shape)
 
     def _same_or_adjacent_surface_path_distance_m(
         self,

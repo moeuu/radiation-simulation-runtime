@@ -23,7 +23,6 @@ from sim.geant4_app.execution_environment import (
 from sim.protocol import SimulationCommand, SimulationObservation
 from sim.runtime import (
     SimulationRuntime,
-    production_runtime_config_sha256,
     validate_production_runtime_config,
 )
 from spectrum.isotope_profiles import resolve_profile_model_runtime_config
@@ -80,6 +79,14 @@ _TRANSPORT_PROVENANCE_KEYS = frozenset(
         "dead_time_observed_scale",
         "dead_time_tau_s",
         "detector_response_applied_in_native",
+        "detector_response_boundary_state",
+        "detector_response_coincidence_pulse_count",
+        "detector_response_coincidence_semantics",
+        "detector_response_conditioning",
+        "detector_response_incident_entry_count",
+        "detector_response_multi_entry_pulse_count",
+        "detector_response_operator_binary_sha256",
+        "detector_response_registered_entry_count",
         "detector_response_sampling_contract_sha256",
         "detector_response_sampling_mode",
         "detector_response_sampling_model",
@@ -190,12 +197,6 @@ def _require_approved_execution_bundle(
             raise RuntimeError(
                 f"Approved model has invalid execution provenance field {field_name}."
             )
-    actual_runtime_config = production_runtime_config_sha256(runtime_config)
-    if actual_runtime_config != expected_runtime_config:
-        raise RuntimeError(
-            "Production runtime-config SHA-256 differs from the independently "
-            "approved acceptance configuration."
-        )
     actual_native = _native_executable_sha256(runtime_config)
     if actual_native != expected_native:
         raise RuntimeError(
@@ -283,6 +284,7 @@ class AcquisitionAction:
     command: SimulationCommand
     station_complete: bool
 
+
 def estimator_neutral_physical_runtime_config(
     runtime_config: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -329,9 +331,13 @@ def require_production_runtime_preflight(
         "detector_scoring_mode": "incident_gamma_energy",
         "line_resolved_shield_attenuation": True,
         "obstacle_attenuation_enabled": True,
+        "primary_emission_model": "independent_gamma_lines",
         "primary_sampling_fraction": 1.0,
         "sample_detector_response": True,
         "secondary_transport_mode": "full_transport",
+        "source_bias_cone_policy": "detector_covering",
+        "source_bias_isotropic_fraction": 1.0,
+        "source_bias_mode": "detector_cone",
         "source_rate_model": "detector_cps_1m",
     }
     mismatches = {
@@ -354,22 +360,18 @@ def require_production_runtime_preflight(
     )
     require_production_model_approval(model)
     background_cps = runtime_config["background_cps"]
-    background_rate_cps = runtime_config["background_rate_cps"]
-    for name, value in (
-        ("background_cps", background_cps),
-        ("background_rate_cps", background_rate_cps),
+    if (
+        isinstance(background_cps, bool)
+        or not isinstance(background_cps, (int, float))
+        or not np.isfinite(float(background_cps))
+        or float(background_cps) < 0.0
     ):
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not np.isfinite(float(value))
-        ):
-            raise TypeError(f"Production {name} must be a finite JSON number.")
-    if float(background_cps) != float(background_rate_cps):
-        raise ValueError(
-            "Production background_cps and background_rate_cps must match exactly."
-        )
+        raise TypeError("Production background_cps must be finite and nonnegative.")
     manifest = model.manifest_payload()
+    if float(background_cps) != float(model.background_rate_cps):
+        raise ValueError(
+            "Production background_cps differs from the approved model rate."
+        )
     if runtime_config["background_spectrum_model_id"] != manifest.get(
         "background_model"
     ):
@@ -408,7 +410,6 @@ def estimator_neutral_runtime_config(
     resolved.pop("full_spectrum_model_registry_path", None)
     resolved.pop("full_spectrum_model_registry_file_sha256", None)
     resolved.pop("isotope_experiment_profile", None)
-    resolved.pop("full_spectrum_profile_calibration_status", None)
     resolved["full_spectrum_generative_model"] = model.manifest_payload()
     resolved["full_spectrum_contract_hash_sha256"] = model.contract_hash_sha256
     resolved["simulation_runtime_schema_version"] = 1

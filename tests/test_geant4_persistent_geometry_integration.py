@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import math
 from pathlib import Path
 import shutil
@@ -15,12 +16,15 @@ from measurement.shielding import (
     SHIELD_POSE_CONTRACT_ID,
     SHIELD_POSE_CONTRACT_SHA256,
 )
+from sim.geant4_app.io_format import NATIVE_ACTION_IDENTITY_CONTRACT_ID
+from spectrum.detector_green_operator import DetectorGreenOperator
+from tests.green_test_support import (
+    write_synthetic_detector_green_artifact,
+)
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
-SCENE_PATH = (
-    REPOSITORY_ROOT / "tests/native/force_collision_thin_leaf.scene"
-)
+SCENE_PATH = REPOSITORY_ROOT / "tests/native/force_collision_thin_leaf.scene"
 
 
 @dataclass(frozen=True)
@@ -32,15 +36,25 @@ class SidecarResult:
     variance: tuple[float, ...]
 
 
+@dataclass(frozen=True)
+class SidecarFixture:
+    """Hold the native executable and its explicit detector operator."""
+
+    executable: Path
+    detector_green_binary: Path
+    detector_green_binary_sha256: str
+    detector_green_contract_sha256: str
+
+
 @pytest.fixture(scope="module")
-def geant4_sidecar(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """Build the complete native sidecar once when Geant4 is available."""
+def geant4_sidecar(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> SidecarFixture:
+    """Build the sidecar and one explicit synthetic detector operator."""
 
     if shutil.which("g++") is None or shutil.which("geant4-config") is None:
         pytest.skip("g++ and geant4-config are required for this integration.")
-    executable = (
-        tmp_path_factory.mktemp("persistent_geometry_sidecar") / "sidecar"
-    )
+    executable = tmp_path_factory.mktemp("persistent_geometry_sidecar") / "sidecar"
     completed = subprocess.run(
         [
             sys.executable,
@@ -56,7 +70,16 @@ def geant4_sidecar(tmp_path_factory: pytest.TempPathFactory) -> Path:
         text=True,
     )
     assert completed.returncode == 0, completed.stderr
-    return executable
+    operator_manifest = write_synthetic_detector_green_artifact(
+        tmp_path_factory.mktemp("persistent_geometry_green") / "operator"
+    )
+    operator = DetectorGreenOperator.from_artifact(operator_manifest)
+    return SidecarFixture(
+        executable=executable,
+        detector_green_binary=operator_manifest.parent / "operator.bin",
+        detector_green_binary_sha256=str(operator.binary_sha256),
+        detector_green_contract_sha256=str(operator.contract_hash_sha256),
+    )
 
 
 def _write_request(
@@ -67,7 +90,9 @@ def _write_request(
     detector_x_m: float,
 ) -> None:
     """Write one deterministic detector-pose request."""
-
+    action_sha256 = hashlib.sha256(
+        f"{step_id}|{seed}|{detector_x_m}".encode("utf-8")
+    ).hexdigest()
     path.write_text(
         "\n".join(
             (
@@ -76,23 +101,14 @@ def _write_request(
                     f"shield_pose_contract_id={SHIELD_POSE_CONTRACT_ID} "
                     "shield_pose_contract_sha256="
                     f"{SHIELD_POSE_CONTRACT_SHA256} "
+                    "native_action_contract_id="
+                    f"{NATIVE_ACTION_IDENTITY_CONTRACT_ID} "
+                    f"native_action_sha256={action_sha256} "
                     "fe_orientation_index=7 pb_orientation_index=7"
                 ),
-                (
-                    "POSE kind=detector "
-                    f"x={detector_x_m} y=0 z=0 "
-                    "qw=1 qx=0 qy=0 qz=0"
-                ),
-                (
-                    "POSE kind=fe "
-                    f"x={detector_x_m} y=0 z=0 "
-                    "qw=1 qx=0 qy=0 qz=0"
-                ),
-                (
-                    "POSE kind=pb "
-                    f"x={detector_x_m} y=0 z=0 "
-                    "qw=1 qx=0 qy=0 qz=0"
-                ),
+                (f"POSE kind=detector x={detector_x_m} y=0 z=0 qw=1 qx=0 qy=0 qz=0"),
+                (f"POSE kind=fe x={detector_x_m} y=0 z=0 qw=1 qx=0 qy=0 qz=0"),
+                (f"POSE kind=pb x={detector_x_m} y=0 z=0 qw=1 qx=0 qy=0 qz=0"),
             )
         )
         + "\n",
@@ -120,7 +136,7 @@ def _parse_response(path: Path) -> SidecarResult:
 
 
 def _sidecar_arguments(
-    executable: Path,
+    sidecar: SidecarFixture,
     *,
     threads: int,
     secondary_transport_mode: str,
@@ -128,7 +144,7 @@ def _sidecar_arguments(
     """Return standard unit-weight observation arguments."""
 
     return [
-        executable.as_posix(),
+        sidecar.executable.as_posix(),
         "--physics-profile",
         "balanced",
         "--threads",
@@ -146,13 +162,19 @@ def _sidecar_arguments(
         "--primary-sampling-fraction",
         "1",
         "--sample-detector-response",
+        "--detector-green-operator-path",
+        sidecar.detector_green_binary.as_posix(),
+        "--detector-green-operator-binary-sha256",
+        sidecar.detector_green_binary_sha256,
+        "--detector-green-operator-contract-sha256",
+        sidecar.detector_green_contract_sha256,
         "--background-cps",
         "12",
     ]
 
 
 def _run_fresh(
-    executable: Path,
+    sidecar: SidecarFixture,
     request_path: Path,
     response_path: Path,
     *,
@@ -164,7 +186,7 @@ def _run_fresh(
     completed = subprocess.run(
         [
             *_sidecar_arguments(
-                executable,
+                sidecar,
                 threads=threads,
                 secondary_transport_mode=secondary_transport_mode,
             ),
@@ -185,7 +207,7 @@ def _run_fresh(
 
 
 def _run_persistent_pair(
-    executable: Path,
+    sidecar: SidecarFixture,
     first_request: Path,
     second_request: Path,
     first_response: Path,
@@ -198,7 +220,7 @@ def _run_persistent_pair(
 
     command = [
         *_sidecar_arguments(
-            executable,
+            sidecar,
             threads=threads,
             secondary_transport_mode=secondary_transport_mode,
         ),
@@ -240,7 +262,7 @@ def _run_persistent_pair(
 
 @pytest.mark.parametrize("threads", (1, 16, 32))
 def test_persistent_pose_update_reuses_session_and_matches_fresh_transport(
-    geant4_sidecar: Path,
+    geant4_sidecar: SidecarFixture,
     tmp_path: Path,
     threads: int,
 ) -> None:
@@ -271,6 +293,12 @@ def test_persistent_pose_update_reuses_session_and_matches_fresh_transport(
     assert cached.metadata["movable_geometry_updated"] == "true"
     assert cached.metadata["transport_history_mode"] == "full_unit_weight"
     assert cached.metadata["transport_tally_weighted"] == "false"
+    assert cached.metadata["native_action_contract_id"] == (
+        NATIVE_ACTION_IDENTITY_CONTRACT_ID
+    )
+    assert cached.metadata["native_action_step_id"] == "1"
+    assert cached.metadata["native_action_seed"] == "2753"
+    assert float(cached.metadata["native_action_detector_pose_x"]) == 2.5
     assert fresh.metadata["geometry_cache_hit"] == "false"
     assert fresh.metadata["movable_geometry_updated"] == "false"
     if threads == 1:
@@ -285,7 +313,7 @@ def test_persistent_pose_update_reuses_session_and_matches_fresh_transport(
 
 
 def test_gamma_only_stacking_uses_the_moved_detector_center(
-    geant4_sidecar: Path,
+    geant4_sidecar: SidecarFixture,
     tmp_path: Path,
 ) -> None:
     """Gamma-only secondary filtering must follow the runtime detector pose."""
@@ -318,7 +346,7 @@ def test_gamma_only_stacking_uses_the_moved_detector_center(
 
 
 def test_persistent_pose_outside_world_fails_before_transport(
-    geant4_sidecar: Path,
+    geant4_sidecar: SidecarFixture,
     tmp_path: Path,
 ) -> None:
     """A later pose outside the fixed world must fail closed."""
@@ -374,13 +402,13 @@ def test_persistent_pose_outside_world_fails_before_transport(
     ("--exact-free-flight", "--first-flight-forcing"),
 )
 def test_actual_observation_free_flight_switches_fail_closed(
-    geant4_sidecar: Path,
+    geant4_sidecar: SidecarFixture,
     unsupported_option: str,
 ) -> None:
     """Unproven unit-weight free-flight routes must remain unselectable."""
 
     completed = subprocess.run(
-        [geant4_sidecar.as_posix(), unsupported_option],
+        [geant4_sidecar.executable.as_posix(), unsupported_option],
         cwd=REPOSITORY_ROOT,
         check=False,
         capture_output=True,
@@ -389,6 +417,5 @@ def test_actual_observation_free_flight_switches_fail_closed(
 
     assert completed.returncode != 0
     assert (
-        f"Unsupported Geant4 sidecar option: {unsupported_option}"
-        in completed.stderr
+        f"Unsupported Geant4 sidecar option: {unsupported_option}" in completed.stderr
     )

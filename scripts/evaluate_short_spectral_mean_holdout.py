@@ -14,6 +14,9 @@ from spectrum.mean_calibration_runner import (
     canonical_json_bytes,
     load_mean_calibration_pair_artifact,
 )
+from spectrum.full_spectrum_acceptance_runner import (
+    canonical_detector_green_operator,
+)
 from spectrum.transport_spectral import GeometryConditionedSpectralModel
 
 
@@ -51,7 +54,10 @@ def _parser() -> argparse.ArgumentParser:
 def _load_model(path: Path) -> GeometryConditionedSpectralModel:
     """Load and authenticate one file-backed full-spectrum model."""
     payload = json.loads(path.read_text(encoding="utf-8"))
-    model = GeometryConditionedSpectralModel.from_manifest_payload(payload)
+    model = GeometryConditionedSpectralModel.from_manifest_payload(
+        payload,
+        detector_green_operator=canonical_detector_green_operator(),
+    )
     model.require_runtime_ready()
     return model
 

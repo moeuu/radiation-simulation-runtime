@@ -13,7 +13,10 @@ import pytest
 from measurement.obstacles import ObstacleGrid
 from runtime.adaptive import AdaptiveCandidateProvider
 from runtime.cli import _build_parser, main as runtime_cli_main
-from runtime.experiment_profiles import STANDARD_EXPERIMENT_PROFILE
+from runtime.experiment_profiles import (
+    CS_CO_SURFACE_SEARCH_PROFILE,
+    MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE,
+)
 from runtime.scenarios import (
     build_private_truth_manifest,
     build_random_surface_scenario,
@@ -28,6 +31,8 @@ def _scenario(tmp_path: Path, *, seed: int = 123) -> dict[str, object]:
         scene_seed=seed,
         measurement_log_output_dir=tmp_path / "measurement-log",
         run_id=f"scenario-{seed}",
+        experiment_profile_id=MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE.profile_id,
+        scene_variant_id="mix9",
     )
 
 
@@ -73,7 +78,7 @@ def test_scenario_contains_physics_and_runtime_contract_but_no_estimator_plan(
         assert forbidden not in fields
     assert scenario["metadata"]["measurement_actions_precomputed"] is False
     assert scenario["scene"]["obstacle_material"] == (
-        STANDARD_EXPERIMENT_PROFILE.obstacle_material
+        MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE.obstacle_material
     )
     assert scenario["scene"]["use_config_usd_fallback"] is False
     assert scenario["scene"]["usd_path"]
@@ -85,9 +90,9 @@ def test_scenario_derives_every_room_payload_from_one_profile(
     """The runtime-owned profile must drive all published room bounds."""
     scenario = _scenario(tmp_path)
     expected = (
-        STANDARD_EXPERIMENT_PROFILE.environment.size_x,
-        STANDARD_EXPERIMENT_PROFILE.environment.size_y,
-        STANDARD_EXPERIMENT_PROFILE.environment.size_z,
+        MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE.environment.size_x,
+        MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE.environment.size_y,
+        MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE.environment.size_z,
     )
     environment = scenario["environment"]
 
@@ -99,10 +104,10 @@ def test_scenario_derives_every_room_payload_from_one_profile(
     ) == expected
     assert tuple(scenario["scene"]["room_size_xyz"]) == expected
     assert environment["environment_model_id"] == (
-        STANDARD_EXPERIMENT_PROFILE.environment_model_id
+        MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE.environment_model_id
     )
     assert environment["acquisition_contract"] == (
-        STANDARD_EXPERIMENT_PROFILE.acquisition.to_payload()
+        MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE.acquisition.to_payload()
     )
     assert set(environment["adaptive_measurement"]) == {
         "candidate_count",
@@ -123,7 +128,7 @@ def test_scenario_derives_every_room_payload_from_one_profile(
     }
 
 
-def test_default_scenario_has_exact_mix9_and_same_isotope_spacing(
+def test_explicit_mix9_scenario_has_exact_counts_and_same_isotope_spacing(
     tmp_path: Path,
 ) -> None:
     """Runtime truth must satisfy the private counts and spacing contract."""
@@ -147,27 +152,27 @@ def test_default_scenario_has_exact_mix9_and_same_isotope_spacing(
         assert float(np.min(distances)) >= 3.0 - 1.0e-12
 
 
-def test_absent_eu_variant_keeps_the_public_candidate_contract(
+def test_explicit_cs_co_profile_has_no_unrequested_eu_candidate(
     tmp_path: Path,
 ) -> None:
-    """An absent Eu truth source must remain a candidate for false-positive tests."""
+    """The requested Cs/Co environment exposes only its two candidates."""
     scenario = build_random_surface_scenario(
         scene_seed=321,
         measurement_log_output_dir=tmp_path / "measurement-log",
-        run_id="scenario-cs4-co3-eu0",
-        scene_variant_id="cs4-co3-eu0",
+        run_id="scenario-cs4-co3",
+        experiment_profile_id=CS_CO_SURFACE_SEARCH_PROFILE.profile_id,
+        scene_variant_id="cs4-co3",
     )
     sources = scenario["scene"]["sources"]
     counts = Counter(source["isotope"] for source in sources)
 
     assert counts == {"Co-60": 3, "Cs-137": 4}
-    assert set(scenario["isotopes"]) == {"Co-60", "Cs-137", "Eu-154"}
+    assert set(scenario["isotopes"]) == {"Co-60", "Cs-137"}
     assert set(scenario["scene"]["transport_mu_by_isotope"]) == {
         "Co-60",
         "Cs-137",
-        "Eu-154",
     }
-    assert scenario["metadata"]["private_scene_variant_id"] == "cs4-co3-eu0"
+    assert scenario["metadata"]["private_scene_variant_id"] == "cs4-co3"
 
 
 def test_scenario_seed_is_deterministic_and_candidates_are_reachable(
@@ -216,16 +221,45 @@ def test_scenario_cli_selects_only_runtime_owned_profiles() -> None:
             "/private/measurement-log",
             "--run-id",
             "run-001",
+            "--experiment-profile",
+            CS_CO_SURFACE_SEARCH_PROFILE.profile_id,
             "--scene-variant",
-            "cs4-co3-eu0",
+            "cs4-co3",
         ]
     )
 
-    assert parsed.experiment_profile == STANDARD_EXPERIMENT_PROFILE.profile_id
-    assert parsed.scene_variant == "cs4-co3-eu0"
+    assert parsed.experiment_profile == (CS_CO_SURFACE_SEARCH_PROFILE.profile_id)
+    assert parsed.scene_variant == "cs4-co3"
     assert not hasattr(parsed, "candidate_count")
     with pytest.raises(SystemExit):
         parser.parse_args(["generate-ral-scenario"])
+
+
+@pytest.mark.parametrize("omitted", ("experiment_profile", "scene_variant"))
+def test_scenario_cli_has_no_implicit_environment_selection(omitted: str) -> None:
+    """Scenario authoring must require the requested profile and source variant."""
+    arguments = [
+        "generate-scenario",
+        "/private/scenario.json",
+        "--truth-manifest-output",
+        "/private/truth.json",
+        "--measurement-log-output",
+        "/private/measurement-log",
+        "--run-id",
+        "run-001",
+    ]
+    if omitted != "experiment_profile":
+        arguments.extend(
+            [
+                "--experiment-profile",
+                MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE.profile_id,
+            ]
+        )
+    if omitted != "scene_variant":
+        arguments.extend(["--scene-variant", "mix9"])
+
+    with pytest.raises(SystemExit):
+        _build_parser().parse_args(arguments)
 
 
 def test_adaptive_cli_rejects_retired_resume_flags() -> None:
@@ -254,7 +288,7 @@ def test_serve_cli_rejects_unknown_runtime_config_before_binding(
     """The public bridge server must use the exact production loader."""
     runtime_root = Path(__file__).resolve().parents[1]
     config_path = (
-        runtime_root / STANDARD_EXPERIMENT_PROFILE.runtime_config_relative_path
+        runtime_root / MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE.runtime_config_relative_path
     )
     payload = json.loads(config_path.read_text(encoding="utf-8"))
     payload["thred_count"] = payload["thread_count"]
@@ -272,7 +306,7 @@ def test_serve_cli_rejects_invalid_model_registry_before_binding(
     """The public server must resolve registry identity before binding a port."""
     runtime_root = Path(__file__).resolve().parents[1]
     config_path = (
-        runtime_root / STANDARD_EXPERIMENT_PROFILE.runtime_config_relative_path
+        runtime_root / MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE.runtime_config_relative_path
     )
     payload = json.loads(config_path.read_text(encoding="utf-8"))
     payload["full_spectrum_model_registry_path"] = "missing-registry.json"
@@ -297,10 +331,10 @@ def test_serve_cli_rejects_invalid_model_registry_before_binding(
 def test_serve_cli_rejects_unapproved_model_before_binding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A runtime-ready model without holdout approval cannot start a server."""
+    """A runtime-ready model without validation approval cannot start a server."""
     runtime_root = Path(__file__).resolve().parents[1]
     config_path = (
-        runtime_root / STANDARD_EXPERIMENT_PROFILE.runtime_config_relative_path
+        runtime_root / MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE.runtime_config_relative_path
     )
     bound = False
 
@@ -311,7 +345,7 @@ def test_serve_cli_rejects_unapproved_model_before_binding(
 
     monkeypatch.setattr("runtime.cli.serve_forever", bind_server)
 
-    with pytest.raises(RuntimeError, match="independent all-64 holdout"):
+    with pytest.raises(RuntimeError, match="independent all-64 validation"):
         runtime_cli_main(["serve", "--config", str(config_path)])
 
     assert bound is False
@@ -328,7 +362,9 @@ def test_private_truth_manifest_is_separate_and_joined_by_run_id(
     payload = json.loads(target.read_text(encoding="utf-8"))
     assert payload["run_id"] == scenario["run_id"]
     assert payload["sources"] == scenario["scene"]["sources"]
-    assert payload["experiment_profile_id"] == (STANDARD_EXPERIMENT_PROFILE.profile_id)
+    assert payload["experiment_profile_id"] == (
+        MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE.profile_id
+    )
     assert payload["scene_variant_id"] == "mix9"
     assert stat.S_IMODE(target.stat().st_mode) == 0o600
     with pytest.raises(FileExistsError):

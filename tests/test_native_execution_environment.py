@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import subprocess
 
@@ -73,9 +74,7 @@ def test_bundle_binds_libraries_data_and_geant4_environment(
         environment=environment,
     )
     library.write_bytes(b"geant4 library v1")
-    (data_root / "G4EMLOW-test" / "physics.dat").write_bytes(
-        b"cross sections v2"
-    )
+    (data_root / "G4EMLOW-test" / "physics.dat").write_bytes(b"cross sections v2")
     changed_data = native_execution_environment_bundle_sha256(
         executable,
         environment=environment,
@@ -105,10 +104,8 @@ def test_bundle_payload_records_complete_tiny_data_tree(
         environment={"GEANT4_DATA_DIR": data_root.as_posix()},
     )
 
-    assert payload["schema_version"] == 1
-    assert payload["dynamic_libraries"][0]["loader_name"] == (
-        "libG4physicslists.so"
-    )
+    assert payload["schema_version"] == 2
+    assert payload["dynamic_libraries"][0]["loader_name"] == ("libG4physicslists.so")
     assert payload["geant4_data_trees"] == [
         {
             "environment_variable": "GEANT4_DATA_DIR",
@@ -164,3 +161,78 @@ def test_bundle_rejects_symlinked_geant4_data(
             executable,
             environment={"GEANT4_DATA_DIR": linked_root.as_posix()},
         )
+
+
+def test_library_search_path_is_strict_and_duplicate_insensitive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Shell-added duplicate paths cannot change native physics identity."""
+    executable, library, data_root = _native_fixture(tmp_path)
+    _mock_ldd(monkeypatch, library=library)
+    library_root = library.parent.as_posix()
+    base_environment = {
+        "GEANT4_DATA_DIR": data_root.as_posix(),
+        "LD_LIBRARY_PATH": library_root,
+    }
+
+    baseline = native_execution_environment_bundle_sha256(
+        executable,
+        environment=base_environment,
+    )
+    duplicated = native_execution_environment_bundle_sha256(
+        executable,
+        environment={
+            **base_environment,
+            "LD_LIBRARY_PATH": os.pathsep.join((library_root,) * 3),
+        },
+    )
+
+    assert duplicated == baseline
+    for invalid in ("", f"{library_root}{os.pathsep}", "relative-library"):
+        with pytest.raises((ValueError, FileNotFoundError)):
+            native_execution_environment_bundle_sha256(
+                executable,
+                environment={
+                    **base_environment,
+                    "LD_LIBRARY_PATH": invalid,
+                },
+            )
+
+
+def test_shadowed_locale_values_do_not_invalidate_native_physics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LC_ALL must make shadowed LANG and LC_NUMERIC hash-insensitive."""
+    executable, library, data_root = _native_fixture(tmp_path)
+    _mock_ldd(monkeypatch, library=library)
+    base_environment = {
+        "GEANT4_DATA_DIR": data_root.as_posix(),
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "LC_NUMERIC": "C.UTF-8",
+    }
+
+    baseline = native_execution_environment_bundle_sha256(
+        executable,
+        environment=base_environment,
+    )
+    shadowed_values_changed = native_execution_environment_bundle_sha256(
+        executable,
+        environment={
+            **base_environment,
+            "LANG": "ja_JP.UTF-8",
+            "LC_NUMERIC": "de_DE.UTF-8",
+        },
+    )
+    effective_locale_changed = native_execution_environment_bundle_sha256(
+        executable,
+        environment={
+            **base_environment,
+            "LC_ALL": "POSIX",
+        },
+    )
+
+    assert shadowed_values_changed == baseline
+    assert effective_locale_changed != baseline

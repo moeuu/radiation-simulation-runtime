@@ -8,6 +8,8 @@ import math
 from numbers import Integral, Real
 from typing import Any
 
+from spectrum.detector_green_operator import DETECTOR_GREEN_SAMPLING_MODE
+
 
 def _strict_nonnegative_integer(value: object, *, name: str) -> int:
     """Return one exact nonnegative integer without string coercion."""
@@ -396,7 +398,7 @@ class SimulationObservation:
             raise TypeError("spectrum_counts must be a sequence.")
         sampled_event_counts = metadata.get(
             "detector_response_sampling_mode"
-        ) == "multinomial_marking_with_nonparalyzable_event_time"
+        ) == DETECTOR_GREEN_SAMPLING_MODE
         if sampled_event_counts:
             spectrum: list[int | float] = []
             for index, value in enumerate(self.spectrum_counts):

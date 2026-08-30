@@ -19,13 +19,11 @@ from spectrum.mean_calibration_runner import (
     MeanCalibrationLayout,
     MeanCalibrationTrainingRow,
     build_mean_calibration_app_payload,
-    build_mean_calibration_completion_manifest,
     canonical_json_sha256,
     build_predeclared_mean_calibration_design,
     fit_additive_scatter_training_rows,
     freeze_mean_calibration_completion_manifest,
     freeze_mean_calibration_scene_manifest,
-    freeze_runtime_ready_model,
     initialize_mean_calibration_layout,
     load_mean_calibration_pair_artifact,
     validate_predeclared_mean_calibration_design,
@@ -33,7 +31,6 @@ from spectrum.mean_calibration_runner import (
 )
 from spectrum.transport_spectral import (
     DESIGNATED_TRAINING_SCENE_SEEDS,
-    GeometryConditionedSpectralModel,
 )
 
 
@@ -50,12 +47,8 @@ def _metadata() -> dict[str, object]:
     """Return two angular strata for one synthetic source line."""
     payload: dict[str, object] = {
         "mean_calibration_enabled": True,
-        "primary_schedule_mode": (
-            "fixed_source_line_stratified_mean_calibration"
-        ),
-        "transport_history_mode": (
-            "fixed_source_line_stratified_weighted_mean"
-        ),
+        "primary_schedule_mode": ("fixed_source_line_stratified_mean_calibration"),
+        "transport_history_mode": ("fixed_source_line_stratified_weighted_mean"),
         "transport_tally_weighted": True,
         "history_thinning_enabled": False,
         "mean_calibration_forced_collision": False,
@@ -63,8 +56,7 @@ def _metadata() -> dict[str, object]:
             "expected_source_line_mean_divided_by_fixed_quota"
         ),
         "mean_calibration_covariance_semantics": (
-            "independent_mu_phi_stratum_sample_mean_cluster_"
-            "sufficient_statistics_v1"
+            "independent_mu_phi_stratum_sample_mean_cluster_sufficient_statistics_v1"
         ),
         "spectrum_variance_semantics": (
             "stratified_fixed_quota_sample_mean_covariance"
@@ -90,10 +82,8 @@ def _metadata() -> dict[str, object]:
                 prefix + "sampled_histories": 2,
                 prefix + "history_weight": 2.0,
                 prefix + "angle_stratum_index": stratum,
-                prefix
-                + "sparse_entry_histogram_uncollided_primary": uncollided,
-                prefix
-                + "sparse_entry_histogram_interacted_primary": interacted,
+                prefix + "sparse_entry_histogram_uncollided_primary": uncollided,
+                prefix + "sparse_entry_histogram_interacted_primary": interacted,
                 prefix + "sparse_entry_histogram_secondary": secondary,
             }
         )
@@ -106,10 +96,7 @@ def test_design_is_predeclared_training_only_and_holdout_optional() -> None:
 
     assert validate_predeclared_mean_calibration_design(design) == design
     assert design["holdout_consumed_by_training"] is False
-    assert (
-        design["all64_holdout_role"]
-        == "optional_independent_release_evidence"
-    )
+    assert design["all64_holdout_role"] == "optional_independent_release_evidence"
     assert design["forced_collision"] is False
 
     corrupted = dict(design)
@@ -277,9 +264,9 @@ def test_smaller_predeclared_design_seals_only_declared_artifacts(
     completion_payload = json.loads(completion.read_text(encoding="utf-8"))
 
     assert scene_payload["shield_pair_ids"] == [pair_id]
-    assert set(
-        scene_payload["pair_manifest_sha256_by_scenario"][scenario_id]
-    ) == {str(pair_id)}
+    assert set(scene_payload["pair_manifest_sha256_by_scenario"][scenario_id]) == {
+        str(pair_id)
+    }
     assert completion_payload["training_scene_seeds"] == [scene_seed]
     assert completion_payload["scenario_ids"] == [scenario_id]
     assert completion_payload["shield_pair_ids"] == [pair_id]
@@ -375,9 +362,7 @@ def test_additive_fit_accepts_only_complete_training_scene_identity() -> None:
     """Physical fitting must bind all designated training-scene manifests."""
     rows: list[MeanCalibrationTrainingRow] = []
     coefficients = np.linspace(0.02, 0.08, 7)
-    for scene_index, scene_seed in enumerate(
-        DESIGNATED_TRAINING_SCENE_SEEDS
-    ):
+    for scene_index, scene_seed in enumerate(DESIGNATED_TRAINING_SCENE_SEEDS):
         scale = 1.0 + 0.01 * scene_index
         for feature_index in range(7):
             basis = np.zeros(7, dtype=np.float64)
@@ -386,9 +371,7 @@ def test_additive_fit_accepts_only_complete_training_scene_identity() -> None:
                 MeanCalibrationTrainingRow(
                     scene_id=str(scene_seed),
                     feature_basis=tuple(float(value) for value in basis),
-                    scatter_fraction=float(
-                        np.dot(coefficients, basis)
-                    ),
+                    scatter_fraction=float(np.dot(coefficients, basis)),
                     sample_weight=1000.0,
                 )
             )
@@ -427,9 +410,7 @@ def test_additive_fit_accepts_declared_subset_without_all64_claim() -> None:
                 MeanCalibrationTrainingRow(
                     scene_id=str(scene_seed),
                     feature_basis=tuple(float(value) for value in basis),
-                    scatter_fraction=float(
-                        np.dot(coefficients, basis)
-                    ),
+                    scatter_fraction=float(np.dot(coefficients, basis)),
                     sample_weight=1000.0,
                 )
             )
@@ -447,63 +428,8 @@ def test_additive_fit_accepts_declared_subset_without_all64_claim() -> None:
 
     assert response.training_ready is True
     assert response.training_manifest["training_scene_seeds"] == [101, 202]
-    assert response.training_manifest["scenario_ids"] == [
-        "single_line_source_resolved"
-    ]
+    assert response.training_manifest["scenario_ids"] == ["single_line_source_resolved"]
     assert response.training_manifest["pair_ids_by_scene"] == {
         "101": [7],
         "202": [7],
     }
-
-
-def test_incomplete_calibration_cannot_create_runtime_ready_model(
-    tmp_path: Path,
-) -> None:
-    """Mean-only or incomplete artifacts must fail closed at runtime freeze."""
-    layout = MeanCalibrationLayout(tmp_path / "calibration")
-    initialize_mean_calibration_layout(layout=layout, design=_design())
-
-    with pytest.raises(FileNotFoundError):
-        build_mean_calibration_completion_manifest(
-            layout=layout,
-            design=_design(),
-        )
-
-    rows: list[MeanCalibrationTrainingRow] = []
-    for scene_seed in DESIGNATED_TRAINING_SCENE_SEEDS:
-        for feature_index in range(7):
-            basis = np.zeros(7, dtype=np.float64)
-            basis[feature_index] = 1.0
-            rows.append(
-                MeanCalibrationTrainingRow(
-                    scene_id=str(scene_seed),
-                    feature_basis=tuple(float(value) for value in basis),
-                    scatter_fraction=0.05,
-                    sample_weight=100.0,
-                )
-            )
-    additive = fit_additive_scatter_training_rows(
-        rows,
-        scene_manifest_sha256_by_seed={
-            str(seed): f"{index + 1:064x}"
-            for index, seed in enumerate(DESIGNATED_TRAINING_SCENE_SEEDS)
-        },
-    )
-    mean_only_model = GeometryConditionedSpectralModel.standard_native(
-        ("Co-60", "Cs-137", "Eu-154"),
-        dead_time_tau_s=0.0,
-        background_rate_cps=0.0,
-        additive_scatter_response=additive,
-    )
-
-    assert mean_only_model.exact_physical_statistics_ready is True
-    assert mean_only_model.runtime_ready is True
-    with pytest.raises(RuntimeError, match="complete predeclared"):
-        freeze_runtime_ready_model(
-            output_path=tmp_path / "runtime_model.json",
-            model=mean_only_model,
-            additive_response=additive,
-            layout=layout,
-            design=_design(),
-        )
-    assert not (tmp_path / "runtime_model.json").exists()

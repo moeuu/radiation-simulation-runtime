@@ -34,9 +34,9 @@ from spectrum.library import default_library
 from spectrum.response_matrix import (
     NATIVE_GEANT4_BIN_COUNT,
     NATIVE_GEANT4_BIN_WIDTH_KEV,
-    NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256,
+    LEGACY_ANALYTIC_DETECTOR_RESPONSE_CONTRACT_SHA256,
     backscatter_energy,
-    build_native_geant4_detector_response_matrix,
+    build_legacy_analytic_detector_response_matrix,
     compton_continuum_shape,
     default_resolution,
     gaussian_peak,
@@ -212,15 +212,16 @@ class PythonTransportSpectrumModel:
     ) -> None:
         """Store model configuration and scene state."""
         self.library = default_library()
-        self.energy_axis_keV = (
-            np.arange(NATIVE_GEANT4_BIN_COUNT, dtype=np.float64)
-            * float(NATIVE_GEANT4_BIN_WIDTH_KEV)
-        )
+        self.energy_axis_keV = np.arange(
+            NATIVE_GEANT4_BIN_COUNT, dtype=np.float64
+        ) * float(NATIVE_GEANT4_BIN_WIDTH_KEV)
         self.bin_width_keV = float(NATIVE_GEANT4_BIN_WIDTH_KEV)
         self.resolution_fn = default_resolution()
-        self._native_response_lb = build_native_geant4_detector_response_matrix(
-            self.energy_axis_keV,
-            self.bin_width_keV,
+        self._legacy_analytic_response_lb = (
+            build_legacy_analytic_detector_response_matrix(
+                self.energy_axis_keV,
+                self.bin_width_keV,
+            )
         )
         self.background_shape_b = native_geant4_background_shape(
             self.energy_axis_keV,
@@ -233,10 +234,7 @@ class PythonTransportSpectrumModel:
         self.rng_seed = int(rng_seed)
         self.dead_time_s = float(dead_time_s)
         self.background_rate_cps = float(background_rate_cps)
-        if (
-            not np.isfinite(self.background_rate_cps)
-            or self.background_rate_cps < 0.0
-        ):
+        if not np.isfinite(self.background_rate_cps) or self.background_rate_cps < 0.0:
             raise ValueError("background_rate_cps must be finite and nonnegative.")
         self.detector_model = dict(detector_model or {})
         self.octant_shield = OctantShield()
@@ -519,9 +517,7 @@ class PythonTransportSpectrumModel:
             expected += self.source_expected_spectrum(transport_result)
         if self.background_rate_cps > 0.0:
             expected += (
-                self.background_shape_b
-                * self.background_rate_cps
-                * float(dwell_time_s)
+                self.background_shape_b * self.background_rate_cps * float(dwell_time_s)
             )
         return np.clip(expected, a_min=0.0, a_max=None)
 
@@ -617,13 +613,13 @@ class PythonTransportSpectrumModel:
             "detector_scoring_mode": "incident_gamma_energy",
             "detector_response_applied_in_native": True,
             "detector_response_sampling_mode": (
-                "multinomial_marking_with_nonparalyzable_event_time"
+                "legacy_analytic_response_marking_offline_only"
             ),
             "detector_response_sampling_model": (
-                "shared_native_response_matrix_conditional_multinomial"
+                "legacy_analytic_response_matrix_offline_only"
             ),
             "detector_response_sampling_contract_sha256": (
-                NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
+                LEGACY_ANALYTIC_DETECTOR_RESPONSE_CONTRACT_SHA256
             ),
         }
         if self.detector_model:
@@ -646,7 +642,7 @@ class PythonTransportSpectrumModel:
             )
         )
         response = np.asarray(
-            self._native_response_lb[:, incident_index],
+            self._legacy_analytic_response_lb[:, incident_index],
             dtype=np.float64,
         ).copy()
         self._line_response_cache[cache_key] = response

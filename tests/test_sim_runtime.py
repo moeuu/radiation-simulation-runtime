@@ -29,18 +29,26 @@ from sim.runtime import (
     _start_sidecar_process,
     create_simulation_runtime,
     load_production_runtime_config,
+    load_production_runtime_config_with_digest,
     load_runtime_config,
     production_runtime_config_sha256,
 )
 from sim.protocol import decode_message, encode_message
+from spectrum.detector_green_operator import (
+    DETECTOR_GREEN_COINCIDENCE_SEMANTICS,
+    DETECTOR_GREEN_SAMPLING_MODE,
+)
 from spectrum.response_matrix import (
     NATIVE_GEANT4_BACKGROUND_MODEL_ID,
     NATIVE_GEANT4_BIN_COUNT,
     NATIVE_GEANT4_BIN_WIDTH_KEV,
-    NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256,
     NATIVE_GEANT4_ENERGY_MAX_KEV,
     NATIVE_GEANT4_ENERGY_MIN_KEV,
 )
+
+
+TEST_GREEN_CONTRACT_SHA256 = "1" * 64
+TEST_GREEN_BINARY_SHA256 = "2" * 64
 
 
 def _full_spectrum_handshake() -> dict[str, object]:
@@ -55,8 +63,23 @@ def _full_spectrum_handshake() -> dict[str, object]:
             "primary_sampling_fraction_resolution": "fixed_fraction",
             "accelerated_weighted_transport_enable": False,
             "sample_detector_response": True,
-            "detector_response_sampling_contract_sha256": (
-                NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
+            "detector_response_sampling_contract_sha256": (TEST_GREEN_CONTRACT_SHA256),
+            "detector_response_operator_binary_sha256": (TEST_GREEN_BINARY_SHA256),
+            "detector_response_sampling_model": (
+                "isotope_independent_full_detector_green_operator_v3"
+            ),
+            "detector_response_sampling_mode": DETECTOR_GREEN_SAMPLING_MODE,
+            "detector_response_boundary_state": (
+                "normalized_impact_parameter_at_detector_housing_entry_v1"
+            ),
+            "detector_response_conditioning": (
+                "registered_pulse_subprobability_given_housing_incident_gamma_v1"
+            ),
+            "detector_response_coincidence_semantics": (
+                DETECTOR_GREEN_COINCIDENCE_SEMANTICS
+            ),
+            "detector_cps_green_reference_normalization": (
+                "catalog_branching_weighted_absolute_detection_efficiency_at_1m_v1"
             ),
             "background_spectrum_model_id": NATIVE_GEANT4_BACKGROUND_MODEL_ID,
             "spectrum_energy_min_keV": NATIVE_GEANT4_ENERGY_MIN_KEV,
@@ -92,6 +115,8 @@ def _client(
         "127.0.0.1",
         65530,
         expected_detector_response_sampling=True,
+        expected_detector_green_operator_contract_sha256=(TEST_GREEN_CONTRACT_SHA256),
+        expected_detector_green_operator_binary_sha256=(TEST_GREEN_BINARY_SHA256),
         expected_thread_count=expected_thread_count,
         expected_runtime_config_sha256=expected_runtime_config_sha256,
         expected_native_executable_sha256=(expected_native_executable_sha256),
@@ -613,9 +638,10 @@ def test_standard_production_runtime_config_matches_the_exact_schema(
     registry_path = root / payload["full_spectrum_model_registry_path"]
 
     assert payload["simulation_runtime_schema_version"] == 1
-    assert payload["full_spectrum_model_registry_file_sha256"] == hashlib.sha256(
-        registry_path.read_bytes()
-    ).hexdigest()
+    assert (
+        payload["full_spectrum_model_registry_file_sha256"]
+        == hashlib.sha256(registry_path.read_bytes()).hexdigest()
+    )
     assert payload["obstacle_attenuation_enabled"] is True
     assert payload["backend"] == "geant4"
     assert (
@@ -704,6 +730,8 @@ def test_production_runtime_config_rejects_extends(tmp_path: Path) -> None:
         "detector_height_sampling_mode",
         "detector_pose_consistency_tolerance_m",
         "detector_transport_height_m",
+        "background_rate_cps",
+        "source_bias_cone_half_angle_deg",
         "headless_visualizer_defer",
         "min_rotations_per_pose",
         "random_environment_base_usd_path",
@@ -795,6 +823,16 @@ def test_production_runtime_digest_binds_detector_geometry() -> None:
     )
 
 
+def test_production_runtime_loader_returns_the_canonical_digest() -> None:
+    """All validation and acceptance phases must share one config identity."""
+    root = Path(__file__).resolve().parents[1]
+    path = root / "configs/geant4/variance_reduction_external_no_isaac_32threads.json"
+
+    config, digest = load_production_runtime_config_with_digest(path)
+
+    assert digest == production_runtime_config_sha256(config)
+
+
 def test_reset_handshake_accepts_exact_native_full_spectrum_contract() -> None:
     """The reset boundary authenticates response sampling before any action."""
     _client()._validate_fidelity_handshake(_full_spectrum_handshake())
@@ -853,6 +891,13 @@ def test_production_create_rejects_existing_tcp_endpoint(
         root / "configs/geant4/diagnostic_external_no_isaac_1thread.json"
     )
     monkeypatch.setattr("sim.runtime._tcp_server_available", lambda *_args: True)
+    monkeypatch.setattr(
+        "sim.runtime._configured_detector_green_hashes",
+        lambda *_args: (
+            TEST_GREEN_CONTRACT_SHA256,
+            TEST_GREEN_BINARY_SHA256,
+        ),
+    )
 
     with pytest.raises(RuntimeError, match="refuses to attach"):
         create_simulation_runtime(
@@ -907,6 +952,13 @@ def test_production_gui_rejects_existing_isaac_endpoint_and_closes_geant4(
         lambda *_args, **_kwargs: geant4_runtime,
     )
     monkeypatch.setattr(
+        "sim.runtime._configured_detector_green_hashes",
+        lambda *_args: (
+            TEST_GREEN_CONTRACT_SHA256,
+            TEST_GREEN_BINARY_SHA256,
+        ),
+    )
+    monkeypatch.setattr(
         "sim.runtime._resolve_isaacsim_sidecar_config_path",
         lambda *_args, **_kwargs: (
             root / "configs/isaacsim/demo_room_gui.json",
@@ -956,6 +1008,13 @@ def test_production_create_rejects_incorrect_declared_config_digest(
     (
         "sample_detector_response",
         "detector_response_sampling_contract_sha256",
+        "detector_response_operator_binary_sha256",
+        "detector_response_sampling_model",
+        "detector_response_sampling_mode",
+        "detector_response_boundary_state",
+        "detector_response_conditioning",
+        "detector_response_coincidence_semantics",
+        "detector_cps_green_reference_normalization",
         "background_spectrum_model_id",
         "spectrum_energy_min_keV",
         "spectrum_energy_max_keV",

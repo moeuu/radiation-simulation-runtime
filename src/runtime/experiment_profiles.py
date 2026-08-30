@@ -10,7 +10,8 @@ from types import MappingProxyType
 
 from measurement.model import EnvironmentConfig
 
-DEFAULT_EXPERIMENT_PROFILE_ID = "multi_isotope_surface_search_v1"
+MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE_ID = "multi_isotope_surface_search"
+CS_CO_SURFACE_SEARCH_PROFILE_ID = "cs4_co3_surface_search"
 ACQUISITION_CONTRACT_FIELD = "acquisition_contract"
 EXPERIMENT_PROFILE_ID_FIELD = "experiment_profile_id"
 STANDARD_ACQUISITION_LIVE_TIME_S = 20.0
@@ -174,15 +175,15 @@ class ExperimentProfile:
             raise ValueError("intensity_cps_1m must be one positive ordered range.")
 
     def public_environment_fields(self) -> dict[str, object]:
-        """Return standard truth-free fields added to every authored environment."""
+        """Return profile-specific fields added to one authored environment."""
         return {
             EXPERIMENT_PROFILE_ID_FIELD: self.profile_id,
             ACQUISITION_CONTRACT_FIELD: self.acquisition.to_payload(),
         }
 
 
-STANDARD_EXPERIMENT_PROFILE = ExperimentProfile(
-    profile_id=DEFAULT_EXPERIMENT_PROFILE_ID,
+MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE = ExperimentProfile(
+    profile_id=MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE_ID,
     environment=EnvironmentConfig(
         size_x=10.0,
         size_y=15.0,
@@ -207,19 +208,42 @@ STANDARD_EXPERIMENT_PROFILE = ExperimentProfile(
     blocked_fraction=0.4,
     same_isotope_min_distance_m=3.0,
     intensity_cps_1m=(300_000.0, 2_000_000.0),
-    environment_model_id="random_manchester_component_union_v1",
+    environment_model_id="random_manchester_component_union",
     obstacle_material=STANDARD_OBSTACLE_MATERIAL,
     room_boundary_thickness_m=STANDARD_ROOM_BOUNDARY_THICKNESS_M,
     surface_chart_max_edge_m=1.0,
 )
 
-_DEFAULT_PRIVATE_SCENE_VARIANT_BY_PROFILE = MappingProxyType(
-    {DEFAULT_EXPERIMENT_PROFILE_ID: "mix9"}
+CS_CO_SURFACE_SEARCH_PROFILE = ExperimentProfile(
+    profile_id=CS_CO_SURFACE_SEARCH_PROFILE_ID,
+    environment=MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE.environment,
+    acquisition=MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE.acquisition,
+    candidate_isotopes=("Co-60", "Cs-137"),
+    runtime_config_relative_path=(
+        "configs/geant4/cs_co_external_no_isaac_32threads.json"
+    ),
+    isotope_experiment_profile="unconditioned_cs_co",
+    candidate_count=MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE.candidate_count,
+    passage_width_m=MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE.passage_width_m,
+    blocked_fraction=MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE.blocked_fraction,
+    same_isotope_min_distance_m=(
+        MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE.same_isotope_min_distance_m
+    ),
+    intensity_cps_1m=MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE.intensity_cps_1m,
+    environment_model_id="random_manchester_component_union",
+    obstacle_material=MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE.obstacle_material,
+    room_boundary_thickness_m=(
+        MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE.room_boundary_thickness_m
+    ),
+    surface_chart_max_edge_m=(
+        MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE.surface_chart_max_edge_m
+    ),
 )
+
 _PRIVATE_SCENE_VARIANTS_BY_PROFILE: Mapping[str, Mapping[str, _PrivateSceneVariant]] = (
     MappingProxyType(
         {
-            DEFAULT_EXPERIMENT_PROFILE_ID: MappingProxyType(
+            MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE_ID: MappingProxyType(
                 {
                     "mix9": _PrivateSceneVariant(
                         variant_id="mix9",
@@ -235,8 +259,12 @@ _PRIVATE_SCENE_VARIANTS_BY_PROFILE: Mapping[str, Mapping[str, _PrivateSceneVaria
                             "Eu-154",
                         ),
                     ),
-                    "cs4-co3-eu0": _PrivateSceneVariant(
-                        variant_id="cs4-co3-eu0",
+                }
+            ),
+            CS_CO_SURFACE_SEARCH_PROFILE_ID: MappingProxyType(
+                {
+                    "cs4-co3": _PrivateSceneVariant(
+                        variant_id="cs4-co3",
                         isotope_sequence=(
                             "Cs-137",
                             "Cs-137",
@@ -248,13 +276,18 @@ _PRIVATE_SCENE_VARIANTS_BY_PROFILE: Mapping[str, Mapping[str, _PrivateSceneVaria
                         ),
                     ),
                 }
-            )
+            ),
         }
     )
 )
 
 _EXPERIMENT_PROFILES: Mapping[str, ExperimentProfile] = MappingProxyType(
-    {STANDARD_EXPERIMENT_PROFILE.profile_id: STANDARD_EXPERIMENT_PROFILE}
+    {
+        MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE.profile_id: (
+            MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE
+        ),
+        CS_CO_SURFACE_SEARCH_PROFILE.profile_id: CS_CO_SURFACE_SEARCH_PROFILE,
+    }
 )
 
 
@@ -265,8 +298,10 @@ def available_experiment_profiles() -> tuple[str, ...]:
 
 def require_experiment_profile(profile_id: str) -> ExperimentProfile:
     """Return one runtime-owned experiment profile by identifier."""
+    if type(profile_id) is not str or not profile_id:
+        raise TypeError("experiment profile ID must be a nonempty JSON string.")
     try:
-        return _EXPERIMENT_PROFILES[str(profile_id)]
+        return _EXPERIMENT_PROFILES[profile_id]
     except KeyError as exc:
         expected = ", ".join(available_experiment_profiles())
         raise ValueError(
@@ -280,20 +315,16 @@ def available_private_scene_variants(profile_id: str) -> tuple[str, ...]:
     return tuple(sorted(_PRIVATE_SCENE_VARIANTS_BY_PROFILE[profile_id]))
 
 
-def default_private_scene_variant_id(profile_id: str) -> str:
-    """Return the runtime-owned default private variant for one experiment."""
-    require_experiment_profile(profile_id)
-    return _DEFAULT_PRIVATE_SCENE_VARIANT_BY_PROFILE[profile_id]
-
-
 def require_private_scene_variant(
     profile_id: str,
     variant_id: str,
 ) -> _PrivateSceneVariant:
     """Return one private runtime variant without publishing it as package API."""
     require_experiment_profile(profile_id)
+    if type(variant_id) is not str or not variant_id:
+        raise TypeError("scene variant ID must be a nonempty JSON string.")
     try:
-        return _PRIVATE_SCENE_VARIANTS_BY_PROFILE[profile_id][str(variant_id)]
+        return _PRIVATE_SCENE_VARIANTS_BY_PROFILE[profile_id][variant_id]
     except KeyError as exc:
         expected = ", ".join(available_private_scene_variants(profile_id))
         raise ValueError(
@@ -329,11 +360,13 @@ def experiment_profile_from_environment(
 __all__ = [
     "ACQUISITION_CONTRACT_FIELD",
     "AcquisitionContract",
-    "DEFAULT_EXPERIMENT_PROFILE_ID",
+    "CS_CO_SURFACE_SEARCH_PROFILE",
+    "CS_CO_SURFACE_SEARCH_PROFILE_ID",
     "EXPERIMENT_PROFILE_ID_FIELD",
     "ExperimentProfile",
+    "MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE",
+    "MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE_ID",
     "STANDARD_ACQUISITION_LIVE_TIME_S",
-    "STANDARD_EXPERIMENT_PROFILE",
     "STANDARD_OBSTACLE_MATERIAL",
     "STANDARD_ROOM_BOUNDARY_THICKNESS_M",
     "acquisition_contract_from_environment",

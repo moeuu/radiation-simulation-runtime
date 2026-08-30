@@ -65,8 +65,7 @@ from sim.geant4_app.io_format import (
 from sim.isaacsim_app.scene_builder import build_scene_description
 from sim.protocol import SimulationCommand
 from sim.runtime import (
-    load_production_runtime_config,
-    production_runtime_config_sha256,
+    load_production_runtime_config_with_digest,
 )
 from spectrum.additive_scatter import (
     ADDITIVE_SCATTER_FEATURE_ORDER,
@@ -76,6 +75,7 @@ from spectrum.additive_scatter import (
 )
 from spectrum.full_spectrum_acceptance import (
     SURFACE_BOUNDARY_GATE_SCHEMA_VERSION,
+    SURFACE_BOUNDARY_PROBE_DWELL_TIME_S,
 )
 from spectrum.full_spectrum_acceptance_runner import (
     ACCEPTANCE_ISOTOPES,
@@ -101,9 +101,12 @@ from spectrum.physics_contracts import (
     OBSTACLE_MATERIAL_CONTRACT_SHA256,
     TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256,
 )
-from spectrum.response_matrix import (
-    NATIVE_GEANT4_BIN_COUNT,
-    NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256,
+from spectrum.response_matrix import NATIVE_GEANT4_BIN_COUNT
+from spectrum.runtime_model_keys import FULL_SPECTRUM_MODEL_RUNTIME_KEYS
+from spectrum.detector_green_operator import (
+    DETECTOR_GREEN_COINCIDENCE_SEMANTICS,
+    DETECTOR_GREEN_SAMPLING_MODE,
+    DetectorGreenOperator,
 )
 from spectrum.transport_spectral import (
     ACCEPTANCE_DETECTOR_POSE_XYZ,
@@ -112,6 +115,11 @@ from spectrum.transport_spectral import (
     ACCEPTANCE_GEOMETRY_USE_GPU,
     ACCEPTANCE_OBSTACLE_BLOCKED_FRACTION,
     ACCEPTANCE_PASSAGE_WIDTH_M,
+    ACCEPTANCE_PERTURBATION_MINIMUM_BEARING_ANGLE_RAD,
+    ACCEPTANCE_PERTURBATION_MINIMUM_DISPLACEMENT_M,
+    ACCEPTANCE_PERTURBATION_MINIMUM_LOG_RATE_SEPARATION,
+    ACCEPTANCE_PERTURBATION_TANGENT_DIRECTIONS_UV,
+    ACCEPTANCE_PERTURBATION_TANGENT_MAGNITUDES_M,
     ACCEPTANCE_ROOM_SIZE_XYZ,
     ACCEPTANCE_SURFACE_CHART_MAX_EDGE_M,
     FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256,
@@ -124,19 +132,6 @@ from spectrum.transport_spectral import (
 _SOURCE_RNG_DOMAIN = "full_spectrum_acceptance_surface_truth_v1"
 _BOUNDARY_RNG_DOMAIN = "full_spectrum_acceptance_boundary_probe_v1"
 _BOUNDARY_ERROR_MARKER = "surface-anchor epsilon contract"
-_FULL_SPECTRUM_RUNTIME_KEYS = frozenset(
-    {
-        "full_spectrum_generative_model",
-        "full_spectrum_generative_model_path",
-        "full_spectrum_generative_model_file_sha256",
-        "full_spectrum_contract_hash_sha256",
-        "full_spectrum_model_registry_file_sha256",
-        "full_spectrum_model_registry_path",
-        "isotope_experiment_profile",
-    }
-)
-
-
 def _file_sha256(path: Path) -> str:
     """Return the SHA-256 digest of one file."""
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -170,10 +165,16 @@ def _strict_metadata_number(
 def _native_counter_map(
     metadata: Mapping[str, object],
     key: str,
+    *,
+    allow_empty: bool,
 ) -> dict[str, int]:
     """Parse one exact native comma-separated nonnegative counter map."""
     raw = metadata.get(key)
-    if not isinstance(raw, str) or raw in {"", "-"}:
+    if raw == "-":
+        if allow_empty:
+            return {}
+        raise RuntimeError(f"Native Geant4 metadata {key} must be nonempty.")
+    if not isinstance(raw, str) or raw == "":
         raise RuntimeError(f"Native Geant4 metadata {key} must be nonempty.")
     parsed: dict[str, int] = {}
     for item in raw.split(","):
@@ -187,18 +188,31 @@ def _native_counter_map(
                 f"Native Geant4 metadata {key} has a non-integer count."
             ) from exc
         if count < 0:
-            raise RuntimeError(
-                f"Native Geant4 metadata {key} has a negative count."
-            )
+            raise RuntimeError(f"Native Geant4 metadata {key} has a negative count.")
         parsed[name] = count
     return {name: parsed[name] for name in sorted(parsed)}
 
 
 def _native_process_diagnostics(
     metadata: Mapping[str, object],
+    *,
+    expect_transport_processes: bool,
 ) -> dict[str, object]:
     """Return exact native interaction counters for persisted audit."""
-    counters = _native_counter_map(metadata, "transport_process_counts")
+    counters = _native_counter_map(
+        metadata,
+        "transport_process_counts",
+        allow_empty=not expect_transport_processes,
+    )
+    if expect_transport_processes:
+        if not counters or sum(counters.values()) <= 0:
+            raise RuntimeError(
+                "Source-bearing native acquisition emitted no transport processes."
+            )
+    elif counters:
+        raise RuntimeError(
+            "Background-only native acquisition emitted transport processes."
+        )
     result: dict[str, object] = {
         key: int(_strict_metadata_number(metadata, key))
         for key in (
@@ -227,6 +241,84 @@ def _native_process_diagnostics(
             "Native named process counters disagree with the process map."
         )
     result["transport_process_counts"] = counters
+    if metadata.get("detector_response_coincidence_semantics") != (
+        DETECTOR_GREEN_COINCIDENCE_SEMANTICS
+    ):
+        raise RuntimeError(
+            "Native detector-response coincidence semantics are incompatible."
+        )
+    result["detector_response_coincidence_semantics"] = (
+        DETECTOR_GREEN_COINCIDENCE_SEMANTICS
+    )
+    for field_name in (
+        "detector_response_incident_entry_count",
+        "detector_response_registered_entry_count",
+        "detector_response_coincidence_pulse_count",
+        "detector_response_multi_entry_pulse_count",
+    ):
+        value = _strict_metadata_number(metadata, field_name)
+        if value < 0.0 or value != int(value):
+            raise RuntimeError(
+                f"Native detector-response counter {field_name} is invalid."
+            )
+        result[field_name] = int(value)
+    incident_count = int(result["detector_response_incident_entry_count"])
+    registered_count = int(result["detector_response_registered_entry_count"])
+    pulse_count = int(result["detector_response_coincidence_pulse_count"])
+    multi_entry_count = int(result["detector_response_multi_entry_pulse_count"])
+    if (
+        incident_count < registered_count
+        or registered_count < pulse_count
+        or multi_entry_count > pulse_count
+        or registered_count - pulse_count < multi_entry_count
+        or (
+            not expect_transport_processes
+            and any(
+                value != 0
+                for value in (
+                    incident_count,
+                    registered_count,
+                    pulse_count,
+                    multi_entry_count,
+                )
+            )
+        )
+    ):
+        raise RuntimeError(
+            "Native detector-response coincidence counters are inconsistent."
+        )
+    for field_name in (
+        "pre_dead_time_total_spectrum_counts",
+        "weighted_spectrum_sumw2",
+    ):
+        value = _strict_metadata_number(metadata, field_name)
+        if value < 0.0 or value != int(value):
+            raise RuntimeError(
+                f"Native detector-response counter {field_name} is invalid."
+            )
+    pre_dead_time_count = int(
+        _strict_metadata_number(metadata, "pre_dead_time_total_spectrum_counts")
+    )
+    post_dead_time_count = int(
+        _strict_metadata_number(metadata, "weighted_spectrum_sumw2")
+    )
+    observed_scale = _strict_metadata_number(metadata, "dead_time_observed_scale")
+    expected_scale = (
+        float(post_dead_time_count) / float(pre_dead_time_count)
+        if pre_dead_time_count > 0
+        else 1.0
+    )
+    if (
+        post_dead_time_count > pre_dead_time_count
+        or observed_scale <= 0.0
+        or observed_scale > 1.0
+        or (pre_dead_time_count > 0 and post_dead_time_count == 0)
+        or not np.isclose(observed_scale, expected_scale, rtol=0.0, atol=1.0e-15)
+    ):
+        raise RuntimeError("Native dead-time pulse counters are inconsistent.")
+    result["pre_dead_time_total_pulse_count"] = pre_dead_time_count
+    result["post_dead_time_total_pulse_count"] = post_dead_time_count
+    result["dead_time_observed_scale"] = observed_scale
     return result
 
 
@@ -242,9 +334,7 @@ def _integer_spectrum(
         or raw.dtype == np.bool_
         or not np.issubdtype(raw.dtype, np.number)
     ):
-        raise RuntimeError(
-            f"{field_name} must be a numeric 851-bin native spectrum."
-        )
+        raise RuntimeError(f"{field_name} must be a numeric 851-bin native spectrum.")
     numeric = np.asarray(raw, dtype=np.float64)
     rounded = np.rint(numeric)
     if (
@@ -269,15 +359,11 @@ def _metadata_spectrum(
         raise RuntimeError(f"Native Geant4 metadata {key} is missing.")
     parts = raw.split(",")
     if len(parts) != NATIVE_GEANT4_BIN_COUNT:
-        raise RuntimeError(
-            f"Native Geant4 metadata {key} must contain 851 bins."
-        )
+        raise RuntimeError(f"Native Geant4 metadata {key} must contain 851 bins.")
     try:
         values = np.asarray([float(part) for part in parts], dtype=np.float64)
     except ValueError as exc:
-        raise RuntimeError(
-            f"Native Geant4 metadata {key} is not numeric."
-        ) from exc
+        raise RuntimeError(f"Native Geant4 metadata {key} is not numeric.") from exc
     return _integer_spectrum(values, field_name=key)
 
 
@@ -288,9 +374,7 @@ def _source_payload(source: PointSource) -> dict[str, object]:
             {
                 "isotope": source.isotope,
                 "position": list(source.position),
-                "transport_position": list(
-                    source.transport_position_array()
-                ),
+                "transport_position": list(source.transport_position_array()),
                 "intensity_cps_1m": source.intensity_cps_1m,
                 "surface_chart_id": source.surface_chart_id,
                 "surface_uv": list(source.surface_uv),
@@ -320,13 +404,12 @@ def _validation_labels(
         for line in model.line_identity
         if line["isotope"] == source.isotope
     }
-    count_prefix = "source_equivalent_counts_"
-    expected_line_count_keys = {
-        count_prefix + token for token in expected_tokens
-    }
+    source_count_prefix = "source_equivalent_counts_"
+    line_count_prefix = "scheduled_incident_gamma_counts_"
+    expected_line_count_keys = {line_count_prefix + token for token in expected_tokens}
     expected_source_count_keys = {
         (
-            f"{count_prefix}src{source_index}_"
+            f"{source_count_prefix}src{source_index}_"
             f"{sanitize_native_metadata_token(source.isotope)}"
         )
         for source_index, source in enumerate(sources)
@@ -335,9 +418,11 @@ def _validation_labels(
         key
         for key in metadata
         if isinstance(key, str)
-        and key.startswith(count_prefix + "src")
-        and key
-        not in expected_line_count_keys | expected_source_count_keys
+        and (
+            key.startswith(source_count_prefix + "src")
+            or key.startswith(line_count_prefix + "src")
+        )
+        and key not in expected_line_count_keys | expected_source_count_keys
     }
     if unexpected_source_count_keys:
         raise RuntimeError(
@@ -354,7 +439,7 @@ def _validation_labels(
         ):
             raise RuntimeError(
                 "Native Geant4 must emit a finite nonnegative "
-                f"source-equivalent count for every scheduled line: {key}."
+                f"scheduled incident count for every catalog line: {key}."
             )
     class_names = (
         "uncollided_primary",
@@ -385,15 +470,9 @@ def _validation_labels(
         hashes[token] = {}
         for class_name in class_names:
             key = native_prefix + token + "_" + class_name
-            spectrum = (
-                _metadata_spectrum(metadata, key)
-                if key in metadata
-                else zero
-            )
+            spectrum = _metadata_spectrum(metadata, key) if key in metadata else zero
             totals[token][class_name] = int(np.sum(spectrum, dtype=np.int64))
-            hashes[token][class_name] = canonical_json_sha256(
-                spectrum.tolist()
-            )
+            hashes[token][class_name] = canonical_json_sha256(spectrum.tolist())
     background = _metadata_spectrum(
         metadata,
         "validation_only_background_analysis_spectrum",
@@ -403,12 +482,8 @@ def _validation_labels(
         "target_semantics": ADDITIVE_SCATTER_TARGET_SEMANTICS,
         "entry_class_totals_by_source_line": totals,
         "entry_spectrum_sha256_by_source_line_class": hashes,
-        "background_entry_total": int(
-            np.sum(background, dtype=np.int64)
-        ),
-        "background_entry_spectrum_sha256": canonical_json_sha256(
-            background.tolist()
-        ),
+        "background_entry_total": int(np.sum(background, dtype=np.int64)),
+        "background_entry_spectrum_sha256": canonical_json_sha256(background.tolist()),
     }
 
 
@@ -417,6 +492,7 @@ def _native_fidelity(
     *,
     config: Geant4AppConfig,
     source_count: int,
+    operator: DetectorGreenOperator,
 ) -> dict[str, object]:
     """Authenticate native unit-history postconditions and return the contract."""
     exact_strings = {
@@ -424,35 +500,43 @@ def _native_fidelity(
         "engine_mode": "external",
         "physics_profile": "balanced",
         "source_rate_model": "detector_cps_1m",
+        "primary_emission_model": "independent_gamma_lines",
+        "emission_model": "detector_equivalent_cone",
+        "source_strength_field": "intensity_cps_1m",
+        "intensity_cps_1m_definition": (
+            "pre_dead_time_detector_pulse_rate_at_1m"
+        ),
+        "true_coincidence_summing": "disabled",
+        "radioactive_decay_time_window": "disabled",
+        "source_bias_mode": "detector_cone",
+        "source_bias_cone_policy": "detector_covering",
         "detector_scoring_mode": "incident_gamma_energy",
         "secondary_transport_mode": "full_transport",
         "transport_history_mode": "full_unit_weight",
-        "validation_entry_spectrum_space": (
-            "pre_dead_time_raw_incident_gamma"
-        ),
+        "validation_entry_spectrum_space": ("pre_dead_time_raw_incident_gamma"),
         "validation_entry_spectrum_grouping": (
             "source_token_initial_gamma_line_entry_class"
         ),
         "absorbing_transport_groups": "wall",
         "geant4_version_tag": GEANT4_VERSION_TAG,
         "reference_physics_list": "FTFP_BERT",
-        "electromagnetic_physics_constructor": (
-            "G4EmStandardPhysics_option4"
-        ),
+        "electromagnetic_physics_constructor": ("G4EmStandardPhysics_option4"),
         "gamma_process_names": "GammaGeneralProc,Transportation",
         "gamma_em_subprocess_names": "Rayl,compt,conv,phot",
     }
     for key, expected in exact_strings.items():
         if metadata.get(key) != expected:
-            raise RuntimeError(
-                f"Native Geant4 metadata {key} != {expected!r}."
-            )
+            raise RuntimeError(f"Native Geant4 metadata {key} != {expected!r}.")
     validate_geant4_physics_metadata(metadata)
     if (
         config.engine_mode != "external"
         or config.physics_profile != "balanced"
         or config.thread_count != 32
         or config.source_rate_model != "detector_cps_1m"
+        or config.primary_emission_model != "independent_gamma_lines"
+        or config.source_bias_mode != "detector_cone"
+        or config.source_bias_cone_policy != "detector_covering"
+        or config.source_bias_isotropic_fraction != 1.0
         or config.detector_scoring_mode != "incident_gamma_energy"
         or config.secondary_transport_mode != "full_transport"
         or config.primary_sampling_fraction != 1.0
@@ -473,6 +557,10 @@ def _native_fidelity(
         "spectrum_bin_count": float(NATIVE_GEANT4_BIN_COUNT),
         "geant4_version_number": 1132.0,
         "production_cut_range_mm": 0.7,
+        "source_bias_isotropic_fraction": 1.0,
+        "detector_coincidence_window_s": (
+            float(config.detector_model.coincidence_window_s)
+        ),
     }
     for key, expected in numeric_expected.items():
         if not np.isclose(
@@ -482,6 +570,25 @@ def _native_fidelity(
             atol=1.0e-15,
         ):
             raise RuntimeError(f"Native Geant4 numeric fidelity failed: {key}.")
+    effective_cone_min = _strict_metadata_number(
+        metadata,
+        "source_bias_effective_cone_half_angle_deg_min",
+    )
+    effective_cone_max = _strict_metadata_number(
+        metadata,
+        "source_bias_effective_cone_half_angle_deg_max",
+    )
+    if source_count > 0:
+        if not (
+            0.0 < effective_cone_min <= effective_cone_max <= 180.0
+        ):
+            raise RuntimeError(
+                "Native detector-covering cone bounds are invalid."
+            )
+    elif effective_cone_min != 0.0 or effective_cone_max != 0.0:
+        raise RuntimeError(
+            "Background-only native transport emitted nonzero cone bounds."
+        )
     bool_expected = {
         "multithreaded_run_manager": True,
         "primary_sampling_budget_enabled": False,
@@ -492,20 +599,41 @@ def _native_fidelity(
         "detector_response_applied_in_native": True,
         "validation_entry_class_spectra": True,
         "source_bias_weighted_transport": False,
+        "line_intensities_normalized": True,
+        "prompt_decay_cascade_transport": False,
+        "delayed_decay_pulse_separation": False,
     }
     for key, expected in bool_expected.items():
         if _strict_metadata_bool(metadata, key) is not expected:
             raise RuntimeError(f"Native Geant4 boolean fidelity failed: {key}.")
+    expected_green = {
+        "detector_response_sampling_model": (
+            "isotope_independent_full_detector_green_operator_v3"
+        ),
+        "detector_response_sampling_contract_sha256": (operator.contract_hash_sha256),
+        "detector_response_operator_binary_sha256": operator.binary_sha256,
+        "detector_response_boundary_state": (
+            "normalized_impact_parameter_at_detector_housing_entry_v1"
+        ),
+        "detector_response_conditioning": (
+            "registered_pulse_subprobability_given_housing_incident_gamma_v1"
+        ),
+        "detector_cps_green_reference_normalization": (
+            "catalog_branching_weighted_absolute_detection_efficiency_at_1m_v1"
+        ),
+    }
     if (
-        metadata.get("detector_response_sampling_contract_sha256")
-        != NATIVE_ACCEPTANCE_FIDELITY[
-            "detector_response_sampling_contract_sha256"
-        ]
+        any(metadata.get(key) != value for key, value in expected_green.items())
         or metadata.get("detector_response_sampling_mode")
-        != "multinomial_marking_with_nonparalyzable_event_time"
+        != DETECTOR_GREEN_SAMPLING_MODE
+        or metadata.get("detector_response_coincidence_semantics")
+        != DETECTOR_GREEN_COINCIDENCE_SEMANTICS
     ):
         raise RuntimeError("Native detector-response marking is incompatible.")
-    _native_process_diagnostics(metadata)
+    _native_process_diagnostics(
+        metadata,
+        expect_transport_processes=source_count > 0,
+    )
     surface_bound = _strict_metadata_bool(
         metadata,
         "all_sources_surface_bound",
@@ -559,38 +687,24 @@ def _scene_payload(
         "obstacle_material": obstacle_material,
         "obstacle_grid_shape": list(grid.grid_shape),
         "obstacle_cells": [list(cell) for cell in grid.blocked_cells],
-        "collision_boxes_m": [
-            list(box) for box in grid.collision_boxes_m
-        ],
-        "transport_boxes_m": [
-            list(box) for box in grid.transport_boxes_m
-        ],
+        "collision_boxes_m": [list(box) for box in grid.collision_boxes_m],
+        "transport_boxes_m": [list(box) for box in grid.transport_boxes_m],
         "absorber_transport_group": grid.absorber_transport_group,
         "absorber_transport_boxes_m": [
             list(box) for box in grid.absorber_transport_boxes_m
         ],
-        "absorber_transport_contract_sha256": (
-            grid.absorber_transport_contract_sha256
-        ),
+        "absorber_transport_contract_sha256": (grid.absorber_transport_contract_sha256),
         "transport_mu_by_isotope": {
             str(isotope): [float(value) for value in values]
             for isotope, values in grid.transport_mu_by_isotope.items()
         },
         "transport_line_mu_by_isotope": {
-            str(isotope): [
-                [float(value) for value in row] for row in rows
-            ]
-            for isotope, rows in (
-                grid.transport_line_mu_by_isotope.items()
-            )
+            str(isotope): [[float(value) for value in row] for row in rows]
+            for isotope, rows in (grid.transport_line_mu_by_isotope.items())
         },
         "transport_line_compton_mu_by_isotope": {
-            str(isotope): [
-                [float(value) for value in row] for row in rows
-            ]
-            for isotope, rows in (
-                grid.transport_line_compton_mu_by_isotope.items()
-            )
+            str(isotope): [[float(value) for value in row] for row in rows]
+            for isotope, rows in (grid.transport_line_compton_mu_by_isotope.items())
         },
         "obstacle_instances": obstacle_instances_to_dicts(instances),
         "author_obstacle_prims": True,
@@ -634,6 +748,7 @@ def _build_environment(
         room_size_xyz=ACCEPTANCE_ROOM_SIZE_XYZ,
         obstacle_height_m=float(family_parameters["obstacle_height_m"]),
         rng_seed=scene_seed,
+        isotopes=ACCEPTANCE_ISOTOPES,
         include_room_boundaries=author_room_boundaries,
         room_boundary_thickness_m=room_boundary_thickness_m,
     )
@@ -653,9 +768,7 @@ def _generate_sources(
     if not specification:
         return ()
     isotopes = tuple(isotope for isotope, _ in specification)
-    intensities = {
-        isotope: float(intensity) for isotope, intensity in specification
-    }
+    intensities = {isotope: float(intensity) for isotope, intensity in specification}
     sources = generate_surface_sources(
         env=environment,
         obstacle_grid=grid,
@@ -680,7 +793,7 @@ def _perturbed_sources(
     sources: Sequence[PointSource],
     obstacle_height_m: float,
 ) -> tuple[PointSource, ...]:
-    """Return a fixed tangent displacement without response-based selection."""
+    """Return the first predeclared geometry-separable tangent alternative."""
     if len(sources) != 1:
         raise ValueError("Perturbation scenario requires exactly one source.")
     source = sources[0]
@@ -692,46 +805,83 @@ def _perturbed_sources(
             obstacle_height_m=obstacle_height_m,
         )
     )
-    chart_ids = np.full(8, int(source.surface_chart_id), dtype=np.int64)
-    uv = np.broadcast_to(
-        np.asarray(source.surface_uv, dtype=np.float64),
-        (8, 2),
-    ).copy()
-    displacements = np.asarray(
-        (
-            (0.25, 0.0),
-            (-0.25, 0.0),
-            (0.0, 0.25),
-            (0.0, -0.25),
-            (0.18, 0.18),
-            (-0.18, 0.18),
-            (0.18, -0.18),
-            (-0.18, -0.18),
-        ),
+    magnitudes = np.asarray(
+        ACCEPTANCE_PERTURBATION_TANGENT_MAGNITUDES_M,
         dtype=np.float64,
     )
-    proposed_ids, proposed_uv, _, valid, _ = (
-        atlas.trace_tangent_displacements(
-            chart_ids,
-            uv,
-            displacements,
-        )
+    directions = np.asarray(
+        ACCEPTANCE_PERTURBATION_TANGENT_DIRECTIONS_UV,
+        dtype=np.float64,
+    )
+    displacements = (
+        magnitudes[:, np.newaxis, np.newaxis]
+        * directions[np.newaxis, :, :]
+    ).reshape(-1, 2)
+    chart_ids = np.full(
+        displacements.shape[0],
+        int(source.surface_chart_id),
+        dtype=np.int64,
+    )
+    uv = np.broadcast_to(
+        np.asarray(source.surface_uv, dtype=np.float64),
+        displacements.shape,
+    ).copy()
+    proposed_ids, proposed_uv, _, valid, _ = atlas.trace_tangent_displacements(
+        chart_ids,
+        uv,
+        displacements,
     )
     proposed_positions = atlas.positions_xyz(proposed_ids, proposed_uv)
     anchor = np.asarray(source.position, dtype=np.float64)
-    usable = valid & (
-        np.linalg.norm(proposed_positions - anchor[None, :], axis=1) >= 0.20
+    detector = environment.detector()
+    anchor_vector = anchor - detector
+    anchor_distance = float(np.linalg.norm(anchor_vector))
+    candidate_vectors = proposed_positions - detector[np.newaxis, :]
+    candidate_distances = np.linalg.norm(candidate_vectors, axis=1)
+    if not np.isfinite(anchor_distance) or anchor_distance <= 0.0:
+        raise RuntimeError("Perturbation truth coincides with the detector.")
+    positive_distance = candidate_distances > 0.0
+    log_rate_separation = np.full(candidate_distances.shape, np.inf)
+    log_rate_separation[positive_distance] = np.abs(
+        2.0 * np.log(candidate_distances[positive_distance] / anchor_distance)
+    )
+    cosine = np.zeros(candidate_distances.shape, dtype=np.float64)
+    cosine[positive_distance] = np.sum(
+        candidate_vectors[positive_distance] * anchor_vector[np.newaxis, :],
+        axis=1,
+    ) / (candidate_distances[positive_distance] * anchor_distance)
+    bearing_angle = np.full(candidate_distances.shape, np.pi, dtype=np.float64)
+    bearing_angle[positive_distance] = np.arccos(
+        np.clip(cosine[positive_distance], -1.0, 1.0)
+    )
+    surface_displacement = np.linalg.norm(
+        proposed_positions - anchor[np.newaxis, :],
+        axis=1,
+    )
+    geometrically_separable = (
+        log_rate_separation
+        >= ACCEPTANCE_PERTURBATION_MINIMUM_LOG_RATE_SEPARATION
+    ) | (
+        bearing_angle >= ACCEPTANCE_PERTURBATION_MINIMUM_BEARING_ANGLE_RAD
+    )
+    usable = (
+        valid
+        & positive_distance
+        & (
+            surface_displacement
+            >= ACCEPTANCE_PERTURBATION_MINIMUM_DISPLACEMENT_M
+        )
+        & geometrically_separable
     )
     if not np.any(usable):
         raise RuntimeError(
-            "Fixed continuous-surface perturbation could not be traced."
+            "No predeclared continuous-surface perturbation satisfies the "
+            "geometry-only separability contract."
         )
     index = int(np.flatnonzero(usable)[0])
     chart_id = int(proposed_ids[index])
     position = proposed_positions[index]
-    normal = atlas.air_facing_normals_xyz(
-        np.asarray([chart_id], dtype=np.int64)
-    )[0]
+    normal = atlas.air_facing_normals_xyz(np.asarray([chart_id], dtype=np.int64))[0]
     transport = position + SURFACE_EMISSION_EPSILON_M * normal
     return (
         PointSource(
@@ -742,9 +892,7 @@ def _perturbed_sources(
             surface_uv=tuple(float(value) for value in proposed_uv[index]),
             surface_normal=tuple(float(value) for value in normal),
             transport_position=tuple(float(value) for value in transport),
-            surface_emission_policy_sha256=(
-                surface_emission_policy_sha256()
-            ),
+            surface_emission_policy_sha256=(surface_emission_policy_sha256()),
         ),
     )
 
@@ -818,38 +966,30 @@ def _geometry_batch(
             dtype=np.int64,
         )
         local_indices = np.asarray(
-            [
-                int(line_rows[index]["transport_line_index"])
-                for index in global_indices
-            ],
+            [int(line_rows[index]["transport_line_index"]) for index in global_indices],
             dtype=np.int64,
         )
         source_positions = np.asarray(
-            [
-                sources[index].transport_position_array()
-                for index in source_indices
-            ],
+            [sources[index].transport_position_array() for index in source_indices],
             dtype=np.float64,
         )
-        components = (
-            kernel.line_transport_components_selected_pairs_for_detectors(
-                isotope,
-                detectors,
-                source_positions,
-                fe_indices,
-                pb_indices,
-                local_indices,
-            )
+        components = kernel.line_transport_components_selected_pairs_for_detectors(
+            isotope,
+            detectors,
+            source_positions,
+            fe_indices,
+            pb_indices,
+            local_indices,
+            impact_parameter_edges_fraction=(
+                model.detector_impact_parameter_edges_fraction
+            ),
         )
         branching = kernel.line_branching_weights(
             isotope,
             local_indices,
         )
         strengths = np.asarray(
-            [
-                sources[index].intensity_cps_1m
-                for index in source_indices
-            ],
+            [sources[index].intensity_cps_1m for index in source_indices],
             dtype=np.float64,
         )
         rate_scale = strengths[None, :, None] * branching[None, None, :]
@@ -858,16 +998,21 @@ def _geometry_batch(
             source_indices,
             global_indices,
         )
-        unattenuated[selection] = (
-            components.unattenuated_kernel * rate_scale
-        )
+        unattenuated[selection] = components.unattenuated_kernel * rate_scale
         uncollided[selection] = components.uncollided_kernel * rate_scale
-        feature_values = np.stack(
+        feature_values = np.concatenate(
             (
-                components.tau_fe,
-                components.tau_pb,
-                components.tau_obstacle,
-                components.distance_m,
+                np.stack(
+                    (
+                        components.tau_fe,
+                        components.tau_pb,
+                        components.tau_obstacle,
+                        components.tau_obstacle_compton,
+                        components.distance_m,
+                    ),
+                    axis=-1,
+                ),
+                components.uncollided_impact_fractions,
             ),
             axis=-1,
         )
@@ -962,8 +1107,7 @@ def _mutated_surface_scene(
             continue
         fields = line.split()
         values = {
-            token.split("=", 1)[0]: token.split("=", 1)[1]
-            for token in fields[1:]
+            token.split("=", 1)[0]: token.split("=", 1)[1] for token in fields[1:]
         }
         anchor = np.asarray(
             [
@@ -1023,9 +1167,7 @@ def _boundary_probe_evidence_sha256(
     implementation_bundle_sha256: str,
 ) -> str:
     """Hash deterministic boundary outcome semantics, not sampled counts."""
-    marker_seen = _BOUNDARY_ERROR_MARKER in (
-        result.stdout + result.stderr
-    )
+    marker_seen = _BOUNDARY_ERROR_MARKER in (result.stdout + result.stderr)
     return canonical_json_sha256(
         {
             "schema_version": SURFACE_BOUNDARY_GATE_SCHEMA_VERSION,
@@ -1062,7 +1204,7 @@ def _surface_boundary_gate(
             scenario_id="single_line_source_resolved",
             shield_pair_id=0,
         ),
-        dwell_time_s=1.0e-6,
+        dwell_time_s=SURFACE_BOUNDARY_PROBE_DWELL_TIME_S,
     )
     executable = Path(str(app.config.executable_path)).resolve()
     variants = (
@@ -1084,9 +1226,7 @@ def _surface_boundary_gate(
         base_scene = base_scene_path.read_text(encoding="utf-8")
         for variant in variants:
             expected_executable = app.native_executable_sha256
-            expected_environment = (
-                app.native_execution_environment_sha256
-            )
+            expected_environment = app.native_execution_environment_sha256
             if expected_executable is None or expected_environment is None:
                 raise RuntimeError(
                     "Acceptance boundary probe lacks native execution provenance."
@@ -1131,8 +1271,8 @@ def _surface_boundary_gate(
                 str(app.config.dead_time_tau_s),
                 "--source-rate-model",
                 app.config.source_rate_model,
-                "--source-bias-cone-half-angle-deg",
-                str(app.config.source_bias_cone_half_angle_deg),
+                "--source-bias-cone-policy",
+                str(app.config.source_bias_cone_policy),
                 "--detector-scoring-mode",
                 app.config.detector_scoring_mode,
                 "--secondary-transport-mode",
@@ -1142,6 +1282,12 @@ def _surface_boundary_gate(
                 "--background-cps",
                 str(app.config.background_cps),
                 "--sample-detector-response",
+                "--detector-green-operator-path",
+                str(app.engine.config.detector_green_operator_path),
+                "--detector-green-operator-binary-sha256",
+                str(app.engine.config.detector_green_operator_binary_sha256),
+                "--detector-green-operator-contract-sha256",
+                str(app.engine.config.detector_green_operator_contract_sha256),
                 "--validation-entry-class-spectra",
                 *app.config.executable_args,
             ]
@@ -1164,21 +1310,22 @@ def _surface_boundary_gate(
                         and np.all(spectrum == np.floor(spectrum))
                     )
                     if response_contract_valid:
+                        if app.detector_green_operator is None:
+                            raise RuntimeError(
+                                "Boundary probe has no detector Green operator."
+                            )
                         _native_fidelity(
                             metadata,
                             config=app.config,
                             source_count=1,
+                            operator=app.detector_green_operator,
                         )
                 except (OSError, RuntimeError, TypeError, ValueError):
                     response_contract_valid = False
-            response_contract_valid_by_variant[variant] = (
-                response_contract_valid
-            )
+            response_contract_valid_by_variant[variant] = response_contract_valid
             evidence[variant] = _boundary_probe_evidence_sha256(
                 variant=variant,
-                scene_sha256=hashlib.sha256(
-                    scene_text.encode("utf-8")
-                ).hexdigest(),
+                scene_sha256=hashlib.sha256(scene_text.encode("utf-8")).hexdigest(),
                 request_sha256=_file_sha256(request_path),
                 result=result,
                 response_contract_valid=response_contract_valid,
@@ -1190,33 +1337,24 @@ def _surface_boundary_gate(
         results["air_plus_epsilon"].returncode == 0
         and response_contract_valid_by_variant["air_plus_epsilon"]
     )
-    exact_error = (
-        results["exact_surface_anchor"].returncode != 0
-        and _BOUNDARY_ERROR_MARKER
-        in (
-            results["exact_surface_anchor"].stdout
-            + results["exact_surface_anchor"].stderr
-        )
+    exact_error = results[
+        "exact_surface_anchor"
+    ].returncode != 0 and _BOUNDARY_ERROR_MARKER in (
+        results["exact_surface_anchor"].stdout + results["exact_surface_anchor"].stderr
     )
-    solid_error = (
-        results["solid_minus_epsilon"].returncode != 0
-        and _BOUNDARY_ERROR_MARKER
-        in (
-            results["solid_minus_epsilon"].stdout
-            + results["solid_minus_epsilon"].stderr
-        )
+    solid_error = results[
+        "solid_minus_epsilon"
+    ].returncode != 0 and _BOUNDARY_ERROR_MARKER in (
+        results["solid_minus_epsilon"].stdout + results["solid_minus_epsilon"].stderr
     )
     passed = air_ok and exact_error and solid_error
     if not passed:
-        raise RuntimeError(
-            "Native signed-epsilon surface-boundary probes failed."
-        )
+        raise RuntimeError("Native signed-epsilon surface-boundary probes failed.")
     return {
         "schema_version": SURFACE_BOUNDARY_GATE_SCHEMA_VERSION,
-        "surface_emission_policy_sha256": (
-            surface_emission_policy_sha256()
-        ),
+        "surface_emission_policy_sha256": (surface_emission_policy_sha256()),
         "surface_emission_epsilon_m": SURFACE_EMISSION_EPSILON_M,
+        "probe_dwell_time_s": SURFACE_BOUNDARY_PROBE_DWELL_TIME_S,
         "native_position_variants": list(variants),
         "evidence_sha256_by_variant": evidence,
         "exact_anchor_vs_air_gate_passed": air_ok and exact_error,
@@ -1261,12 +1399,8 @@ class _NativeScenarioSession(AcceptanceScenarioSession):
         if exported is None:
             raise RuntimeError("Acceptance native scene was not exported.")
         self.scene_hash = str(exported.scene_hash)
-        self.source_payloads = tuple(
-            _source_payload(source) for source in sources
-        )
-        self.source_hash = surface_source_runtime_contract_sha256(
-            self.source_payloads
-        )
+        self.source_payloads = tuple(_source_payload(source) for source in sources)
+        self.source_hash = surface_source_runtime_contract_sha256(self.source_payloads)
 
     def acquire_pair(self, shield_pair_id: int) -> Mapping[str, object]:
         """Run one exact native pair and return its authenticated artifact."""
@@ -1298,8 +1432,12 @@ class _NativeScenarioSession(AcceptanceScenarioSession):
             metadata,
             config=self.app.config,
             source_count=len(self.sources),
+            operator=self.model.detector_green_operator,
         )
-        process_diagnostics = _native_process_diagnostics(metadata)
+        process_diagnostics = _native_process_diagnostics(
+            metadata,
+            expect_transport_processes=bool(self.sources),
+        )
         labels = _validation_labels(
             metadata,
             sources=self.sources,
@@ -1318,9 +1456,7 @@ class _NativeScenarioSession(AcceptanceScenarioSession):
                     self.geometry.features_vslf[index : index + 1].tolist()
                 ),
                 "additive_scatter_basis_vslf": (
-                    self.geometry.scatter_basis_vslf[
-                        index : index + 1
-                    ].tolist()
+                    self.geometry.scatter_basis_vslf[index : index + 1].tolist()
                 ),
             }
         else:
@@ -1366,9 +1502,7 @@ class _NativeScenarioSession(AcceptanceScenarioSession):
             )
         return {
             "schema_version": ACCEPTANCE_PAIR_SCHEMA_VERSION,
-            "acceptance_contract_sha256": (
-                FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256
-            ),
+            "acceptance_contract_sha256": (FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256),
             "scene_seed": self.scene_seed,
             "split": self.split,
             "scenario_id": self.scenario_id,
@@ -1389,13 +1523,14 @@ class _NativeScenarioSession(AcceptanceScenarioSession):
             "validation_labels": labels,
             "native_fidelity": fidelity,
             "native_process_diagnostics": process_diagnostics,
-            "detector_response_contract_sha256": (
-                NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
+            "detector_green_operator_contract_sha256": (
+                self.model.detector_green_operator.contract_hash_sha256
+            ),
+            "detector_green_operator_binary_sha256": (
+                self.model.detector_green_operator.binary_sha256
             ),
             "shield_pose_contract_sha256": SHIELD_POSE_CONTRACT_SHA256,
-            "obstacle_material_contract_sha256": (
-                OBSTACLE_MATERIAL_CONTRACT_SHA256
-            ),
+            "obstacle_material_contract_sha256": (OBSTACLE_MATERIAL_CONTRACT_SHA256),
             "transport_physics_table_contract_sha256": (
                 TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256
             ),
@@ -1437,8 +1572,8 @@ class ExternalGeant4AcceptanceBackend(AcceptanceTransportBackend):
         """Load and authenticate the standard native runtime configuration."""
         self.repository_root = Path(repository_root).resolve()
         self.runtime_config_path = Path(runtime_config_path).resolve()
-        self.runtime_config = load_production_runtime_config(
-            self.runtime_config_path
+        self.runtime_config, self.runtime_config_sha256 = (
+            load_production_runtime_config_with_digest(self.runtime_config_path)
         )
         app_payload = dict(self.runtime_config)
         app_payload["validation_entry_class_spectra"] = True
@@ -1455,6 +1590,15 @@ class ExternalGeant4AcceptanceBackend(AcceptanceTransportBackend):
         app_payload["executable_path"] = executable.as_posix()
         self.app_payload = app_payload
         self.app_config = Geant4AppConfig.from_dict(app_payload)
+        operator_manifest = Path(
+            str(self.app_config.detector_green_operator_manifest)
+        ).expanduser()
+        if not operator_manifest.is_absolute():
+            operator_manifest = self.repository_root / operator_manifest
+        self.detector_green_operator = DetectorGreenOperator.from_artifact(
+            operator_manifest
+        )
+        self.detector_green_operator.require_runtime_ready()
         if (
             self.app_config.engine_mode != "external"
             or self.app_config.physics_profile != "balanced"
@@ -1463,8 +1607,11 @@ class ExternalGeant4AcceptanceBackend(AcceptanceTransportBackend):
             or self.app_config.target_sampled_primaries is not None
             or self.app_config.accelerated_weighted_transport_enable
             or self.app_config.source_rate_model != "detector_cps_1m"
-            or self.app_config.detector_scoring_mode
-            != "incident_gamma_energy"
+            or self.app_config.primary_emission_model
+            != "independent_gamma_lines"
+            or self.app_config.source_bias_mode != "detector_cone"
+            or self.app_config.source_bias_isotropic_fraction != 1.0
+            or self.app_config.detector_scoring_mode != "incident_gamma_energy"
             or self.app_config.secondary_transport_mode != "full_transport"
             or not self.app_config.sample_detector_response
             or not self.app_config.validation_entry_class_spectra
@@ -1476,15 +1623,12 @@ class ExternalGeant4AcceptanceBackend(AcceptanceTransportBackend):
                 "full unit-weight histories, full secondary transport, and "
                 "native detector-response sampling."
             )
-        self.runtime_config_sha256 = production_runtime_config_sha256(
-            self.runtime_config
-        )
         self.native_executable_sha256 = _file_sha256(executable)
         self.native_execution_environment_sha256 = (
             native_execution_environment_bundle_sha256(executable)
         )
-        self.implementation_bundle_sha256 = (
-            acceptance_implementation_bundle_sha256(self.repository_root)
+        self.implementation_bundle_sha256 = acceptance_implementation_bundle_sha256(
+            self.repository_root
         )
         self._boundary_gate_by_seed: dict[int, Mapping[str, object]] = {}
 
@@ -1496,7 +1640,7 @@ class ExternalGeant4AcceptanceBackend(AcceptanceTransportBackend):
         observation_payload = {
             key: value
             for key, value in self.runtime_config.items()
-            if key not in _FULL_SPECTRUM_RUNTIME_KEYS
+            if key not in FULL_SPECTRUM_MODEL_RUNTIME_KEYS
         }
         observation = build_nonproduction_observation_model(
             observation_payload,
@@ -1536,15 +1680,11 @@ class ExternalGeant4AcceptanceBackend(AcceptanceTransportBackend):
             )
         app = Geant4Application(
             app_config=dict(self.app_payload),
-            expected_native_executable_sha256=(
-                self.native_executable_sha256
-            ),
+            expected_native_executable_sha256=(self.native_executable_sha256),
             expected_native_execution_environment_sha256=(
                 self.native_execution_environment_sha256
             ),
-            expected_implementation_bundle_sha256=(
-                self.implementation_bundle_sha256
-            ),
+            expected_implementation_bundle_sha256=(self.implementation_bundle_sha256),
         )
         app.reset(
             build_scene_description(
@@ -1587,9 +1727,7 @@ class ExternalGeant4AcceptanceBackend(AcceptanceTransportBackend):
                 _BOUNDARY_RNG_DOMAIN,
             ),
             count=1,
-            obstacle_height_m=float(
-                family_parameters["obstacle_height_m"]
-            ),
+            obstacle_height_m=float(family_parameters["obstacle_height_m"]),
             chart_max_edge_m=ACCEPTANCE_SURFACE_CHART_MAX_EDGE_M,
         )
         app = self._app_for_scene(
@@ -1618,12 +1756,8 @@ class ExternalGeant4AcceptanceBackend(AcceptanceTransportBackend):
         environment, grid, instances = _build_environment(
             scene_seed=scene_seed,
             obstacle_height_m=float(self.app_config.obstacle_height_m),
-            author_room_boundaries=bool(
-                self.app_config.author_room_boundary_prims
-            ),
-            room_boundary_thickness_m=(
-                STANDARD_ROOM_BOUNDARY_THICKNESS_M
-            ),
+            author_room_boundaries=bool(self.app_config.author_room_boundary_prims),
+            room_boundary_thickness_m=(STANDARD_ROOM_BOUNDARY_THICKNESS_M),
         )
         family_parameters = randomized_training_geometry_parameters(
             scene_seed,
@@ -1634,14 +1768,13 @@ class ExternalGeant4AcceptanceBackend(AcceptanceTransportBackend):
             grid=grid,
             scene_seed=scene_seed,
             scenario_id=scenario_id,
-            obstacle_height_m=float(
-                family_parameters["obstacle_height_m"]
-            ),
+            obstacle_height_m=float(family_parameters["obstacle_height_m"]),
         )
-        model = GeometryConditionedSpectralModel.standard_native(
+        model = GeometryConditionedSpectralModel.physics_only_native(
             ACCEPTANCE_ISOTOPES,
             dead_time_tau_s=float(self.app_config.dead_time_tau_s),
             background_rate_cps=float(self.app_config.background_cps),
+            detector_green_operator=self.detector_green_operator,
         )
         actual_line_hash = canonical_json_sha256(
             [dict(row) for row in model.line_identity]
@@ -1661,9 +1794,7 @@ class ExternalGeant4AcceptanceBackend(AcceptanceTransportBackend):
                 environment=environment,
                 grid=grid,
                 sources=sources,
-                obstacle_height_m=float(
-                    family_parameters["obstacle_height_m"]
-                ),
+                obstacle_height_m=float(family_parameters["obstacle_height_m"]),
             )
             perturbed_geometry = _geometry_batch(
                 kernel=kernel,
@@ -1697,9 +1828,7 @@ class ExternalGeant4AcceptanceBackend(AcceptanceTransportBackend):
                     grid,
                     instances,
                     room_size_xyz=ACCEPTANCE_ROOM_SIZE_XYZ,
-                    passage_width_m=float(
-                        family_parameters["passage_width_m"]
-                    ),
+                    passage_width_m=float(family_parameters["passage_width_m"]),
                     target_blocked_fraction=float(
                         family_parameters["blocked_fraction"]
                     ),

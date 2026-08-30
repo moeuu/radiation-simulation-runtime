@@ -120,7 +120,7 @@ def test_standard_unapproved_profile_cannot_open_production_session() -> None:
     """The current unvalidated profile must fail before acquisition starts."""
     payload = load_runtime_config(STANDARD_CONFIG)
 
-    with pytest.raises(RuntimeError, match="independent all-64 holdout"):
+    with pytest.raises(RuntimeError, match="independent all-64 validation"):
         estimator_neutral_runtime_config(
             payload,
             backend="geant4",
@@ -145,7 +145,7 @@ def test_production_session_rejects_analytic_requested_backend() -> None:
 @pytest.mark.parametrize(
     ("mutation", "message"),
     (
-        ("background_rate", "background_cps and background_rate_cps"),
+        ("background_rate", "differs from the approved model rate"),
         ("background_model", "background_spectrum_model_id"),
     ),
 )
@@ -161,8 +161,9 @@ def test_production_preflight_rejects_background_contract_mismatch(
         "runtime.session.geometry_conditioned_model_from_runtime_config",
         lambda *args, **kwargs: approved,
     )
+    payload["background_cps"] = float(approved.background_rate_cps)
     if mutation == "background_rate":
-        payload["background_rate_cps"] = float(payload["background_cps"]) + 1.0
+        payload["background_cps"] = float(approved.background_rate_cps) + 1.0
     else:
         payload["background_spectrum_model_id"] = "wrong-background-model"
 
@@ -182,9 +183,13 @@ def test_production_preflight_rejects_background_contract_mismatch(
         ("detector_scoring_mode", "energy_deposit"),
         ("line_resolved_shield_attenuation", False),
         ("obstacle_attenuation_enabled", False),
+        ("primary_emission_model", "geant4_radioactive_decay"),
         ("primary_sampling_fraction", 0.5),
         ("sample_detector_response", False),
         ("secondary_transport_mode", "primary_only"),
+        ("source_bias_cone_policy", "fixed_angle"),
+        ("source_bias_isotropic_fraction", 0.5),
+        ("source_bias_mode", "analog"),
         ("source_rate_model", "activity_bq"),
     ),
 )
@@ -226,62 +231,49 @@ def test_native_executable_digest_hashes_one_exact_regular_file(
 
 
 @pytest.mark.parametrize(
+    ("mutation", "message"),
     (
-        "native_digest",
-        "native_environment_digest",
-        "implementation_digest",
-        "message",
-    ),
-    (
-        (
-            "0" * 64,
-            "e" * 64,
-            "c" * 64,
-            "native Geant4 executable SHA-256",
-        ),
-        (
-            "b" * 64,
-            "0" * 64,
-            "c" * 64,
-            "execution-environment SHA-256",
-        ),
-        (
-            "b" * 64,
-            "e" * 64,
-            "0" * 64,
-            "implementation bundle SHA-256",
-        ),
+        ("native", "native Geant4 executable SHA-256"),
+        ("environment", "execution-environment SHA-256"),
+        ("implementation", "implementation bundle SHA-256"),
     ),
 )
 def test_production_preflight_rejects_unapproved_execution_bundle(
     monkeypatch: pytest.MonkeyPatch,
-    native_digest: str,
-    native_environment_digest: str,
-    implementation_digest: str,
+    mutation: str,
     message: str,
 ) -> None:
     """A changed native binary or Python transport bundle must abort startup."""
     payload = load_runtime_config(STANDARD_CONFIG)
     approved = approved_full_spectrum_model()
+    validation = approved.validation_manifest
+    assert validation is not None
     monkeypatch.setattr(
         "runtime.session.geometry_conditioned_model_from_runtime_config",
         lambda *args, **kwargs: approved,
     )
+    payload["background_cps"] = float(approved.background_rate_cps)
     monkeypatch.setattr(
         "runtime.session._native_executable_sha256",
-        lambda _config: native_digest,
-    )
-    monkeypatch.setattr(
-        "runtime.session.production_runtime_config_sha256",
-        lambda _config: "a" * 64,
+        lambda _config: (
+            "0" * 64 if mutation == "native" else validation["native_executable_sha256"]
+        ),
     )
     monkeypatch.setattr(
         "runtime.session.native_execution_environment_bundle_sha256",
-        lambda _path: native_environment_digest,
+        lambda _path: (
+            "0" * 64
+            if mutation == "environment"
+            else validation["native_execution_environment_sha256"]
+        ),
     )
     monkeypatch.setattr(
         "runtime.session.acceptance_implementation_bundle_sha256",
-        lambda _root: implementation_digest,
+        lambda _root: (
+            "0" * 64
+            if mutation == "implementation"
+            else validation["implementation_bundle_sha256"]
+        ),
     )
 
     with pytest.raises(RuntimeError, match=message):
@@ -291,22 +283,38 @@ def test_production_preflight_rejects_unapproved_execution_bundle(
         )
 
 
-def test_production_preflight_rejects_unapproved_runtime_config(
+def test_nonalgorithm_runtime_config_change_does_not_expire_model_approval(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A different canonical transport config cannot reuse model approval."""
+    """Path and orchestration changes may reuse the same approved algorithm."""
     payload = load_production_runtime_config(STANDARD_CONFIG)
     approved = approved_full_spectrum_model()
+    validation = approved.validation_manifest
+    assert validation is not None
     monkeypatch.setattr(
         "runtime.session.geometry_conditioned_model_from_runtime_config",
         lambda *args, **kwargs: approved,
     )
+    payload["background_cps"] = float(approved.background_rate_cps)
+    monkeypatch.setattr(
+        "runtime.session._native_executable_sha256",
+        lambda _config: validation["native_executable_sha256"],
+    )
+    monkeypatch.setattr(
+        "runtime.session.native_execution_environment_bundle_sha256",
+        lambda _path: validation["native_execution_environment_sha256"],
+    )
+    monkeypatch.setattr(
+        "runtime.session.acceptance_implementation_bundle_sha256",
+        lambda _root: validation["implementation_bundle_sha256"],
+    )
 
-    with pytest.raises(RuntimeError, match="runtime-config SHA-256"):
-        require_production_runtime_preflight(
-            payload,
-            requested_backend="geant4",
-        )
+    result = require_production_runtime_preflight(
+        payload,
+        requested_backend="geant4",
+    )
+
+    assert result is approved
 
 
 def test_approved_profile_resolves_once_for_estimator_neutral_log(
@@ -315,6 +323,8 @@ def test_approved_profile_resolves_once_for_estimator_neutral_log(
     """An approved model must produce one immutable logged contract."""
     payload = load_runtime_config(STANDARD_CONFIG)
     approved = approved_full_spectrum_model()
+    validation = approved.validation_manifest
+    assert validation is not None
 
     def resolve_approved_profile(
         config: dict[str, object],
@@ -332,25 +342,22 @@ def test_approved_profile_resolves_once_for_estimator_neutral_log(
         "runtime.session.geometry_conditioned_model_from_runtime_config",
         lambda *args, **kwargs: approved,
     )
+    payload["background_cps"] = float(approved.background_rate_cps)
     monkeypatch.setattr(
         "runtime.session.resolve_profile_model_runtime_config",
         resolve_approved_profile,
     )
     monkeypatch.setattr(
         "runtime.session._native_executable_sha256",
-        lambda _config: "b" * 64,
-    )
-    monkeypatch.setattr(
-        "runtime.session.production_runtime_config_sha256",
-        lambda _config: "a" * 64,
+        lambda _config: validation["native_executable_sha256"],
     )
     monkeypatch.setattr(
         "runtime.session.native_execution_environment_bundle_sha256",
-        lambda _path: "e" * 64,
+        lambda _path: validation["native_execution_environment_sha256"],
     )
     monkeypatch.setattr(
         "runtime.session.acceptance_implementation_bundle_sha256",
-        lambda _root: "c" * 64,
+        lambda _root: validation["implementation_bundle_sha256"],
     )
     resolved = estimator_neutral_runtime_config(
         payload,
@@ -368,7 +375,8 @@ def test_approved_profile_resolves_once_for_estimator_neutral_log(
     assert "isotope_experiment_profile" not in resolved
     assert "full_spectrum_profile_calibration_status" not in resolved
     model = GeometryConditionedSpectralModel.from_manifest_payload(
-        resolved["full_spectrum_generative_model"]
+        resolved["full_spectrum_generative_model"],
+        detector_green_operator=approved.detector_green_operator,
     )
     assert model.runtime_ready is True
     assert model.production_ready is True
@@ -382,7 +390,7 @@ def test_standard_profile_reaches_shared_continuous_kernel_contract() -> None:
     """Only explicit non-production tooling may inspect an unapproved model."""
     payload = load_runtime_config(STANDARD_CONFIG)
 
-    with pytest.raises(RuntimeError, match="independent all-64 holdout"):
+    with pytest.raises(RuntimeError, match="independent all-64 validation"):
         build_runtime_observation_model(
             payload,
             isotopes=("Co-60", "Cs-137", "Eu-154"),
@@ -426,6 +434,46 @@ def test_runtime_observation_model_requires_literal_production_approval(
     )
 
     with pytest.raises(RuntimeError, match="production_ready=False"):
+        build_runtime_observation_model(
+            payload,
+            isotopes=("Co-60", "Cs-137", "Eu-154"),
+            authenticated_full_spectrum_model=model,
+        )
+
+
+def test_production_observation_model_requires_one_spectrum_model() -> None:
+    """Production cannot silently construct a count-only observation model."""
+    payload = runtime_config()
+    del payload["full_spectrum_generative_model"]
+    del payload["full_spectrum_contract_hash_sha256"]
+
+    with pytest.raises(RuntimeError, match="authenticated full-spectrum model"):
+        build_runtime_observation_model(
+            payload,
+            isotopes=("Co-60", "Cs-137", "Eu-154"),
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("missing_source_rate", "missing_line_flag", "disabled_line_transport"),
+)
+def test_production_observation_model_rejects_implicit_line_semantics(
+    mutation: str,
+) -> None:
+    """Catalog and source-rate semantics must be explicit and line resolved."""
+    payload = runtime_config()
+    model = approved_full_spectrum_model()
+    if mutation == "missing_source_rate":
+        del payload["source_rate_model"]
+    elif mutation == "missing_line_flag":
+        del payload["line_resolved_shield_attenuation"]
+    else:
+        payload["line_resolved_shield_attenuation"] = False
+
+    with pytest.raises(
+        (TypeError, ValueError), match="source_rate_model|line.resolved"
+    ):
         build_runtime_observation_model(
             payload,
             isotopes=("Co-60", "Cs-137", "Eu-154"),

@@ -76,6 +76,8 @@ def _exported_surface_scene() -> ExportedGeant4Scene:
 
 def _native_scene_identity_metadata(
     scene: ExportedGeant4Scene,
+    *,
+    detector_green_reference_efficiency: float | None = None,
 ) -> dict[str, object]:
     """Return the identity fields emitted after native scene parsing."""
     source = scene.sources[0]
@@ -92,7 +94,7 @@ def _native_scene_identity_metadata(
         ),
     }
     prefix = "native_surface_source_0_"
-    return {
+    result = {
         "backend": "geant4",
         "engine_mode": "external",
         "scene_hash": scene.scene_hash,
@@ -122,6 +124,11 @@ def _native_scene_identity_metadata(
         prefix + "surface_normal_y": source.surface_normal_xyz[1],
         prefix + "surface_normal_z": source.surface_normal_xyz[2],
     }
+    if detector_green_reference_efficiency is not None:
+        result[prefix + "detector_green_reference_efficiency"] = (
+            detector_green_reference_efficiency
+        )
+    return result
 
 
 def test_surface_atlas_normals_follow_semantic_air_side() -> None:
@@ -319,3 +326,38 @@ def test_native_parsed_source_payload_is_rehashed_before_ingestion() -> None:
     extra["native_surface_source_1_isotope"] = "Eu-154"
     with pytest.raises(RuntimeError, match="unexpected fields"):
         validate_native_scene_identity(extra, scene)
+
+
+def test_native_detector_green_reference_efficiency_is_recomputed() -> None:
+    """Native source-rate normalization must match operator/catalog evidence."""
+    scene = _exported_surface_scene()
+    expected = {"Cs-137": 0.25}
+    metadata = _native_scene_identity_metadata(
+        scene,
+        detector_green_reference_efficiency=0.25,
+    )
+
+    validate_native_scene_identity(
+        metadata,
+        scene,
+        expected_detector_green_reference_efficiency_by_isotope=expected,
+    )
+
+    tampered = _native_scene_identity_metadata(
+        scene,
+        detector_green_reference_efficiency=0.3,
+    )
+    with pytest.raises(RuntimeError, match="reference efficiency differs"):
+        validate_native_scene_identity(
+            tampered,
+            scene,
+            expected_detector_green_reference_efficiency_by_isotope=expected,
+        )
+
+    missing = _native_scene_identity_metadata(scene)
+    with pytest.raises(RuntimeError, match="reference efficiency differs"):
+        validate_native_scene_identity(
+            missing,
+            scene,
+            expected_detector_green_reference_efficiency_by_isotope=expected,
+        )

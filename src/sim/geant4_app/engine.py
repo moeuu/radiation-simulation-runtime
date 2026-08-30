@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+import hashlib
+import json
 from pathlib import Path
 import selectors
 import subprocess
@@ -24,6 +27,7 @@ from measurement.source_boundary import (
     surface_source_runtime_contract_sha256,
 )
 from sim.geant4_app.io_format import (
+    NATIVE_ACTION_IDENTITY_CONTRACT_ID,
     read_response_file,
     write_request_file,
     write_scene_file,
@@ -37,12 +41,18 @@ from sim.radiation_visualization import (
     build_visualization_metadata_from_scene,
 )
 from sim.shield_geometry import shield_normal_from_quaternion_wxyz
-from spectrum.library import default_library, nuclide_catalog_sha256
+from spectrum.detector_green_operator import DetectorGreenOperator
+from spectrum.library import Nuclide, default_library, nuclide_catalog_sha256
 
 
 def validate_native_scene_identity(
     metadata: dict[str, Any],
     scene: ExportedGeant4Scene,
+    *,
+    expected_nuclide_catalog_sha256: str | None = None,
+    expected_detector_green_reference_efficiency_by_isotope: (
+        Mapping[str, float] | None
+    ) = None,
 ) -> None:
     """Authenticate the exact scene and source payload parsed by native Geant4."""
     activity_sources = [
@@ -71,13 +81,38 @@ def validate_native_scene_identity(
         }
         for source in scene.sources
     ]
+    expected_efficiencies = (
+        None
+        if expected_detector_green_reference_efficiency_by_isotope is None
+        else dict(expected_detector_green_reference_efficiency_by_isotope)
+    )
+    expected_isotopes = {str(entry["isotope"]) for entry in expected_entries}
+    if expected_efficiencies is not None and (
+        activity_sources
+        or set(expected_efficiencies) != expected_isotopes
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not np.isfinite(float(value))
+            or float(value) <= 0.0
+            or float(value) > 1.0
+            for value in expected_efficiencies.values()
+        )
+    ):
+        raise RuntimeError(
+            "Expected detector Green source-rate efficiencies are invalid."
+        )
     expected_source_hash = contract_function(expected_entries)
     expected = {
         "backend": "geant4",
         "engine_mode": "external",
         "scene_hash": scene.scene_hash,
         "surface_source_contract_sha256": expected_source_hash,
-        "nuclide_catalog_sha256": nuclide_catalog_sha256(),
+        "nuclide_catalog_sha256": (
+            nuclide_catalog_sha256()
+            if expected_nuclide_catalog_sha256 is None
+            else expected_nuclide_catalog_sha256
+        ),
     }
     for key, expected_value in expected.items():
         actual = metadata.get(key)
@@ -147,6 +182,27 @@ def validate_native_scene_identity(
                 for field, components in vector_fields.items()
             }
         )
+        if expected_efficiencies is not None:
+            isotope = str(expected_entries[source_index]["isotope"])
+            actual_efficiency = metadata.pop(
+                prefix + "detector_green_reference_efficiency",
+                None,
+            )
+            if (
+                isinstance(actual_efficiency, bool)
+                or not isinstance(actual_efficiency, (int, float))
+                or not np.isfinite(float(actual_efficiency))
+                or not np.isclose(
+                    float(actual_efficiency),
+                    float(expected_efficiencies[isotope]),
+                    rtol=1.0e-14,
+                    atol=1.0e-15,
+                )
+            ):
+                raise RuntimeError(
+                    "Native detector Green reference efficiency differs from "
+                    f"the authenticated operator/catalog value for {isotope!r}."
+                )
         native_entries.append(entry)
     try:
         native_source_hash = contract_function(native_entries)
@@ -203,6 +259,88 @@ def validate_native_shield_pose_identity(
             raise RuntimeError(
                 f"Native Geant4 {kind} shield placement disagrees with "
                 "the requested octant orientation."
+            )
+
+
+def _required_native_action_number(
+    metadata: Mapping[str, Any],
+    key: str,
+) -> float:
+    """Return one finite non-boolean native action metadata number."""
+    value = metadata.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RuntimeError(f"Native Geant4 omitted action field {key!r}.")
+    parsed = float(value)
+    if not np.isfinite(parsed):
+        raise RuntimeError(f"Native Geant4 action field {key!r} is nonfinite.")
+    return parsed
+
+
+def _required_native_action_integer(
+    metadata: Mapping[str, Any],
+    key: str,
+) -> int:
+    """Return one exact non-boolean native action metadata integer."""
+    value = metadata.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise RuntimeError(
+            f"Native Geant4 action field {key!r} is not an exact integer."
+        )
+    return value
+
+
+def validate_native_action_identity(
+    metadata: Mapping[str, Any],
+    request: Geant4StepRequest,
+) -> None:
+    """Require the native spectrum to echo the complete requested action."""
+    if metadata.get("native_action_contract_id") != (
+        NATIVE_ACTION_IDENTITY_CONTRACT_ID
+    ):
+        raise RuntimeError("Native Geant4 action contract is incompatible.")
+    if metadata.get("native_action_sha256") != request.action_identity_sha256():
+        raise RuntimeError("Native Geant4 action digest differs from the request.")
+    integer_fields = {
+        "native_action_step_id": int(request.step_id),
+        "native_action_seed": int(request.seed),
+        "native_action_fe_orientation_index": (
+            request.resolved_orientation_indices()[0]
+        ),
+        "native_action_pb_orientation_index": (
+            request.resolved_orientation_indices()[1]
+        ),
+    }
+    for key, expected in integer_fields.items():
+        actual = _required_native_action_integer(metadata, key)
+        if actual != expected:
+            raise RuntimeError(
+                f"Native Geant4 action field {key!r} differs from the request."
+            )
+    numeric_fields = {
+        "native_action_dwell_time_s": float(request.dwell_time_s),
+    }
+    for prefix, position, quaternion in (
+        ("detector", request.detector_pose_xyz, request.detector_quat_wxyz),
+        ("fe_shield", request.fe_shield_pose_xyz, request.fe_shield_quat_wxyz),
+        ("pb_shield", request.pb_shield_pose_xyz, request.pb_shield_quat_wxyz),
+    ):
+        numeric_fields.update(
+            {
+                f"native_action_{prefix}_pose_{axis}": float(value)
+                for axis, value in zip("xyz", position, strict=True)
+            }
+        )
+        numeric_fields.update(
+            {
+                f"native_action_{prefix}_quat_{axis}": float(value)
+                for axis, value in zip("wxyz", quaternion, strict=True)
+            }
+        )
+    for key, expected in numeric_fields.items():
+        actual = _required_native_action_number(metadata, key)
+        if actual != expected:
+            raise RuntimeError(
+                f"Native Geant4 action field {key!r} differs from the request."
             )
 
 
@@ -274,6 +412,21 @@ class Geant4StepRequest:
             "pb_orientation_index": pb_index,
         }
 
+    def action_identity_sha256(self) -> str:
+        """Hash the complete action payload before native transport starts."""
+        payload = {
+            "schema_version": 1,
+            "contract_id": NATIVE_ACTION_IDENTITY_CONTRACT_ID,
+            **self.to_dict(),
+        }
+        encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
 
 @dataclass(frozen=True)
 class Geant4EngineConfig:
@@ -291,7 +444,7 @@ class Geant4EngineConfig:
     source_rate_model: str = "detector_cps_1m"
     primary_emission_model: str = "independent_gamma_lines"
     source_bias_mode: str = "detector_cone"
-    source_bias_cone_half_angle_deg: float = 0.0
+    source_bias_cone_policy: str = "detector_covering"
     source_bias_isotropic_fraction: float = 1.0
     detector_scoring_mode: str = "full_transport"
     secondary_transport_mode: str = "full_transport"
@@ -303,6 +456,9 @@ class Geant4EngineConfig:
     mean_calibration_forced_collision: bool = False
     background_cps: float = 0.0
     sample_detector_response: bool = False
+    detector_green_operator_path: str | None = None
+    detector_green_operator_binary_sha256: str | None = None
+    detector_green_operator_contract_sha256: str | None = None
     validation_entry_class_spectra: bool = False
     expected_native_executable_sha256: str | None = None
     expected_native_execution_environment_sha256: str | None = None
@@ -372,16 +528,74 @@ def _force_stop_persistent_process(
 class ExternalCommandGeant4Engine(Geant4Engine):
     """Delegate transport to an external executable or persistent native process."""
 
-    def __init__(self, config: Geant4EngineConfig) -> None:
-        """Store external-engine launch configuration."""
+    def __init__(
+        self,
+        config: Geant4EngineConfig,
+        *,
+        nuclide_library: Mapping[str, Nuclide] | None = None,
+        detector_green_operator: DetectorGreenOperator | None = None,
+    ) -> None:
+        """Store launch configuration and its explicit nuclide-line mapping."""
         if config.executable_path in (None, ""):
             raise ValueError(
                 "executable_path is required for the external Geant4 engine."
             )
+        green_values = (
+            config.detector_green_operator_path,
+            config.detector_green_operator_binary_sha256,
+            config.detector_green_operator_contract_sha256,
+        )
+        if config.sample_detector_response:
+            if any(
+                not isinstance(value, str) or not value for value in green_values
+            ) or any(
+                len(str(value)) != 64
+                or any(character not in "0123456789abcdef" for character in str(value))
+                for value in green_values[1:]
+            ):
+                raise ValueError(
+                    "Detector-response sampling requires one authenticated "
+                    "detector Green binary and contract."
+                )
+            green_path = Path(str(green_values[0])).resolve()
+            if not green_path.is_file():
+                raise FileNotFoundError(
+                    f"Detector Green binary does not exist: {green_path}."
+                )
+            actual_binary_sha256 = hashlib.sha256(green_path.read_bytes()).hexdigest()
+            if actual_binary_sha256 != green_values[1]:
+                raise ValueError("Detector Green binary hash is stale.")
+            if not isinstance(detector_green_operator, DetectorGreenOperator):
+                raise ValueError(
+                    "Detector-response sampling requires its authenticated "
+                    "DetectorGreenOperator object."
+                )
+            detector_green_operator.require_runtime_ready()
+            if (
+                detector_green_operator.binary_sha256 != green_values[1]
+                or detector_green_operator.contract_hash_sha256 != green_values[2]
+            ):
+                raise ValueError(
+                    "Detector Green object differs from the configured binary."
+                )
+        elif any(value is not None for value in green_values):
+            raise ValueError(
+                "Detector Green settings are forbidden when response "
+                "sampling is disabled."
+            )
+        elif detector_green_operator is not None:
+            raise ValueError(
+                "Detector Green object is forbidden when response sampling "
+                "is disabled."
+            )
         self.config = config
+        self.detector_green_operator = detector_green_operator
         self.scene: ExportedGeant4Scene | None = None
         self._last_cache_hit = False
-        self.library = default_library()
+        self.library = (
+            default_library() if nuclide_library is None else dict(nuclide_library)
+        )
+        self.nuclide_catalog_sha256 = nuclide_catalog_sha256(self.library)
         self._persistent_process: subprocess.Popen[str] | None = None
         self._persistent_tmpdir: tempfile.TemporaryDirectory[str] | None = None
         self._persistent_scene_path: Path | None = None
@@ -405,10 +619,18 @@ class ExternalCommandGeant4Engine(Geant4Engine):
             spectrum, metadata = self._simulate_persistent(request)
         else:
             spectrum, metadata = self._simulate_one_shot(request)
-        validate_native_scene_identity(metadata, self.scene)
+        validate_native_scene_identity(
+            metadata,
+            self.scene,
+            expected_nuclide_catalog_sha256=(self.nuclide_catalog_sha256),
+            expected_detector_green_reference_efficiency_by_isotope=(
+                self._detector_green_reference_efficiencies()
+            ),
+        )
         validate_native_shield_pose_identity(metadata, request)
+        validate_native_action_identity(metadata, request)
         metadata["cache_hit"] = bool(self._last_cache_hit)
-        metadata["seed"] = int(request.seed)
+        metadata["seed"] = int(metadata["native_action_seed"])
         metadata.update(
             build_visualization_metadata_from_scene(
                 self.scene,
@@ -422,6 +644,33 @@ class ExternalCommandGeant4Engine(Geant4Engine):
         )
         return spectrum, metadata
 
+    def _detector_green_reference_efficiencies(
+        self,
+    ) -> dict[str, float] | None:
+        """Return exact catalog/operator efficiencies expected from native."""
+        operator = self.detector_green_operator
+        scene = self.scene
+        if operator is None or scene is None:
+            return None
+        if any(source.activity_bq is not None for source in scene.sources):
+            return None
+        radius = float(
+            scene.detector_model.crystal_radius_m
+            + scene.detector_model.housing_thickness_m
+        )
+        result: dict[str, float] = {}
+        for isotope in sorted({source.isotope for source in scene.sources}):
+            nuclide = self.library.get(isotope)
+            if nuclide is None:
+                raise RuntimeError(
+                    f"Detector Green normalization lacks catalog isotope {isotope!r}."
+                )
+            result[isotope] = operator.catalog_weighted_reference_efficiency(
+                nuclide,
+                detector_target_radius_m=radius,
+            )
+        return result
+
     def _simulate_one_shot(
         self, request: Geant4StepRequest
     ) -> tuple[np.ndarray, dict[str, Any]]:
@@ -434,7 +683,11 @@ class ExternalCommandGeant4Engine(Geant4Engine):
             scene_path = tmp_path / "scene.txt"
             request_path = tmp_path / "request.txt"
             response_path = tmp_path / "response.txt"
-            write_scene_file(self.scene, scene_path)
+            write_scene_file(
+                self.scene,
+                scene_path,
+                nuclide_library=self.library,
+            )
             write_request_file(request, request_path)
             command = [
                 str(self.config.executable_path),
@@ -546,6 +799,7 @@ class ExternalCommandGeant4Engine(Geant4Engine):
 
     def _require_approved_native_launch_environment(self) -> None:
         """Reauthenticate executable, libraries, and physics data before Popen."""
+        self._require_detector_green_binary()
         expected_executable = self.config.expected_native_executable_sha256
         expected_environment = self.config.expected_native_execution_environment_sha256
         expected_implementation = self.config.expected_implementation_bundle_sha256
@@ -581,6 +835,21 @@ class ExternalCommandGeant4Engine(Geant4Engine):
                 "Python implementation bundle changed after provenance validation."
             )
 
+    def _require_detector_green_binary(self) -> None:
+        """Reauthenticate the immutable detector operator before each launch."""
+        if not self.config.sample_detector_response:
+            return
+        path_value = self.config.detector_green_operator_path
+        expected = self.config.detector_green_operator_binary_sha256
+        if not isinstance(path_value, str) or not isinstance(expected, str):
+            raise RuntimeError("Detector Green launch contract is incomplete.")
+        path = Path(path_value).resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"Detector Green binary does not exist: {path}.")
+        actual = hashlib.sha256(path.read_bytes()).hexdigest()
+        if actual != expected:
+            raise RuntimeError("Detector Green binary changed before launch.")
+
     def _persistent_tmp_path(self) -> Path:
         """Return the persistent process temporary directory path."""
         if self._persistent_tmpdir is None:
@@ -600,7 +869,11 @@ class ExternalCommandGeant4Engine(Geant4Engine):
         ):
             return self._persistent_scene_path
         scene_path = tmp_path / f"scene_{self.scene.scene_hash[:16]}.txt"
-        write_scene_file(self.scene, scene_path)
+        write_scene_file(
+            self.scene,
+            scene_path,
+            nuclide_library=self.library,
+        )
         self._persistent_scene_hash = self.scene.scene_hash
         self._persistent_scene_path = scene_path
         return scene_path
@@ -754,8 +1027,8 @@ class ExternalCommandGeant4Engine(Geant4Engine):
             str(self.config.source_rate_model),
             "--primary-emission-model",
             str(self.config.primary_emission_model),
-            "--source-bias-cone-half-angle-deg",
-            str(float(self.config.source_bias_cone_half_angle_deg)),
+            "--source-bias-cone-policy",
+            str(self.config.source_bias_cone_policy),
         ]
         if str(self.config.source_rate_model) != "detector_cps_1m":
             arguments.extend(
@@ -805,19 +1078,37 @@ class ExternalCommandGeant4Engine(Geant4Engine):
             str(float(self.config.background_cps)),
         ]
         if self.config.sample_detector_response:
-            arguments.append("--sample-detector-response")
+            arguments.extend(
+                [
+                    "--sample-detector-response",
+                    "--detector-green-operator-path",
+                    str(self.config.detector_green_operator_path),
+                    "--detector-green-operator-binary-sha256",
+                    str(self.config.detector_green_operator_binary_sha256),
+                    "--detector-green-operator-contract-sha256",
+                    str(self.config.detector_green_operator_contract_sha256),
+                ]
+            )
         if self.config.validation_entry_class_spectra:
             arguments.append("--validation-entry-class-spectra")
         return arguments
 
 
 def build_geant4_engine(
-    config: Geant4EngineConfig, *, engine_mode: str
+    config: Geant4EngineConfig,
+    *,
+    engine_mode: str,
+    nuclide_library: Mapping[str, Nuclide] | None = None,
+    detector_green_operator: DetectorGreenOperator | None = None,
 ) -> Geant4Engine:
     """Instantiate the requested Geant4 engine implementation."""
     normalized = engine_mode.strip().lower()
     if normalized == "external":
-        return ExternalCommandGeant4Engine(config)
+        return ExternalCommandGeant4Engine(
+            config,
+            nuclide_library=nuclide_library,
+            detector_green_operator=detector_green_operator,
+        )
     raise ValueError(
         f"Unsupported Geant4 engine mode: {engine_mode}. "
         "Only 'external' native Geant4 transport is supported."

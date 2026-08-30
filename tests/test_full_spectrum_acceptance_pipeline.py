@@ -31,7 +31,9 @@ from spectrum.additive_scatter import (
 )
 from spectrum.full_spectrum_acceptance import (
     SURFACE_BOUNDARY_GATE_SCHEMA_VERSION,
+    SURFACE_BOUNDARY_PROBE_DWELL_TIME_S,
 )
+from spectrum.detector_green_operator import DETECTOR_GREEN_COINCIDENCE_SEMANTICS
 import spectrum.full_spectrum_acceptance_evaluator as evaluator
 from spectrum.full_spectrum_acceptance_runner import (
     ACCEPTANCE_PAIR_SCHEMA_VERSION,
@@ -40,7 +42,6 @@ from spectrum.full_spectrum_acceptance_runner import (
     NATIVE_ACCEPTANCE_FIDELITY,
     AcceptanceRunLayout,
     acceptance_transport_seed,
-    canonical_json_bytes,
     canonical_json_sha256,
     line_identity_contract_sha256,
     validate_scene_corpus,
@@ -50,24 +51,28 @@ from spectrum.physics_contracts import (
     OBSTACLE_MATERIAL_CONTRACT_SHA256,
     TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256,
 )
-from spectrum.response_matrix import (
-    NATIVE_GEANT4_BIN_COUNT,
-    NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256,
-)
+from spectrum.response_matrix import NATIVE_GEANT4_BIN_COUNT
 from spectrum.transport_spectral import (
     ACCEPTANCE_METRIC_CONTRACT,
+    DESIGNATED_VALIDATION_SCENE_SEEDS,
     FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256,
     GeometryConditionedSpectralModel,
 )
-from tests.detector_response_test_support import (
-    write_passing_detector_response_validation,
+from tests.green_test_support import (
+    synthetic_detector_green_operator,
+    synthetic_detector_green_validation_manifest,
 )
+
+
+_TEST_OPERATOR = synthetic_detector_green_operator()
 
 
 class _ComponentMarkDiagnosticModel:
     """Minimal model proving acceptance uses component mark concentration."""
 
-    physical_component_discrepancy = object()
+    physical_component_discrepancy = SimpleNamespace(
+        mark_latent_model="component_dirichlet_tree_hierarchical"
+    )
     mark_concentration_source = None
 
     def __init__(self) -> None:
@@ -88,26 +93,46 @@ class _ComponentMarkDiagnosticModel:
             (total.shape[0], 2),
         ).copy()
 
-    def pre_dead_time_components_numpy(
+    def _pre_dead_time_mean_numpy(
         self,
         total: np.ndarray,
         uncollided: np.ndarray,
         features: np.ndarray,
         live: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Return source and zero-background component means."""
-        source = self.predict_mean_numpy(total, uncollided, features, live)
-        return source, np.zeros_like(source)
+        *,
+        return_physical_components: bool,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return direct, scatter, and background means for diagnostics."""
+        if not return_physical_components:
+            raise AssertionError("The component diagnostic must request components.")
+        direct = self.predict_mean_numpy(total, uncollided, features, live)
+        return direct, np.zeros_like(direct), np.zeros_like(direct)
 
-    def _base_mark_concentration_numpy(
+    def _component_tree_mark_concentrations_numpy(
         self,
         total: np.ndarray,
         uncollided: np.ndarray,
-    ) -> np.ndarray:
-        """Return the physical-component concentration used by likelihood."""
+        component_means: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return finite tree and leaf concentration tensors."""
         del uncollided
         self.component_calls += 1
-        return np.full(total.shape[0], 300.0, dtype=np.float64)
+        prefix = component_means.shape[:-2]
+        assert prefix[-1] == total.shape[0]
+        concentration = np.full(prefix + (1,), 300.0, dtype=np.float64)
+        return concentration, concentration.copy()
+
+    def _sample_component_tree_probabilities_numpy(
+        self,
+        probabilities: np.ndarray,
+        tree_concentration: np.ndarray,
+        leaf_concentration: np.ndarray,
+        *,
+        rng: np.random.Generator,
+    ) -> np.ndarray:
+        """Return the fixed test mean while accepting the tree API contract."""
+        del tree_concentration, leaf_concentration, rng
+        return np.asarray(probabilities, dtype=np.float64)
 
 
 def _source(
@@ -120,8 +145,7 @@ def _source(
     anchor = [1.0 + source_index, 2.0 + source_index, 0.0]
     normal = [0.0, 0.0, 1.0]
     transport = [
-        anchor[index] + SURFACE_EMISSION_EPSILON_M * normal[index]
-        for index in range(3)
+        anchor[index] + SURFACE_EMISSION_EPSILON_M * normal[index] for index in range(3)
     ]
     return {
         "isotope": isotope,
@@ -131,9 +155,7 @@ def _source(
         "surface_chart_id": int(source_index),
         "surface_uv": [0.25, 0.75],
         "surface_normal": normal,
-        "surface_emission_policy_sha256": (
-            surface_emission_policy_sha256()
-        ),
+        "surface_emission_policy_sha256": (surface_emission_policy_sha256()),
     }
 
 
@@ -146,10 +168,9 @@ def _boundary_gate(scene_seed: int) -> dict[str, object]:
     )
     return {
         "schema_version": SURFACE_BOUNDARY_GATE_SCHEMA_VERSION,
-        "surface_emission_policy_sha256": (
-            surface_emission_policy_sha256()
-        ),
+        "surface_emission_policy_sha256": (surface_emission_policy_sha256()),
         "surface_emission_epsilon_m": SURFACE_EMISSION_EPSILON_M,
+        "probe_dwell_time_s": SURFACE_BOUNDARY_PROBE_DWELL_TIME_S,
         "native_position_variants": list(variants),
         "evidence_sha256_by_variant": {
             variant: canonical_json_sha256([scene_seed, variant])
@@ -177,10 +198,11 @@ class _FakeSession:
         self.split = split
         self.scenario_id = scenario_id
         self.line_hash = line_hash
-        self.model = GeometryConditionedSpectralModel.standard_native(
+        self.model = GeometryConditionedSpectralModel.physics_only_native(
             ACCEPTANCE_ISOTOPES,
             dead_time_tau_s=0.0,
             background_rate_cps=0.0,
+            detector_green_operator=_TEST_OPERATOR,
         )
         self.sources = [
             _source(
@@ -201,7 +223,10 @@ class _FakeSession:
         if source_count:
             unattenuated = np.zeros(shape, dtype=np.float64)
             uncollided = np.zeros_like(unattenuated)
-            features = np.zeros(shape + (4,), dtype=np.float64)
+            features = np.zeros(
+                shape + (len(self.model.transport_feature_order),),
+                dtype=np.float64,
+            )
             scatter = np.zeros(
                 shape + (len(ADDITIVE_SCATTER_FEATURE_ORDER),),
                 dtype=np.float64,
@@ -211,7 +236,10 @@ class _FakeSession:
                     if line["isotope"] == source["isotope"]:
                         unattenuated[0, source_index, line_index] = 10.0
                         uncollided[0, source_index, line_index] = 9.0
-                        features[0, source_index, line_index, 3] = 1.0
+                        features[0, source_index, line_index, 4] = 1.0
+                        features[0, source_index, line_index, 5:] = 1.0 / (
+                            len(self.model.transport_feature_order) - 5
+                        )
                         scatter[0, source_index, line_index, 0] = 0.5
             geometry: dict[str, object] = {
                 "unattenuated_source_line_rate_vsl": unattenuated.tolist(),
@@ -283,11 +311,7 @@ class _FakeSession:
                 }
         return {
             "schema_version": ACCEPTANCE_PAIR_SCHEMA_VERSION,
-            "acceptance_contract_sha256": (
-                self.model.manifest_payload()[
-                    "acceptance_contract_sha256"
-                ]
-            ),
+            "acceptance_contract_sha256": (FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256),
             "scene_seed": self.scene_seed,
             "split": self.split,
             "scenario_id": self.scenario_id,
@@ -325,15 +349,25 @@ class _FakeSession:
                 "process_count_compton": 0,
                 "process_count_rayleigh": 0,
                 "process_count_photoelectric": 0,
-                "transport_process_counts": {"Transportation": 1},
+                "transport_process_counts": (
+                    {"Transportation": 1} if self.sources else {}
+                ),
+                "detector_response_coincidence_semantics": (
+                    DETECTOR_GREEN_COINCIDENCE_SEMANTICS
+                ),
+                "detector_response_incident_entry_count": 0,
+                "detector_response_registered_entry_count": 0,
+                "detector_response_coincidence_pulse_count": 0,
+                "detector_response_multi_entry_pulse_count": 0,
+                "pre_dead_time_total_pulse_count": 0,
+                "post_dead_time_total_pulse_count": 0,
+                "dead_time_observed_scale": 1.0,
             },
             "geometry_family": {
                 "schema_version": GEOMETRY_FAMILY_SCHEMA_VERSION,
                 "geometry_family_id": GEOMETRY_FAMILY_ID,
                 "generator_algorithm_id": GEOMETRY_GENERATOR_ALGORITHM_ID,
-                "transport_representation": (
-                    "explicit_material_component_boxes"
-                ),
+                "transport_representation": ("explicit_material_component_boxes"),
                 "room_size_xyz_m": [10.0, 20.0, 10.0],
                 "cell_size_m": 1.0,
                 "target_blocked_fraction": 0.4,
@@ -346,17 +380,14 @@ class _FakeSession:
                 "template_names": ["fake_hollow_obstacle"],
                 "component_materials": ["concrete"],
                 "component_geometry_sha256": "9" * 64,
-                "applicability_contract_sha256": (
-                    GEOMETRY_FAMILY_APPLICABILITY_SHA256
-                ),
+                "applicability_contract_sha256": (GEOMETRY_FAMILY_APPLICABILITY_SHA256),
             },
-            "detector_response_contract_sha256": (
-                NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
+            "detector_green_operator_contract_sha256": (
+                _TEST_OPERATOR.contract_hash_sha256
             ),
+            "detector_green_operator_binary_sha256": (_TEST_OPERATOR.binary_sha256),
             "shield_pose_contract_sha256": SHIELD_POSE_CONTRACT_SHA256,
-            "obstacle_material_contract_sha256": (
-                OBSTACLE_MATERIAL_CONTRACT_SHA256
-            ),
+            "obstacle_material_contract_sha256": (OBSTACLE_MATERIAL_CONTRACT_SHA256),
             "transport_physics_table_contract_sha256": (
                 TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256
             ),
@@ -372,9 +403,10 @@ class _FakeBackend:
     def __init__(self, **_: object) -> None:
         """Expose the hashes and rates required by the production CLI."""
         self.runtime_config_sha256 = "a" * 64
-        self.native_executable_sha256 = "b" * 64
-        self.native_execution_environment_sha256 = "c" * 64
+        self.native_executable_sha256 = "2" * 64
+        self.native_execution_environment_sha256 = "3" * 64
         self.implementation_bundle_sha256 = "d" * 64
+        self.detector_green_operator = _TEST_OPERATOR
         self.app_config = SimpleNamespace(
             dead_time_tau_s=0.0,
             background_cps=0.0,
@@ -400,10 +432,14 @@ class _FakeBackend:
         )
 
 
-def _write_detector_response_validation(path: Path) -> Path:
-    """Write a passing full-detector gate bound to the fake native build."""
-    return write_passing_detector_response_validation(
-        path.parent / path.stem
+def _green_validation() -> dict[str, object]:
+    """Return passing Green evidence bound to the fake native build."""
+    return synthetic_detector_green_validation_manifest(
+        _TEST_OPERATOR,
+        runtime_config_sha256="a" * 64,
+        native_executable_sha256="2" * 64,
+        native_execution_environment_sha256="3" * 64,
+        detector_implementation_bundle_sha256="4" * 64,
     )
 
 
@@ -429,7 +465,7 @@ def test_default_output_root_is_scoped_to_the_current_contract() -> None:
 
 
 def test_mark_diagnostic_uses_physical_component_concentration() -> None:
-    """Acceptance PIT must evaluate the same component latent as runtime."""
+    """Acceptance tail checks must evaluate the runtime component latent."""
     pair_count = len(evaluator.ACCEPTANCE_PAIR_IDS)
     observed = np.broadcast_to(
         np.asarray([90.0, 10.0], dtype=np.float64),
@@ -460,23 +496,21 @@ def test_mark_diagnostic_uses_physical_component_concentration() -> None:
     assert np.all(result.upper_tail_probability_v > 0.01)
 
 
-def test_fake_backend_full_pipeline_is_resumable_and_holdout_cannot_refit(
+def test_fake_backend_validation_pipeline_is_resumable_and_cannot_refit(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    """Training, freeze, holdout, evaluation, and approval must be one-way."""
+    """Freeze, validation, evaluation, and approval must be one-way."""
     root = tmp_path / "acceptance"
-    response_validation = _write_detector_response_validation(
-        tmp_path / "detector_response_validation.json"
-    )
+    green_validation_path = tmp_path / "green-validation.json"
     arguments = [
         "--output-root",
         root.as_posix(),
     ]
     approval_arguments = [
         *arguments,
-        "--detector-response-validation-manifest",
-        response_validation.as_posix(),
+        "--detector-green-validation-manifest",
+        green_validation_path.as_posix(),
     ]
     _FakeBackend.opened.clear()
     monkeypatch.setattr(
@@ -486,18 +520,39 @@ def test_fake_backend_full_pipeline_is_resumable_and_holdout_cannot_refit(
     )
     monkeypatch.setattr(acceptance_cli, "_progress", lambda _: None)
     monkeypatch.setattr(evaluator, "_scene_metrics", _passing_metrics)
+    monkeypatch.setattr(
+        acceptance_cli,
+        "canonical_detector_green_operator",
+        lambda: _TEST_OPERATOR,
+    )
+    monkeypatch.setattr(
+        "spectrum.full_spectrum_acceptance_runner.canonical_detector_green_operator",
+        lambda: _TEST_OPERATOR,
+    )
+    monkeypatch.setattr(
+        evaluator,
+        "canonical_detector_green_operator",
+        lambda: _TEST_OPERATOR,
+    )
+    monkeypatch.setattr(
+        evaluator,
+        "load_detector_green_validation_manifest",
+        lambda *args, **kwargs: _green_validation(),
+    )
+    monkeypatch.setattr(
+        "spectrum.full_spectrum_acceptance._canonical_detector_green_operator",
+        lambda: _TEST_OPERATOR,
+    )
 
-    assert acceptance_cli.main(["training", *arguments]) == 0
-    assert all(split == "training" for split, _, _ in _FakeBackend.opened)
-    assert acceptance_cli.main(["fit-freeze", *arguments]) == 0
+    assert acceptance_cli.main(["freeze", *arguments]) == 0
     layout = AcceptanceRunLayout(root)
-    frozen_before_holdout = layout.candidate_model_path.read_bytes()
+    frozen_before_validation = layout.candidate_model_path.read_bytes()
 
-    assert acceptance_cli.main(["holdout", *arguments]) == 0
-    assert any(split == "holdout" for split, _, _ in _FakeBackend.opened)
-    assert layout.candidate_model_path.read_bytes() == frozen_before_holdout
+    assert acceptance_cli.main(["validation", *arguments]) == 0
+    assert any(split == "validation" for split, _, _ in _FakeBackend.opened)
+    assert layout.candidate_model_path.read_bytes() == frozen_before_validation
     assert acceptance_cli.main(["evaluate", *arguments]) == 0
-    assert layout.candidate_model_path.read_bytes() == frozen_before_holdout
+    assert layout.candidate_model_path.read_bytes() == frozen_before_validation
     assert acceptance_cli.main(["approve", *approval_arguments]) == 0
     assert layout.validation_manifest_path.is_file()
     assert layout.production_model_path.is_file()
@@ -505,7 +560,7 @@ def test_fake_backend_full_pipeline_is_resumable_and_holdout_cannot_refit(
     opened_before_resume = tuple(_FakeBackend.opened)
     assert acceptance_cli.main(["all", *approval_arguments]) == 0
     assert tuple(_FakeBackend.opened) == opened_before_resume
-    assert layout.candidate_model_path.read_bytes() == frozen_before_holdout
+    assert layout.candidate_model_path.read_bytes() == frozen_before_validation
 
 
 def test_validation_labels_are_absent_from_production_projection(
@@ -525,15 +580,24 @@ def test_validation_labels_are_absent_from_production_projection(
         _FakeBackend,
     )
     monkeypatch.setattr(acceptance_cli, "_progress", lambda _: None)
-    assert acceptance_cli.main(["training", *arguments]) == 0
-    assert acceptance_cli.main(["fit-freeze", *arguments]) == 0
+    monkeypatch.setattr(
+        acceptance_cli,
+        "canonical_detector_green_operator",
+        lambda: _TEST_OPERATOR,
+    )
+    monkeypatch.setattr(
+        "spectrum.full_spectrum_acceptance_runner.canonical_detector_green_operator",
+        lambda: _TEST_OPERATOR,
+    )
+    assert acceptance_cli.main(["freeze", *arguments]) == 0
+    assert acceptance_cli.main(["validation", *arguments]) == 0
     layout = AcceptanceRunLayout(root)
     model = evaluator.load_frozen_candidate_model(layout)
     line_hash = line_identity_contract_sha256(model)
     records = validate_scene_corpus(
         layout.scene_corpus_path(
-            split="training",
-            scene_seed=2026072701,
+            split="validation",
+            scene_seed=DESIGNATED_VALIDATION_SCENE_SEEDS[0],
         ),
         layout=layout,
         expected_line_identity_sha256=line_hash,
@@ -545,7 +609,7 @@ def test_validation_labels_are_absent_from_production_projection(
     )
     original = evaluator._scenario_data(selected, model=model)
     mutated = tuple(
-        replace(record, labels={"holdout_canary": index})
+        replace(record, labels={"validation_canary": index})
         for index, record in enumerate(selected)
     )
     canary = evaluator._scenario_data(mutated, model=model)

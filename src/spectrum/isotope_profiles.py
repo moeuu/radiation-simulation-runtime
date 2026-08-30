@@ -19,7 +19,6 @@ _REGISTRY_ENTRY_FIELDS = frozenset(
         "model_path",
         "model_file_sha256",
         "model_contract_hash_sha256",
-        "calibration_status",
     }
 )
 
@@ -40,10 +39,7 @@ class IsotopeExperimentProfile:
         if (
             type(self.isotopes) is not tuple
             or not self.isotopes
-            or any(
-                type(value) is not str or not value
-                for value in self.isotopes
-            )
+            or any(type(value) is not str or not value for value in self.isotopes)
             or len(set(self.isotopes)) != len(self.isotopes)
         ):
             raise ValueError("Isotope profile isotopes must be nonempty and unique.")
@@ -58,6 +54,12 @@ class IsotopeExperimentProfile:
 
 _PROFILES: Mapping[str, IsotopeExperimentProfile] = MappingProxyType(
     {
+        "unconditioned_cs_co": IsotopeExperimentProfile(
+            name="unconditioned_cs_co",
+            isotopes=("Cs-137", "Co-60"),
+            material_conditioning="none",
+            description="Area-uniform Cs/Co set without material conditioning.",
+        ),
         "unconditioned_eu154": IsotopeExperimentProfile(
             name="unconditioned_eu154",
             isotopes=("Cs-137", "Co-60", "Eu-154"),
@@ -130,6 +132,7 @@ def require_isotope_profile(name: str) -> IsotopeExperimentProfile:
             f"Unknown isotope_experiment_profile {name!r}; expected: {supported}."
         ) from exc
 
+
 def resolve_profile_model_runtime_config(
     runtime_config: Mapping[str, object],
     *,
@@ -164,9 +167,7 @@ def resolve_profile_model_runtime_config(
     profile = require_isotope_profile(profile_value)
     registry_path = _resolve_registry_path(registry_value, run_root=run_root)
     raw_bytes = registry_path.read_bytes()
-    declared_registry_hash = resolved.get(
-        "full_spectrum_model_registry_file_sha256"
-    )
+    declared_registry_hash = resolved.get("full_spectrum_model_registry_file_sha256")
     actual_registry_hash = hashlib.sha256(raw_bytes).hexdigest()
     if declared_registry_hash != actual_registry_hash:
         raise ValueError(
@@ -178,34 +179,26 @@ def resolve_profile_model_runtime_config(
     schema_version = payload["schema_version"]
     if type(schema_version) is not int or schema_version != 1:
         raise ValueError("Full-spectrum model registry payload is invalid.")
-    if (
-        payload["model"] != "isotope_profile_full_spectrum_registry"
-        or not isinstance(payload["profiles"], Mapping)
+    if payload["model"] != "isotope_profile_full_spectrum_registry" or not isinstance(
+        payload["profiles"], Mapping
     ):
         raise ValueError("Full-spectrum model registry payload is invalid.")
     entry = payload["profiles"].get(profile.name)
     if not isinstance(entry, Mapping):
-        raise ValueError(
-            f"Profile {profile.name!r} has no full-spectrum model asset."
-        )
+        raise ValueError(f"Profile {profile.name!r} has no full-spectrum model asset.")
     if set(entry) != _REGISTRY_ENTRY_FIELDS:
-        raise ValueError(
-            f"Profile registry entry {profile.name!r} has invalid fields."
-        )
+        raise ValueError(f"Profile registry entry {profile.name!r} has invalid fields.")
     entry_isotopes = entry["isotopes"]
     if (
         type(entry_isotopes) is not list
         or any(type(value) is not str for value in entry_isotopes)
         or tuple(entry_isotopes) != profile.isotopes
     ):
-        raise ValueError(
-            f"Profile registry isotopes disagree for {profile.name!r}."
-        )
+        raise ValueError(f"Profile registry isotopes disagree for {profile.name!r}.")
     for key in (
         "model_path",
         "model_file_sha256",
         "model_contract_hash_sha256",
-        "calibration_status",
     ):
         if type(entry[key]) is not str or not entry[key]:
             raise TypeError(
@@ -217,15 +210,8 @@ def resolve_profile_model_runtime_config(
         registry_path=registry_path,
     )
     resolved["full_spectrum_generative_model_path"] = str(entry["model_path"])
-    resolved["full_spectrum_generative_model_file_sha256"] = entry[
-        "model_file_sha256"
-    ]
-    resolved["full_spectrum_contract_hash_sha256"] = entry[
-        "model_contract_hash_sha256"
-    ]
-    resolved["full_spectrum_profile_calibration_status"] = entry[
-        "calibration_status"
-    ]
+    resolved["full_spectrum_generative_model_file_sha256"] = entry["model_file_sha256"]
+    resolved["full_spectrum_contract_hash_sha256"] = entry["model_contract_hash_sha256"]
     return resolved
 
 

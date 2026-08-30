@@ -32,7 +32,7 @@ uv run rotating-shield-sim generate-scenario PRIVATE_SCENARIO.json \
   --truth-manifest-output /private/truth/run-001.json \
   --measurement-log-output /private/logs/run-001 \
   --run-id run-001 \
-  --experiment-profile multi_isotope_surface_search_v1 \
+  --experiment-profile multi_isotope_surface_search \
   --scene-variant mix9
 uv run rotating-shield-sim calibrate-discrepancy CALIBRATION_ROWS.npz \
   discrepancy-calibration.json --calibration-id ral-independent
@@ -73,10 +73,11 @@ Omitting
 `--scene-seed` creates a fresh environment and source realization; an explicit seed
 is reserved for reproducing a previously declared validation scene. The command
 publishes the runtime-owned acquisition contract but does not choose a shield policy,
-estimator setting, or statistical stopping rule. `--scene-variant cs4-co3-eu0`
-realizes exactly four Cs-137 and three Co-60 sources while keeping Eu-154 in the
-truth-free candidate set for an absent-isotope test. The default `mix9` variant adds
-two Eu-154 sources.
+estimator setting, or statistical stopping rule. The command has no default
+environment. Selecting `--experiment-profile cs4_co3_surface_search` with
+`--scene-variant cs4-co3` realizes exactly four Cs-137 and three Co-60 sources and
+exposes only those two candidate isotopes. The separately selected
+`multi_isotope_surface_search` / `mix9` experiment adds two Eu-154 sources.
 
 ## Common adaptive workspace
 
@@ -115,8 +116,9 @@ moving their algorithms into this package:
 - `AdaptiveRuntimeClient.connect(...)` exposes typed `handshake()`, `acquire()`,
   `refine_candidates()`, and `finalize_log()` calls. It is a context manager with
   bounded termination and an optional immutable protocol observer. This client is
-  estimator-facing: it rejects `request_cui_overlay(include_truth=True)` and also
-  rejects any unexpected truth-bearing overlay response.
+  estimator-facing and exposes no CUI-truth request method. A retired private-overlay
+  frame on the estimator stream is a fatal protocol error rather than a compatibility
+  path.
 - `candidate_index_for_pose(...)` requires an `AdaptiveCandidateSnapshot`, so raw
   unvalidated candidate mappings cannot enter controller decisions.
 - `AdaptiveCandidateSnapshot.quote_shield_program_time_s(...)` quotes the exact
@@ -131,6 +133,10 @@ moving their algorithms into this package:
   obstacle, URL, and page structure. Each estimator supplies its own result panel
   specifications and renders particles, grids, density surfaces, or combined plots
   inside those panels.
+- `CUITruthOverlaySocketServer` is a separate, mode-`0600`, single-response owner
+  channel for an evaluation renderer. It is enabled only by an explicit
+  `--cui-truth-overlay-socket-path`; its payload never enters adaptive events,
+  MeasurementLog, or `AdaptiveRuntimeClient`.
 - `cui_scene_from_run_context(...)` resolves embedded or root-confined file-backed
   obstacle geometry from a truth-free `RunContext` without constructing a spectral
   response model.

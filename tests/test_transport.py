@@ -55,8 +55,8 @@ def test_python_transport_samples_one_renewal_total() -> None:
     assert int(np.sum(sampled)) > 0
 
 
-def test_python_transport_observation_preserves_integer_event_histogram() -> None:
-    """Analytic observations must retain exact integer counts through the wire type."""
+def test_python_transport_observation_is_explicitly_offline_only() -> None:
+    """The analytic backend must not claim the native sampled-event contract."""
     model = PythonTransportSpectrumModel(
         sources=[
             PointSource(
@@ -84,6 +84,9 @@ def test_python_transport_observation_preserves_integer_event_histogram() -> Non
     )
 
     assert observation.metadata["detector_response_sampling_mode"] == (
-        "multinomial_marking_with_nonparalyzable_event_time"
+        "legacy_analytic_response_marking_offline_only"
     )
-    assert all(isinstance(value, int) for value in observation.spectrum_counts)
+    assert all(
+        isinstance(value, float) and value.is_integer()
+        for value in observation.spectrum_counts
+    )

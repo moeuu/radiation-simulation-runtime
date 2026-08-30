@@ -426,15 +426,17 @@ def sample_multinomial_counts_torch(
 
 
 @dataclass(frozen=True)
-class HierarchicalMarkParameters:
-    """Define the production photopeak/continuum mark hierarchy."""
+class ComponentTreeMarkParameters:
+    """Define the component-aware production mark-partition tree."""
 
-    peak_mask_b: object
-    continuum_group_mask_gb: object
-    peak_fraction_concentration_xv: object
-    peak_shape_concentration: float
-    continuum_group_concentration: float
-    continuum_within_concentration: float
+    leaf_group_mask_hb: object
+    tree_left_mask_tb: object
+    tree_right_mask_tb: object
+    tree_depth_t: object
+    tree_left_child_t: object
+    tree_right_child_t: object
+    tree_concentration_xvt: object
+    leaf_concentration_xvh: object
 
 
 def _safe_dirichlet_probabilities(
@@ -469,152 +471,194 @@ def _safe_dirichlet_probabilities(
     )
 
 
-def _sample_hierarchical_marks_torch(
+def _sample_component_tree_marks_torch(
     totals: object,
     probabilities: object,
-    parameters: HierarchicalMarkParameters,
+    parameters: ComponentTreeMarkParameters,
     *,
     generator: object,
 ) -> object:
-    """Draw exact hierarchical photopeak and grouped-continuum marks."""
+    """Draw component-aware Dirichlet-tree marks in batched device form."""
     torch = _torch_module()
     probability = _require_float64_tensor(
         probabilities,
         name="probabilities",
     )
     total = torch.as_tensor(totals, device=probability.device, dtype=torch.int64)
-    peak = torch.as_tensor(
-        parameters.peak_mask_b,
-        device=probability.device,
-        dtype=torch.bool,
-    )
-    group_mask = torch.as_tensor(
-        parameters.continuum_group_mask_gb,
+    leaf_masks = torch.as_tensor(
+        parameters.leaf_group_mask_hb,
         device=probability.device,
         dtype=torch.float64,
     )
+    left_masks = torch.as_tensor(
+        parameters.tree_left_mask_tb,
+        device=probability.device,
+        dtype=torch.float64,
+    )
+    right_masks = torch.as_tensor(
+        parameters.tree_right_mask_tb,
+        device=probability.device,
+        dtype=torch.float64,
+    )
+    depths = torch.as_tensor(
+        parameters.tree_depth_t,
+        device=probability.device,
+        dtype=torch.long,
+    )
+    left_children = torch.as_tensor(
+        parameters.tree_left_child_t,
+        device=probability.device,
+        dtype=torch.long,
+    )
+    right_children = torch.as_tensor(
+        parameters.tree_right_child_t,
+        device=probability.device,
+        dtype=torch.long,
+    )
     if (
-        tuple(peak.shape) != (int(probability.shape[-1]),)
-        or group_mask.ndim != 2
-        or int(group_mask.shape[1]) != int(probability.shape[-1])
+        leaf_masks.ndim != 2
+        or left_masks.ndim != 2
+        or tuple(right_masks.shape) != tuple(left_masks.shape)
+        or int(leaf_masks.shape[1]) != int(probability.shape[-1])
+        or int(left_masks.shape[1]) != int(probability.shape[-1])
+        or tuple(depths.shape) != (int(left_masks.shape[0]),)
+        or tuple(left_children.shape) != tuple(depths.shape)
+        or tuple(right_children.shape) != tuple(depths.shape)
     ):
-        raise ValueError("Hierarchical mark masks are not bin-aligned.")
-    continuum = ~peak
-    continuum_membership = torch.sum(group_mask[:, continuum], dim=0)
+        raise ValueError("Component-tree mark topology is not bin-aligned.")
+    leaf_membership = torch.sum(leaf_masks, dim=0)
+    node_partition = torch.sum(left_masks + right_masks, dim=1)
     mask_invalid = torch.stack(
         (
-            ~torch.any(peak),
-            ~torch.any(continuum),
-            torch.any(~torch.isfinite(group_mask)),
-            torch.any(group_mask < 0.0),
-            torch.any(torch.abs(continuum_membership - 1.0) > 1.0e-12),
+            torch.any(~torch.isfinite(leaf_masks)),
+            torch.any(leaf_masks < 0.0),
+            torch.any(torch.abs(leaf_membership - 1.0) > 1.0e-12),
+            torch.any(~torch.isfinite(left_masks)),
+            torch.any(~torch.isfinite(right_masks)),
+            torch.any(left_masks < 0.0),
+            torch.any(right_masks < 0.0),
+            torch.any(node_partition <= 0.0),
+            depths[0] != 0,
         )
     ).any()
     if bool(mask_invalid.item()):
-        raise ValueError("Hierarchical mark partition masks are invalid.")
+        raise ValueError("Component-tree mark partition masks are invalid.")
 
-    peak_probability = torch.sum(probability[..., peak], dim=-1)
-    raw_concentration = torch.as_tensor(
-        parameters.peak_fraction_concentration_xv,
+    raw_tree_concentration = torch.as_tensor(
+        parameters.tree_concentration_xvt,
+        device=probability.device,
+        dtype=torch.float64,
+    )
+    raw_leaf_concentration = torch.as_tensor(
+        parameters.leaf_concentration_xvh,
         device=probability.device,
         dtype=torch.float64,
     )
     try:
-        concentration = torch.broadcast_to(
-            raw_concentration.unsqueeze(-2),
-            peak_probability.shape,
+        tree_concentration = torch.broadcast_to(
+            raw_tree_concentration.unsqueeze(-3),
+            probability.shape[:-1] + (int(left_masks.shape[0]),),
+        )
+        leaf_concentration = torch.broadcast_to(
+            raw_leaf_concentration.unsqueeze(-3),
+            probability.shape[:-1] + (int(leaf_masks.shape[0]),),
         )
     except RuntimeError as error:
         raise ValueError(
-            "Peak-fraction concentrations are not state/view aligned."
+            "Component-tree concentrations are not state/view aligned."
         ) from error
-    concentration_invalid = torch.any(~torch.isfinite(concentration)) | torch.any(
-        concentration <= 0.0
-    )
+    concentration_invalid = torch.stack(
+        (
+            torch.any(~torch.isfinite(tree_concentration)),
+            torch.any(tree_concentration <= 0.0),
+            torch.any(~torch.isfinite(leaf_concentration)),
+            torch.any(leaf_concentration <= 0.0),
+        )
+    ).any()
     if bool(concentration_invalid.item()):
-        raise ValueError("Peak-fraction concentrations must be positive.")
-    interior = (peak_probability > 0.0) & (peak_probability < 1.0)
+        raise ValueError("Component-tree concentrations must be positive.")
+
+    left_mass = torch.einsum("...b,tb->...t", probability, left_masks)
+    right_mass = torch.einsum("...b,tb->...t", probability, right_masks)
+    parent_mass = left_mass + right_mass
+    branch_probability = torch.where(
+        parent_mass > 0.0,
+        left_mass
+        / torch.clamp(parent_mass, min=torch.finfo(torch.float64).tiny),
+        torch.zeros_like(parent_mass),
+    )
+    interior = (branch_probability > 0.0) & (branch_probability < 1.0)
     safe_alpha = torch.where(
         interior,
-        concentration * peak_probability,
-        torch.ones_like(peak_probability),
+        tree_concentration * branch_probability,
+        torch.ones_like(branch_probability),
     )
     safe_beta = torch.where(
         interior,
-        concentration * (1.0 - peak_probability),
-        torch.ones_like(peak_probability),
+        tree_concentration * (1.0 - branch_probability),
+        torch.ones_like(branch_probability),
     )
-    random_peak_probability = sample_beta_torch(
+    random_branch_probability = sample_beta_torch(
         safe_alpha,
         safe_beta,
         generator=generator,
     )
-    sampled_peak_probability = torch.where(
+    sampled_branch_probability = torch.where(
         interior,
-        random_peak_probability,
-        peak_probability,
+        random_branch_probability,
+        branch_probability,
     )
-    peak_totals = torch.binomial(
-        total.to(torch.float64),
-        sampled_peak_probability,
-        generator=generator,
-    ).to(torch.int64)
-    continuum_totals = total - peak_totals
+    node_mass = torch.zeros_like(sampled_branch_probability)
+    node_mass[..., 0] = 1.0
+    leaf_mass = torch.zeros(
+        probability.shape[:-1] + (int(leaf_masks.shape[0]),),
+        device=probability.device,
+        dtype=torch.float64,
+    )
+    maximum_depth = int(torch.max(depths).item())
+    for depth in range(maximum_depth + 1):
+        node_ids = torch.nonzero(depths == depth, as_tuple=False).flatten()
+        if int(node_ids.numel()) == 0:
+            continue
+        parent = node_mass[..., node_ids]
+        left_value = parent * sampled_branch_probability[..., node_ids]
+        right_value = parent - left_value
+        left_target = left_children[node_ids]
+        right_target = right_children[node_ids]
+        left_nodes = left_target >= 0
+        right_nodes = right_target >= 0
+        if bool(torch.any(left_nodes).item()):
+            node_mass[..., left_target[left_nodes]] = left_value[..., left_nodes]
+        if bool(torch.any(right_nodes).item()):
+            node_mass[..., right_target[right_nodes]] = right_value[..., right_nodes]
+        if bool(torch.any(~left_nodes).item()):
+            leaf_mass[..., -left_target[~left_nodes] - 1] = left_value[..., ~left_nodes]
+        if bool(torch.any(~right_nodes).item()):
+            leaf_mass[..., -right_target[~right_nodes] - 1] = right_value[
+                ..., ~right_nodes
+            ]
 
-    peak_probabilities = torch.where(
-        peak_probability.unsqueeze(-1) > 0.0,
-        probability[..., peak]
+    base_leaf_mass = torch.einsum("...b,hb->...h", probability, leaf_masks)
+    mapped_base_leaf_mass = torch.einsum(
+        "...h,hb->...b",
+        base_leaf_mass,
+        leaf_masks,
+    )
+    within_probability = torch.where(
+        mapped_base_leaf_mass > 0.0,
+        probability
         / torch.clamp(
-            peak_probability.unsqueeze(-1),
+            mapped_base_leaf_mass,
             min=torch.finfo(torch.float64).tiny,
         ),
-        torch.zeros_like(probability[..., peak]),
+        torch.zeros_like(probability),
     )
-    continuum_probability = 1.0 - peak_probability
-    continuum_probabilities = torch.where(
-        continuum_probability.unsqueeze(-1) > 0.0,
-        probability[..., continuum]
-        / torch.clamp(
-            continuum_probability.unsqueeze(-1),
-            min=torch.finfo(torch.float64).tiny,
-        ),
-        torch.zeros_like(probability[..., continuum]),
+    mapped_leaf_concentration = torch.einsum(
+        "...h,hb->...b",
+        leaf_concentration,
+        leaf_masks,
     )
-    peak_random_probabilities = _safe_dirichlet_probabilities(
-        peak_probabilities,
-        concentration=parameters.peak_shape_concentration,
-        generator=generator,
-    )
-
-    continuum_mask = group_mask[:, continuum]
-    continuum_group_probabilities = torch.einsum(
-        "...b,gb->...g",
-        continuum_probabilities,
-        continuum_mask,
-    )
-    random_group_probabilities = _safe_dirichlet_probabilities(
-        continuum_group_probabilities,
-        concentration=parameters.continuum_group_concentration,
-        generator=generator,
-    )
-    probability_by_bin_group = torch.einsum(
-        "...g,gb->...b",
-        continuum_group_probabilities,
-        continuum_mask,
-    )
-    continuum_within_probabilities = torch.where(
-        probability_by_bin_group > 0.0,
-        continuum_probabilities
-        / torch.clamp(
-            probability_by_bin_group,
-            min=torch.finfo(torch.float64).tiny,
-        ),
-        torch.zeros_like(continuum_probabilities),
-    )
-    within_alpha = continuum_within_probabilities * _positive_finite(
-        parameters.continuum_within_concentration,
-        name="continuum_within_concentration",
-    )
+    within_alpha = within_probability * mapped_leaf_concentration
     positive_within = within_alpha > 0.0
     within_gamma = sample_standard_gamma_torch(
         torch.where(
@@ -630,14 +674,14 @@ def _sample_hierarchical_marks_torch(
         torch.zeros_like(within_gamma),
     )
     within_group_sums = torch.einsum(
-        "...b,gb->...g",
+        "...b,hb->...h",
         within_gamma,
-        continuum_mask,
+        leaf_masks,
     )
     within_sum_by_bin = torch.einsum(
-        "...g,gb->...b",
+        "...h,hb->...b",
         within_group_sums,
-        continuum_mask,
+        leaf_masks,
     )
     random_within_probabilities = torch.where(
         within_sum_by_bin > 0.0,
@@ -646,27 +690,26 @@ def _sample_hierarchical_marks_torch(
             within_sum_by_bin,
             min=torch.finfo(torch.float64).tiny,
         ),
-        continuum_within_probabilities,
+        within_probability,
     )
-    random_group_by_bin = torch.einsum(
-        "...g,gb->...b",
-        random_group_probabilities,
-        continuum_mask,
+    random_leaf_mass_by_bin = torch.einsum(
+        "...h,hb->...b",
+        leaf_mass,
+        leaf_masks,
     )
-    continuum_random_probabilities = random_group_by_bin * random_within_probabilities
-
-    samples = torch.zeros_like(probability, dtype=torch.int64)
-    samples[..., peak] = sample_multinomial_counts_torch(
-        peak_totals,
-        peak_random_probabilities,
+    random_probability = random_leaf_mass_by_bin * random_within_probabilities
+    normalization = torch.sum(random_probability, dim=-1, keepdim=True)
+    random_probability = torch.where(
+        normalization > 0.0,
+        random_probability
+        / torch.clamp(normalization, min=torch.finfo(torch.float64).tiny),
+        probability,
+    )
+    return sample_multinomial_counts_torch(
+        total,
+        random_probability,
         generator=generator,
     )
-    samples[..., continuum] = sample_multinomial_counts_torch(
-        continuum_totals,
-        continuum_random_probabilities,
-        generator=generator,
-    )
-    return samples
 
 
 def sample_predictive_action_torch(
@@ -683,11 +726,7 @@ def sample_predictive_action_torch(
     count_scope: str = "renewal",
     count_concentration_xv: object | None = None,
     mark_concentration_xv: object | None = None,
-    hierarchical_marks: HierarchicalMarkParameters | None = None,
-    component_direct_mean_xvb: object | None = None,
-    component_scatter_mean_xvb: object | None = None,
-    component_scale_nodes_k2: object | None = None,
-    component_scale_weights_k: object | None = None,
+    hierarchical_marks: ComponentTreeMarkParameters | None = None,
 ) -> object:
     """Draw one action's future spectra from prepared pre-dead-time means.
 
@@ -722,11 +761,10 @@ def sample_predictive_action_torch(
     if mark_model not in (
         "fixed_multinomial",
         "fraction_dirichlet_multinomial",
-        "station_shared_two_point_component_scale",
-        "photopeak_continuum_hierarchical",
+        "component_dirichlet_tree_hierarchical",
     ):
         raise ValueError(f"Unsupported predictive mark_model: {mark_model!r}.")
-    if (mark_model == "photopeak_continuum_hierarchical") != (
+    if (mark_model == "component_dirichlet_tree_hierarchical") != (
         hierarchical_marks is not None
     ):
         raise ValueError(
@@ -738,23 +776,6 @@ def sample_predictive_action_torch(
     ):
         raise ValueError(
             "Mark concentrations must exactly match the fraction-Dirichlet mark model."
-        )
-    component_values = (
-        component_direct_mean_xvb,
-        component_scatter_mean_xvb,
-        component_scale_nodes_k2,
-        component_scale_weights_k,
-    )
-    has_all_components = all(value is not None for value in component_values)
-    has_any_component = any(value is not None for value in component_values)
-    if (
-        mark_model == "station_shared_two_point_component_scale"
-    ) != has_all_components or (
-        mark_model != "station_shared_two_point_component_scale" and has_any_component
-    ):
-        raise ValueError(
-            "Component means, nodes, and weights must exactly match the "
-            "component-scale mark model."
         )
     if (
         source_mean.ndim < 2
@@ -774,52 +795,6 @@ def sample_predictive_action_torch(
     ).any()
     if bool(invalid.item()):
         raise ValueError("Prepared predictive means contain invalid values.")
-
-    direct_mean = None
-    scatter_mean = None
-    component_nodes = None
-    component_weights = None
-    if mark_model == "station_shared_two_point_component_scale":
-        direct_mean = torch.as_tensor(
-            component_direct_mean_xvb,
-            device=source_mean.device,
-            dtype=torch.float64,
-        )
-        scatter_mean = torch.as_tensor(
-            component_scatter_mean_xvb,
-            device=source_mean.device,
-            dtype=torch.float64,
-        )
-        component_nodes = torch.as_tensor(
-            component_scale_nodes_k2,
-            device=source_mean.device,
-            dtype=torch.float64,
-        )
-        component_weights = torch.as_tensor(
-            component_scale_weights_k,
-            device=source_mean.device,
-            dtype=torch.float64,
-        ).reshape(-1)
-        component_invalid = torch.stack(
-            (
-                torch.any(~torch.isfinite(direct_mean)),
-                torch.any(direct_mean < 0.0),
-                torch.any(~torch.isfinite(scatter_mean)),
-                torch.any(scatter_mean < 0.0),
-                torch.any(~torch.isfinite(component_nodes)),
-                torch.any(component_nodes < 0.0),
-                torch.any(~torch.isfinite(component_weights)),
-                torch.any(component_weights < 0.0),
-                torch.sum(component_weights) <= 0.0,
-            )
-        ).any()
-        if (
-            tuple(direct_mean.shape) != tuple(source_mean.shape)
-            or tuple(scatter_mean.shape) != tuple(source_mean.shape)
-            or tuple(component_nodes.shape) != (int(component_weights.numel()), 2)
-            or bool(component_invalid.item())
-        ):
-            raise ValueError("Component-scale mark inputs are invalid.")
 
     nodes = torch.as_tensor(
         rate_scale_nodes_j,
@@ -868,40 +843,6 @@ def sample_predictive_action_torch(
     pre_total = torch.sum(pre_mean, dim=-1)
     live = live_times.reshape((1,) * (pre_total.ndim - 1) + (-1,))
     mark_pre_mean = pre_mean
-    if mark_model == "station_shared_two_point_component_scale":
-        if (
-            direct_mean is None
-            or scatter_mean is None
-            or component_nodes is None
-            or component_weights is None
-        ):  # pragma: no cover - validated above
-            raise RuntimeError("Component-scale mark inputs disappeared.")
-        normalized_component_weights = component_weights / torch.sum(component_weights)
-        component_cumulative = torch.cumsum(
-            normalized_component_weights,
-            dim=0,
-        )
-        component_cumulative[-1] = 1.0
-        component_uniform = torch.rand(
-            scale_shape,
-            device=source_mean.device,
-            dtype=torch.float64,
-            generator=generator,
-        )
-        component_indices = torch.searchsorted(
-            component_cumulative,
-            component_uniform.contiguous(),
-            right=False,
-        ).clamp(max=int(component_nodes.shape[0]) - 1)
-        sampled_components = component_nodes[component_indices]
-        mark_pre_mean = background_mean.unsqueeze(-3) + sampled_scale.unsqueeze(
-            -1
-        ).unsqueeze(-1) * (
-            direct_mean.unsqueeze(-3)
-            * sampled_components[..., 0].unsqueeze(-1).unsqueeze(-1)
-            + scatter_mean.unsqueeze(-3)
-            * sampled_components[..., 1].unsqueeze(-1).unsqueeze(-1)
-        )
 
     if count_scope == "renewal":
         if count_concentration_xv is not None:
@@ -968,6 +909,22 @@ def sample_predictive_action_torch(
         totals = totals_float.to(torch.int64)
     else:
         raise ValueError(f"Unsupported predictive count_scope: {count_scope!r}.")
+
+    if mark_model == "component_dirichlet_tree_hierarchical":
+        source_active = torch.sum(node_source, dim=-1) > 0.0
+        if bool(torch.any(~source_active).item()):
+            background_only_totals = sample_nonparalyzable_counts_torch(
+                pre_total / live,
+                torch.broadcast_to(live, pre_total.shape),
+                dead_time_tau_s=tau,
+                sample_count=1,
+                generator=generator,
+            ).squeeze(-1)
+            totals = torch.where(
+                source_active,
+                totals,
+                background_only_totals,
+            )
 
     mark_total = torch.sum(mark_pre_mean, dim=-1)
     probabilities = torch.where(
@@ -1053,7 +1010,6 @@ def sample_predictive_action_torch(
     if mark_model in (
         "fixed_multinomial",
         "fraction_dirichlet_multinomial",
-        "station_shared_two_point_component_scale",
     ):
         samples = sample_multinomial_counts_torch(
             totals,
@@ -1063,7 +1019,7 @@ def sample_predictive_action_torch(
     else:
         if hierarchical_marks is None:  # pragma: no cover - checked above
             raise RuntimeError("Hierarchical mark parameters disappeared.")
-        samples = _sample_hierarchical_marks_torch(
+        samples = _sample_component_tree_marks_torch(
             totals,
             probabilities,
             hierarchical_marks,
@@ -1154,17 +1110,13 @@ def sample_geometry_conditioned_predictive_torch(
         raise ValueError("Torch action seeds require a leading action transport axis.")
 
     component = model.physical_component_discrepancy
-    component_scale_marks = bool(
+    component_tree_marks = bool(
         component is not None
-        and component.mark_latent_model == "station_shared_two_point_component_scale"
-    )
-    hierarchical_marks = bool(
-        component is not None
-        and component.mark_latent_model == "photopeak_continuum_hierarchical"
+        and component.mark_latent_model == "component_dirichlet_tree_hierarchical"
     )
     direct_mean = None
     scatter_mean = None
-    if component_scale_marks:
+    if component_tree_marks:
         direct_mean, scatter_mean, background_mean = model._pre_dead_time_mean_torch(
             total_line_contributions_xvsl,
             uncollided_line_contributions_xvsl,
@@ -1190,6 +1142,7 @@ def sample_geometry_conditioned_predictive_torch(
         count_concentration = model._component_count_concentration_torch(
             total_line_contributions_xvsl,
             uncollided_line_contributions_xvsl,
+            transport_features_xvslf,
         )
         count_concentration_has_action_axis = action_seeds_a is not None
     elif model.count_discrepancy_concentration is not None:
@@ -1208,57 +1161,49 @@ def sample_geometry_conditioned_predictive_torch(
     mark_concentration = None
     hierarchy_concentration = None
     hierarchy = None
-    component_nodes = None
-    component_weights = None
-    if component_scale_marks:
-        mark_model = "station_shared_two_point_component_scale"
-        raw_component_nodes, raw_component_weights = (
-            model._physical_mark_scale_nodes_numpy()
-        )
-        component_nodes = torch.tensor(
-            raw_component_nodes,
-            device=source_mean.device,
-            dtype=torch.float64,
-        )
-        component_weights = torch.tensor(
-            raw_component_weights,
-            device=source_mean.device,
-            dtype=torch.float64,
-        )
-    elif hierarchical_marks:
+    if component_tree_marks:
         if component is None:  # pragma: no cover - implied above
             raise RuntimeError("Hierarchical component settings disappeared.")
-        mark_model = "photopeak_continuum_hierarchical"
-        hierarchy_concentration = model._base_mark_concentration_torch(
-            total_line_contributions_xvsl,
-            uncollided_line_contributions_xvsl,
+        mark_model = "component_dirichlet_tree_hierarchical"
+        component_means = torch.stack(
+            (direct_mean, scatter_mean, background_mean),
+            dim=-2,
+        ).unsqueeze(-4)
+        raw_tree_concentration, raw_leaf_concentration = (
+            model._component_tree_mark_concentrations_torch(
+                total_line_contributions_xvsl,
+                uncollided_line_contributions_xvsl,
+                component_means,
+            )
         )
-        full_continuum_groups = torch.zeros(
-            (int(continuum_groups.shape[0]), int(peak_mask.numel())),
-            device=source_mean.device,
-            dtype=torch.float64,
+        tree_concentration = raw_tree_concentration.squeeze(-3)
+        leaf_concentration = raw_leaf_concentration.squeeze(-3)
+        hierarchy_concentration = (tree_concentration, leaf_concentration)
+        (
+            leaf_masks,
+            left_masks,
+            right_masks,
+            _domains,
+            depths,
+            left_children,
+            right_children,
+        ) = model._torch_mark_tree_constants(source_mean)
+        hierarchy = ComponentTreeMarkParameters(
+            leaf_group_mask_hb=leaf_masks,
+            tree_left_mask_tb=left_masks,
+            tree_right_mask_tb=right_masks,
+            tree_depth_t=depths,
+            tree_left_child_t=left_children,
+            tree_right_child_t=right_children,
+            tree_concentration_xvt=tree_concentration,
+            leaf_concentration_xvh=leaf_concentration,
         )
-        full_continuum_groups[:, ~peak_mask] = continuum_groups
-        hierarchy = HierarchicalMarkParameters(
-            peak_mask_b=peak_mask,
-            continuum_group_mask_gb=full_continuum_groups,
-            peak_fraction_concentration_xv=hierarchy_concentration,
-            peak_shape_concentration=float(component.mark_uncollided_concentration),
-            continuum_group_concentration=float(
-                component.mark_continuum_group_concentration
-            ),
-            continuum_within_concentration=float(
-                component.mark_uncollided_concentration
-            ),
-        )
-    elif model.mark_concentration_source is not None or component is not None:
+    else:
         mark_model = "fraction_dirichlet_multinomial"
         mark_concentration = model._base_mark_concentration_torch(
             total_line_contributions_xvsl,
-            (uncollided_line_contributions_xvsl if component is not None else None),
+            uncollided_line_contributions_xvsl,
         )
-    else:
-        mark_model = "fixed_multinomial"
 
     def _sample_prepared_action(
         action_index: int | None,
@@ -1283,18 +1228,22 @@ def sample_geometry_conditioned_predictive_torch(
             selected_mark_concentration = mark_concentration[action_index]
         selected_hierarchy = hierarchy
         if hierarchy is not None:
-            selected_hierarchy_concentration = hierarchy_concentration
-            if action_index is not None and hierarchy_concentration is not None:
-                selected_hierarchy_concentration = hierarchy_concentration[action_index]
-            selected_hierarchy = HierarchicalMarkParameters(
-                peak_mask_b=hierarchy.peak_mask_b,
-                continuum_group_mask_gb=hierarchy.continuum_group_mask_gb,
-                peak_fraction_concentration_xv=(selected_hierarchy_concentration),
-                peak_shape_concentration=hierarchy.peak_shape_concentration,
-                continuum_group_concentration=(hierarchy.continuum_group_concentration),
-                continuum_within_concentration=(
-                    hierarchy.continuum_within_concentration
-                ),
+            if hierarchy_concentration is None:
+                raise RuntimeError("Component-tree concentrations disappeared.")
+            selected_tree_concentration = hierarchy_concentration[0]
+            selected_leaf_concentration = hierarchy_concentration[1]
+            if action_index is not None:
+                selected_tree_concentration = selected_tree_concentration[action_index]
+                selected_leaf_concentration = selected_leaf_concentration[action_index]
+            selected_hierarchy = ComponentTreeMarkParameters(
+                leaf_group_mask_hb=hierarchy.leaf_group_mask_hb,
+                tree_left_mask_tb=hierarchy.tree_left_mask_tb,
+                tree_right_mask_tb=hierarchy.tree_right_mask_tb,
+                tree_depth_t=hierarchy.tree_depth_t,
+                tree_left_child_t=hierarchy.tree_left_child_t,
+                tree_right_child_t=hierarchy.tree_right_child_t,
+                tree_concentration_xvt=selected_tree_concentration,
+                leaf_concentration_xvh=selected_leaf_concentration,
             )
         return sample_predictive_action_torch(
             selected_source,
@@ -1310,22 +1259,6 @@ def sample_geometry_conditioned_predictive_torch(
             count_concentration_xv=selected_count_concentration,
             mark_concentration_xv=selected_mark_concentration,
             hierarchical_marks=selected_hierarchy,
-            component_direct_mean_xvb=(
-                None
-                if direct_mean is None
-                else (
-                    direct_mean if action_index is None else direct_mean[action_index]
-                )
-            ),
-            component_scatter_mean_xvb=(
-                None
-                if scatter_mean is None
-                else (
-                    scatter_mean if action_index is None else scatter_mean[action_index]
-                )
-            ),
-            component_scale_nodes_k2=component_nodes,
-            component_scale_weights_k=component_weights,
         )
 
     if action_seeds_a is None:

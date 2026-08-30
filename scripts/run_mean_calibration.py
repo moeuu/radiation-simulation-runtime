@@ -3,14 +3,9 @@
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 from collections.abc import Sequence
 
-from sim.runtime import load_runtime_config
-from spectrum.additive_scatter import (
-    AdditiveNoncollidedTransportResponse,
-)
 from spectrum.mean_calibration_runner import (
     ExternalGeant4MeanCalibrationBackend,
     MeanCalibrationLayout,
@@ -18,7 +13,6 @@ from spectrum.mean_calibration_runner import (
     fit_additive_scatter_from_complete_mean_calibration,
     freeze_mean_calibration_completion_manifest,
     freeze_mean_calibration_scene_manifest,
-    freeze_runtime_ready_model,
     initialize_mean_calibration_layout,
 )
 from spectrum.transport_spectral import (
@@ -87,8 +81,7 @@ def _add_layout_arguments(parser: argparse.ArgumentParser) -> None:
         type=int,
         choices=range(64),
         help=(
-            "Predeclare one shield pair; repeat as needed. The default is "
-            "all 64 pairs."
+            "Predeclare one shield pair; repeat as needed. The default is all 64 pairs."
         ),
     )
 
@@ -167,24 +160,6 @@ def _parser() -> argparse.ArgumentParser:
     )
     _add_layout_arguments(fit_additive)
 
-    freeze_runtime = subparsers.add_parser(
-        "freeze-runtime",
-        help=(
-            "Freeze the exact physical statistical model or an authenticated "
-            "empirical-discrepancy candidate."
-        ),
-    )
-    _add_layout_arguments(freeze_runtime)
-    _add_runtime_arguments(freeze_runtime)
-    freeze_runtime.add_argument(
-        "--candidate",
-        type=Path,
-        help=(
-            "Optional candidate carrying an independently trained discrepancy "
-            "contract. When omitted, use exact physical statistics."
-        ),
-    )
-    freeze_runtime.add_argument("--output", type=Path, required=True)
     return parser
 
 
@@ -216,16 +191,6 @@ def _design(arguments: argparse.Namespace) -> dict[str, object]:
 def _layout(arguments: argparse.Namespace) -> MeanCalibrationLayout:
     """Return the selected immutable artifact layout."""
     return MeanCalibrationLayout(Path(arguments.output_root).resolve())
-
-
-def _load_additive(layout: MeanCalibrationLayout) -> (
-    AdditiveNoncollidedTransportResponse
-):
-    """Load the fitted additive response from its immutable JSON."""
-    payload = json.loads(
-        layout.additive_model_path.read_text(encoding="utf-8")
-    )
-    return AdditiveNoncollidedTransportResponse.from_payload(payload)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -273,7 +238,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if arguments.phase == "fit-additive":
-        base_model = GeometryConditionedSpectralModel.standard_native(
+        base_model = GeometryConditionedSpectralModel.nonproduction_native(
             ("Co-60", "Cs-137", "Eu-154"),
             dead_time_tau_s=0.0,
             background_rate_cps=0.0,
@@ -284,35 +249,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             model=base_model,
         )
         print(response.contract_hash_sha256)
-        return 0
-
-    if arguments.phase == "freeze-runtime":
-        additive_response = _load_additive(layout)
-        if arguments.candidate is None:
-            runtime_config = load_runtime_config(arguments.config)
-            candidate = GeometryConditionedSpectralModel.standard_native(
-                ("Co-60", "Cs-137", "Eu-154"),
-                dead_time_tau_s=float(runtime_config["dead_time_tau_s"]),
-                background_rate_cps=float(
-                    runtime_config["background_rate_cps"]
-                ),
-                additive_scatter_response=additive_response,
-            )
-        else:
-            candidate_payload = json.loads(
-                arguments.candidate.read_text(encoding="utf-8")
-            )
-            candidate = GeometryConditionedSpectralModel.from_manifest_payload(
-                candidate_payload
-            )
-        path = freeze_runtime_ready_model(
-            output_path=arguments.output,
-            model=candidate,
-            additive_response=additive_response,
-            layout=layout,
-            design=design,
-        )
-        print(path)
         return 0
 
     raise AssertionError(f"Unhandled phase: {arguments.phase}.")

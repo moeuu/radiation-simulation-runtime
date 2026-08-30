@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -14,17 +15,47 @@ from measurement.source_boundary import (
 )
 from sim.geant4_app.scene_export import ExportedGeant4Scene
 from sim.shield_geometry import require_no_angle_attenuation
-from spectrum.library import nuclide_catalog_sha256, require_nuclide
+from spectrum.library import (
+    Nuclide,
+    default_library,
+    nuclide_catalog_sha256,
+)
 
 if TYPE_CHECKING:
     from sim.geant4_app.engine import Geant4StepRequest
 
 
-def write_scene_file(scene: ExportedGeant4Scene, path: str | Path) -> None:
-    """Write an exported Geant4 scene into a line-oriented text format."""
+NATIVE_ACTION_IDENTITY_CONTRACT_ID = "geant4_native_action_identity_v1"
+
+
+def write_scene_file(
+    scene: ExportedGeant4Scene,
+    path: str | Path,
+    *,
+    nuclide_library: Mapping[str, Nuclide] | None = None,
+) -> None:
+    """Write a scene with an explicit authenticated nuclide-line mapping."""
     output_path = Path(path)
+    library = default_library() if nuclide_library is None else nuclide_library
+    if not isinstance(library, Mapping) or not library:
+        raise ValueError("Geant4 scene requires a nonempty nuclide mapping.")
     source_isotopes = tuple(sorted({source.isotope for source in scene.sources}))
-    source_nuclides = tuple(require_nuclide(name) for name in source_isotopes)
+    try:
+        source_nuclides = tuple(library[name] for name in source_isotopes)
+    except KeyError as exc:
+        raise ValueError(
+            f"Geant4 scene source {exc.args[0]!r} is absent from its "
+            "authenticated nuclide mapping."
+        ) from exc
+    if any(
+        not isinstance(nuclide, Nuclide) or nuclide.name != isotope
+        for isotope, nuclide in zip(
+            source_isotopes,
+            source_nuclides,
+            strict=True,
+        )
+    ):
+        raise ValueError("Geant4 scene nuclide mapping is malformed.")
     activity_sources = [
         source for source in scene.sources if source.activity_bq is not None
     ]
@@ -60,7 +91,7 @@ def write_scene_file(scene: ExportedGeant4Scene, path: str | Path) -> None:
             "SCENE",
             scene_hash=scene.scene_hash,
             surface_source_contract_sha256=source_contract_sha256,
-            nuclide_catalog_sha256=nuclide_catalog_sha256(),
+            nuclide_catalog_sha256=nuclide_catalog_sha256(library),
             usd_path=scene.usd_path or "-",
             room_x=scene.room_size_xyz[0],
             room_y=scene.room_size_xyz[1],
@@ -139,7 +170,9 @@ def write_scene_file(scene: ExportedGeant4Scene, path: str | Path) -> None:
                 sy="-" if shield.size_xyz is None else shield.size_xyz[1],
                 sz="-" if shield.size_xyz is None else shield.size_xyz[2],
                 material_name=shield.material.name,
-                density_g_cm3=shield.material.density_g_cm3 if shield.material.density_g_cm3 is not None else "-",
+                density_g_cm3=shield.material.density_g_cm3
+                if shield.material.density_g_cm3 is not None
+                else "-",
                 preset_name=shield.material.preset_name or "-",
             )
         )
@@ -153,13 +186,9 @@ def write_scene_file(scene: ExportedGeant4Scene, path: str | Path) -> None:
                 y=source.position_xyz[1],
                 z=source.position_xyz[2],
                 intensity_cps_1m=(
-                    "-"
-                    if source.intensity_cps_1m is None
-                    else source.intensity_cps_1m
+                    "-" if source.intensity_cps_1m is None else source.intensity_cps_1m
                 ),
-                activity_bq=(
-                    "-" if source.activity_bq is None else source.activity_bq
-                ),
+                activity_bq=("-" if source.activity_bq is None else source.activity_bq),
                 anchor_x=(
                     source.position_xyz[0]
                     if source.anchor_position_xyz is None
@@ -176,16 +205,10 @@ def write_scene_file(scene: ExportedGeant4Scene, path: str | Path) -> None:
                     else source.anchor_position_xyz[2]
                 ),
                 surface_chart_id=(
-                    "-"
-                    if source.surface_chart_id is None
-                    else source.surface_chart_id
+                    "-" if source.surface_chart_id is None else source.surface_chart_id
                 ),
-                surface_u=(
-                    "-" if source.surface_uv is None else source.surface_uv[0]
-                ),
-                surface_v=(
-                    "-" if source.surface_uv is None else source.surface_uv[1]
-                ),
+                surface_u=("-" if source.surface_uv is None else source.surface_uv[0]),
+                surface_v=("-" if source.surface_uv is None else source.surface_uv[1]),
                 surface_normal_x=(
                     "-"
                     if source.surface_normal_xyz is None
@@ -212,7 +235,11 @@ def write_scene_file(scene: ExportedGeant4Scene, path: str | Path) -> None:
         density_g_cm3 = "-"
         preset_name = "-"
         if volume.material is not None:
-            density_g_cm3 = volume.material.density_g_cm3 if volume.material.density_g_cm3 is not None else "-"
+            density_g_cm3 = (
+                volume.material.density_g_cm3
+                if volume.material.density_g_cm3 is not None
+                else "-"
+            )
             preset_name = volume.material.preset_name or "-"
         lines.append(
             _format_line(
@@ -262,9 +289,7 @@ def write_scene_file(scene: ExportedGeant4Scene, path: str | Path) -> None:
 def write_request_file(request: Geant4StepRequest, path: str | Path) -> None:
     """Write one Geant4 step request into a line-oriented text format."""
     output_path = Path(path)
-    fe_orientation_index, pb_orientation_index = (
-        request.resolved_orientation_indices()
-    )
+    fe_orientation_index, pb_orientation_index = request.resolved_orientation_indices()
     lines = [
         _format_line(
             "STEP",
@@ -272,9 +297,9 @@ def write_request_file(request: Geant4StepRequest, path: str | Path) -> None:
             dwell_time_s=request.dwell_time_s,
             seed=request.seed,
             shield_pose_contract_id=request.shield_pose_contract_id,
-            shield_pose_contract_sha256=(
-                request.shield_pose_contract_sha256
-            ),
+            shield_pose_contract_sha256=(request.shield_pose_contract_sha256),
+            native_action_contract_id=(NATIVE_ACTION_IDENTITY_CONTRACT_ID),
+            native_action_sha256=request.action_identity_sha256(),
             fe_orientation_index=fe_orientation_index,
             pb_orientation_index=pb_orientation_index,
         ),
@@ -333,7 +358,9 @@ def read_response_file(path: str | Path) -> tuple[np.ndarray, dict[str, Any]]:
         if stripped.startswith("SPECTRUM "):
             _, payload = stripped.split(" ", 1)
             if payload.strip():
-                spectrum = np.asarray([float(part) for part in payload.split(",") if part], dtype=float)
+                spectrum = np.asarray(
+                    [float(part) for part in payload.split(",") if part], dtype=float
+                )
             else:
                 spectrum = np.zeros(0, dtype=float)
             continue
@@ -347,7 +374,9 @@ def read_response_file(path: str | Path) -> tuple[np.ndarray, dict[str, Any]]:
             else:
                 spectrum_variance = np.zeros(0, dtype=float)
     if spectrum is None:
-        raise RuntimeError("External Geant4 response did not contain a SPECTRUM record.")
+        raise RuntimeError(
+            "External Geant4 response did not contain a SPECTRUM record."
+        )
     if spectrum_variance is not None:
         metadata["spectrum_count_variance"] = spectrum_variance.tolist()
         metadata["spectrum_count_variance_total"] = float(np.sum(spectrum_variance))
@@ -365,7 +394,9 @@ def _material_detail_lines(path: str, material: object) -> list[str]:
         lines.append(_format_line("MASS_ATT", path=path, isotope=isotope, value=value))
     composition = getattr(material, "composition_by_mass", {})
     for element, fraction in sorted(composition.items()):
-        lines.append(_format_line("COMP", path=path, element=element, fraction=fraction))
+        lines.append(
+            _format_line("COMP", path=path, element=element, fraction=fraction)
+        )
     return lines
 
 

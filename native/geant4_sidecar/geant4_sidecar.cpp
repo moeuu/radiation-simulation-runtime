@@ -131,6 +131,8 @@ constexpr const char* kShieldPoseContractId =
     "spherical_octant_positive_xyz_incoming_index_v1";
 constexpr const char* kShieldPoseContractSha256 =
     "0732f12d1f2aa83607560643484652da6ba942d02a0fdfdf4b0fda4e6d3116fd";
+constexpr const char* kNativeActionIdentityContractId =
+    "geant4_native_action_identity_v1";
 
 struct MaterialSpec {
     std::string name;
@@ -363,14 +365,20 @@ struct SceneSpec {
 };
 
 struct RequestSpec {
-    int step_id = 0;
-    double dwell_time_s = 1.0;
-    long seed = 123;
+    int step_id = -1;
+    double dwell_time_s = std::numeric_limits<double>::quiet_NaN();
+    long seed = -1;
     PoseSpec detector_pose;
     PoseSpec fe_pose;
     PoseSpec pb_pose;
+    bool has_step = false;
+    bool has_detector_pose = false;
+    bool has_fe_pose = false;
+    bool has_pb_pose = false;
     std::string shield_pose_contract_id;
     std::string shield_pose_contract_sha256;
+    std::string native_action_contract_id;
+    std::string native_action_sha256;
     int fe_orientation_index = -1;
     int pb_orientation_index = -1;
 };
@@ -385,7 +393,7 @@ struct TransportOptions {
     double background_cps = 0.0;
     std::string source_rate_model = "detector_cps_1m";
     std::string source_bias_mode = "detector_cone";
-    double source_bias_cone_half_angle_deg = 0.0;
+    std::string source_bias_cone_policy = "detector_covering";
     double source_bias_isotropic_fraction = 1.0;
     std::string detector_scoring_mode = "full_transport";
     std::string secondary_transport_mode = "full_transport";
@@ -397,6 +405,9 @@ struct TransportOptions {
     bool mean_calibration_forced_collision = false;
     bool validation_entry_class_spectra = false;
     bool sample_detector_response = false;
+    std::string detector_green_operator_path;
+    std::string detector_green_operator_binary_sha256;
+    std::string detector_green_operator_contract_sha256;
     std::string primary_emission_model = "independent_gamma_lines";
     bool decay_comparison_diagnostic = false;
     double decay_comparison_energy_max_keV = 3400.0;
@@ -443,6 +454,8 @@ struct EnergyDeposit {
     long long bias_branch_lineage_id = -1;
     long long step_deposit_count = 0;
     double global_time_s = 0.0;
+    double impact_parameter_fraction =
+        std::numeric_limits<double>::quiet_NaN();
 };
 
 struct WeightedEventDeposit {
@@ -455,6 +468,8 @@ struct WeightedEventDeposit {
     double global_time_s = 0.0;
     long long step_deposit_count = 0;
     double primary_event_time_s = 0.0;
+    double impact_parameter_fraction =
+        std::numeric_limits<double>::quiet_NaN();
 };
 
 DetectorEntryClass MergeDetectorEntryClass(
@@ -479,6 +494,18 @@ std::string ToLower(std::string value) {
         return static_cast<char>(std::tolower(c));
     });
     return value;
+}
+
+bool IsLowercaseSha256(const std::string& value) {
+    if (value.size() != 64U) {
+        return false;
+    }
+    return std::all_of(value.begin(), value.end(), [](const char character) {
+        return (
+            (character >= '0' && character <= '9')
+            || (character >= 'a' && character <= 'f')
+        );
+    });
 }
 
 std::string NormalizeModeToken(std::string value) {
@@ -661,6 +688,22 @@ std::map<std::string, std::string> ParseFields(const std::vector<std::string>& t
     return fields;
 }
 
+void RequireExactFields(
+    const std::map<std::string, std::string>& fields,
+    const std::set<std::string>& expected,
+    const std::string& record_type
+) {
+    std::set<std::string> actual;
+    for (const auto& entry : fields) {
+        actual.insert(entry.first);
+    }
+    if (actual != expected) {
+        throw std::runtime_error(
+            "Request " + record_type + " fields are missing or unknown."
+        );
+    }
+}
+
 std::vector<std::string> Split(const std::string& line) {
     std::istringstream stream(line);
     std::vector<std::string> tokens;
@@ -700,141 +743,437 @@ std::vector<LineSpec> GammaLinesForIsotope(
     const std::string& isotope
 ) {
     const auto evaluated = scene.nuclides.find(isotope);
-    if (evaluated != scene.nuclides.end()) {
-        if (evaluated->second.transport_gamma_lines.empty()) {
-            throw std::runtime_error(
-                "Evaluated nuclide has no positive transport gamma lines: "
-                + isotope
-            );
-        }
-        return evaluated->second.transport_gamma_lines;
+    if (evaluated == scene.nuclides.end()) {
+        throw std::runtime_error(
+            "Source isotope is absent from the authenticated nuclide "
+            "catalog: " + isotope
+        );
     }
-    // Legacy native fixture compatibility. Exported runtime scenes always
-    // provide the authenticated catalog above.
-    if (isotope == "Cs-137") {
-        return {{662.0, 0.85}};
+    if (evaluated->second.transport_gamma_lines.empty()) {
+        throw std::runtime_error(
+            "Evaluated nuclide has no positive transport gamma lines: "
+            + isotope
+        );
     }
-    if (isotope == "Co-60") {
-        return {{1173.0, 0.5}, {1332.0, 0.5}};
-    }
-    if (isotope == "Eu-154") {
-        return {
-            {723.3, 0.25},
-            {873.2, 0.14},
-            {996.3, 0.14},
-            {1274.5, 0.45},
-            {1494.0, 0.01},
-            {1596.5, 0.02},
-        };
-    }
-    return {};
+    return evaluated->second.transport_gamma_lines;
 }
 
 double SigmaEnergyKeV(const double energy_keV) {
     return std::max(0.5 * std::sqrt(std::max(0.0, energy_keV)) - 1.5, 0.5);
 }
 
-std::vector<std::vector<double>> BuildDetectorResponseCdfs(
-    const int num_bins,
-    const double bin_width_keV
-) {
-    constexpr double kElectronRestEnergyKeV = 511.0;
-    constexpr double kContinuumToPeak = 2.0;
-    constexpr double kBackscatterFraction = 0.03;
-    std::vector<std::vector<double>> cdfs(
-        static_cast<std::size_t>(num_bins),
-        std::vector<double>(static_cast<std::size_t>(num_bins), 0.0)
-    );
-    for (int input_index = 0; input_index < num_bins; ++input_index) {
-        const double incident_energy = static_cast<double>(input_index) * bin_width_keV;
-        auto& weights = cdfs[static_cast<std::size_t>(input_index)];
-        if (incident_energy <= 0.0) {
-            weights[0] = 1.0;
-            continue;
-        }
-        const double sigma = SigmaEnergyKeV(incident_energy);
-        const double compton_edge = incident_energy * (
-            1.0 - 1.0 / (
-                1.0 + 2.0 * incident_energy / kElectronRestEnergyKeV
-            )
-        );
-        const double continuum_tau = std::max(compton_edge / 3.0, 1.0e-12);
-        const double backscatter_energy = incident_energy / (
-            1.0 + 2.0 * incident_energy / kElectronRestEnergyKeV
-        );
-        const double backscatter_sigma = SigmaEnergyKeV(backscatter_energy);
-        double peak_sum = 0.0;
-        double continuum_sum = 0.0;
-        double backscatter_sum = 0.0;
-        std::vector<double> peak(weights.size(), 0.0);
-        std::vector<double> continuum(weights.size(), 0.0);
-        std::vector<double> backscatter(weights.size(), 0.0);
-        for (int output_index = 0; output_index < num_bins; ++output_index) {
-            const double energy = static_cast<double>(output_index) * bin_width_keV;
-            const double peak_value = std::exp(
-                -0.5 * std::pow((energy - incident_energy) / sigma, 2.0)
-            );
-            peak[static_cast<std::size_t>(output_index)] = peak_value;
-            peak_sum += peak_value;
-            if (energy <= compton_edge) {
-                const double continuum_value = std::exp(-energy / continuum_tau);
-                continuum[static_cast<std::size_t>(output_index)] = continuum_value;
-                continuum_sum += continuum_value;
-            }
-            const double backscatter_value = std::exp(
-                -0.5 * std::pow(
-                    (energy - backscatter_energy) / backscatter_sigma,
-                    2.0
-                )
-            );
-            backscatter[static_cast<std::size_t>(output_index)] = backscatter_value;
-            backscatter_sum += backscatter_value;
-        }
-        double cumulative = 0.0;
-        for (int output_index = 0; output_index < num_bins; ++output_index) {
-            double probability = peak[static_cast<std::size_t>(output_index)]
-                / std::max(peak_sum, 1.0e-300);
-            probability += kContinuumToPeak
-                * continuum[static_cast<std::size_t>(output_index)]
-                / std::max(continuum_sum, 1.0e-300);
-            probability += kBackscatterFraction
-                * backscatter[static_cast<std::size_t>(output_index)]
-                / std::max(backscatter_sum, 1.0e-300);
-            probability /= (
-                1.0 + kContinuumToPeak + kBackscatterFraction
-            );
-            cumulative += std::max(0.0, probability);
-            weights[static_cast<std::size_t>(output_index)] = cumulative;
-        }
-        if (!(cumulative > 0.0) || !std::isfinite(cumulative)) {
-            throw std::runtime_error("Detector response CDF is invalid");
-        }
-        for (double& value : weights) {
-            value /= cumulative;
-        }
-        weights.back() = 1.0;
+template <typename Value>
+Value ReadDetectorGreenValue(std::ifstream& input) {
+    Value value{};
+    input.read(reinterpret_cast<char*>(&value), sizeof(Value));
+    if (!input) {
+        throw std::runtime_error("Detector Green operator binary is truncated.");
     }
-    return cdfs;
+    return value;
 }
 
-int SampleDetectorResponseBin(
-    const int raw_bin,
-    const std::vector<std::vector<double>>& cdfs,
-    std::mt19937_64& rng
-) {
-    if (raw_bin < 0 || raw_bin >= static_cast<int>(cdfs.size())) {
-        throw std::runtime_error("Raw detector-response bin is outside its axis");
+class DetectorGreenOperator {
+public:
+    explicit DetectorGreenOperator(const std::string& path) {
+        std::ifstream input(path, std::ios::binary);
+        if (!input) {
+            throw std::runtime_error(
+                "Failed to open detector Green operator: " + path
+            );
+        }
+        std::array<char, 8> magic{};
+        input.read(magic.data(), static_cast<std::streamsize>(magic.size()));
+        const std::array<char, 8> expected_magic = {
+            'R', 'S', 'G', 'K', 'V', '3', '\0', '\0'
+        };
+        const auto schema_version = ReadDetectorGreenValue<std::uint32_t>(input);
+        energy_node_count_ = ReadDetectorGreenValue<std::uint32_t>(input);
+        impact_bin_count_ = ReadDetectorGreenValue<std::uint32_t>(input);
+        output_bin_count_ = ReadDetectorGreenValue<std::uint32_t>(input);
+        output_energy_min_keV_ = ReadDetectorGreenValue<double>(input);
+        output_bin_width_keV_ = ReadDetectorGreenValue<double>(input);
+        const double domain_min_keV = ReadDetectorGreenValue<double>(input);
+        const double domain_max_keV = ReadDetectorGreenValue<double>(input);
+        if (
+            magic != expected_magic
+            || schema_version != 3U
+            || energy_node_count_ < 2U
+            || impact_bin_count_ < 1U
+            || output_bin_count_ != 851U
+            || output_energy_min_keV_ != 0.0
+            || output_bin_width_keV_ != 2.0
+            || domain_min_keV != 0.0
+            || domain_max_keV != 1700.0
+        ) {
+            throw std::runtime_error(
+                "Detector Green operator header is incompatible."
+            );
+        }
+        energy_nodes_keV_.reserve(energy_node_count_);
+        for (std::uint32_t index = 0; index < energy_node_count_; ++index) {
+            energy_nodes_keV_.push_back(
+                ReadDetectorGreenValue<double>(input)
+            );
+        }
+        impact_edges_fraction_.reserve(impact_bin_count_ + 1U);
+        for (std::uint32_t index = 0; index <= impact_bin_count_; ++index) {
+            impact_edges_fraction_.push_back(
+                ReadDetectorGreenValue<double>(input)
+            );
+        }
+        if (
+            energy_nodes_keV_.front() != 0.0
+            || energy_nodes_keV_.back() != 1700.0
+            || !std::is_sorted(
+                energy_nodes_keV_.begin(),
+                energy_nodes_keV_.end()
+            )
+            || std::adjacent_find(
+                energy_nodes_keV_.begin(),
+                energy_nodes_keV_.end()
+            ) != energy_nodes_keV_.end()
+            || impact_edges_fraction_.front() != 0.0
+            || impact_edges_fraction_.back() != 1.0
+            || !std::is_sorted(
+                impact_edges_fraction_.begin(),
+                impact_edges_fraction_.end()
+            )
+            || std::adjacent_find(
+                impact_edges_fraction_.begin(),
+                impact_edges_fraction_.end()
+            ) != impact_edges_fraction_.end()
+        ) {
+            throw std::runtime_error(
+                "Detector Green energy or impact axis is invalid."
+            );
+        }
+        const std::size_t column_count = (
+            static_cast<std::size_t>(energy_node_count_)
+            * static_cast<std::size_t>(impact_bin_count_)
+        );
+        const std::size_t probability_count = (
+            column_count * static_cast<std::size_t>(output_bin_count_)
+        );
+        cdfs_.assign(probability_count, 0.0);
+        for (std::size_t column = 0; column < column_count; ++column) {
+            double cumulative = 0.0;
+            for (
+                std::uint32_t output_index = 0;
+                output_index < output_bin_count_;
+                ++output_index
+            ) {
+                const float raw = ReadDetectorGreenValue<float>(input);
+                if (!std::isfinite(raw) || raw < 0.0F) {
+                    throw std::runtime_error(
+                        "Detector Green probability is invalid."
+                    );
+                }
+                cumulative += static_cast<double>(raw);
+                cdfs_[
+                    column * static_cast<std::size_t>(output_bin_count_)
+                    + static_cast<std::size_t>(output_index)
+                ] = cumulative;
+            }
+            if (
+                !std::isfinite(cumulative)
+                || std::abs(cumulative - 1.0) > 1.0e-5
+            ) {
+                throw std::runtime_error(
+                    "Detector Green response column does not preserve one "
+                    "registered pulse."
+                );
+            }
+            for (
+                std::uint32_t output_index = 0;
+                output_index < output_bin_count_;
+                ++output_index
+            ) {
+                cdfs_[
+                    column * static_cast<std::size_t>(output_bin_count_)
+                    + static_cast<std::size_t>(output_index)
+                ] /= cumulative;
+            }
+            cdfs_[
+                (column + 1U)
+                    * static_cast<std::size_t>(output_bin_count_)
+                - 1U
+            ] = 1.0;
+        }
+        for (std::size_t index = 0; index < column_count; ++index) {
+            const double histories = ReadDetectorGreenValue<double>(input);
+            if (!std::isfinite(histories) || histories < 2.0) {
+                throw std::runtime_error(
+                    "Detector Green effective history count is invalid."
+                );
+            }
+        }
+        detection_probabilities_.assign(column_count, 0.0);
+        for (std::size_t index = 0; index < column_count; ++index) {
+            const double detection = ReadDetectorGreenValue<double>(input);
+            if (
+                !std::isfinite(detection)
+                || detection < 0.0
+                || detection > 1.0
+            ) {
+                throw std::runtime_error(
+                    "Detector Green pulse-detection probability is invalid."
+                );
+            }
+            detection_probabilities_[index] = detection;
+        }
+        if (input.peek() != std::ifstream::traits_type::eof()) {
+            throw std::runtime_error(
+                "Detector Green operator contains trailing bytes."
+            );
+        }
     }
-    const auto& cdf = cdfs[static_cast<std::size_t>(raw_bin)];
-    const double draw = std::generate_canonical<double, 53>(rng);
-    const auto iterator = std::lower_bound(cdf.begin(), cdf.end(), draw);
-    return static_cast<int>(
-        std::distance(
-            cdf.begin(),
-            iterator == cdf.end() ? std::prev(cdf.end()) : iterator
-        )
-    );
-}
+
+    int SampleBin(
+        const double incident_energy_keV,
+        const double impact_parameter_fraction,
+        std::mt19937_64& rng
+    ) const {
+        if (
+            !std::isfinite(incident_energy_keV)
+            || incident_energy_keV < 0.0
+            || incident_energy_keV > energy_nodes_keV_.back()
+            || !std::isfinite(impact_parameter_fraction)
+            || impact_parameter_fraction < -1.0e-9
+            || impact_parameter_fraction > 1.0 + 1.0e-9
+        ) {
+            throw std::runtime_error(
+                "Detector Green input state is outside its closed domain."
+            );
+        }
+        const double impact = std::clamp(
+            impact_parameter_fraction,
+            0.0,
+            1.0
+        );
+        auto impact_iterator = std::upper_bound(
+            impact_edges_fraction_.begin(),
+            impact_edges_fraction_.end(),
+            impact
+        );
+        std::size_t impact_index = impact_iterator
+            == impact_edges_fraction_.begin()
+            ? 0U
+            : static_cast<std::size_t>(
+                std::distance(
+                    impact_edges_fraction_.begin(),
+                    impact_iterator
+                ) - 1
+            );
+        impact_index = std::min(
+            impact_index,
+            static_cast<std::size_t>(impact_bin_count_ - 1U)
+        );
+        auto upper_iterator = std::lower_bound(
+            energy_nodes_keV_.begin(),
+            energy_nodes_keV_.end(),
+            incident_energy_keV
+        );
+        std::size_t upper_index = static_cast<std::size_t>(
+            std::distance(energy_nodes_keV_.begin(), upper_iterator)
+        );
+        upper_index = std::min(
+            upper_index,
+            static_cast<std::size_t>(energy_node_count_ - 1U)
+        );
+        std::size_t lower_index = upper_index;
+        double upper_weight = 0.0;
+        if (energy_nodes_keV_[upper_index] != incident_energy_keV) {
+            if (upper_index == 0U) {
+                throw std::runtime_error(
+                    "Detector Green energy bracketing failed."
+                );
+            }
+            lower_index = upper_index - 1U;
+            upper_weight = (
+                incident_energy_keV - energy_nodes_keV_[lower_index]
+            ) / (
+                energy_nodes_keV_[upper_index]
+                - energy_nodes_keV_[lower_index]
+            );
+        }
+        const double node_draw = std::generate_canonical<double, 53>(rng);
+        const std::size_t node_index = node_draw < upper_weight
+            ? upper_index
+            : lower_index;
+        const std::size_t column = (
+            node_index * static_cast<std::size_t>(impact_bin_count_)
+            + impact_index
+        );
+        const double detection_draw = std::generate_canonical<double, 53>(rng);
+        if (detection_draw >= detection_probabilities_[column]) {
+            return -1;
+        }
+        const auto begin = cdfs_.begin()
+            + static_cast<std::ptrdiff_t>(
+                column * static_cast<std::size_t>(output_bin_count_)
+            );
+        const auto end = begin
+            + static_cast<std::ptrdiff_t>(output_bin_count_);
+        const double response_draw = std::generate_canonical<double, 53>(rng);
+        const auto sampled = std::lower_bound(begin, end, response_draw);
+        const int sampled_bin = static_cast<int>(
+            std::distance(begin, sampled == end ? std::prev(end) : sampled)
+        );
+        const double source_energy_keV = energy_nodes_keV_[node_index];
+        if (source_energy_keV <= 0.0) {
+            return 0;
+        }
+        const double source_bin_anchor = (
+            std::floor(
+                (source_energy_keV - output_energy_min_keV_)
+                / output_bin_width_keV_
+            ) + 0.5
+        );
+        const double target_bin_anchor = (
+            std::floor(
+                (incident_energy_keV - output_energy_min_keV_)
+                / output_bin_width_keV_
+            ) + 0.5
+        );
+        const double aligned_coordinate = (
+            (static_cast<double>(sampled_bin) + 0.5)
+            * target_bin_anchor / source_bin_anchor
+            - 0.5
+        );
+        const int raw_aligned_lower = static_cast<int>(
+            std::floor(aligned_coordinate)
+        );
+        double aligned_fraction = aligned_coordinate
+            - static_cast<double>(raw_aligned_lower);
+        const int aligned_lower = std::clamp(
+            raw_aligned_lower,
+            0,
+            static_cast<int>(output_bin_count_ - 1U)
+        );
+        const int aligned_upper = std::clamp(
+            raw_aligned_lower + 1,
+            0,
+            static_cast<int>(output_bin_count_ - 1U)
+        );
+        if (aligned_lower == aligned_upper) {
+            aligned_fraction = 0.0;
+        }
+        return std::generate_canonical<double, 53>(rng) < aligned_fraction
+            ? aligned_upper
+            : aligned_lower;
+    }
+
+    double ReferencePulseDetectionProbability(
+        const double incident_energy_keV,
+        const double detector_target_radius_m
+    ) const {
+        if (
+            !std::isfinite(incident_energy_keV)
+            || incident_energy_keV <= 0.0
+            || incident_energy_keV > energy_nodes_keV_.back()
+            || !std::isfinite(detector_target_radius_m)
+            || detector_target_radius_m <= 0.0
+            || detector_target_radius_m >= 1.0
+        ) {
+            throw std::runtime_error(
+                "Detector Green reference-efficiency input is invalid."
+            );
+        }
+        auto upper_iterator = std::lower_bound(
+            energy_nodes_keV_.begin(),
+            energy_nodes_keV_.end(),
+            incident_energy_keV
+        );
+        std::size_t upper_index = static_cast<std::size_t>(
+            std::distance(energy_nodes_keV_.begin(), upper_iterator)
+        );
+        upper_index = std::min(
+            upper_index,
+            static_cast<std::size_t>(energy_node_count_ - 1U)
+        );
+        std::size_t lower_index = upper_index;
+        double upper_weight = 0.0;
+        if (energy_nodes_keV_[upper_index] != incident_energy_keV) {
+            if (upper_index == 0U) {
+                throw std::runtime_error(
+                    "Detector Green reference-energy bracketing failed."
+                );
+            }
+            lower_index = upper_index - 1U;
+            upper_weight = (
+                incident_energy_keV - energy_nodes_keV_[lower_index]
+            ) / (
+                energy_nodes_keV_[upper_index]
+                - energy_nodes_keV_[lower_index]
+            );
+        }
+        const double radius_ratio = detector_target_radius_m;
+        const double normalization = std::max(
+            1.0 - std::sqrt(
+                std::max(0.0, 1.0 - radius_ratio * radius_ratio)
+            ),
+            std::numeric_limits<double>::min()
+        );
+        double efficiency = 0.0;
+        for (
+            std::size_t impact_index = 0;
+            impact_index < static_cast<std::size_t>(impact_bin_count_);
+            ++impact_index
+        ) {
+            const double lower_impact = impact_edges_fraction_[impact_index];
+            const double upper_impact = impact_edges_fraction_[impact_index + 1U];
+            const double phase_weight = (
+                std::sqrt(
+                    std::max(
+                        0.0,
+                        1.0 - std::pow(radius_ratio * lower_impact, 2.0)
+                    )
+                )
+                - std::sqrt(
+                    std::max(
+                        0.0,
+                        1.0 - std::pow(radius_ratio * upper_impact, 2.0)
+                    )
+                )
+            ) / normalization;
+            const std::size_t lower_column = (
+                lower_index * static_cast<std::size_t>(impact_bin_count_)
+                + impact_index
+            );
+            const std::size_t upper_column = (
+                upper_index * static_cast<std::size_t>(impact_bin_count_)
+                + impact_index
+            );
+            const double phase_efficiency = (
+                (1.0 - upper_weight)
+                    * detection_probabilities_[lower_column]
+                + upper_weight * detection_probabilities_[upper_column]
+            );
+            efficiency += phase_weight * phase_efficiency;
+        }
+        if (
+            !std::isfinite(efficiency)
+            || efficiency <= 0.0
+            || efficiency > 1.0 + 1.0e-12
+        ) {
+            throw std::runtime_error(
+                "Detector Green reference pulse efficiency is invalid."
+            );
+        }
+        return std::min(efficiency, 1.0);
+    }
+
+private:
+    std::uint32_t energy_node_count_ = 0U;
+    std::uint32_t impact_bin_count_ = 0U;
+    std::uint32_t output_bin_count_ = 0U;
+    double output_energy_min_keV_ = 0.0;
+    double output_bin_width_keV_ = 0.0;
+    std::vector<double> energy_nodes_keV_;
+    std::vector<double> impact_edges_fraction_;
+    std::vector<double> cdfs_;
+    std::vector<double> detection_probabilities_;
+};
 
 std::vector<long long> SampleUniformHistogramSubset(
     const std::vector<long long>& histogram,
@@ -1217,8 +1556,10 @@ double EffectiveConeHalfAngleRad(
     if (distance_m > target_radius_m) {
         covering_angle = std::asin(std::clamp(target_radius_m / distance_m, 0.0, 1.0));
     }
-    const double configured_angle = std::max(0.0, options.source_bias_cone_half_angle_deg) * CLHEP::pi / 180.0;
-    return std::clamp(std::max(covering_angle, configured_angle), 1.0e-9, CLHEP::pi);
+    if (options.source_bias_cone_policy != "detector_covering") {
+        throw std::runtime_error("Unsupported source-bias cone policy");
+    }
+    return std::clamp(covering_angle, 1.0e-9, CLHEP::pi);
 }
 
 double ConeSolidAngleSr(const double half_angle_rad) {
@@ -1335,6 +1676,74 @@ void ValidateShieldPoseContract(const RequestSpec& request) {
     }
 }
 
+void ValidateNativeActionIdentityContract(const RequestSpec& request) {
+    if (
+        !request.has_step
+        || !request.has_detector_pose
+        || !request.has_fe_pose
+        || !request.has_pb_pose
+    ) {
+        throw std::runtime_error(
+            "Native action request requires one STEP and all three POSE records."
+        );
+    }
+    if (
+        request.step_id < 0
+        || request.seed < 0
+        || !std::isfinite(request.dwell_time_s)
+        || request.dwell_time_s <= 0.0
+    ) {
+        throw std::runtime_error(
+            "Native action step, seed, and dwell values are invalid."
+        );
+    }
+    if (request.native_action_contract_id != kNativeActionIdentityContractId) {
+        throw std::runtime_error(
+            "Request native_action_contract_id is missing or incompatible."
+        );
+    }
+    if (
+        request.native_action_sha256.size() != 64
+        || !std::all_of(
+            request.native_action_sha256.begin(),
+            request.native_action_sha256.end(),
+            [](const unsigned char ch) {
+                return std::isdigit(ch) || (ch >= 'a' && ch <= 'f');
+            }
+        )
+    ) {
+        throw std::runtime_error(
+            "Request native_action_sha256 must be one lowercase SHA-256 digest."
+        );
+    }
+    const std::array<PoseSpec, 3> poses = {
+        request.detector_pose,
+        request.fe_pose,
+        request.pb_pose,
+    };
+    for (const auto& pose : poses) {
+        const std::array<double, 7> values = {
+            pose.x, pose.y, pose.z, pose.qw, pose.qx, pose.qy, pose.qz,
+        };
+        if (!std::all_of(values.begin(), values.end(), [](const double value) {
+            return std::isfinite(value);
+        })) {
+            throw std::runtime_error("Native action poses must be finite.");
+        }
+        const double quaternion_norm = std::sqrt(
+            pose.qw * pose.qw
+            + pose.qx * pose.qx
+            + pose.qy * pose.qy
+            + pose.qz * pose.qz
+        );
+        if (!(quaternion_norm > 1.0e-12)) {
+            throw std::runtime_error(
+                "Native action pose quaternions must have positive norm."
+            );
+        }
+    }
+}
+
 std::array<std::array<double, 3>, 3> ShieldAxesFromPose(const PoseSpec& pose) {
     const double norm = std::sqrt(
         pose.qw * pose.qw + pose.qx * pose.qx + pose.qy * pose.qy + pose.qz * pose.qz
@@ -1381,6 +1790,20 @@ void AddShieldAxisMetadata(
             ] = std::to_string(axes[axis][component]);
         }
     }
+}
+
+void AddNativeActionPoseMetadata(
+    SimulationResult& result,
+    const std::string& prefix,
+    const PoseSpec& pose
+) {
+    result.metadata["native_action_" + prefix + "_pose_x"] = SerializeDouble(pose.x);
+    result.metadata["native_action_" + prefix + "_pose_y"] = SerializeDouble(pose.y);
+    result.metadata["native_action_" + prefix + "_pose_z"] = SerializeDouble(pose.z);
+    result.metadata["native_action_" + prefix + "_quat_w"] = SerializeDouble(pose.qw);
+    result.metadata["native_action_" + prefix + "_quat_x"] = SerializeDouble(pose.qx);
+    result.metadata["native_action_" + prefix + "_quat_y"] = SerializeDouble(pose.qy);
+    result.metadata["native_action_" + prefix + "_quat_z"] = SerializeDouble(pose.qz);
 }
 
 int SignWithTolerance(const double value, const double tolerance = 1.0e-6) {
@@ -2740,6 +3163,8 @@ public:
         long long primary_history_index = -1;
         long long step_deposit_count = 1;
         double primary_event_time_s = 0.0;
+        double impact_parameter_fraction =
+            std::numeric_limits<double>::quiet_NaN();
     };
 
     struct BranchPulse {
@@ -2754,6 +3179,8 @@ public:
         long long primary_history_index = -1;
         long long step_deposit_count = 0;
         double primary_event_time_s = 0.0;
+        double impact_parameter_fraction =
+            std::numeric_limits<double>::quiet_NaN();
     };
 
     struct LocalState {
@@ -2820,7 +3247,9 @@ public:
         const std::size_t primary_batch_index,
         const long long primary_history_index,
         const long long bias_branch_lineage_id,
-        const double primary_event_time_s
+        const double primary_event_time_s,
+        const double impact_parameter_fraction =
+            std::numeric_limits<double>::quiet_NaN()
     ) {
         if (state == nullptr) {
             return;
@@ -2837,6 +3266,13 @@ public:
                 == std::numeric_limits<std::size_t>::max()
             || primary_history_index < 0
             || bias_branch_lineage_id < 0
+            || (
+                std::isfinite(impact_parameter_fraction)
+                && (
+                    impact_parameter_fraction < -1.0e-9
+                    || impact_parameter_fraction > 1.0 + 1.0e-9
+                )
+            )
         ) {
             throw std::runtime_error(
                 "Detected Geant4 energy has invalid weight or lineage."
@@ -2854,6 +3290,7 @@ public:
             primary_history_index,
             1,
             primary_event_time_s,
+            impact_parameter_fraction,
         });
     }
 
@@ -2873,6 +3310,57 @@ public:
                     return lhs.global_time_s < rhs.global_time_s;
                 }
             );
+            const bool incident_gamma_entries = std::any_of(
+                deposits.begin(),
+                deposits.end(),
+                [](const auto& deposit) {
+                    return std::isfinite(deposit.impact_parameter_fraction);
+                }
+            );
+            if (incident_gamma_entries) {
+                const auto& first = deposits.front();
+                for (const auto& deposit : deposits) {
+                    const double weight_tolerance = (
+                        1.0e-15
+                        + 1.0e-12
+                            * std::max(
+                                std::abs(first.weight),
+                                std::abs(deposit.weight)
+                            )
+                    );
+                    if (
+                        !std::isfinite(deposit.impact_parameter_fraction)
+                        || std::abs(first.weight - deposit.weight)
+                            > weight_tolerance
+                        || first.primary_batch_index
+                            != deposit.primary_batch_index
+                        || first.primary_history_index
+                            != deposit.primary_history_index
+                        || std::abs(
+                            first.primary_event_time_s
+                            - deposit.primary_event_time_s
+                        ) > 1.0e-15
+                    ) {
+                        throw std::runtime_error(
+                            "Incident-gamma branch mixed weights, scoring "
+                            "modes, or original history lineage."
+                        );
+                    }
+                    state->event_deposits.push_back({
+                        deposit.edep_mev,
+                        deposit.weight,
+                        deposit.entry_class,
+                        deposit.primary_batch_index,
+                        deposit.primary_history_index,
+                        item.first,
+                        deposit.global_time_s,
+                        deposit.step_deposit_count,
+                        deposit.primary_event_time_s,
+                        deposit.impact_parameter_fraction,
+                    });
+                }
+                continue;
+            }
             BranchPulse pulse;
             const auto flush_pulse = [&]() {
                 if (!pulse.initialized || pulse.edep_mev <= 0.0) {
@@ -2888,6 +3376,7 @@ public:
                     pulse.start_time_s,
                     pulse.step_deposit_count,
                     pulse.primary_event_time_s,
+                    pulse.impact_parameter_fraction,
                 });
             };
             for (const auto& deposit : deposits) {
@@ -2906,6 +3395,9 @@ public:
                     pulse.primary_history_index = deposit.primary_history_index;
                     pulse.step_deposit_count = 0;
                     pulse.primary_event_time_s = deposit.primary_event_time_s;
+                    pulse.impact_parameter_fraction = (
+                        deposit.impact_parameter_fraction
+                    );
                 } else {
                     const double weight_tolerance = (
                         1.0e-15
@@ -2926,10 +3418,23 @@ public:
                             pulse.primary_event_time_s
                             - deposit.primary_event_time_s
                         ) > 1.0e-15
+                        || (
+                            std::isfinite(pulse.impact_parameter_fraction)
+                            != std::isfinite(
+                                deposit.impact_parameter_fraction
+                            )
+                        )
+                        || (
+                            std::isfinite(pulse.impact_parameter_fraction)
+                            && std::abs(
+                                pulse.impact_parameter_fraction
+                                - deposit.impact_parameter_fraction
+                            ) > 1.0e-12
+                        )
                     ) {
                         throw std::runtime_error(
-                            "One force-collision branch mixed weights or "
-                            "original history lineage."
+                            "One detector pulse mixed weights or original "
+                            "history lineage."
                         );
                     }
                     pulse.entry_class = MergeDetectorEntryClass(
@@ -4424,7 +4929,9 @@ public:
         ForceCollisionDiagnostics* force_collision_diagnostics,
         EventStore* event_store,
         const std::string& detector_scoring_mode,
-        const std::string& secondary_transport_mode
+        const std::string& secondary_transport_mode,
+        const RuntimeDetectorState* detector_state,
+        const double detector_radius
     ) : absorbing_volume_names_(std::move(absorbing_volume_names)),
         diagnostics_state_(
             diagnostics == nullptr ? nullptr : diagnostics->AcquireLocal()
@@ -4438,7 +4945,9 @@ public:
             event_store == nullptr ? nullptr : event_store->AcquireLocal()
         ),
         detector_scoring_mode_(NormalizeDetectorScoringMode(detector_scoring_mode)),
-        secondary_transport_mode_(NormalizeSecondaryTransportMode(secondary_transport_mode)) {}
+        secondary_transport_mode_(NormalizeSecondaryTransportMode(secondary_transport_mode)),
+        detector_state_(detector_state),
+        detector_radius_(std::max(0.0, detector_radius)) {}
 
     void UserSteppingAction(const G4Step* step) override {
         if (step == nullptr) {
@@ -4571,6 +5080,33 @@ private:
                 energy_mev = track->GetKineticEnergy() / MeV;
             }
             if (std::isfinite(energy_mev) && energy_mev > 0.0) {
+                if (detector_state_ == nullptr || detector_radius_ <= 0.0) {
+                    throw std::runtime_error(
+                        "Incident-gamma scoring requires detector geometry."
+                    );
+                }
+                const auto direction = track->GetMomentumDirection().unit();
+                const auto relative = (
+                    post_point->GetPosition() - detector_state_->Center()
+                );
+                const double raw_impact_parameter_fraction = (
+                    relative.cross(direction).mag() / detector_radius_
+                );
+                if (
+                    !std::isfinite(raw_impact_parameter_fraction)
+                    || raw_impact_parameter_fraction < -1.0e-9
+                    || raw_impact_parameter_fraction > 1.0 + 1.0e-6
+                ) {
+                    throw std::runtime_error(
+                        "Detector-entry impact parameter is outside its "
+                        "physical support."
+                    );
+                }
+                const double impact_parameter_fraction = std::clamp(
+                    raw_impact_parameter_fraction,
+                    0.0,
+                    1.0
+                );
                 EventStore::AddEnergyDeposit(
                     event_state_.get(),
                     energy_mev,
@@ -4580,7 +5116,8 @@ private:
                     PrimaryBatchIndexForTrack(track),
                     PrimaryHistoryIndexForTrack(track),
                     BiasBranchLineageIdForTrack(track),
-                    PrimaryEventTimeForTrack(track)
+                    PrimaryEventTimeForTrack(track),
+                    impact_parameter_fraction
                 );
                 TransportDiagnostics::AddDetectorHitStep(
                     diagnostics_state_.get()
@@ -4631,6 +5168,8 @@ private:
     EventStore::LocalHandle event_state_;
     std::string detector_scoring_mode_ = "full_transport";
     std::string secondary_transport_mode_ = "full_transport";
+    const RuntimeDetectorState* detector_state_ = nullptr;
+    double detector_radius_ = 0.0;
 };
 
 class EventAction : public G4UserEventAction {
@@ -4702,7 +5241,9 @@ public:
             force_collision_diagnostics_,
             event_store_,
             detector_scoring_mode_,
-            secondary_transport_mode_
+            secondary_transport_mode_,
+            detector_state_,
+            detector_radius_
         ));
     }
 
@@ -4904,16 +5445,27 @@ SceneSpec ReadSceneFile(const std::string& scene_path) {
                 fields,
                 "prompt_cascade_model"
             );
+            const bool monoenergetic_probe = (
+                nuclide.prompt_cascade_model
+                    == "independent_monoenergetic_probe"
+                && nuclide.atomic_number == 0
+                && nuclide.mass_number == 0
+                && nuclide.geant4_excitation_keV == 0.0
+                && nuclide.half_life_s == 0.0
+            );
+            const bool evaluated_nuclide = (
+                nuclide.atomic_number > 0
+                && nuclide.mass_number > 0
+                && std::isfinite(nuclide.geant4_excitation_keV)
+                && nuclide.geant4_excitation_keV >= 0.0
+                && std::isfinite(nuclide.half_life_s)
+                && nuclide.half_life_s > 0.0
+                && nuclide.prompt_cascade_model
+                    == "geant4_radioactive_decay"
+            );
             if (
                 nuclide.isotope.empty()
-                || nuclide.atomic_number <= 0
-                || nuclide.mass_number <= 0
-                || !std::isfinite(nuclide.geant4_excitation_keV)
-                || nuclide.geant4_excitation_keV < 0.0
-                || !std::isfinite(nuclide.half_life_s)
-                || nuclide.half_life_s <= 0.0
-                || nuclide.prompt_cascade_model
-                    != "geant4_radioactive_decay"
+                || (!evaluated_nuclide && !monoenergetic_probe)
             ) {
                 throw std::runtime_error(
                     "NUCLIDE contains invalid evaluated decay metadata."
@@ -5148,6 +5700,25 @@ RequestSpec ReadRequestFile(const std::string& request_path) {
         }
         const auto fields = ParseFields(tokens);
         if (tokens[0] == "STEP") {
+            RequireExactFields(
+                fields,
+                {
+                    "step_id",
+                    "dwell_time_s",
+                    "seed",
+                    "shield_pose_contract_id",
+                    "shield_pose_contract_sha256",
+                    "native_action_contract_id",
+                    "native_action_sha256",
+                    "fe_orientation_index",
+                    "pb_orientation_index",
+                },
+                "STEP"
+            );
+            if (request.has_step) {
+                throw std::runtime_error("Request contains duplicate STEP records.");
+            }
+            request.has_step = true;
             request.step_id = static_cast<int>(ParseLong(fields, "step_id", 0));
             request.dwell_time_s = ParseDouble(fields, "dwell_time_s", 1.0);
             request.seed = ParseLong(fields, "seed", 123);
@@ -5158,6 +5729,14 @@ RequestSpec ReadRequestFile(const std::string& request_path) {
             request.shield_pose_contract_sha256 = ParseString(
                 fields,
                 "shield_pose_contract_sha256"
+            );
+            request.native_action_contract_id = ParseString(
+                fields,
+                "native_action_contract_id"
+            );
+            request.native_action_sha256 = ParseString(
+                fields,
+                "native_action_sha256"
             );
             request.fe_orientation_index = static_cast<int>(ParseLong(
                 fields,
@@ -5170,6 +5749,11 @@ RequestSpec ReadRequestFile(const std::string& request_path) {
                 -1
             ));
         } else if (tokens[0] == "POSE") {
+            RequireExactFields(
+                fields,
+                {"kind", "x", "y", "z", "qw", "qx", "qy", "qz"},
+                "POSE"
+            );
             PoseSpec pose;
             pose.x = ParseDouble(fields, "x");
             pose.y = ParseDouble(fields, "y");
@@ -5180,14 +5764,37 @@ RequestSpec ReadRequestFile(const std::string& request_path) {
             pose.qz = ParseDouble(fields, "qz", 0.0);
             const auto kind = ParseString(fields, "kind");
             if (kind == "detector") {
+                if (request.has_detector_pose) {
+                    throw std::runtime_error(
+                        "Request contains duplicate detector POSE records."
+                    );
+                }
+                request.has_detector_pose = true;
                 request.detector_pose = pose;
             } else if (kind == "fe") {
+                if (request.has_fe_pose) {
+                    throw std::runtime_error(
+                        "Request contains duplicate Fe POSE records."
+                    );
+                }
+                request.has_fe_pose = true;
                 request.fe_pose = pose;
             } else if (kind == "pb") {
+                if (request.has_pb_pose) {
+                    throw std::runtime_error(
+                        "Request contains duplicate Pb POSE records."
+                    );
+                }
+                request.has_pb_pose = true;
                 request.pb_pose = pose;
+            } else {
+                throw std::runtime_error("Request contains an unknown POSE kind.");
             }
+        } else {
+            throw std::runtime_error("Request contains an unknown record type.");
         }
     }
+    ValidateNativeActionIdentityContract(request);
     ValidateShieldPoseContract(request);
     return request;
 }
@@ -5199,7 +5806,10 @@ std::string GeometryCacheKey(
     const std::string& detector_scoring_mode,
     const std::string& secondary_transport_mode,
     const bool mean_calibration_forced_collision,
-    const std::string& primary_emission_model
+    const std::string& primary_emission_model,
+    const bool sample_detector_response,
+    const std::string& detector_green_operator_binary_sha256,
+    const std::string& detector_green_operator_contract_sha256
 ) {
     std::ostringstream stream;
     stream << std::setprecision(17)
@@ -5209,6 +5819,10 @@ std::string GeometryCacheKey(
            << NormalizeDetectorScoringMode(detector_scoring_mode) << "|"
            << NormalizeSecondaryTransportMode(secondary_transport_mode) << "|"
            << NormalizePrimaryEmissionModel(primary_emission_model) << "|"
+           << (sample_detector_response ? "green_operator" : "raw_detector")
+           << "|"
+           << detector_green_operator_binary_sha256 << "|"
+           << detector_green_operator_contract_sha256 << "|"
            << (
                 mean_calibration_forced_collision
                     ? "forced_first_collision"
@@ -5227,7 +5841,11 @@ public:
         std::string detector_scoring_mode,
         std::string secondary_transport_mode,
         const bool mean_calibration_forced_collision,
-        std::string primary_emission_model
+        std::string primary_emission_model,
+        const bool sample_detector_response,
+        std::string detector_green_operator_path,
+        std::string detector_green_operator_binary_sha256,
+        std::string detector_green_operator_contract_sha256
     ) : scene_(std::move(scene)),
         geometry_request_(geometry_request),
         physics_profile_(std::move(physics_profile)),
@@ -5240,8 +5858,46 @@ public:
         mean_calibration_forced_collision_(
             mean_calibration_forced_collision
         ),
+        sample_detector_response_(sample_detector_response),
+        detector_green_operator_path_(
+            std::move(detector_green_operator_path)
+        ),
+        detector_green_operator_binary_sha256_(
+            std::move(detector_green_operator_binary_sha256)
+        ),
+        detector_green_operator_contract_sha256_(
+            std::move(detector_green_operator_contract_sha256)
+        ),
         use_theory_tvl_(UseTheoryTvlProfile(physics_profile_)),
         event_store_(scene_.detector.coincidence_window_s) {
+        const bool green_contract_complete = (
+            !detector_green_operator_path_.empty()
+            && IsLowercaseSha256(
+                detector_green_operator_binary_sha256_
+            )
+            && IsLowercaseSha256(
+                detector_green_operator_contract_sha256_
+            )
+        );
+        const bool green_contract_empty = (
+            detector_green_operator_path_.empty()
+            && detector_green_operator_binary_sha256_.empty()
+            && detector_green_operator_contract_sha256_.empty()
+        );
+        if (
+            (sample_detector_response_ && !green_contract_complete)
+            || (!sample_detector_response_ && !green_contract_empty)
+        ) {
+            throw std::runtime_error(
+                "Detector Green path and hashes are required exactly when "
+                "detector-response sampling is enabled."
+            );
+        }
+        if (sample_detector_response_) {
+            detector_green_operator_ = std::make_unique<
+                DetectorGreenOperator
+            >(detector_green_operator_path_);
+        }
         for (const auto& volume : scene_.volumes) {
             if (ToLower(volume.transport_mode) != "absorber") {
                 continue;
@@ -5385,6 +6041,25 @@ public:
                 "request options."
             );
         }
+        if (
+            options.sample_detector_response
+                != sample_detector_response_
+            || options.detector_green_operator_path
+                != detector_green_operator_path_
+            || options.detector_green_operator_binary_sha256
+                != detector_green_operator_binary_sha256_
+            || options.detector_green_operator_contract_sha256
+                != detector_green_operator_contract_sha256_
+            || (
+                options.sample_detector_response
+                != (detector_green_operator_ != nullptr)
+            )
+        ) {
+            throw std::runtime_error(
+                "Transport session detector Green contract changed after "
+                "initialization."
+            );
+        }
         CLHEP::HepRandom::setTheSeed(request.seed);
         bool movable_geometry_updated = false;
         if (detector_construction_ != nullptr) {
@@ -5480,6 +6155,10 @@ public:
                     !std::isfinite(source.activity_bq)
                     || source.activity_bq <= 0.0
                     || std::isfinite(source.intensity_cps_1m)
+                    || nuclide->second.atomic_number <= 0
+                    || nuclide->second.mass_number <= 0
+                    || nuclide->second.prompt_cascade_model
+                        != "geant4_radioactive_decay"
                 ) {
                     throw std::runtime_error(
                         "Radioactive-decay sources require only activity_bq."
@@ -5618,6 +6297,67 @@ public:
                 "source-line history quota."
             );
         }
+        std::map<std::string, double>
+            detector_green_reference_efficiency_by_isotope;
+        if (detector_cps_rate_model && sample_detector_response_) {
+            if (detector_green_operator_ == nullptr) {
+                throw std::runtime_error(
+                    "Detector-cps Green normalization requires its operator."
+                );
+            }
+            const double target_radius_m = DetectorTargetRadiusM(
+                scene_.detector
+            );
+            for (const auto& source : scene_.sources) {
+                if (
+                    detector_green_reference_efficiency_by_isotope.count(
+                        source.isotope
+                    ) != 0U
+                ) {
+                    continue;
+                }
+                const auto lines = GammaLinesForIsotope(
+                    scene_,
+                    source.isotope
+                );
+                double total_line_intensity = 0.0;
+                double weighted_efficiency = 0.0;
+                for (const auto& line : lines) {
+                    total_line_intensity += std::max(0.0, line.intensity);
+                    weighted_efficiency += std::max(0.0, line.intensity)
+                        * detector_green_operator_
+                            ->ReferencePulseDetectionProbability(
+                                line.energy_keV,
+                                target_radius_m
+                            );
+                }
+                if (
+                    !std::isfinite(total_line_intensity)
+                    || total_line_intensity <= 0.0
+                ) {
+                    throw std::runtime_error(
+                        "Detector Green source-rate normalization requires "
+                        "positive catalog line intensity."
+                    );
+                }
+                const double reference_efficiency = (
+                    weighted_efficiency / total_line_intensity
+                );
+                if (
+                    !std::isfinite(reference_efficiency)
+                    || reference_efficiency <= 0.0
+                    || reference_efficiency > 1.0 + 1.0e-12
+                ) {
+                    throw std::runtime_error(
+                        "Detector Green catalog-weighted reference efficiency "
+                        "is invalid."
+                    );
+                }
+                detector_green_reference_efficiency_by_isotope[
+                    source.isotope
+                ] = std::min(reference_efficiency, 1.0);
+            }
+        }
         for (const auto& source : scene_.sources) {
             if (radioactive_decay_emission) {
                 const double mean_events = source.activity_bq
@@ -5664,11 +6404,19 @@ public:
                 )
                     ? line.intensity / total_line_intensity
                     : line.intensity;
+                const double detector_green_reference_efficiency = (
+                    detector_cps_rate_model && sample_detector_response_
+                )
+                    ? detector_green_reference_efficiency_by_isotope.at(
+                        source.isotope
+                    )
+                    : 1.0;
                 const double mean_events = source.intensity_cps_1m
                     * request.dwell_time_s
                     * shield_transmission
                     * line_weight
-                    * source_rate_scale;
+                    * source_rate_scale
+                    / detector_green_reference_efficiency;
                 if (mean_events > 0.0) {
                     expected_unthinned_primaries += mean_events;
                 }
@@ -5716,7 +6464,7 @@ public:
             request.detector_pose.z * m
         );
         std::map<std::string, double> source_equivalent_counts_by_source;
-        std::map<std::string, double> source_equivalent_counts_by_line;
+        std::map<std::string, double> scheduled_incident_gamma_counts_by_line;
         std::map<std::string, double> transport_detected_counts_by_source;
         std::map<std::string, double> transport_uncollided_primary_counts_by_source;
         std::map<std::string, double> transport_interacted_primary_counts_by_source;
@@ -5780,7 +6528,7 @@ public:
                 const double mean_events = source.activity_bq
                     * request.dwell_time_s;
                 const std::string line_token = source_token + "_decay";
-                source_equivalent_counts_by_line[line_token] += mean_events;
+                scheduled_incident_gamma_counts_by_line[line_token] += mean_events;
                 if (mean_events <= 0.0) {
                     continue;
                 }
@@ -5849,14 +6597,22 @@ public:
                 )
                     ? line.intensity / total_line_intensity
                     : line.intensity;
+                const double detector_green_reference_efficiency = (
+                    detector_cps_rate_model && sample_detector_response_
+                )
+                    ? detector_green_reference_efficiency_by_isotope.at(
+                        source.isotope
+                    )
+                    : 1.0;
                 const double mean_events = source.intensity_cps_1m
                     * request.dwell_time_s
                     * shield_transmission
                     * line_weight
-                    * source_rate_scale;
+                    * source_rate_scale
+                    / detector_green_reference_efficiency;
                 const std::string line_token = source_token
                     + "_" + EnergyMetadataToken(line.energy_keV);
-                source_equivalent_counts_by_line[line_token] += mean_events;
+                scheduled_incident_gamma_counts_by_line[line_token] += mean_events;
                 if (mean_events <= 0.0) {
                     continue;
                 }
@@ -6131,6 +6887,7 @@ public:
                 deposit.bias_branch_lineage_id,
                 deposit.step_deposit_count,
                 deposit.global_time_s,
+                deposit.impact_parameter_fraction,
             });
         }
         std::map<std::string, long long> parent_pulse_multiplicity;
@@ -6175,6 +6932,22 @@ public:
             validation_observed_entry_spectra;
         std::map<std::string, std::vector<double>>
             mean_calibration_entry_variance;
+        using DetectorResponsePulseKey = std::tuple<
+            std::size_t,
+            long long,
+            long long
+        >;
+        struct SampledDetectorResponseEntry {
+            double global_time_s = 0.0;
+            int bin_index = -1;
+        };
+        std::map<
+            DetectorResponsePulseKey,
+            std::vector<SampledDetectorResponseEntry>
+        > sampled_detector_response_entries;
+        long long detector_response_registered_entry_count = 0;
+        long long detector_response_coincidence_pulse_count = 0;
+        long long detector_response_multi_entry_pulse_count = 0;
         std::normal_distribution<double> gaussian(0.0, 1.0);
         const bool incident_gamma_scoring = detector_scoring_mode_ == "incident_gamma_energy";
         if (options.sample_detector_response && !incident_gamma_scoring) {
@@ -6182,9 +6955,6 @@ public:
                 "sample_detector_response requires incident_gamma_energy scoring"
             );
         }
-        const auto detector_response_cdfs = options.sample_detector_response
-            ? BuildDetectorResponseCdfs(num_bins, kBinWidthKeV)
-            : std::vector<std::vector<double>>();
         for (const auto& deposit : energy_deposits) {
             const double energy_keV = deposit.energy_keV;
             if (energy_keV < 0.0 || energy_keV > kEnergyMaxKeV) {
@@ -6292,9 +7062,9 @@ public:
                         "Detector-response marking requires unit-weight histories"
                     );
                 }
-                index = SampleDetectorResponseBin(
-                    raw_index,
-                    detector_response_cdfs,
+                index = detector_green_operator_->SampleBin(
+                    energy_keV,
+                    deposit.impact_parameter_fraction,
                     rng
                 );
             } else if (!incident_gamma_scoring) {
@@ -6326,12 +7096,77 @@ public:
                         static_cast<std::size_t>(index)
                     ] += deposit.weight;
                 }
-                spectrum[index] += deposit.weight;
-                if (!mean_calibration_enabled) {
-                    spectrum_variance[index] += (
-                        deposit.weight * deposit.weight
-                    );
+                if (options.sample_detector_response) {
+                    sampled_detector_response_entries[{
+                        deposit.primary_batch_index,
+                        deposit.primary_history_index,
+                        deposit.bias_branch_lineage_id,
+                    }].push_back({
+                        deposit.global_time_s,
+                        index,
+                    });
+                    ++detector_response_registered_entry_count;
+                } else {
+                    spectrum[index] += deposit.weight;
+                    if (!mean_calibration_enabled) {
+                        spectrum_variance[index] += (
+                            deposit.weight * deposit.weight
+                        );
+                    }
                 }
+            }
+        }
+        if (options.sample_detector_response) {
+            for (auto& pulse_item : sampled_detector_response_entries) {
+                auto& entries = pulse_item.second;
+                std::sort(
+                    entries.begin(),
+                    entries.end(),
+                    [](const auto& lhs, const auto& rhs) {
+                        return lhs.global_time_s < rhs.global_time_s;
+                    }
+                );
+                double pulse_start_time_s = 0.0;
+                int pulse_bin_index = -1;
+                long long pulse_entry_count = 0;
+                const auto flush_response_pulse = [&]() {
+                    if (pulse_entry_count <= 0) {
+                        return;
+                    }
+                    if (
+                        pulse_bin_index < 0
+                        || pulse_bin_index >= num_bins
+                    ) {
+                        throw std::runtime_error(
+                            "Coincident detector-response pulse is outside "
+                            "the approved observed-energy domain."
+                        );
+                    }
+                    spectrum[static_cast<std::size_t>(pulse_bin_index)] += 1.0;
+                    spectrum_variance[
+                        static_cast<std::size_t>(pulse_bin_index)
+                    ] += 1.0;
+                    ++detector_response_coincidence_pulse_count;
+                    if (pulse_entry_count > 1) {
+                        ++detector_response_multi_entry_pulse_count;
+                    }
+                };
+                for (const auto& entry : entries) {
+                    if (
+                        pulse_entry_count == 0
+                        || entry.global_time_s - pulse_start_time_s
+                            > scene_.detector.coincidence_window_s
+                    ) {
+                        flush_response_pulse();
+                        pulse_start_time_s = entry.global_time_s;
+                        pulse_bin_index = entry.bin_index;
+                        pulse_entry_count = 1;
+                    } else {
+                        pulse_bin_index += entry.bin_index;
+                        ++pulse_entry_count;
+                    }
+                }
+                flush_response_pulse();
             }
         }
         if (mean_calibration_enabled) {
@@ -6791,6 +7626,12 @@ public:
             result.metadata["intensity_cps_1m_definition"] =
                 "pre_dead_time_detector_pulse_rate_at_1m";
         }
+        result.metadata["detector_cps_green_reference_normalization"] = (
+            detector_cps_rate_model && sample_detector_response_
+                ? "catalog_branching_weighted_absolute_detection_"
+                    "efficiency_at_1m_v1"
+                : "disabled"
+        );
         result.metadata["line_intensities_normalized"] = (
             detector_cps_rate_model && !radioactive_decay_emission
         ) ? "true" : "false";
@@ -6912,6 +7753,15 @@ public:
                 result.metadata[prefix + "intensity_cps_1m"] = SerializeDouble(
                     source.intensity_cps_1m
                 );
+                if (sample_detector_response_) {
+                    result.metadata[
+                        prefix + "detector_green_reference_efficiency"
+                    ] = SerializeDouble(
+                        detector_green_reference_efficiency_by_isotope.at(
+                            source.isotope
+                        )
+                    );
+                }
             }
             result.metadata[prefix + "surface_chart_id"] = std::to_string(
                 source.surface_chart_id
@@ -6980,19 +7830,53 @@ public:
         ) ? "true" : "false";
         result.metadata["detector_response_sampling_mode"] = (
             options.sample_detector_response
-                ? "multinomial_marking_with_nonparalyzable_event_time"
+                ? "independent_green_mark_then_same_history_coincidence_"
+                    "sum_nonparalyzable_v1"
                 : "disabled"
+        );
+        result.metadata["detector_response_coincidence_semantics"] = (
+            options.sample_detector_response
+                ? "sample_each_housing_incident_gamma_then_sum_registered_"
+                    "energy_within_same_history_branch_and_detector_window_v1"
+                : "disabled"
+        );
+        result.metadata["detector_response_incident_entry_count"] = (
+            std::to_string(energy_deposits.size())
+        );
+        result.metadata["detector_response_registered_entry_count"] = (
+            std::to_string(detector_response_registered_entry_count)
+        );
+        result.metadata["detector_response_coincidence_pulse_count"] = (
+            std::to_string(detector_response_coincidence_pulse_count)
+        );
+        result.metadata["detector_response_multi_entry_pulse_count"] = (
+            std::to_string(detector_response_multi_entry_pulse_count)
         );
         result.metadata["detector_response_sampling_model"] = (
             options.sample_detector_response
-                ? "native_incident_gamma_response_v1"
+                ? "isotope_independent_full_detector_green_operator_v3"
                 : ""
         );
         result.metadata[
             "detector_response_sampling_contract_sha256"
         ] = (
             options.sample_detector_response
-                ? "0ab48601e0965c2c9ea973505523558bf4dd5d394129397c3d4079c143787ae5"
+                ? options.detector_green_operator_contract_sha256
+                : ""
+        );
+        result.metadata["detector_response_operator_binary_sha256"] = (
+            options.sample_detector_response
+                ? options.detector_green_operator_binary_sha256
+                : ""
+        );
+        result.metadata["detector_response_boundary_state"] = (
+            options.sample_detector_response
+                ? "normalized_impact_parameter_at_detector_housing_entry_v1"
+                : ""
+        );
+        result.metadata["detector_response_conditioning"] = (
+            options.sample_detector_response
+                ? "registered_pulse_subprobability_given_housing_incident_gamma_v1"
                 : ""
         );
         result.metadata["detector_response_sampling_seed"] = (
@@ -7320,6 +8204,22 @@ public:
         );
         const auto fe_shield_normal = ShieldNormalFromPose(request.fe_pose);
         const auto pb_shield_normal = ShieldNormalFromPose(request.pb_pose);
+        result.metadata["native_action_contract_id"] =
+            kNativeActionIdentityContractId;
+        result.metadata["native_action_sha256"] = request.native_action_sha256;
+        result.metadata["native_action_step_id"] = std::to_string(request.step_id);
+        result.metadata["native_action_seed"] = std::to_string(request.seed);
+        result.metadata["native_action_dwell_time_s"] =
+            SerializeDouble(request.dwell_time_s);
+        result.metadata["native_action_fe_orientation_index"] = std::to_string(
+            request.fe_orientation_index
+        );
+        result.metadata["native_action_pb_orientation_index"] = std::to_string(
+            request.pb_orientation_index
+        );
+        AddNativeActionPoseMetadata(result, "detector", request.detector_pose);
+        AddNativeActionPoseMetadata(result, "fe_shield", request.fe_pose);
+        AddNativeActionPoseMetadata(result, "pb_shield", request.pb_pose);
         result.metadata["shield_pose_contract_id"] = kShieldPoseContractId;
         result.metadata["shield_pose_contract_sha256"] =
             kShieldPoseContractSha256;
@@ -7422,11 +8322,7 @@ public:
                 ? std::clamp(options.source_bias_isotropic_fraction, 1.0e-6, 1.0)
                 : 1.0
         );
-        result.metadata["source_bias_cone_half_angle_deg"] = std::to_string(
-            cone_sampled_transport && std::isfinite(effective_cone_max_deg) ? effective_cone_max_deg : 0.0
-        );
-        result.metadata["cone_half_angle_deg"] = result.metadata["source_bias_cone_half_angle_deg"];
-        result.metadata["isotropic_mixture_fraction"] = result.metadata["source_bias_isotropic_fraction"];
+        result.metadata["source_bias_cone_policy"] = options.source_bias_cone_policy;
         result.metadata["source_bias_effective_cone_half_angle_deg_min"] = std::to_string(
             cone_sampled_transport && std::isfinite(effective_cone_min_deg) ? effective_cone_min_deg : 0.0
         );
@@ -7483,8 +8379,8 @@ public:
         for (const auto& item : source_equivalent_counts_by_source) {
             result.metadata["source_equivalent_counts_" + item.first] = std::to_string(item.second);
         }
-        for (const auto& item : source_equivalent_counts_by_line) {
-            result.metadata["source_equivalent_counts_" + item.first] = std::to_string(item.second);
+        for (const auto& item : scheduled_incident_gamma_counts_by_line) {
+            result.metadata["scheduled_incident_gamma_counts_" + item.first] = std::to_string(item.second);
         }
         for (const auto& item : transport_detected_counts) {
             result.metadata["transport_detected_counts_" + item.first] = std::to_string(item.second);
@@ -7546,6 +8442,11 @@ private:
     std::string primary_emission_model_ = "independent_gamma_lines";
     int thread_count_ = 1;
     bool mean_calibration_forced_collision_ = false;
+    bool sample_detector_response_ = false;
+    std::string detector_green_operator_path_;
+    std::string detector_green_operator_binary_sha256_;
+    std::string detector_green_operator_contract_sha256_;
+    std::unique_ptr<DetectorGreenOperator> detector_green_operator_;
     bool use_theory_tvl_ = false;
     bool run_manager_multithreaded_ = false;
     EventStore event_store_;
@@ -7577,7 +8478,11 @@ SimulationResult RunTransport(
         options.detector_scoring_mode,
         options.secondary_transport_mode,
         options.mean_calibration_forced_collision,
-        options.primary_emission_model
+        options.primary_emission_model,
+        options.sample_detector_response,
+        options.detector_green_operator_path,
+        options.detector_green_operator_binary_sha256,
+        options.detector_green_operator_contract_sha256
     );
     return session.Run(request, dead_time_tau_s, options, false, false);
 }
@@ -7652,7 +8557,10 @@ void RunPersistentServer(
                 options.detector_scoring_mode,
                 options.secondary_transport_mode,
                 options.mean_calibration_forced_collision,
-                options.primary_emission_model
+                options.primary_emission_model,
+                options.sample_detector_response,
+                options.detector_green_operator_binary_sha256,
+                options.detector_green_operator_contract_sha256
             );
             const bool geometry_cache_hit = session != nullptr && key == session_key;
             if (!geometry_cache_hit) {
@@ -7664,7 +8572,11 @@ void RunPersistentServer(
                     options.detector_scoring_mode,
                     options.secondary_transport_mode,
                     options.mean_calibration_forced_collision,
-                    options.primary_emission_model
+                    options.primary_emission_model,
+                    options.sample_detector_response,
+                    options.detector_green_operator_path,
+                    options.detector_green_operator_binary_sha256,
+                    options.detector_green_operator_contract_sha256
                 );
                 session_key = key;
             }
@@ -7721,8 +8633,13 @@ int main(int argc, char** argv) {
                 );
             } else if (arg == "--source-bias-mode" && index + 1 < argc) {
                 transport_options.source_bias_mode = NormalizeSourceBiasMode(argv[++index]);
-            } else if (arg == "--source-bias-cone-half-angle-deg" && index + 1 < argc) {
-                transport_options.source_bias_cone_half_angle_deg = std::max(0.0, std::stod(argv[++index]));
+            } else if (arg == "--source-bias-cone-policy" && index + 1 < argc) {
+                transport_options.source_bias_cone_policy = argv[++index];
+                if (transport_options.source_bias_cone_policy != "detector_covering") {
+                    throw std::runtime_error(
+                        "--source-bias-cone-policy must be detector_covering"
+                    );
+                }
             } else if (arg == "--source-bias-isotropic-fraction" && index + 1 < argc) {
                 transport_options.source_bias_isotropic_fraction = std::clamp(std::stod(argv[++index]), 1.0e-6, 1.0);
             } else if (arg == "--detector-scoring-mode" && index + 1 < argc) {
@@ -7804,6 +8721,25 @@ int main(int argc, char** argv) {
                 transport_options.validation_entry_class_spectra = true;
             } else if (arg == "--sample-detector-response") {
                 transport_options.sample_detector_response = true;
+            } else if (
+                arg == "--detector-green-operator-path"
+                && index + 1 < argc
+            ) {
+                transport_options.detector_green_operator_path = argv[++index];
+            } else if (
+                arg == "--detector-green-operator-binary-sha256"
+                && index + 1 < argc
+            ) {
+                transport_options.detector_green_operator_binary_sha256 = (
+                    argv[++index]
+                );
+            } else if (
+                arg == "--detector-green-operator-contract-sha256"
+                && index + 1 < argc
+            ) {
+                transport_options.detector_green_operator_contract_sha256 = (
+                    argv[++index]
+                );
             } else if (arg == "--decay-comparison-diagnostic") {
                 transport_options.decay_comparison_diagnostic = true;
             } else if (
@@ -7895,6 +8831,35 @@ int main(int argc, char** argv) {
             );
         }
         transport_options.secondary_transport_mode = normalized_secondary_transport_mode;
+        const bool detector_green_contract_complete = (
+            !transport_options.detector_green_operator_path.empty()
+            && IsLowercaseSha256(
+                transport_options.detector_green_operator_binary_sha256
+            )
+            && IsLowercaseSha256(
+                transport_options.detector_green_operator_contract_sha256
+            )
+        );
+        const bool detector_green_contract_empty = (
+            transport_options.detector_green_operator_path.empty()
+            && transport_options.detector_green_operator_binary_sha256.empty()
+            && transport_options.detector_green_operator_contract_sha256.empty()
+        );
+        if (
+            (
+                transport_options.sample_detector_response
+                && !detector_green_contract_complete
+            )
+            || (
+                !transport_options.sample_detector_response
+                && !detector_green_contract_empty
+            )
+        ) {
+            throw std::runtime_error(
+                "Detector Green path and lowercase SHA-256 contracts are "
+                "required exactly with --sample-detector-response."
+            );
+        }
         if (persistent) {
             RunPersistentServer(
                 physics_profile,

@@ -29,7 +29,7 @@ from spectrum.air_attenuation import (
     dry_air_total_linear_attenuation_torch,
 )
 from spectrum.transport_spectral import (
-    DESIGNATED_HOLDOUT_SCENE_SEEDS,
+    DESIGNATED_VALIDATION_SCENE_SEEDS,
     DESIGNATED_TRAINING_SCENE_SEEDS,
     FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256,
     VALIDATION_SCENARIO_IDS,
@@ -392,12 +392,16 @@ def test_stored_legacy_geometry_reconstructs_exact_versioned_basis() -> None:
         [[0.4, 0.7]],
         dtype=np.float64,
     )
+    features = np.concatenate(
+        (features[..., :3], obstacle_compton[..., None], features[..., 3:]),
+        axis=-1,
+    )
     inputs = {
         "tau_fe": features[..., 0],
         "tau_pb": features[..., 1],
         "tau_obstacle": features[..., 2],
         "tau_obstacle_compton": obstacle_compton,
-        "distance_m": features[..., 3],
+        "distance_m": features[..., 4],
         "energy_keV": np.asarray([662.0, 1173.0]).reshape(line_shape),
         "mu_fe_cm_inv": np.asarray([0.58, 0.43]).reshape(line_shape),
         "mu_pb_cm_inv": np.asarray([1.29, 0.76]).reshape(line_shape),
@@ -410,6 +414,13 @@ def test_stored_legacy_geometry_reconstructs_exact_versioned_basis() -> None:
     reconstructed = scatter_basis_from_stored_geometry_numpy(
         stored_basis=stored,
         transport_features=features,
+        transport_feature_order=(
+            "tau_fe",
+            "tau_pb",
+            "tau_obstacle",
+            "tau_obstacle_compton",
+            "distance_m",
+        ),
         line_identity=lines,
         target_semantics=EXACT_SINGLE_SCATTER_BASIS_SEMANTICS,
     )
@@ -457,12 +468,16 @@ def test_detector_cone_basis_reconstruction_uses_response_geometry() -> None:
         [[0.4, 0.7]],
         dtype=np.float64,
     )
+    features = np.concatenate(
+        (features[..., :3], obstacle_compton[..., None], features[..., 3:]),
+        axis=-1,
+    )
     stored = physical_scatter_basis_numpy(
         tau_fe=features[..., 0],
         tau_pb=features[..., 1],
         tau_obstacle=features[..., 2],
         tau_obstacle_compton=obstacle_compton,
-        distance_m=features[..., 3],
+        distance_m=features[..., 4],
         energy_keV=energy,
         mu_fe_cm_inv=mu_fe,
         mu_pb_cm_inv=mu_pb,
@@ -472,7 +487,7 @@ def test_detector_cone_basis_reconstruction_uses_response_geometry() -> None:
         tau_pb=features[..., 1],
         tau_obstacle=features[..., 2],
         tau_obstacle_compton=obstacle_compton,
-        distance_m=features[..., 3],
+        distance_m=features[..., 4],
         energy_keV=energy,
         mu_fe_cm_inv=mu_fe,
         mu_pb_cm_inv=mu_pb,
@@ -484,6 +499,13 @@ def test_detector_cone_basis_reconstruction_uses_response_geometry() -> None:
     reconstructed = scatter_basis_from_stored_geometry_numpy(
         stored_basis=stored,
         transport_features=features,
+        transport_feature_order=(
+            "tau_fe",
+            "tau_pb",
+            "tau_obstacle",
+            "tau_obstacle_compton",
+            "distance_m",
+        ),
         line_identity=lines,
         target_semantics=DETECTOR_CONE_SINGLE_SCATTER_BASIS_SEMANTICS,
         detector_radius_m=0.038,
@@ -715,7 +737,7 @@ def test_training_provenance_rejects_leakage_and_schema_tampering(
     manifest = copy.deepcopy(dict(_response().training_manifest))
     if tamper == "holdout_seed":
         manifest["training_scene_seeds"][-1] = (
-            DESIGNATED_HOLDOUT_SCENE_SEEDS[0]
+            DESIGNATED_VALIDATION_SCENE_SEEDS[0]
         )
     elif tamper == "missing_pair":
         manifest["pair_ids_by_scene"]["2026072701"] = list(range(63))

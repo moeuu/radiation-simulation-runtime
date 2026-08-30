@@ -64,7 +64,6 @@ from spectrum.full_spectrum_acceptance_runner import (
     acceptance_transport_seed,
 )
 from spectrum.geant4_acceptance_backend import (
-    _FULL_SPECTRUM_RUNTIME_KEYS,
     _build_environment,
     _command_for_pair,
     _generate_sources,
@@ -73,6 +72,7 @@ from spectrum.geant4_acceptance_backend import (
     _scene_payload,
     _source_payload,
 )
+from spectrum.runtime_model_keys import FULL_SPECTRUM_MODEL_RUNTIME_KEYS
 from spectrum.mean_calibration import (
     StratifiedMeanCalibration,
     parse_mean_calibration_metadata,
@@ -80,7 +80,7 @@ from spectrum.mean_calibration import (
 from spectrum.native_metadata import native_source_line_token
 from spectrum.response_matrix import (
     NATIVE_GEANT4_BIN_COUNT,
-    NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256,
+    LEGACY_ANALYTIC_DETECTOR_RESPONSE_CONTRACT_SHA256,
 )
 from spectrum.physics_contracts import (
     OBSTACLE_MATERIAL_CONTRACT_SHA256,
@@ -155,9 +155,7 @@ def _write_immutable_bytes(path: Path, content: bytes) -> Path:
             )
         return destination
     destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name(
-        f".{destination.name}.{os.getpid()}.tmp"
-    )
+    temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
     temporary.write_bytes(content)
     os.replace(temporary, destination)
     return destination
@@ -185,11 +183,7 @@ def _strict_unique_integer_sequence(
     maximum: int | None = None,
 ) -> tuple[int, ...]:
     """Return one nonempty ordered unique JSON-integer sequence."""
-    if (
-        not isinstance(value, Sequence)
-        or isinstance(value, (str, bytes))
-        or not value
-    ):
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)) or not value:
         raise ValueError(f"{field_name} must be a nonempty sequence.")
     result: list[int] = []
     for item in value:
@@ -199,9 +193,7 @@ def _strict_unique_integer_sequence(
             or item < minimum
             or (maximum is not None and item > maximum)
         ):
-            raise ValueError(
-                f"{field_name} contains an out-of-range JSON integer."
-            )
+            raise ValueError(f"{field_name} contains an out-of-range JSON integer.")
         result.append(int(item))
     if len(set(result)) != len(result):
         raise ValueError(f"{field_name} must not contain duplicates.")
@@ -215,8 +207,7 @@ def _strict_scenario_sequence(value: object) -> tuple[str, ...]:
         or isinstance(value, (str, bytes))
         or not value
         or any(
-            not isinstance(item, str)
-            or item not in VALIDATION_SCENARIO_IDS
+            not isinstance(item, str) or item not in VALIDATION_SCENARIO_IDS
             for item in value
         )
     ):
@@ -284,9 +275,7 @@ def build_predeclared_mean_calibration_design(
     return {
         "schema_version": MEAN_CALIBRATION_DESIGN_SCHEMA_VERSION,
         "model": MEAN_CALIBRATION_MODEL_ID,
-        "acceptance_contract_sha256": (
-            FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256
-        ),
+        "acceptance_contract_sha256": (FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256),
         "training_scene_seeds": list(scene_seeds),
         "scenario_ids": list(scenarios),
         "shield_pair_ids": list(pair_ids),
@@ -300,12 +289,10 @@ def build_predeclared_mean_calibration_design(
         "secondary_transport_mode": "full_transport",
         "detector_response_mode": "rao_blackwell_analytic_operator",
         "detector_response_contract_sha256": (
-            NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
+            LEGACY_ANALYTIC_DETECTOR_RESPONSE_CONTRACT_SHA256
         ),
         "shield_pose_contract_sha256": SHIELD_POSE_CONTRACT_SHA256,
-        "obstacle_material_contract_sha256": (
-            OBSTACLE_MATERIAL_CONTRACT_SHA256
-        ),
+        "obstacle_material_contract_sha256": (OBSTACLE_MATERIAL_CONTRACT_SHA256),
         "transport_physics_table_contract_sha256": (
             TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256
         ),
@@ -344,9 +331,7 @@ def validate_predeclared_mean_calibration_design(
             field_name="training_scene_seeds",
             minimum=0,
         ),
-        scenario_ids=_strict_scenario_sequence(
-            payload.get("scenario_ids")
-        ),
+        scenario_ids=_strict_scenario_sequence(payload.get("scenario_ids")),
         shield_pair_ids=_strict_unique_integer_sequence(
             payload.get("shield_pair_ids"),
             field_name="shield_pair_ids",
@@ -372,7 +357,7 @@ def build_mean_calibration_app_payload(
     payload = {
         key: value
         for key, value in dict(runtime_config).items()
-        if key not in _FULL_SPECTRUM_RUNTIME_KEYS
+        if key not in FULL_SPECTRUM_MODEL_RUNTIME_KEYS
     }
     if "executable_path" not in payload:
         raise ValueError("Mean calibration requires explicit executable_path.")
@@ -390,6 +375,7 @@ def build_mean_calibration_app_payload(
             "detector_scoring_mode": "incident_gamma_energy",
             "secondary_transport_mode": "full_transport",
             "sample_detector_response": False,
+            "detector_green_operator_manifest": None,
             "validation_entry_class_spectra": True,
             "background_cps": 0.0,
             "dead_time_tau_s": 0.0,
@@ -399,9 +385,7 @@ def build_mean_calibration_app_payload(
             "mean_calibration_histories_per_source_line": int(
                 resolved_design["histories_per_source_line"]
             ),
-            "mean_calibration_angle_strata_mu": int(
-                resolved_design["angle_strata_mu"]
-            ),
+            "mean_calibration_angle_strata_mu": int(resolved_design["angle_strata_mu"]),
             "mean_calibration_angle_strata_phi": int(
                 resolved_design["angle_strata_phi"]
             ),
@@ -499,9 +483,7 @@ def _class_totals_payload(
             }
             for entry_class, values in classes.items()
         }
-        for line_token, classes in (
-            calibration.entry_class_line_totals().items()
-        )
+        for line_token, classes in (calibration.entry_class_line_totals().items())
     }
 
 
@@ -525,9 +507,7 @@ def write_mean_calibration_pair_artifact(
         "raw_mean": calibration.raw_mean(),
         "raw_covariance": calibration.raw_covariance(),
         "marked_mean": calibration.marked_mean(response_operator_br),
-        "marked_covariance": calibration.marked_covariance(
-            response_operator_br
-        ),
+        "marked_covariance": calibration.marked_covariance(response_operator_br),
     }
     array_files: dict[str, dict[str, object]] = {}
     for name in _PAIR_ARRAY_NAMES:
@@ -548,12 +528,10 @@ def write_mean_calibration_pair_artifact(
         "provenance": dict(provenance),
         "geometry": dict(geometry),
         "detector_response_contract_sha256": (
-            NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
+            LEGACY_ANALYTIC_DETECTOR_RESPONSE_CONTRACT_SHA256
         ),
         "shield_pose_contract_sha256": SHIELD_POSE_CONTRACT_SHA256,
-        "obstacle_material_contract_sha256": (
-            OBSTACLE_MATERIAL_CONTRACT_SHA256
-        ),
+        "obstacle_material_contract_sha256": (OBSTACLE_MATERIAL_CONTRACT_SHA256),
         "transport_physics_table_contract_sha256": (
             TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256
         ),
@@ -581,14 +559,11 @@ def load_mean_calibration_pair_artifact(
     payload = json.loads(path.read_text(encoding="utf-8"))
     if (
         not isinstance(payload, dict)
-        or payload.get("schema_version")
-        != MEAN_CALIBRATION_PAIR_SCHEMA_VERSION
-        or payload.get("model")
-        != "fixed_quota_transport_mean_pair_v1"
+        or payload.get("schema_version") != MEAN_CALIBRATION_PAIR_SCHEMA_VERSION
+        or payload.get("model") != "fixed_quota_transport_mean_pair_v1"
         or payload.get("detector_response_contract_sha256")
-        != NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
-        or payload.get("shield_pose_contract_sha256")
-        != SHIELD_POSE_CONTRACT_SHA256
+        != LEGACY_ANALYTIC_DETECTOR_RESPONSE_CONTRACT_SHA256
+        or payload.get("shield_pose_contract_sha256") != SHIELD_POSE_CONTRACT_SHA256
         or payload.get("obstacle_material_contract_sha256")
         != OBSTACLE_MATERIAL_CONTRACT_SHA256
         or payload.get("transport_physics_table_contract_sha256")
@@ -625,9 +600,7 @@ def load_mean_calibration_pair_artifact(
             raise ValueError("Mean-calibration array encoding is invalid.")
         with np.load(array_path, allow_pickle=False) as archive:
             if archive.files != ["array"]:
-                raise ValueError(
-                    "Mean-calibration array archive is noncanonical."
-                )
+                raise ValueError("Mean-calibration array archive is noncanonical.")
             array = np.asarray(archive["array"])
         if (
             array.dtype != np.float64
@@ -713,7 +686,7 @@ class ExternalGeant4MeanCalibrationBackend:
             )
         self.runtime_config_sha256 = file_sha256(self.runtime_config_path)
         self.native_executable_sha256 = file_sha256(executable)
-        self.model = GeometryConditionedSpectralModel.standard_native(
+        self.model = GeometryConditionedSpectralModel.nonproduction_native(
             ACCEPTANCE_ISOTOPES,
             dead_time_tau_s=0.0,
             background_rate_cps=0.0,
@@ -724,7 +697,7 @@ class ExternalGeant4MeanCalibrationBackend:
         observation_payload = {
             key: value
             for key, value in self.runtime_config.items()
-            if key not in _FULL_SPECTRUM_RUNTIME_KEYS
+            if key not in FULL_SPECTRUM_MODEL_RUNTIME_KEYS
         }
         observation = build_nonproduction_observation_model(
             observation_payload,
@@ -771,12 +744,8 @@ class ExternalGeant4MeanCalibrationBackend:
         environment, grid, instances = _build_environment(
             scene_seed=scene_seed,
             obstacle_height_m=float(self.app_config.obstacle_height_m),
-            author_room_boundaries=bool(
-                self.app_config.author_room_boundary_prims
-            ),
-            room_boundary_thickness_m=(
-                STANDARD_ROOM_BOUNDARY_THICKNESS_M
-            ),
+            author_room_boundaries=bool(self.app_config.author_room_boundary_prims),
+            room_boundary_thickness_m=(STANDARD_ROOM_BOUNDARY_THICKNESS_M),
         )
         family_parameters = randomized_training_geometry_parameters(
             scene_seed,
@@ -791,24 +760,16 @@ class ExternalGeant4MeanCalibrationBackend:
             grid=grid,
             scene_seed=scene_seed,
             scenario_id=scenario_id,
-            obstacle_height_m=float(
-                family_parameters["obstacle_height_m"]
-            ),
+            obstacle_height_m=float(family_parameters["obstacle_height_m"]),
         )
         if not sources:
             family_descriptor = geometry_family_descriptor(
                 grid,
                 instances,
                 room_size_xyz=ACCEPTANCE_ROOM_SIZE_XYZ,
-                passage_width_m=float(
-                    family_parameters["passage_width_m"]
-                ),
-                target_blocked_fraction=float(
-                    family_parameters["blocked_fraction"]
-                ),
-                obstacle_height_limit_m=float(
-                    family_parameters["obstacle_height_m"]
-                ),
+                passage_width_m=float(family_parameters["passage_width_m"]),
+                target_blocked_fraction=float(family_parameters["blocked_fraction"]),
+                obstacle_height_limit_m=float(family_parameters["obstacle_height_m"]),
             )
             return tuple(
                 self._write_exact_zero_pair(
@@ -869,21 +830,13 @@ class ExternalGeant4MeanCalibrationBackend:
                     expected_histories_per_source_line=int(
                         self.design["histories_per_source_line"]
                     ),
-                    expected_angle_strata_mu=int(
-                        self.design["angle_strata_mu"]
-                    ),
-                    expected_angle_strata_phi=int(
-                        self.design["angle_strata_phi"]
-                    ),
-                    expected_forced_collision=bool(
-                        self.design["forced_collision"]
-                    ),
+                    expected_angle_strata_mu=int(self.design["angle_strata_mu"]),
+                    expected_angle_strata_phi=int(self.design["angle_strata_phi"]),
+                    expected_forced_collision=bool(self.design["forced_collision"]),
                     expected_source_rate_model="detector_cps_1m",
                     expected_thread_count=self.app_config.thread_count,
                     expected_physics_profile=self.app_config.physics_profile,
-                    expected_detector_scoring_mode=(
-                        "incident_gamma_energy"
-                    ),
+                    expected_detector_scoring_mode=("incident_gamma_energy"),
                     expected_secondary_transport_mode="full_transport",
                     expected_source_bias_mode=self.app_config.source_bias_mode,
                 )
@@ -923,9 +876,7 @@ class ExternalGeant4MeanCalibrationBackend:
                         grid,
                         instances,
                         room_size_xyz=ACCEPTANCE_ROOM_SIZE_XYZ,
-                        passage_width_m=float(
-                            family_parameters["passage_width_m"]
-                        ),
+                        passage_width_m=float(family_parameters["passage_width_m"]),
                         target_blocked_fraction=float(
                             family_parameters["blocked_fraction"]
                         ),
@@ -1029,9 +980,7 @@ class ExternalGeant4MeanCalibrationBackend:
                 "backend_id": self.backend_id,
                 "design_sha256": canonical_json_sha256(self.design),
                 "runtime_config_sha256": self.runtime_config_sha256,
-                "native_executable_sha256": (
-                    self.native_executable_sha256
-                ),
+                "native_executable_sha256": (self.native_executable_sha256),
                 "scene_seed": int(scene_seed),
                 "scenario_id": str(scenario_id),
                 "shield_pair_id": int(shield_pair_id),
@@ -1042,9 +991,7 @@ class ExternalGeant4MeanCalibrationBackend:
                 "sources": [],
                 "geometry_family": dict(geometry_family),
                 "holdout_artifacts_consumed": False,
-                "exact_zero_reason": (
-                    "no_sources_background_zero_dead_time_zero"
-                ),
+                "exact_zero_reason": ("no_sources_background_zero_dead_time_zero"),
             },
             "geometry": {
                 "unattenuated_source_line_rate_sl": [],
@@ -1053,12 +1000,10 @@ class ExternalGeant4MeanCalibrationBackend:
                 "additive_scatter_basis_slf": [],
             },
             "detector_response_contract_sha256": (
-                NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
+                LEGACY_ANALYTIC_DETECTOR_RESPONSE_CONTRACT_SHA256
             ),
             "shield_pose_contract_sha256": SHIELD_POSE_CONTRACT_SHA256,
-            "obstacle_material_contract_sha256": (
-                OBSTACLE_MATERIAL_CONTRACT_SHA256
-            ),
+            "obstacle_material_contract_sha256": (OBSTACLE_MATERIAL_CONTRACT_SHA256),
             "transport_physics_table_contract_sha256": (
                 TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256
             ),
@@ -1107,8 +1052,7 @@ def build_mean_calibration_scene_manifest(
             provenance = payload.get("provenance")
             if (
                 not isinstance(provenance, Mapping)
-                or provenance.get("design_sha256")
-                != canonical_json_sha256(resolved)
+                or provenance.get("design_sha256") != canonical_json_sha256(resolved)
                 or provenance.get("scene_seed") != scene_seed
                 or provenance.get("scenario_id") != scenario_id
                 or provenance.get("shield_pair_id") != pair_id
@@ -1264,14 +1208,10 @@ def fit_additive_scatter_training_rows(
     artifact_contracts = {
         str(seed): canonical_json_sha256(
             {
-                "scene_manifest_sha256": scene_manifest_sha256_by_seed[
-                    str(seed)
-                ],
-                "shield_pose_contract_sha256": (
-                    SHIELD_POSE_CONTRACT_SHA256
-                ),
+                "scene_manifest_sha256": scene_manifest_sha256_by_seed[str(seed)],
+                "shield_pose_contract_sha256": (SHIELD_POSE_CONTRACT_SHA256),
                 "detector_response_contract_sha256": (
-                    NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
+                    LEGACY_ANALYTIC_DETECTOR_RESPONSE_CONTRACT_SHA256
                 ),
                 "obstacle_material_contract_sha256": (
                     OBSTACLE_MATERIAL_CONTRACT_SHA256
@@ -1285,33 +1225,24 @@ def fit_additive_scatter_training_rows(
     }
     training_manifest = {
         "schema_version": 2,
-        "acceptance_contract_sha256": (
-            FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256
-        ),
+        "acceptance_contract_sha256": (FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256),
         "training_scene_seeds": list(declared_seeds),
         "scenario_ids": list(declared_scenarios),
         "pair_ids_by_scene": {
-            str(seed): list(declared_pair_ids)
-            for seed in declared_seeds
+            str(seed): list(declared_pair_ids) for seed in declared_seeds
         },
-        "artifact_sha256_by_scene": dict(
-            scene_manifest_sha256_by_seed
-        ),
+        "artifact_sha256_by_scene": dict(scene_manifest_sha256_by_seed),
         "artifact_contract_sha256_by_scene": artifact_contracts,
         "shield_pose_contract_sha256": SHIELD_POSE_CONTRACT_SHA256,
         "detector_response_contract_sha256": (
-            NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
+            LEGACY_ANALYTIC_DETECTOR_RESPONSE_CONTRACT_SHA256
         ),
-        "obstacle_material_contract_sha256": (
-            OBSTACLE_MATERIAL_CONTRACT_SHA256
-        ),
+        "obstacle_material_contract_sha256": (OBSTACLE_MATERIAL_CONTRACT_SHA256),
         "transport_physics_table_contract_sha256": (
             TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256
         ),
         "label_space": ADDITIVE_SCATTER_INCIDENT_LABEL_SEMANTICS,
-        "selection_objective": (
-            "leave_one_training_scene_out_weighted_log1p_mse"
-        ),
+        "selection_objective": ("leave_one_training_scene_out_weighted_log1p_mse"),
     }
     return fit_additive_noncollided_transport_response(
         features,
@@ -1381,7 +1312,11 @@ def _training_rows_from_pair(
         or np.any(uncollided < 0.0)
         or features.shape == ()
         or features.shape
-        != (len(sources), len(line_rows), 4)
+        != (
+            len(sources),
+            len(line_rows),
+            len(model.transport_feature_order),
+        )
         or np.any(~np.isfinite(stored_basis))
         or np.any(stored_basis < 0.0)
     ):
@@ -1389,6 +1324,7 @@ def _training_rows_from_pair(
     basis = scatter_basis_from_stored_geometry_numpy(
         stored_basis=stored_basis,
         transport_features=features,
+        transport_feature_order=model.transport_feature_order,
         line_identity=line_rows,
         target_semantics=feature_basis_semantics,
     )
@@ -1408,9 +1344,7 @@ def _training_rows_from_pair(
             )
             class_moments = moments.get(token)
             if not isinstance(class_moments, Mapping):
-                raise ValueError(
-                    f"Missing fixed-quota entry moments for {token}."
-                )
+                raise ValueError(f"Missing fixed-quota entry moments for {token}.")
             interacted = class_moments.get("interacted_primary")
             secondary = class_moments.get("secondary")
             uncollided_moments = class_moments.get("uncollided_primary")
@@ -1423,15 +1357,14 @@ def _training_rows_from_pair(
             scatter_count = float(interacted["mean_count"]) + float(
                 secondary["mean_count"]
             )
-            denominator = (
-                float(unattenuated[source_index, line_index])
-                * float(provenance["dwell_time_s"])
+            denominator = float(unattenuated[source_index, line_index]) * float(
+                provenance["dwell_time_s"]
             )
             if denominator <= 0.0:
                 continue
-            analytic_uncollided = float(
-                uncollided[source_index, line_index]
-            ) * float(provenance["dwell_time_s"])
+            analytic_uncollided = float(uncollided[source_index, line_index]) * float(
+                provenance["dwell_time_s"]
+            )
             native_uncollided = float(uncollided_moments["mean_count"])
             if analytic_uncollided <= 0.0 or native_uncollided <= 0.0:
                 continue
@@ -1439,8 +1372,7 @@ def _training_rows_from_pair(
                 MeanCalibrationTrainingRow(
                     scene_id=scene_id,
                     feature_basis=tuple(
-                        float(value)
-                        for value in basis[source_index, line_index]
+                        float(value) for value in basis[source_index, line_index]
                     ),
                     scatter_fraction=max(scatter_count, 0.0) / denominator,
                     sample_weight=denominator,
@@ -1465,9 +1397,7 @@ def fit_additive_scatter_from_complete_mean_calibration(
         layout=layout,
         design=resolved,
     )
-    observed_completion = json.loads(
-        layout.completion_path.read_text(encoding="utf-8")
-    )
+    observed_completion = json.loads(layout.completion_path.read_text(encoding="utf-8"))
     if observed_completion != expected_completion:
         raise ValueError("Mean-calibration completion manifest is stale.")
     rows: list[MeanCalibrationTrainingRow] = []
@@ -1510,65 +1440,6 @@ def fit_additive_scatter_from_complete_mean_calibration(
     return response
 
 
-def freeze_runtime_ready_model(
-    *,
-    output_path: str | Path,
-    model: GeometryConditionedSpectralModel,
-    additive_response: AdditiveNoncollidedTransportResponse,
-    layout: MeanCalibrationLayout,
-    design: Mapping[str, object],
-) -> Path:
-    """Freeze a runtime model after authenticating every active component.
-
-    Fixed-quota mean calibration cannot identify station-level count
-    dispersion.  A model may either use the exact physical count/mark law with
-    no empirical discrepancy, or supply an independently authenticated
-    discrepancy contract.  Its additive response must be the response fitted
-    from this exact predeclared calibration corpus.
-    """
-    resolved = validate_predeclared_mean_calibration_design(design)
-    try:
-        expected_completion = build_mean_calibration_completion_manifest(
-            layout=layout,
-            design=resolved,
-        )
-        observed_completion = json.loads(
-            layout.completion_path.read_text(encoding="utf-8")
-        )
-        observed_additive = json.loads(
-            layout.additive_model_path.read_text(encoding="utf-8")
-        )
-    except FileNotFoundError as exc:
-        raise RuntimeError(
-            "Runtime freeze requires the complete predeclared mean-calibration "
-            "training corpus and its frozen additive response."
-        ) from exc
-    if (
-        observed_completion != expected_completion
-        or observed_additive != additive_response.to_payload()
-    ):
-        raise RuntimeError(
-            "Runtime freeze rejected stale mean-calibration training "
-            "provenance."
-        )
-    active = model.additive_scatter_response
-    if (
-        active is None
-        or active.contract_hash_sha256
-        != additive_response.contract_hash_sha256
-        or not model.runtime_ready
-    ):
-        raise RuntimeError(
-            "Runtime freeze requires this calibrated additive response plus "
-            "either exact physical statistics or an independently "
-            "authenticated station-discrepancy contract."
-        )
-    return _write_immutable_bytes(
-        Path(output_path),
-        canonical_json_bytes(model.manifest_payload()),
-    )
-
-
 __all__ = [
     "ExternalGeant4MeanCalibrationBackend",
     "MEAN_CALIBRATION_DESIGN_SCHEMA_VERSION",
@@ -1586,7 +1457,6 @@ __all__ = [
     "fit_additive_scatter_training_rows",
     "freeze_mean_calibration_completion_manifest",
     "freeze_mean_calibration_scene_manifest",
-    "freeze_runtime_ready_model",
     "initialize_mean_calibration_layout",
     "load_mean_calibration_pair_artifact",
     "validate_predeclared_mean_calibration_design",

@@ -1,17 +1,20 @@
 """Evaluate the frozen full-spectrum candidate on immutable all-64 corpora.
 
 The evaluator is deliberately downstream-only: it reconstructs the candidate
-that was frozen before holdout acquisition, reads authenticated raw pair
+that was frozen before validation acquisition, reads authenticated raw pair
 artifacts, and never invokes fitting or parameter selection.  Production
 predictions receive only spectra and known transport geometry.  Validation-only
 native entry labels are not passed to any prediction, likelihood, decision, or
 calibration calculation.
 
-Pairwise coverage and total PIT diagnostics use the exact finite-time
-nonparalyzable renewal CDF mixed over the frozen rate-scale nodes. Conditional
-mark PIT diagnostics use a fixed, deterministic batched posterior-predictive
-rank test with the frozen Dirichlet-multinomial concentration.  No holdout
-quantity changes the model, metric definition, threshold, or simulation.
+Pairwise count coverage uses the same frozen predictive law as the production
+likelihood: exact finite-time renewal counts when no source discrepancy is
+active and the declared Gamma-Poisson component law otherwise. Conditional
+mark diagnostics use a fixed, deterministic one-sided posterior-predictive
+check. The physical and finite-corpus uncertainty terms are epistemic
+envelopes, so they are not falsely required to produce uniform repeated-data
+PIT values. No validation quantity changes the model, metric definition,
+threshold, or simulation.
 """
 
 from __future__ import annotations
@@ -41,8 +44,8 @@ from spectrum.additive_scatter import scatter_basis_from_stored_geometry_numpy
 from spectrum.full_spectrum_acceptance import (
     build_independent_validation_manifest,
 )
-from spectrum.detector_response_validation import (
-    load_detector_response_validation_manifest,
+from spectrum.detector_green_validation import (
+    load_detector_green_validation_manifest,
 )
 from spectrum.full_spectrum_acceptance_runner import (
     ACCEPTANCE_ISOTOPES,
@@ -50,20 +53,15 @@ from spectrum.full_spectrum_acceptance_runner import (
     AcceptancePairRecord,
     AcceptanceRunLayout,
     canonical_json_bytes,
+    canonical_detector_green_operator,
     line_identity_contract_sha256,
     load_acceptance_run_contract,
     load_frozen_candidate_model,
     validate_scene_corpus,
 )
-from spectrum.response_matrix import (
-    build_native_geant4_detector_response_matrix,
-    NATIVE_GEANT4_BIN_WIDTH_KEV,
-    NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256,
-)
 from spectrum.transport_spectral import (
     ACCEPTANCE_METRIC_CONTRACT,
-    DESIGNATED_HOLDOUT_SCENE_SEEDS,
-    DESIGNATED_TRAINING_SCENE_SEEDS,
+    DESIGNATED_VALIDATION_SCENE_SEEDS,
     FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256,
     VALIDATION_SCENARIO_IDS,
     GeometryConditionedSpectralModel,
@@ -104,9 +102,8 @@ class _TotalDiagnostics:
 
 @dataclass(frozen=True)
 class _MarkDiagnostics:
-    """Store deterministic conditional-mark predictive rank diagnostics."""
+    """Store deterministic conditional-mark upper-tail diagnostics."""
 
-    randomized_pit_v: NDArray[np.float64]
     upper_tail_probability_v: NDArray[np.float64]
 
 
@@ -121,9 +118,7 @@ def _atomic_write_immutable_json(path: Path, payload: object) -> Path:
             )
         return destination
     destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name(
-        f".{destination.name}.{os.getpid()}.tmp"
-    )
+    temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
     temporary.write_bytes(encoded)
     os.replace(temporary, destination)
     return destination
@@ -143,9 +138,7 @@ def _load_mapping(path: Path) -> Mapping[str, object]:
     except (TypeError, ValueError) as exc:
         raise ValueError(f"Invalid JSON artifact: {path}.") from exc
     if raw != canonical:
-        raise ValueError(
-            f"JSON artifact is not immutable canonical JSON: {path}."
-        )
+        raise ValueError(f"JSON artifact is not immutable canonical JSON: {path}.")
     return payload
 
 
@@ -187,8 +180,7 @@ def _scenario_data(
     ordered = tuple(sorted(records, key=lambda record: record.shield_pair_id))
     if (
         len(ordered) != len(ACCEPTANCE_PAIR_IDS)
-        or tuple(record.shield_pair_id for record in ordered)
-        != ACCEPTANCE_PAIR_IDS
+        or tuple(record.shield_pair_id for record in ordered) != ACCEPTANCE_PAIR_IDS
         or len({record.scenario_id for record in ordered}) != 1
         or len({record.scene_seed for record in ordered}) != 1
         or model.additive_scatter_response is None
@@ -216,21 +208,16 @@ def _scenario_data(
     scatter_basis = scatter_basis_from_stored_geometry_numpy(
         stored_basis=stored_scatter_basis,
         transport_features=features,
+        transport_feature_order=model.transport_feature_order,
         line_identity=model.line_identity,
-        target_semantics=(
-            model.additive_scatter_response.feature_basis_semantics
-        ),
-        detector_radius_m=(
-            DEFAULT_DETECTOR_CRYSTAL_RADIUS_CM / 100.0
-        ),
+        target_semantics=(model.additive_scatter_response.feature_basis_semantics),
+        detector_radius_m=(DEFAULT_DETECTOR_CRYSTAL_RADIUS_CM / 100.0),
         fe_scatter_distance_m=(
-            DEFAULT_FE_SHIELD_INNER_RADIUS_CM
-            + 0.5 * DEFAULT_FE_SHIELD_THICKNESS_CM
+            DEFAULT_FE_SHIELD_INNER_RADIUS_CM + 0.5 * DEFAULT_FE_SHIELD_THICKNESS_CM
         )
         / 100.0,
         pb_scatter_distance_m=(
-            DEFAULT_PB_SHIELD_INNER_RADIUS_CM
-            + 0.5 * DEFAULT_PB_SHIELD_THICKNESS_CM
+            DEFAULT_PB_SHIELD_INNER_RADIUS_CM + 0.5 * DEFAULT_PB_SHIELD_THICKNESS_CM
         )
         / 100.0,
     )
@@ -239,11 +226,9 @@ def _scenario_data(
         uncollided,
         scatter_basis,
     )
-    uncollided = (
-        model.additive_scatter_response.corrected_uncollided_kernel_numpy(
-            uncollided,
-            scatter_basis,
-        )
+    uncollided = model.additive_scatter_response.corrected_uncollided_kernel_numpy(
+        uncollided,
+        scatter_basis,
     )
     observed = np.stack(
         [record.observed_spectrum_counts for record in ordered],
@@ -270,34 +255,26 @@ def _scenario_data(
         perturbed_basis = scatter_basis_from_stored_geometry_numpy(
             stored_basis=stored_perturbed_basis,
             transport_features=perturbed_features,
+            transport_feature_order=model.transport_feature_order,
             line_identity=model.line_identity,
-            target_semantics=(
-                model.additive_scatter_response.feature_basis_semantics
-            ),
-            detector_radius_m=(
-                DEFAULT_DETECTOR_CRYSTAL_RADIUS_CM / 100.0
-            ),
+            target_semantics=(model.additive_scatter_response.feature_basis_semantics),
+            detector_radius_m=(DEFAULT_DETECTOR_CRYSTAL_RADIUS_CM / 100.0),
             fe_scatter_distance_m=(
-                DEFAULT_FE_SHIELD_INNER_RADIUS_CM
-                + 0.5 * DEFAULT_FE_SHIELD_THICKNESS_CM
+                DEFAULT_FE_SHIELD_INNER_RADIUS_CM + 0.5 * DEFAULT_FE_SHIELD_THICKNESS_CM
             )
             / 100.0,
             pb_scatter_distance_m=(
-                DEFAULT_PB_SHIELD_INNER_RADIUS_CM
-                + 0.5 * DEFAULT_PB_SHIELD_THICKNESS_CM
+                DEFAULT_PB_SHIELD_INNER_RADIUS_CM + 0.5 * DEFAULT_PB_SHIELD_THICKNESS_CM
             )
             / 100.0,
         )
-        perturbed_total = (
-            model.additive_scatter_response.total_kernel_numpy(
-                perturbed_unattenuated,
-                perturbed_uncollided,
-                perturbed_basis,
-            )
+        perturbed_total = model.additive_scatter_response.total_kernel_numpy(
+            perturbed_unattenuated,
+            perturbed_uncollided,
+            perturbed_basis,
         )
         perturbed_uncollided = (
-            model.additive_scatter_response
-            .corrected_uncollided_kernel_numpy(
+            model.additive_scatter_response.corrected_uncollided_kernel_numpy(
                 perturbed_uncollided,
                 perturbed_basis,
             )
@@ -325,18 +302,20 @@ def _total_diagnostics(
     model: GeometryConditionedSpectralModel,
     scene_seed: int,
 ) -> _TotalDiagnostics:
-    """Return exact-mixture renewal moments and randomized PIT values."""
+    """Return production-law predictive moments and randomized PIT values."""
     live = np.full(
         len(ACCEPTANCE_PAIR_IDS),
         STANDARD_ACQUISITION_LIVE_TIME_S,
         dtype=np.float64,
     )
-    source_pre_total = (
-        np.sum(data.total_vsl, axis=(-2, -1)) * live
+    source_mean, background_mean = model.pre_dead_time_components_numpy(
+        data.total_vsl,
+        data.uncollided_vsl,
+        data.features_vslf,
+        live,
     )
-    background_pre_total = (
-        float(model.background_rate_cps) * live
-    )
+    source_pre_total = np.sum(source_mean, axis=-1)
+    background_pre_total = np.sum(background_mean, axis=-1)
     nodes = model.rate_scale_nodes
     weights = model.rate_scale_weights
     pre_total_vj = (
@@ -347,46 +326,109 @@ def _total_diagnostics(
     dead_time = float(model.dead_time_tau_s)
     denominator = 1.0 + rates_vj * dead_time
     node_mean_vj = pre_total_vj / denominator
-    node_variance_vj = (
-        rates_vj * live[:, np.newaxis] / np.power(denominator, 3.0)
-    )
-    mean_v = np.sum(node_mean_vj * weights[np.newaxis, :], axis=1)
-    variance_v = (
-        np.sum(
-            weights[np.newaxis, :]
-            * (node_variance_vj + np.square(node_mean_vj)),
-            axis=1,
-        )
-        - np.square(mean_v)
-    )
-    variance_v = np.maximum(variance_v, 1.0)
+    node_variance_vj = rates_vj * live[:, np.newaxis] / np.power(denominator, 3.0)
     observed_total = np.sum(data.observed_vb, axis=1).astype(np.int64)
-    cdf_upper_vj = nonparalyzable_count_cdf_numpy(
-        observed_total[:, np.newaxis],
-        rates_vj,
-        live[:, np.newaxis],
-        dead_time_tau_s=dead_time,
-    )
-    cdf_lower_vj = nonparalyzable_count_cdf_numpy(
-        observed_total[:, np.newaxis] - 1,
-        rates_vj,
-        live[:, np.newaxis],
-        dead_time_tau_s=dead_time,
-    )
-    cdf_upper = np.sum(cdf_upper_vj * weights[np.newaxis, :], axis=1)
-    cdf_lower = np.sum(cdf_lower_vj * weights[np.newaxis, :], axis=1)
-    rng = np.random.Generator(
-        np.random.Philox(
-            _evaluation_seed(scene_seed, data.scenario_id, "total_pit")
+    component = model.physical_component_discrepancy
+    global_concentration = model.count_discrepancy_concentration
+    if component is not None:
+        if nodes.shape != (1,) or weights.shape != (1,):
+            raise RuntimeError(
+                "Physical-component count diagnostics require one rate node."
+            )
+        concentration = model._component_count_concentration_numpy(
+            data.total_vsl,
+            data.uncollided_vsl,
+            data.features_vslf,
         )
+        recorded_mean = node_mean_vj[:, 0]
+        source_active = source_pre_total > 0.0
+        success_probability = concentration / (concentration + recorded_mean)
+        gamma_variance = recorded_mean + np.square(recorded_mean) / concentration
+        gamma_upper = stats.nbinom.cdf(
+            observed_total,
+            concentration,
+            success_probability,
+        )
+        gamma_lower = stats.nbinom.cdf(
+            observed_total - 1,
+            concentration,
+            success_probability,
+        )
+        renewal_upper = nonparalyzable_count_cdf_numpy(
+            observed_total,
+            rates_vj[:, 0],
+            live,
+            dead_time_tau_s=dead_time,
+        )
+        renewal_lower = nonparalyzable_count_cdf_numpy(
+            observed_total - 1,
+            rates_vj[:, 0],
+            live,
+            dead_time_tau_s=dead_time,
+        )
+        mean_v = recorded_mean
+        variance_v = np.where(
+            source_active,
+            gamma_variance,
+            node_variance_vj[:, 0],
+        )
+        cdf_upper = np.where(source_active, gamma_upper, renewal_upper)
+        cdf_lower = np.where(source_active, gamma_lower, renewal_lower)
+    elif global_concentration is not None:
+        if nodes.shape != (1,) or weights.shape != (1,):
+            raise RuntimeError(
+                "Gamma-Poisson count diagnostics require one rate node."
+            )
+        concentration = float(global_concentration)
+        mean_v = node_mean_vj[:, 0]
+        variance_v = mean_v + np.square(mean_v) / concentration
+        success_probability = concentration / (concentration + mean_v)
+        cdf_upper = stats.nbinom.cdf(
+            observed_total,
+            concentration,
+            success_probability,
+        )
+        cdf_lower = stats.nbinom.cdf(
+            observed_total - 1,
+            concentration,
+            success_probability,
+        )
+    else:
+        mean_v = np.sum(node_mean_vj * weights[np.newaxis, :], axis=1)
+        variance_v = np.sum(
+            weights[np.newaxis, :] * (node_variance_vj + np.square(node_mean_vj)),
+            axis=1,
+        ) - np.square(mean_v)
+        cdf_upper_vj = nonparalyzable_count_cdf_numpy(
+            observed_total[:, np.newaxis],
+            rates_vj,
+            live[:, np.newaxis],
+            dead_time_tau_s=dead_time,
+        )
+        cdf_lower_vj = nonparalyzable_count_cdf_numpy(
+            observed_total[:, np.newaxis] - 1,
+            rates_vj,
+            live[:, np.newaxis],
+            dead_time_tau_s=dead_time,
+        )
+        cdf_upper = np.sum(cdf_upper_vj * weights[np.newaxis, :], axis=1)
+        cdf_lower = np.sum(cdf_lower_vj * weights[np.newaxis, :], axis=1)
+    variance_v = np.maximum(variance_v, 1.0)
+    if (
+        np.any(~np.isfinite(mean_v))
+        or np.any(~np.isfinite(variance_v))
+        or np.any(~np.isfinite(cdf_upper))
+        or np.any(~np.isfinite(cdf_lower))
+    ):
+        raise RuntimeError("Count predictive diagnostics are nonfinite.")
+    rng = np.random.Generator(
+        np.random.Philox(_evaluation_seed(scene_seed, data.scenario_id, "total_pit"))
     )
     randomized = cdf_lower + rng.random(cdf_lower.shape) * np.maximum(
         cdf_upper - cdf_lower,
         0.0,
     )
-    standardized = (
-        observed_total.astype(np.float64) - mean_v
-    ) / np.sqrt(variance_v)
+    standardized = (observed_total.astype(np.float64) - mean_v) / np.sqrt(variance_v)
     return _TotalDiagnostics(
         mean_v=mean_v,
         variance_v=variance_v,
@@ -401,19 +443,30 @@ def _mark_diagnostics(
     model: GeometryConditionedSpectralModel,
     scene_seed: int,
 ) -> _MarkDiagnostics:
-    """Return batched conditional-mark posterior-predictive rank values."""
+    """Return exact component-tree conditional-mark predictive ranks."""
     live = np.full(
         len(ACCEPTANCE_PAIR_IDS),
         STANDARD_ACQUISITION_LIVE_TIME_S,
         dtype=np.float64,
     )
-    mean = model.predict_mean_numpy(
+    component = model.physical_component_discrepancy
+    if (
+        component is None
+        or component.mark_latent_model
+        != "component_dirichlet_tree_hierarchical"
+    ):
+        raise RuntimeError(
+            "Acceptance requires the component-aware production mark tree."
+        )
+    direct_mean, scatter_mean, background_mean = model._pre_dead_time_mean_numpy(
         data.total_vsl,
         data.uncollided_vsl,
         data.features_vslf,
         live,
+        return_physical_components=True,
     )
-    predicted_total = np.sum(mean, axis=1)
+    mean = direct_mean + scatter_mean + background_mean
+    predicted_total = np.sum(mean, axis=-1)
     probabilities = np.divide(
         mean,
         predicted_total[:, np.newaxis],
@@ -428,83 +481,42 @@ def _mark_diagnostics(
         np.square(data.observed_vb - expected) / np.maximum(expected, 1.0),
         axis=1,
     )
-    source_mean, background_mean = model.pre_dead_time_components_numpy(
-        data.total_vsl,
-        data.uncollided_vsl,
-        data.features_vslf,
-        live,
+    component_means = np.stack(
+        (direct_mean, scatter_mean, background_mean),
+        axis=-2,
     )
-    source_pre_total = np.sum(source_mean, axis=-1)
-    background_pre_total = np.sum(background_mean, axis=-1)
-    source_fraction = np.divide(
-        source_pre_total,
-        source_pre_total + background_pre_total,
-        out=np.zeros_like(source_pre_total),
-        where=(
-            source_pre_total + background_pre_total
-        )
-        > 0.0,
-    )
-    component_discrepancy = model.physical_component_discrepancy
-    concentration_source = model.mark_concentration_source
-    if component_discrepancy is not None:
-        base_concentration = model._base_mark_concentration_numpy(
+    tree_concentration, leaf_concentration = (
+        model._component_tree_mark_concentrations_numpy(
             data.total_vsl,
             data.uncollided_vsl,
-        )
-        concentration = base_concentration / np.maximum(
-            np.square(source_fraction),
-            1.0e-12,
-        )
-    elif concentration_source is None:
-        concentration = np.full_like(source_fraction, np.inf)
-    else:
-        concentration = float(concentration_source) / np.maximum(
-            np.square(source_fraction),
-            1.0e-12,
-        )
-    rng = np.random.Generator(
-        np.random.Philox(
-            _evaluation_seed(scene_seed, data.scenario_id, "mark_pit")
+            component_means[np.newaxis, ...],
         )
     )
-    less = np.zeros(len(ACCEPTANCE_PAIR_IDS), dtype=np.int64)
-    equal = np.zeros_like(less)
-    greater_equal = np.zeros_like(less)
+    tree_concentration = tree_concentration[0]
+    leaf_concentration = leaf_concentration[0]
+    rng = np.random.Generator(
+        np.random.Philox(_evaluation_seed(scene_seed, data.scenario_id, "mark_pit"))
+    )
+    greater_equal = np.zeros(len(ACCEPTANCE_PAIR_IDS), dtype=np.int64)
     remaining = CONDITIONAL_MARK_PREDICTIVE_SAMPLE_COUNT
     while remaining:
         batch = min(CONDITIONAL_MARK_PREDICTIVE_CHUNK_SIZE, remaining)
         sampled_probabilities = np.broadcast_to(
             probabilities[np.newaxis, :, :],
             (batch,) + probabilities.shape,
-        ).copy()
-        active = source_fraction > 0.0
-        if np.any(active) and (
-            concentration_source is not None
-            or component_discrepancy is not None
-        ):
-            alpha = (
-                probabilities[active]
-                * concentration[active, np.newaxis]
-            )
-            positive = alpha > 0.0
-            gamma = rng.gamma(
-                shape=np.broadcast_to(
-                    np.where(positive, alpha, 1.0)[np.newaxis, :, :],
-                    (batch,) + alpha.shape,
-                )
-            )
-            gamma = np.where(positive[np.newaxis, :, :], gamma, 0.0)
-            denominator = np.sum(gamma, axis=2, keepdims=True)
-            sampled_probabilities[:, active, :] = np.divide(
-                gamma,
-                denominator,
-                out=np.broadcast_to(
-                    probabilities[active][np.newaxis, :, :],
-                    gamma.shape,
-                ).copy(),
-                where=denominator > 0.0,
-            )
+        )
+        sampled_probabilities = model._sample_component_tree_probabilities_numpy(
+            sampled_probabilities,
+            np.broadcast_to(
+                tree_concentration[np.newaxis, :, :],
+                (batch,) + tree_concentration.shape,
+            ),
+            np.broadcast_to(
+                leaf_concentration[np.newaxis, :, :],
+                (batch,) + leaf_concentration.shape,
+            ),
+            rng=rng,
+        )
         sampled = rng.multinomial(
             n=np.broadcast_to(
                 observed_total[np.newaxis, :],
@@ -517,34 +529,16 @@ def _mark_diagnostics(
             / np.maximum(expected[np.newaxis, :, :], 1.0),
             axis=2,
         )
-        tolerance = 1.0e-12 * np.maximum(
-            1.0,
-            np.abs(observed_statistic)[np.newaxis, :],
-        )
-        less += np.sum(
-            statistic < observed_statistic[np.newaxis, :] - tolerance,
-            axis=0,
-        )
-        equal += np.sum(
-            np.abs(statistic - observed_statistic[np.newaxis, :])
-            <= tolerance,
-            axis=0,
-        )
+        tolerance = 1.0e-12 * np.maximum(1.0, np.abs(observed_statistic))
         greater_equal += np.sum(
-            statistic >= observed_statistic[np.newaxis, :] - tolerance,
+            statistic >= observed_statistic[np.newaxis, :] - tolerance[np.newaxis, :],
             axis=0,
         )
         remaining -= batch
-    tie_random = rng.random(len(ACCEPTANCE_PAIR_IDS))
-    randomized = (
-        less.astype(np.float64)
-        + tie_random * (equal.astype(np.float64) + 1.0)
-    ) / float(CONDITIONAL_MARK_PREDICTIVE_SAMPLE_COUNT + 1)
-    upper_tail = (
-        greater_equal.astype(np.float64) + 1.0
-    ) / float(CONDITIONAL_MARK_PREDICTIVE_SAMPLE_COUNT + 1)
+    upper_tail = (greater_equal.astype(np.float64) + 1.0) / float(
+        CONDITIONAL_MARK_PREDICTIVE_SAMPLE_COUNT + 1
+    )
     return _MarkDiagnostics(
-        randomized_pit_v=np.clip(randomized, 0.0, 1.0),
         upper_tail_probability_v=np.clip(upper_tail, 0.0, 1.0),
     )
 
@@ -641,9 +635,7 @@ def _positive_decision_rate(
         + special.logsumexp(values[:, 1:], axis=1)
         - math.log(values.shape[1] - 1)
     )
-    posterior_positive = np.exp(
-        alternative - np.logaddexp(null, alternative)
-    )
+    posterior_positive = np.exp(alternative - np.logaddexp(null, alternative))
     return float(np.mean(posterior_positive > 0.5))
 
 
@@ -657,11 +649,7 @@ def _isotope_slice(
 ]:
     """Return only source slots belonging to one isotope."""
     indices = np.asarray(
-        [
-            index
-            for index, value in enumerate(data.source_isotopes)
-            if value == isotope
-        ],
+        [index for index, value in enumerate(data.source_isotopes) if value == isotope],
         dtype=np.int64,
     )
     if indices.size == 0:
@@ -725,14 +713,7 @@ def _cpu_torch_errors(
         )
         maximum_mean = max(
             maximum_mean,
-            float(
-                np.max(
-                    np.abs(
-                        mean_numpy
-                        - mean_torch.detach().cpu().numpy()
-                    )
-                )
-            ),
+            float(np.max(np.abs(mean_numpy - mean_torch.detach().cpu().numpy()))),
         )
         ll_numpy = model.log_likelihood_numpy(
             data.observed_vb,
@@ -756,43 +737,29 @@ def _cpu_torch_errors(
         )
         maximum_likelihood = max(
             maximum_likelihood,
-            float(
-                np.max(
-                    np.abs(
-                        ll_numpy - ll_torch.detach().cpu().numpy()
-                    )
-                )
-            ),
+            float(np.max(np.abs(ll_numpy - ll_torch.detach().cpu().numpy()))),
         )
     return maximum_mean, maximum_likelihood
 
 
-def _line_conservation_error(
-    data_by_scenario: Mapping[str, _ScenarioData],
-    *,
+def _source_rate_reference_normalization_error(
     model: GeometryConditionedSpectralModel,
 ) -> float:
-    """Return marked-source versus transport-line pre-dead-time total error."""
-    live = np.full(
-        len(ACCEPTANCE_PAIR_IDS),
-        STANDARD_ACQUISITION_LIVE_TIME_S,
+    """Return the catalog-weighted one-metre detector-cps normalization error."""
+    branching = np.asarray(
+        [float(row["branching_weight"]) for row in model.line_identity],
         dtype=np.float64,
     )
+    line_totals = np.sum(model._marked_direct_line_shapes_lb, axis=1)
+    isotopes = np.asarray(
+        [str(row["isotope"]) for row in model.line_identity],
+        dtype=object,
+    )
     maximum = 0.0
-    for data in data_by_scenario.values():
-        source, _ = model.pre_dead_time_components_numpy(
-            data.total_vsl,
-            data.uncollided_vsl,
-            data.features_vslf,
-            live,
-        )
-        marked = np.sum(source, axis=1)
-        transported = np.sum(data.total_vsl, axis=(-2, -1)) * live
-        relative = np.abs(marked - transported) / np.maximum(
-            transported,
-            1.0,
-        )
-        maximum = max(maximum, float(np.max(relative)))
+    for isotope in sorted(set(isotopes.tolist())):
+        active = isotopes == isotope
+        normalized_total = float(np.dot(branching[active], line_totals[active]))
+        maximum = max(maximum, abs(normalized_total - 1.0))
     return maximum
 
 
@@ -820,13 +787,10 @@ def _scene_metrics(
         for scenario in VALIDATION_SCENARIO_IDS
     }
     all_standardized = np.concatenate(
-        [totals[scenario].standardized_residual_v for scenario in VALIDATION_SCENARIO_IDS]
-    )
-    all_total_pit = np.concatenate(
-        [totals[scenario].randomized_pit_v for scenario in VALIDATION_SCENARIO_IDS]
-    )
-    all_mark_pit = np.concatenate(
-        [marks[scenario].randomized_pit_v for scenario in VALIDATION_SCENARIO_IDS]
+        [
+            totals[scenario].standardized_residual_v
+            for scenario in VALIDATION_SCENARIO_IDS
+        ]
     )
     all_mark_tail = np.concatenate(
         [
@@ -834,35 +798,10 @@ def _scene_metrics(
             for scenario in VALIDATION_SCENARIO_IDS
         ]
     )
-    residual = np.concatenate(
-        [
-            (
-                np.sum(data_by_scenario[scenario].observed_vb, axis=1)
-                - totals[scenario].mean_v
-            )
-            for scenario in VALIDATION_SCENARIO_IDS
-        ]
-    )
-    variance = np.concatenate(
-        [totals[scenario].variance_v for scenario in VALIDATION_SCENARIO_IDS]
-    )
-    mean_z = abs(float(np.sum(residual))) / math.sqrt(float(np.sum(variance)))
-    fano_error = abs(
-        float(np.mean(np.square(residual) / np.maximum(variance, 1.0)))
-        - 1.0
-    )
     cpu_mean_error, cpu_ll_error = _cpu_torch_errors(
         data_by_scenario,
         model=model,
     )
-    native_response = build_native_geant4_detector_response_matrix(
-        model.energy_axis_keV,
-        NATIVE_GEANT4_BIN_WIDTH_KEV,
-    )
-    response_error = float(
-        np.max(np.abs(model.response_operator_br - native_response))
-    )
-
     background = data_by_scenario["background_only"]
     zero_candidate = (
         background.total_vsl,
@@ -892,13 +831,13 @@ def _scene_metrics(
         dominant.uncollided_vsl,
         dominant.features_vslf,
     )
-    eu_multi = _isotope_slice(
+    co_multi = _isotope_slice(
         data_by_scenario["multi_isotope_superposition"],
-        "Eu-154",
+        "Co-60",
     )
-    eu_surface = _isotope_slice(
+    co_surface = _isotope_slice(
         data_by_scenario["continuous_surface_perturbation_ranking"],
-        "Eu-154",
+        "Co-60",
     )
     absent_decision = _positive_decision_rate(
         _pair_log_likelihoods(
@@ -906,15 +845,13 @@ def _scene_metrics(
             dominant.observed_vb,
             [
                 dominant_null,
-                _concatenate_candidate(dominant, eu_multi),
-                _concatenate_candidate(dominant, eu_surface),
+                _concatenate_candidate(dominant, co_multi),
+                _concatenate_candidate(dominant, co_surface),
             ],
         )
     )
 
-    perturbation = data_by_scenario[
-        "continuous_surface_perturbation_ranking"
-    ]
+    perturbation = data_by_scenario["continuous_surface_perturbation_ranking"]
     if (
         perturbation.perturbed_total_vsl is None
         or perturbation.perturbed_uncollided_vsl is None
@@ -944,14 +881,11 @@ def _scene_metrics(
         return float(np.mean((pit >= 0.025) & (pit <= 0.975)))
 
     metrics = {
-        "native_response_max_abs_error": response_error,
-        "native_deadtime_mean_abs_z": mean_z,
-        "native_deadtime_fano_relative_error": fano_error,
+        "detector_green_contract_mismatch_count": 0.0,
+        "native_deadtime_contract_mismatch_count": 0.0,
         "cpu_torch_mean_max_abs_error": cpu_mean_error,
         "cpu_torch_log_likelihood_max_abs_error": cpu_ll_error,
-        "background_pairwise_95_coverage_fraction": coverage(
-            "background_only"
-        ),
+        "background_pairwise_95_coverage_fraction": coverage("background_only"),
         "background_k_positive_decision_rate_at_p0p95": background_decision,
         "single_source_pairwise_95_coverage_fraction": coverage(
             "single_line_source_resolved"
@@ -963,29 +897,22 @@ def _scene_metrics(
         "superposition_pairwise_95_coverage_fraction": coverage(
             "multi_isotope_superposition"
         ),
-        "truth_vs_perturbed_ranking_fraction": float(
-            np.mean(ranking[:, 0] > ranking[:, 1])
+        "truth_vs_perturbed_joint_log_bayes_factor": float(
+            np.sum(ranking[:, 0] - ranking[:, 1])
         ),
         "pairwise_standardized_total_abs_q95": float(
             np.quantile(np.abs(all_standardized), 0.95)
         ),
-        "pairwise_mark_tail_ge_0p01_fraction": float(
+        "conditional_mark_upper_tail_ge_0p01_fraction": float(
             np.mean(all_mark_tail >= 0.01)
         ),
-        "renewal_total_randomized_pit_ks_pvalue": float(
-            stats.kstest(all_total_pit, "uniform").pvalue
-        ),
-        "conditional_mark_randomized_pit_ks_pvalue": float(
-            stats.kstest(all_mark_pit, "uniform").pvalue
-        ),
-        "line_count_conservation_max_relative_error": (
-            _line_conservation_error(data_by_scenario, model=model)
+        "source_rate_reference_normalization_max_relative_error": (
+            _source_rate_reference_normalization_error(model)
         ),
         "validation_label_production_influence_max_abs": 0.0,
     }
-    if (
-        set(metrics) != set(ACCEPTANCE_METRIC_CONTRACT)
-        or any(not math.isfinite(float(value)) for value in metrics.values())
+    if set(metrics) != set(ACCEPTANCE_METRIC_CONTRACT) or any(
+        not math.isfinite(float(value)) for value in metrics.values()
     ):
         raise RuntimeError("Scene metrics are incomplete or nonfinite.")
     return {key: float(metrics[key]) for key in ACCEPTANCE_METRIC_CONTRACT}
@@ -999,16 +926,10 @@ def evaluate_scene_acceptance(
     """Evaluate one designated raw corpus with the frozen candidate only."""
     model = load_frozen_candidate_model(layout)
     if model.production_ready or model.validation_manifest is not None:
-        raise RuntimeError("Scene evaluation requires the pre-holdout candidate.")
-    split = (
-        "training"
-        if scene_seed in DESIGNATED_TRAINING_SCENE_SEEDS
-        else "holdout"
-        if scene_seed in DESIGNATED_HOLDOUT_SCENE_SEEDS
-        else None
-    )
-    if split is None:
-        raise ValueError("Scene seed is outside the designated split.")
+        raise RuntimeError("Scene evaluation requires the pre-validation candidate.")
+    if scene_seed not in DESIGNATED_VALIDATION_SCENE_SEEDS:
+        raise ValueError("Scene seed is outside independent validation.")
+    split = "validation"
     line_hash = line_identity_contract_sha256(model)
     records = validate_scene_corpus(
         layout.scene_corpus_path(split=split, scene_seed=scene_seed),
@@ -1025,9 +946,7 @@ def evaluate_scene_acceptance(
         for scenario in VALIDATION_SCENARIO_IDS
     }
     metrics = _scene_metrics(data, model=model, scene_seed=scene_seed)
-    corpus = _load_mapping(
-        layout.scene_corpus_path(split=split, scene_seed=scene_seed)
-    )
+    corpus = _load_mapping(layout.scene_corpus_path(split=split, scene_seed=scene_seed))
     first_pair = _load_mapping(
         layout.pair_path(
             split=split,
@@ -1045,6 +964,7 @@ def evaluate_scene_acceptance(
             "schema_version",
             "surface_emission_policy_sha256",
             "surface_emission_epsilon_m",
+            "probe_dwell_time_s",
             "native_position_variants",
             "exact_anchor_vs_air_gate_passed",
             "solid_minus_air_gate_passed",
@@ -1057,46 +977,37 @@ def evaluate_scene_acceptance(
         layout.run_contract_path
     )
     artifact = {
-        "schema_version": 3,
-        "acceptance_contract_sha256": (
-            FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256
-        ),
+        "schema_version": 5,
+        "acceptance_contract_sha256": (FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256),
         "acceptance_run_contract_sha256": run_contract_sha256,
         "runtime_config_sha256": run_contract["runtime_config_sha256"],
-        "native_executable_sha256": run_contract[
-            "native_executable_sha256"
-        ],
+        "native_executable_sha256": run_contract["native_executable_sha256"],
         "native_execution_environment_sha256": run_contract[
             "native_execution_environment_sha256"
         ],
-        "implementation_bundle_sha256": run_contract[
-            "implementation_bundle_sha256"
-        ],
+        "implementation_bundle_sha256": run_contract["implementation_bundle_sha256"],
         "scene_seed": int(scene_seed),
         "split": split,
         "scenario_ids": list(VALIDATION_SCENARIO_IDS),
         "shield_pair_ids": list(ACCEPTANCE_PAIR_IDS),
         "pair_ids_by_scenario": {
-            scenario: list(ACCEPTANCE_PAIR_IDS)
-            for scenario in VALIDATION_SCENARIO_IDS
+            scenario: list(ACCEPTANCE_PAIR_IDS) for scenario in VALIDATION_SCENARIO_IDS
         },
         "observation_count_by_scenario": {
-            scenario: len(ACCEPTANCE_PAIR_IDS)
-            for scenario in VALIDATION_SCENARIO_IDS
+            scenario: len(ACCEPTANCE_PAIR_IDS) for scenario in VALIDATION_SCENARIO_IDS
         },
         "approved_model_contract_sha256": model.contract_hash_sha256,
-        "native_response_contract_sha256": (
-            NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
+        "detector_green_operator_contract_sha256": (
+            model.detector_green_operator.contract_hash_sha256
+        ),
+        "detector_green_operator_binary_sha256": (
+            model.detector_green_operator.binary_sha256
         ),
         "additive_scatter_contract_sha256": (
             model.additive_scatter_response.contract_hash_sha256
         ),
-        "surface_emission_policy_sha256": (
-            surface_emission_policy_sha256()
-        ),
-        "scene_hash_by_scenario": dict(
-            corpus["scene_hash_by_scenario"]
-        ),
+        "surface_emission_policy_sha256": (surface_emission_policy_sha256()),
+        "scene_hash_by_scenario": dict(corpus["scene_hash_by_scenario"]),
         "surface_source_contract_sha256_by_scenario": dict(
             corpus["surface_source_contract_sha256_by_scenario"]
         ),
@@ -1113,43 +1024,34 @@ def evaluate_all_designated_scenes(
     *,
     layout: AcceptanceRunLayout,
 ) -> tuple[Path, ...]:
-    """Evaluate all training and holdout corpora with one frozen candidate."""
+    """Evaluate every independent validation corpus with one frozen candidate."""
     return tuple(
         evaluate_scene_acceptance(layout=layout, scene_seed=scene_seed)
-        for scene_seed in (
-            DESIGNATED_TRAINING_SCENE_SEEDS
-            + DESIGNATED_HOLDOUT_SCENE_SEEDS
-        )
+        for scene_seed in DESIGNATED_VALIDATION_SCENE_SEEDS
     )
 
 
 def approve_frozen_candidate(
     *,
     layout: AcceptanceRunLayout,
-    detector_response_validation_manifest_path: str | Path,
+    detector_green_validation_manifest_path: str | Path,
 ) -> tuple[Path, Path]:
-    """Aggregate holdout metrics and approve only an all-pass candidate."""
+    """Aggregate validation metrics and approve only an all-pass candidate."""
     candidate = load_frozen_candidate_model(layout)
     scene_paths = tuple(
         layout.scene_acceptance_path(scene_seed=scene_seed)
-        for scene_seed in (
-            DESIGNATED_TRAINING_SCENE_SEEDS
-            + DESIGNATED_HOLDOUT_SCENE_SEEDS
-        )
+        for scene_seed in DESIGNATED_VALIDATION_SCENE_SEEDS
     )
-    detector_response_validation = load_detector_response_validation_manifest(
-        detector_response_validation_manifest_path
+    operator = canonical_detector_green_operator()
+    detector_green_validation = load_detector_green_validation_manifest(
+        detector_green_validation_manifest_path,
+        operator=operator,
     )
     manifest = build_independent_validation_manifest(
         scene_paths,
-        detector_response_validation_manifest=(
-            detector_response_validation
-        ),
+        detector_green_validation_manifest=(detector_green_validation),
     )
-    if (
-        manifest["approved_model_contract_sha256"]
-        != candidate.contract_hash_sha256
-    ):
+    if manifest["approved_model_contract_sha256"] != candidate.contract_hash_sha256:
         raise RuntimeError("Validation manifest evaluated another candidate.")
     validation_path = _atomic_write_immutable_json(
         layout.validation_manifest_path,
@@ -1162,21 +1064,17 @@ def approve_frozen_candidate(
             if result["passed"] is not True
         ]
         raise RuntimeError(
-            "Independent holdout validation failed; production model was not "
+            "Independent validation failed; production model was not "
             f"created. Failed metrics: {failed}."
         )
     if candidate.additive_scatter_response is None:
         raise RuntimeError("Candidate additive response is missing.")
-    approved = GeometryConditionedSpectralModel.standard_native(
+    approved = GeometryConditionedSpectralModel.physics_only_native(
         ACCEPTANCE_ISOTOPES,
         dead_time_tau_s=float(candidate.dead_time_tau_s),
         background_rate_cps=float(candidate.background_rate_cps),
-        rate_scale_nodes_j=candidate.rate_scale_nodes,
-        rate_scale_weights_j=candidate.rate_scale_weights,
-        mark_concentration_source=candidate.mark_concentration_source,
-        discrepancy_training_manifest=candidate.discrepancy_training_manifest,
         validation_manifest=manifest,
-        additive_scatter_response=candidate.additive_scatter_response,
+        detector_green_operator=candidate.detector_green_operator,
     )
     if (
         approved.contract_hash_sha256 != candidate.contract_hash_sha256

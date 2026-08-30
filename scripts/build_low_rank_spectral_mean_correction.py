@@ -14,6 +14,9 @@ from spectrum.additive_scatter import scatter_basis_from_stored_geometry_numpy
 from spectrum.mean_calibration_runner import (
     load_mean_calibration_pair_artifact,
 )
+from spectrum.full_spectrum_acceptance_runner import (
+    canonical_detector_green_operator,
+)
 from spectrum.transport_spectral import (
     DESIGNATED_TRAINING_SCENE_SEEDS,
     VALIDATION_SCENARIO_IDS,
@@ -110,7 +113,10 @@ def _write_json(path: Path, payload: Mapping[str, object]) -> None:
 def _load_base_model(path: Path) -> GeometryConditionedSpectralModel:
     """Load the authenticated uncorrected physical mean model."""
     payload = json.loads(path.read_text(encoding="utf-8"))
-    model = GeometryConditionedSpectralModel.from_manifest_payload(payload)
+    model = GeometryConditionedSpectralModel.from_manifest_payload(
+        payload,
+        detector_green_operator=canonical_detector_green_operator(),
+    )
     model.require_runtime_ready()
     if model.low_rank_spectral_mean_correction is not None:
         raise ValueError("Mean-correction training requires an uncorrected base model.")

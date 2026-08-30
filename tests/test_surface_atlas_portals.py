@@ -684,3 +684,85 @@ def test_local_chart_mixture_sampling_reports_its_exact_density() -> None:
         rtol=0.0,
         atol=0.0,
     )
+
+
+@pytest.mark.parametrize("device_name", ("cpu", "cuda"))
+def test_torch_portal_trace_matches_numpy_oracle(device_name: str) -> None:
+    """Torch portal tracing must preserve the exact NumPy geometry result."""
+    torch = pytest.importorskip("torch")
+    if device_name == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is not available.")
+    atlas = _room_atlas()
+    rng = np.random.default_rng(73_901)
+    chart_ids, uv, _ = atlas.sample(256, rng=rng)
+    displacement = rng.normal(0.0, 0.55, size=(chart_ids.size, 2))
+    expected = atlas.trace_tangent_displacements(
+        chart_ids,
+        uv,
+        displacement,
+    )
+
+    actual = atlas.trace_tangent_displacements_torch(
+        torch.tensor(chart_ids, device=device_name, dtype=torch.long),
+        torch.tensor(uv, device=device_name, dtype=torch.float64),
+        torch.tensor(displacement, device=device_name, dtype=torch.float64),
+    )
+    actual_numpy = tuple(value.detach().cpu().numpy() for value in actual)
+
+    np.testing.assert_array_equal(actual_numpy[0], expected[0])
+    np.testing.assert_allclose(actual_numpy[1], expected[1], rtol=0.0, atol=2.0e-12)
+    np.testing.assert_allclose(actual_numpy[2], expected[2], rtol=0.0, atol=2.0e-12)
+    np.testing.assert_array_equal(actual_numpy[3], expected[3])
+    np.testing.assert_array_equal(actual_numpy[4], expected[4])
+
+
+@pytest.mark.parametrize("device_name", ("cpu", "cuda"))
+def test_torch_local_density_and_path_match_numpy(device_name: str) -> None:
+    """Torch proposal densities and surface paths must equal their CPU oracle."""
+    torch = pytest.importorskip("torch")
+    if device_name == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is not available.")
+    atlas = _room_atlas()
+    rng = np.random.default_rng(91_407)
+    first_ids, first_uv, _ = atlas.sample(192, rng=rng)
+    second_ids, second_uv, _ = atlas.sample(192, rng=rng)
+    probability = 0.15
+    expected_density = atlas.local_chart_mixture_log_density(
+        first_ids,
+        second_ids,
+        global_component_probability=probability,
+    )
+    expected_distance = atlas.local_surface_coordinate_path_distance_m(
+        first_ids,
+        first_uv,
+        second_ids,
+        second_uv,
+    )
+    reference = torch.zeros(1, device=device_name, dtype=torch.float64)
+    first_ids_t = torch.tensor(first_ids, device=device_name, dtype=torch.long)
+    second_ids_t = torch.tensor(second_ids, device=device_name, dtype=torch.long)
+    actual_density = atlas.local_chart_mixture_log_density_torch(
+        first_ids_t,
+        second_ids_t,
+        global_component_probability=probability,
+        reference=reference,
+    )
+    actual_distance = atlas.local_surface_coordinate_path_distance_m_torch(
+        first_ids_t,
+        torch.tensor(first_uv, device=device_name, dtype=torch.float64),
+        second_ids_t,
+        torch.tensor(second_uv, device=device_name, dtype=torch.float64),
+    )
+
+    np.testing.assert_allclose(
+        actual_density.detach().cpu().numpy(),
+        expected_density,
+        rtol=0.0,
+        atol=2.0e-12,
+    )
+    np.testing.assert_allclose(
+        actual_distance.detach().cpu().numpy(),
+        expected_distance,
+        rtol=0.0,
+        atol=2.0e-12,
+    )

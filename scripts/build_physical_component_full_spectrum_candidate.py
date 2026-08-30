@@ -21,6 +21,7 @@ from spectrum.additive_scatter import scatter_basis_from_stored_geometry_numpy
 from spectrum.full_spectrum_acceptance_runner import (
     ACCEPTANCE_ISOTOPES,
     canonical_json_bytes,
+    canonical_detector_green_operator,
     file_sha256,
     line_identity_contract_sha256,
     load_acceptance_pair,
@@ -123,7 +124,7 @@ COMPONENT_LOG_RATIO_REGULARIZATION = 0.01
 COMPONENT_MARK_TAIL_PROBABILITY_THRESHOLD = 0.01
 COMPONENT_MARK_COVERAGE_THRESHOLD = float(
     ACCEPTANCE_METRIC_CONTRACT[
-        "pairwise_mark_tail_ge_0p01_fraction"
+        "conditional_mark_upper_tail_ge_0p01_fraction"
     ][1]
 )
 
@@ -168,7 +169,10 @@ def _parser() -> argparse.ArgumentParser:
 def _load_base_model(path: Path) -> GeometryConditionedSpectralModel:
     """Load a physical mean whose additive response is training-authenticated."""
     payload = json.loads(path.read_text(encoding="utf-8"))
-    model = GeometryConditionedSpectralModel.from_manifest_payload(payload)
+    model = GeometryConditionedSpectralModel.from_manifest_payload(
+        payload,
+        detector_green_operator=canonical_detector_green_operator(),
+    )
     additive = model.additive_scatter_response
     if additive is None or not additive.training_ready:
         raise ValueError(
@@ -202,7 +206,7 @@ def _attach_mean_correction(
     )
     if not correction.training_ready:
         raise ValueError("Spectral mean correction is not training-authenticated.")
-    corrected = GeometryConditionedSpectralModel.standard_native(
+    corrected = GeometryConditionedSpectralModel.nonproduction_native(
         ACCEPTANCE_ISOTOPES,
         dead_time_tau_s=model.dead_time_tau_s,
         background_rate_cps=model.background_rate_cps,
@@ -317,7 +321,7 @@ def _candidate_score(
     score = 0.0
     observation_count = 0
     for fold_model, (observed, total, uncollided, features) in arrays:
-        candidate = GeometryConditionedSpectralModel.standard_native(
+        candidate = GeometryConditionedSpectralModel.nonproduction_native(
             ACCEPTANCE_ISOTOPES,
             dead_time_tau_s=fold_model.dead_time_tau_s,
             background_rate_cps=fold_model.background_rate_cps,
@@ -376,7 +380,7 @@ def _candidate_pairwise_mark_coverage(
         mark_scatter_concentration=mark_scatter,
     )
     for fold_model, (observed, total, uncollided, features) in arrays:
-        candidate = GeometryConditionedSpectralModel.standard_native(
+        candidate = GeometryConditionedSpectralModel.nonproduction_native(
             ACCEPTANCE_ISOTOPES,
             dead_time_tau_s=fold_model.dead_time_tau_s,
             background_rate_cps=fold_model.background_rate_cps,
@@ -650,7 +654,7 @@ def build_candidate(
         "selection_completed": True,
         "holdout_artifacts_consumed": False,
     }
-    model = GeometryConditionedSpectralModel.standard_native(
+    model = GeometryConditionedSpectralModel.nonproduction_native(
         ACCEPTANCE_ISOTOPES,
         dead_time_tau_s=base_model.dead_time_tau_s,
         background_rate_cps=base_model.background_rate_cps,
@@ -735,7 +739,7 @@ def _cross_fitted_mean_models(
             shield_pair_ids=COMPONENT_TRAINING_PAIR_IDS,
             feature_basis_semantics=feature_basis_semantics,
         )
-        fold_uncorrected = GeometryConditionedSpectralModel.standard_native(
+        fold_uncorrected = GeometryConditionedSpectralModel.nonproduction_native(
             ACCEPTANCE_ISOTOPES,
             dead_time_tau_s=uncorrected_model.dead_time_tau_s,
             background_rate_cps=uncorrected_model.background_rate_cps,
@@ -764,7 +768,7 @@ def _cross_fitted_mean_models(
             maximum_abs_log_correction=_MAXIMUM_ABS_LOG_CORRECTION,
             training_manifest={},
         )
-        models[int(holdout_seed)] = GeometryConditionedSpectralModel.standard_native(
+        models[int(holdout_seed)] = GeometryConditionedSpectralModel.nonproduction_native(
             ACCEPTANCE_ISOTOPES,
             dead_time_tau_s=uncorrected_model.dead_time_tau_s,
             background_rate_cps=uncorrected_model.background_rate_cps,

@@ -68,9 +68,7 @@ class Nuclide:
             raise ValueError("Nuclide gamma energies must be unique.")
         decay_lines = tuple(self.decay_lines) or lines
         if any(not isinstance(line, NuclideLine) for line in decay_lines):
-            raise ValueError(
-                "Nuclide decay_lines must contain NuclideLine entries."
-            )
+            raise ValueError("Nuclide decay_lines must contain NuclideLine entries.")
         decay_energies = tuple(float(line.energy_keV) for line in decay_lines)
         if len(set(decay_energies)) != len(decay_energies):
             raise ValueError("Nuclide decay gamma energies must be unique.")
@@ -91,21 +89,39 @@ class Nuclide:
         excitation = float(self.geant4_excitation_keV)
         half_life = float(self.half_life_s)
         if not math.isfinite(excitation) or excitation < 0.0:
-            raise ValueError("Nuclide Geant4 excitation must be finite and nonnegative.")
+            raise ValueError(
+                "Nuclide Geant4 excitation must be finite and nonnegative."
+            )
         if not math.isfinite(half_life) or half_life < 0.0:
             raise ValueError("Nuclide half_life_s must be finite and nonnegative.")
         if int(self.atomic_number) > 0 and half_life <= 0.0:
             raise ValueError(
                 "A physical Nuclide catalog entry requires a positive half_life_s."
             )
-        materials = tuple(str(value).strip().lower() for value in self.eligible_materials)
+        materials = tuple(
+            str(value).strip().lower() for value in self.eligible_materials
+        )
         if not materials or any(not value for value in materials):
             raise ValueError("Nuclide eligible_materials must be nonempty strings.")
         if "*" in materials and len(materials) != 1:
             raise ValueError("Wildcard material eligibility must be used alone.")
-        if self.prompt_cascade_model != "geant4_radioactive_decay":
+        probe_model = self.prompt_cascade_model == "independent_monoenergetic_probe"
+        if probe_model and (
+            int(self.atomic_number) != 0
+            or int(self.mass_number) != 0
+            or half_life != 0.0
+            or self.source_origin != "detector_operator_probe"
+        ):
             raise ValueError(
-                "Prompt cascades must use evaluated Geant4 RadioactiveDecay data."
+                "A monoenergetic probe must be non-nuclear and restricted to "
+                "detector-operator construction."
+            )
+        if not probe_model and self.prompt_cascade_model != (
+            "geant4_radioactive_decay"
+        ):
+            raise ValueError(
+                "Prompt cascades must use evaluated Geant4 RadioactiveDecay "
+                "data or the explicit non-nuclear detector probe."
             )
         object.__setattr__(self, "lines", lines)
         object.__setattr__(self, "decay_lines", decay_lines)
@@ -329,8 +345,23 @@ def require_nuclide(isotope: str) -> Nuclide:
         ) from exc
 
 
-def nuclide_catalog_sha256() -> str:
-    """Return a deterministic hash of all evaluated catalog semantics."""
+def nuclide_catalog_sha256(
+    library: Mapping[str, Nuclide] | None = None,
+) -> str:
+    """Return a deterministic hash of supplied or production catalog semantics."""
+    catalog = _NUCLIDES if library is None else library
+    if (
+        not isinstance(catalog, Mapping)
+        or not catalog
+        or any(
+            not isinstance(name, str)
+            or not name
+            or not isinstance(nuclide, Nuclide)
+            or nuclide.name != name
+            for name, nuclide in catalog.items()
+        )
+    ):
+        raise ValueError("Nuclide catalog hashing requires named Nuclide entries.")
     payload = {
         name: {
             "atomic_number": nuclide.atomic_number,
@@ -356,7 +387,7 @@ def nuclide_catalog_sha256() -> str:
                 for line in nuclide.decay_lines
             ],
         }
-        for name, nuclide in sorted(_NUCLIDES.items())
+        for name, nuclide in sorted(catalog.items())
     }
     encoded = json.dumps(
         payload,

@@ -114,11 +114,19 @@ CUI truth has three explicit modes:
 
 `post_run` is the default. Truth overlay objects must not be stored in estimator
 state, planner inputs, estimator result manifests, or MeasurementLog artifacts.
-`AdaptiveRuntimeClient` is estimator-facing and therefore rejects both requests
-for truth and unexpected truth-bearing overlay responses. The runtime private CUI
-channel remains available only to a separately owned evaluation renderer. The
-`CUITruthDisplayMode` enum describes that renderer policy; it does not grant an
-estimator access to realized truth.
+`AdaptiveRuntimeClient` is estimator-facing and has no truth-overlay request API;
+the retired overlay request is rejected as an unknown adaptive request, and a
+retired private-overlay frame on its event stream is fatal.
+
+Live evaluation uses a distinct owner-only Unix socket. The runtime creates it only
+when `--cui-truth-overlay-socket-path` is explicit, refuses to replace an existing
+path, applies mode `0600`, accepts one exact schema-version-1 request, serves one
+validated response, and removes the endpoint on shutdown. The asynchronous CUI
+renderer child connects to this socket directly before acknowledging readiness and
+adds isotope-local source numbers plus an XYZ inventory to the live figures. PF
+frames and the adaptive estimator stream remain truth-free. The
+`CUITruthDisplayMode` enum describes renderer policy; it does not add a truth method
+to an estimator client.
 
 ## Migration phases
 

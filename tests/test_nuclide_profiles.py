@@ -45,16 +45,12 @@ def test_core_nuclides_expose_current_evaluated_decay_metadata() -> None:
     """Core truth nuclides must retain physical decay and placement data."""
     library = default_library()
 
-    assert library["Cs-137"].half_life_s == pytest.approx(
-        30.018 * 365.25 * 86_400.0
-    )
+    assert library["Cs-137"].half_life_s == pytest.approx(30.018 * 365.25 * 86_400.0)
     assert library["Co-60"].mean_gamma_multiplicity > 1.99
     eu154_energies = {
         round(line.energy_keV, 3) for line in library["Eu-154"].decay_lines
     }
-    assert {123.071, 723.305, 1004.725, 1274.436}.issubset(
-        eu154_energies
-    )
+    assert {123.071, 723.305, 1004.725, 1274.436}.issubset(eu154_energies)
     assert library["Eu-154"].eligible_materials == ("concrete",)
     assert (
         require_isotope_profile("fukushima_eu154").material_conditioning
@@ -97,18 +93,14 @@ def test_every_isotope_profile_resolves_an_authenticated_pf_model(
     """Each selectable truth profile must also define the exact PF line state."""
     root = Path(__file__).resolve().parents[1]
     standard_config = load_runtime_config(
-        root
-        / "configs/geant4/variance_reduction_external_no_isaac_32threads.json"
+        root / "configs/geant4/variance_reduction_external_no_isaac_32threads.json"
     )
     standard_config["isotope_experiment_profile"] = profile_name
     model = geometry_conditioned_model_from_runtime_config(
         standard_config,
         run_root=root,
     )
-    model_isotopes = {
-        str(line["isotope"])
-        for line in model.line_identity
-    }
+    model_isotopes = {str(line["isotope"]) for line in model.line_identity}
 
     assert model_isotopes == set(require_isotope_profile(profile_name).isotopes)
     assert model.runtime_ready is True
@@ -117,15 +109,9 @@ def test_every_isotope_profile_resolves_an_authenticated_pf_model(
 def test_profile_directory_contains_only_registered_models() -> None:
     """Profile assets must not retain superseded unreferenced generations."""
     root = Path(__file__).resolve().parents[1]
-    registry_path = (
-        root
-        / "configs/geant4/models/isotope_profile_model_registry.json"
-    )
+    registry_path = root / "configs/geant4/models/isotope_profile_model_registry.json"
     registry = json.loads(registry_path.read_text(encoding="utf-8"))
-    registered = {
-        root / entry["model_path"]
-        for entry in registry["profiles"].values()
-    }
+    registered = {root / entry["model_path"] for entry in registry["profiles"].values()}
     profile_directory = root / "configs/geant4/models/profiles"
     present = set(profile_directory.glob("*.json"))
 
@@ -133,20 +119,22 @@ def test_profile_directory_contains_only_registered_models() -> None:
 
 
 def test_profile_builder_reproduces_current_registry(tmp_path: Path) -> None:
-    """The sole profile builder must reproduce every committed profile asset."""
+    """The builder preserves and authenticates the canonical approved asset."""
     root = Path(__file__).resolve().parents[1]
     config_path = (
-        tmp_path
-        / "configs/geant4/variance_reduction_external_no_isaac_32threads.json"
+        tmp_path / "configs/geant4/variance_reduction_external_no_isaac_32threads.json"
     )
     config_path.parent.mkdir(parents=True)
     config_path.write_text("{}\n", encoding="utf-8")
+    approved_source = root / "configs/geant4/models/profiles/unconditioned_cs_co.json"
+    approved_target = (
+        tmp_path / "configs/geant4/models/profiles/unconditioned_cs_co.json"
+    )
+    approved_target.parent.mkdir(parents=True)
+    approved_target.write_bytes(approved_source.read_bytes())
 
     generated = build_assets(tmp_path)
-    committed_path = (
-        root
-        / "configs/geant4/models/isotope_profile_model_registry.json"
-    )
+    committed_path = root / "configs/geant4/models/isotope_profile_model_registry.json"
     committed = json.loads(committed_path.read_text(encoding="utf-8"))
 
     assert generated == committed
@@ -156,8 +144,7 @@ def test_profile_builder_reproduces_current_registry(tmp_path: Path) -> None:
             root / relative_path
         ).read_bytes()
     generated_registry_path = (
-        tmp_path
-        / "configs/geant4/models/isotope_profile_model_registry.json"
+        tmp_path / "configs/geant4/models/isotope_profile_model_registry.json"
     )
     generated_config = json.loads(config_path.read_text(encoding="utf-8"))
     assert generated_config["full_spectrum_model_registry_file_sha256"] == (
@@ -168,10 +155,7 @@ def test_profile_builder_reproduces_current_registry(tmp_path: Path) -> None:
 def test_profile_registry_digest_fails_closed() -> None:
     """A stale or substituted profile registry must not select a PF model."""
     root = Path(__file__).resolve().parents[1]
-    registry_path = (
-        root
-        / "configs/geant4/models/isotope_profile_model_registry.json"
-    )
+    registry_path = root / "configs/geant4/models/isotope_profile_model_registry.json"
 
     with pytest.raises(ValueError, match="registry SHA-256"):
         geometry_conditioned_model_from_runtime_config(
@@ -191,9 +175,7 @@ def test_profile_registry_requires_an_exact_integer_schema(
 ) -> None:
     """Registry schema values merely equal to one must not be accepted."""
     root = Path(__file__).resolve().parents[1]
-    committed_path = (
-        root / "configs/geant4/models/isotope_profile_model_registry.json"
-    )
+    committed_path = root / "configs/geant4/models/isotope_profile_model_registry.json"
     payload = json.loads(committed_path.read_text(encoding="utf-8"))
     payload["schema_version"] = schema_version
     registry_path = tmp_path / "registry.json"
@@ -216,9 +198,7 @@ def test_profile_registry_requires_an_exact_integer_schema(
 def test_profile_registry_rejects_unknown_outer_fields(tmp_path: Path) -> None:
     """Unknown registry fields must not be silently ignored."""
     root = Path(__file__).resolve().parents[1]
-    committed_path = (
-        root / "configs/geant4/models/isotope_profile_model_registry.json"
-    )
+    committed_path = root / "configs/geant4/models/isotope_profile_model_registry.json"
     payload = json.loads(committed_path.read_text(encoding="utf-8"))
     payload["ignored_setting"] = "unsafe"
     registry_path = tmp_path / "registry.json"
@@ -254,8 +234,7 @@ def test_material_conditioned_sources_use_isotope_eligible_surface_area() -> Non
     profile = require_isotope_profile("fukushima_nb94")
     library = default_library()
     eligible = {
-        isotope: library[isotope].eligible_materials
-        for isotope in profile.isotopes
+        isotope: library[isotope].eligible_materials for isotope in profile.isotopes
     }
     sources = generate_surface_sources(
         env=environment,
@@ -292,8 +271,7 @@ def test_material_conditioned_sources_use_isotope_eligible_surface_area() -> Non
     assert all(str(face).startswith("transport_component_1_") for face in niobium_faces)
     assert europium_faces
     assert all(
-        not str(face).startswith("transport_component_1_")
-        for face in europium_faces
+        not str(face).startswith("transport_component_1_") for face in europium_faces
     )
 
 
@@ -336,10 +314,7 @@ def test_runtime_transport_tables_follow_selected_profile(tmp_path) -> None:
     expected = set(profile.isotopes)
     assert set(environment.grid.transport_mu_by_isotope) == expected
     assert set(environment.grid.transport_line_mu_by_isotope) == expected
-    assert (
-        set(environment.grid.transport_line_compton_mu_by_isotope)
-        == expected
-    )
+    assert set(environment.grid.transport_line_compton_mu_by_isotope) == expected
 
 
 def test_radioactive_decay_config_is_explicit_and_fail_closed() -> None:
@@ -362,5 +337,6 @@ def test_radioactive_decay_config_is_explicit_and_fail_closed() -> None:
                 **payload,
                 "detector_scoring_mode": "incident_gamma_energy",
                 "sample_detector_response": True,
+                "detector_green_operator_manifest": "operator.json",
             }
         )

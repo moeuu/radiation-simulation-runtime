@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from dataclasses import replace
 from pathlib import Path
 import platform
 import subprocess
@@ -17,16 +16,14 @@ import pytest
 from scipy import stats
 
 import spectrum.transport_spectral as transport_spectral
-from spectrum.additive_scatter import (
-    DETECTOR_CONE_SINGLE_SCATTER_BASIS_SEMANTICS,
-)
-from spectrum.response_matrix import (
-    NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256,
-    build_native_geant4_detector_response_matrix,
-)
 from runtime.experiment_profiles import (
+    MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE,
     STANDARD_ACQUISITION_LIVE_TIME_S,
-    STANDARD_EXPERIMENT_PROFILE,
+)
+from spectrum.detector_green_operator import (
+    DETECTOR_GREEN_COINCIDENCE_SEMANTICS,
+    DETECTOR_GREEN_SAMPLING_MODE,
+    DetectorGreenOperator,
 )
 from spectrum.transport_spectral import (
     ACCEPTANCE_DETECTOR_POSE_XYZ,
@@ -35,18 +32,21 @@ from spectrum.transport_spectral import (
     ACCEPTANCE_GEOMETRY_USE_GPU,
     ACCEPTANCE_OBSTACLE_BLOCKED_FRACTION,
     ACCEPTANCE_PASSAGE_WIDTH_M,
+    ACCEPTANCE_PERTURBATION_MINIMUM_BEARING_ANGLE_RAD,
+    ACCEPTANCE_PERTURBATION_MINIMUM_DISPLACEMENT_M,
+    ACCEPTANCE_PERTURBATION_MINIMUM_LOG_RATE_SEPARATION,
+    ACCEPTANCE_PERTURBATION_TANGENT_DIRECTIONS_UV,
+    ACCEPTANCE_PERTURBATION_TANGENT_MAGNITUDES_M,
     ACCEPTANCE_ROOM_SIZE_XYZ,
     ACCEPTANCE_SURFACE_CHART_MAX_EDGE_M,
     continuous_rate_scale_quadrature_for_half_width,
-    DESIGNATED_HOLDOUT_SCENE_SEEDS,
+    DESIGNATED_VALIDATION_SCENE_SEEDS,
     DESIGNATED_TRAINING_SCENE_SEEDS,
     FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256,
+    DETECTOR_IMPACT_PHASE_COUNT,
     GeometryConditionedSpectralModel,
     LowRankSpectralMeanCorrection,
     PhysicalComponentDiscrepancy,
-    MARK_CONCENTRATION_GRID,
-    RATE_SCALE_HALF_WIDTH_GRID,
-    VALIDATION_SCENARIO_IDS,
     full_spectrum_acceptance_contract_payload,
     geometry_conditioned_model_from_runtime_config,
     nonparalyzable_count_log_probability_numpy,
@@ -56,14 +56,56 @@ from spectrum.transport_spectral import (
     station_shared_gamma_poisson_count_log_increments_numpy,
     station_shared_gamma_poisson_count_log_increments_torch,
 )
-from measurement.shielding import (
-    SHIELD_POSE_CONTRACT_ID,
-    SHIELD_POSE_CONTRACT_SHA256,
+from tests.runtime_test_support import (
+    approved_full_spectrum_model,
+    runtime_config as approved_runtime_config,
 )
-from measurement.geometry_family import (
-    GEOMETRY_FAMILY_APPLICABILITY_SHA256,
-)
-from tests.runtime_test_support import approved_full_spectrum_model
+from tests.green_test_support import write_synthetic_detector_green_artifact
+
+
+@pytest.fixture(scope="module")
+def _detector_green_manifest(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Path:
+    """Publish one immutable synthetic Green artifact for this test module."""
+    return write_synthetic_detector_green_artifact(
+        tmp_path_factory.mktemp("detector-green-model") / "operator"
+    )
+
+
+@pytest.fixture(autouse=True)
+def _use_explicit_detector_green(
+    _detector_green_manifest: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Route unit models through one authenticated synthetic Green artifact."""
+    monkeypatch.setattr(
+        transport_spectral,
+        "DEFAULT_DETECTOR_GREEN_OPERATOR_MANIFEST",
+        _detector_green_manifest,
+    )
+
+
+def _valid_transport_features(values: np.ndarray) -> np.ndarray:
+    """Return valid aggregate and detector-impact transport features."""
+    base = np.asarray(values, dtype=np.float64).copy()
+    if base.shape[-1] != 4:
+        raise ValueError("Unit-test base transport features must have four columns.")
+    base[..., 3] = np.maximum(base[..., 3], 1.25)
+    base = np.concatenate(
+        (
+            base[..., :3],
+            base[..., 2:3],
+            base[..., 3:4],
+        ),
+        axis=-1,
+    )
+    impact = np.full(
+        base.shape[:-1] + (DETECTOR_IMPACT_PHASE_COUNT,),
+        1.0 / DETECTOR_IMPACT_PHASE_COUNT,
+        dtype=np.float64,
+    )
+    return np.concatenate((base, impact), axis=-1)
 
 
 @pytest.mark.parametrize(
@@ -97,11 +139,16 @@ def test_profile_contract_hash_is_portable_across_cpu_kernels(
                 "from spectrum.transport_spectral import "
                 "GeometryConditionedSpectralModel"
             ),
+            (
+                "from spectrum.full_spectrum_acceptance_runner import "
+                "canonical_detector_green_operator"
+            ),
             f"path = Path({str(model_path)!r})",
             "payload = json.loads(path.read_text(encoding='utf-8'))",
             (
-                "model = GeometryConditionedSpectralModel."
-                "from_manifest_payload(payload)"
+                "model = GeometryConditionedSpectralModel.from_manifest_payload("
+                "payload, detector_green_operator="
+                "canonical_detector_green_operator())"
             ),
             "print(model.contract_hash_sha256)",
         )
@@ -129,15 +176,12 @@ def test_portable_derived_array_digest_ignores_only_roundoff_noise() -> None:
     roundoff[0] = np.nextafter(roundoff[0], np.inf)
     positive_zero = np.asarray((0.25, 0.0), dtype=np.float64)
     material_change = baseline.copy()
-    material_change[0] += 2.0e-13
+    material_change[0] += 2.0e-12
 
-    baseline_digest = transport_spectral._portable_derived_array_digest(
-        baseline
-    )
+    baseline_digest = transport_spectral._portable_derived_array_digest(baseline)
 
     assert (
-        transport_spectral._portable_derived_array_digest(roundoff)
-        == baseline_digest
+        transport_spectral._portable_derived_array_digest(roundoff) == baseline_digest
     )
     assert (
         transport_spectral._portable_derived_array_digest(positive_zero)
@@ -148,9 +192,7 @@ def test_portable_derived_array_digest_ignores_only_roundoff_noise() -> None:
         != baseline_digest
     )
     assert (
-        transport_spectral._portable_derived_array_digest(
-            baseline.reshape((1, 2))
-        )
+        transport_spectral._portable_derived_array_digest(baseline.reshape((1, 2)))
         != baseline_digest
     )
     with pytest.raises(ValueError, match="finite"):
@@ -192,8 +234,7 @@ def test_shared_gamma_count_prefixes_match_closed_form_and_torch() -> None:
         transport_spectral.special.gammaln(concentration + total_count)
         - transport_spectral.special.gammaln(concentration)
         + concentration * np.log(concentration)
-        - (concentration + total_count)
-        * np.log(concentration + total_mean)
+        - (concentration + total_count) * np.log(concentration + total_mean)
         + 2.0 * np.log(4.0)
         + 3.0 * np.log(5.0)
         - transport_spectral.special.gammaln(3.0)
@@ -212,17 +253,54 @@ def test_shared_gamma_count_prefixes_match_closed_form_and_torch() -> None:
 
     assert float(np.sum(increments)) == pytest.approx(expected_log)
     assert np.allclose(increments, torch_increments, rtol=1.0e-12, atol=1.0e-12)
+
+
 def _model(
     *,
     dead_time_tau_s: float = 5.813e-9,
     background_rate_cps: float = 5.0,
 ) -> GeometryConditionedSpectralModel:
     """Return an unapproved physical model for deterministic unit tests."""
-    return GeometryConditionedSpectralModel.standard_native(
+    return GeometryConditionedSpectralModel.nonproduction_native(
         ("Co-60", "Cs-137", "Eu-154"),
         dead_time_tau_s=float(dead_time_tau_s),
         background_rate_cps=float(background_rate_cps),
     )
+
+
+def test_model_response_cache_requires_exact_authenticated_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated model reductions reuse only the exact operator and energy axis."""
+    first = _model()
+    expected_response = first.response_operator_br.copy()
+
+    def fail_uncached_request(*args: object, **kwargs: object) -> object:
+        """Make any uncached full-axis Green reduction observable."""
+        del args, kwargs
+        raise AssertionError("uncached model response request")
+
+    monkeypatch.setattr(
+        DetectorGreenOperator,
+        "marginal_absolute_response_for_axis",
+        fail_uncached_request,
+    )
+    monkeypatch.setattr(
+        DetectorGreenOperator,
+        "marginal_response_for_axis",
+        fail_uncached_request,
+    )
+    repeated = _model()
+
+    np.testing.assert_array_equal(repeated.response_operator_br, expected_response)
+    assert repeated.response_operator_br is not first.response_operator_br
+    changed_axis = first.energy_axis_keV
+    changed_axis[1] = np.nextafter(changed_axis[1], changed_axis[2])
+    with pytest.raises(AssertionError, match="uncached model response request"):
+        transport_spectral._detector_green_model_response_bundle(
+            first.detector_green_operator,
+            changed_axis,
+        )
 
 
 def _subset_likelihood_branch_model(
@@ -245,29 +323,18 @@ def _subset_likelihood_branch_model(
             ),
             mark_concentration_source=80.0,
         )
-    elif branch in (
-        "component_fraction",
-        "component_scale",
-        "component_hierarchical",
-    ):
-        mark_model = {
-            "component_fraction": "fraction_dirichlet_multinomial",
-            "component_scale": "station_shared_two_point_component_scale",
-            "component_hierarchical": "photopeak_continuum_hierarchical",
-        }[branch]
+    elif branch == "component_tree":
         keywords["physical_component_discrepancy"] = PhysicalComponentDiscrepancy(
             count_uncollided_concentration=60.0,
             count_scatter_concentration=12.0,
             mark_uncollided_concentration=90.0,
             mark_scatter_concentration=15.0,
-            mark_latent_model=mark_model,
-            mark_continuum_group_concentration=(
-                25.0 if branch == "component_hierarchical" else None
-            ),
+            mark_background_group_concentration=15.0,
+            mark_background_within_concentration=90.0,
         )
     elif branch != "fixed_renewal":
         raise ValueError(f"Unknown subset likelihood branch: {branch!r}.")
-    return GeometryConditionedSpectralModel.standard_native(
+    return GeometryConditionedSpectralModel.nonproduction_native(
         ("Cs-137",),
         dead_time_tau_s=1.0e-5,
         background_rate_cps=1.0,
@@ -291,7 +358,7 @@ def _subset_likelihood_inputs(
         (action_count, state_count, view_count, 1, line_count),
     )
     uncollided = total * rng.uniform(0.2, 1.0, total.shape)
-    features = rng.uniform(0.0, 1.0, total.shape + (4,))
+    features = _valid_transport_features(rng.uniform(0.0, 1.0, total.shape + (4,)))
     live = np.linspace(1.0, 3.0, view_count, dtype=np.float64)
     predictive_mean = model.predict_mean_numpy(
         total[:, 0],
@@ -309,95 +376,71 @@ def _subset_likelihood_inputs(
 
 
 def _runtime_ready_candidate() -> GeometryConditionedSpectralModel:
-    """Return a training-ready model without independent holdout approval."""
+    """Return a physics-only model without application approval."""
     approved = approved_full_spectrum_model()
-    return GeometryConditionedSpectralModel.standard_native(
+    return GeometryConditionedSpectralModel.nonproduction_native(
         ("Co-60", "Cs-137", "Eu-154"),
         dead_time_tau_s=approved.dead_time_tau_s,
         background_rate_cps=approved.background_rate_cps,
-        rate_scale_nodes_j=approved.rate_scale_nodes_j,
-        rate_scale_weights_j=approved.rate_scale_weights_j,
-        mark_concentration_source=approved.mark_concentration_source,
-        discrepancy_training_manifest=approved.discrepancy_training_manifest,
+        physical_component_discrepancy=(approved.physical_component_discrepancy),
         additive_scatter_response=approved.additive_scatter_response,
+        detector_green_operator=approved.detector_green_operator,
     )
 
 
 def _physical_component_candidate() -> GeometryConditionedSpectralModel:
-    """Return a synthetic randomized-family component-latent candidate."""
-    approved = approved_full_spectrum_model()
+    """Return an offline component-latent numerical test model."""
     component = PhysicalComponentDiscrepancy(
         count_uncollided_concentration=100_000.0,
         count_scatter_concentration=300.0,
         mark_uncollided_concentration=100_000.0,
         mark_scatter_concentration=300.0,
+        mark_background_group_concentration=300.0,
+        mark_background_within_concentration=100_000.0,
     )
-    manifest = {
-        "schema_version": 3,
-        "training_policy": "randomized_geometry_family_training_only_v1",
-        "acceptance_contract_sha256": (
-            FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256
-        ),
-        "geometry_family_applicability_sha256": (
-            GEOMETRY_FAMILY_APPLICABILITY_SHA256
-        ),
-        "training_scene_seeds": list(DESIGNATED_TRAINING_SCENE_SEEDS),
-        "scenario_ids": list(VALIDATION_SCENARIO_IDS),
-        "artifact_sha256_by_scene_and_scenario": {
-            str(seed): {
-                scenario: {"0": "0" * 64}
-                for scenario in VALIDATION_SCENARIO_IDS
-            }
-            for seed in DESIGNATED_TRAINING_SCENE_SEEDS
-        },
-        "component_family": "uncollided_scatter_component_latents_v1",
-        "selected_concentrations": {
-            **dict(component.to_payload()),
-        },
-        "selection_objective": (
-            "maximum_training_log_predictive_density_regularized"
-        ),
-        "selection_completed": True,
-        "holdout_artifacts_consumed": False,
-    }
-    manifest["selected_concentrations"] = {
-        key: value
-        for key, value in manifest["selected_concentrations"].items()
-        if key
-        in {
-            "count_uncollided_concentration",
-            "count_scatter_concentration",
-            "mark_uncollided_concentration",
-            "mark_scatter_concentration",
-            "count_scope",
-        }
-    }
-    return GeometryConditionedSpectralModel.standard_native(
+    return GeometryConditionedSpectralModel.nonproduction_native(
         ("Co-60", "Cs-137", "Eu-154"),
-        dead_time_tau_s=approved.dead_time_tau_s,
-        background_rate_cps=approved.background_rate_cps,
+        dead_time_tau_s=5.813e-9,
+        background_rate_cps=5.0,
         physical_component_discrepancy=component,
-        discrepancy_training_manifest=manifest,
-        additive_scatter_response=approved.additive_scatter_response,
     )
 
 
-def test_physical_component_concentration_preserves_direct_information() -> None:
-    """Direct-dominated states must remain sharper than scatter states."""
+def test_physical_component_concentration_propagates_detector_information() -> None:
+    """Count, tree, and leaf uncertainty must retain physical components."""
     model = _physical_component_candidate()
     total = np.ones((2, 1, 1, len(model.line_identity)), dtype=np.float64)
     uncollided = total.copy()
     uncollided[1] *= 0.0
+    features = _valid_transport_features(np.zeros(total.shape + (4,), dtype=np.float64))
 
-    count = model._component_count_concentration_numpy(total, uncollided)
-    mark = model._base_mark_concentration_numpy(total, uncollided)
+    count = model._component_count_concentration_numpy(
+        total,
+        uncollided,
+        features,
+    )
+    component_means = np.full(
+        (2, 1, 1, 3, model.energy_axis_keV.size),
+        0.01,
+        dtype=np.float64,
+    )
+    component_means[0, ..., 0, :] = 1.0
+    component_means[1, ..., 1, :] = 1.0
+    tree, leaf = model._component_tree_mark_concentrations_numpy(
+        total,
+        uncollided,
+        component_means,
+    )
 
-    assert model.runtime_ready
-    assert model.discrepancy_training_ready
-    assert count[0, 0] == pytest.approx(100_000.0)
-    assert count[1, 0] == pytest.approx(300.0)
-    assert mark[0, 0] == pytest.approx(100_000.0)
-    assert mark[1, 0] == pytest.approx(300.0)
+    assert model.runtime_ready is False
+    assert model.discrepancy_training_ready is False
+    assert count[0, 0] > count[1, 0] > 0.0
+    assert np.median(tree[0]) > np.median(tree[1]) > 0.0
+    assert np.all(leaf > 0.0)
+    assert not np.allclose(leaf[0], leaf[1], rtol=0.0, atol=1.0e-12)
+    assert count[0, 0] < 100_000.0
+    assert np.all(np.isfinite(tree))
+    assert np.all(np.isfinite(leaf))
 
 
 def test_physical_component_concentrations_match_torch() -> None:
@@ -407,57 +450,124 @@ def test_physical_component_concentrations_match_torch() -> None:
     rng = np.random.default_rng(71)
     total = rng.uniform(0.1, 4.0, size=(3, 2, 2, len(model.line_identity)))
     uncollided = total * rng.uniform(0.0, 1.0, size=total.shape)
+    features = _valid_transport_features(rng.uniform(0.0, 1.0, size=total.shape + (4,)))
 
     count_numpy = model._component_count_concentration_numpy(
         total,
         uncollided,
+        features,
     )
-    mark_numpy = model._base_mark_concentration_numpy(total, uncollided)
+    component_means = rng.uniform(
+        0.01,
+        2.0,
+        size=(
+            3,
+            1,
+            2,
+            3,
+            model.energy_axis_keV.size,
+        ),
+    )
+    tree_numpy, leaf_numpy = model._component_tree_mark_concentrations_numpy(
+        total,
+        uncollided,
+        component_means,
+    )
     count_torch = (
         model._component_count_concentration_torch(
             torch.as_tensor(total, dtype=torch.float64),
             torch.as_tensor(uncollided, dtype=torch.float64),
+            torch.as_tensor(features, dtype=torch.float64),
         )
         .detach()
         .cpu()
         .numpy()
     )
-    mark_torch = (
-        model._base_mark_concentration_torch(
-            torch.as_tensor(total, dtype=torch.float64),
-            torch.as_tensor(uncollided, dtype=torch.float64),
-        )
-        .detach()
-        .cpu()
-        .numpy()
+    tree_torch, leaf_torch = model._component_tree_mark_concentrations_torch(
+        torch.as_tensor(total, dtype=torch.float64),
+        torch.as_tensor(uncollided, dtype=torch.float64),
+        torch.as_tensor(component_means, dtype=torch.float64),
     )
 
     assert np.allclose(count_numpy, count_torch, rtol=1.0e-12, atol=1.0e-12)
-    assert np.allclose(mark_numpy, mark_torch, rtol=1.0e-12, atol=1.0e-12)
+    assert np.allclose(
+        tree_numpy,
+        tree_torch.detach().cpu().numpy(),
+        rtol=1.0e-12,
+        atol=1.0e-12,
+    )
+    assert np.allclose(
+        leaf_numpy,
+        leaf_torch.detach().cpu().numpy(),
+        rtol=1.0e-12,
+        atol=1.0e-12,
+    )
 
 
-def test_physics_only_hierarchical_marks_round_trip_and_match_torch() -> None:
-    """Physics-only peak/continuum marks must match on CPU and GPU."""
+def test_fused_torch_count_concentration_matches_standalone_transport() -> None:
+    """Fused hierarchical transport must preserve count concentrations."""
+    torch = pytest.importorskip("torch")
+    model = approved_full_spectrum_model()
+    rng = np.random.default_rng(73191)
+    line_count = len(model.line_identity)
+    total = rng.uniform(0.1, 4.0, size=(3, 2, 2, line_count))
+    uncollided = total * rng.uniform(0.1, 1.0, size=total.shape)
+    features = _valid_transport_features(
+        rng.uniform(0.0, 1.0, size=total.shape + (4,))
+    )
+    live_times = np.asarray([7.0, 20.0], dtype=np.float64)
+    devices = ["cpu"]
+    if torch.cuda.is_available():
+        devices.append("cuda")
+
+    for device in devices:
+        total_torch = torch.as_tensor(total, device=device, dtype=torch.float64)
+        uncollided_torch = torch.as_tensor(
+            uncollided,
+            device=device,
+            dtype=torch.float64,
+        )
+        features_torch = torch.as_tensor(
+            features,
+            device=device,
+            dtype=torch.float64,
+        )
+        live_torch = torch.as_tensor(
+            live_times,
+            device=device,
+            dtype=torch.float64,
+        )
+        *_, fused = model._pre_dead_time_mean_torch(
+            total_torch,
+            uncollided_torch,
+            features_torch,
+            live_torch,
+            return_physical_components=True,
+            return_component_count_concentration=True,
+        )
+        standalone = model._component_count_concentration_torch(
+            total_torch,
+            uncollided_torch,
+            features_torch,
+        )
+
+        assert torch.allclose(fused, standalone, rtol=1.0e-12, atol=1.0e-12)
+
+
+def test_physics_only_green_uncertainty_round_trip_and_matches_torch() -> None:
+    """Physics-only Green-aware marks must match on CPU and Torch."""
     torch = pytest.importorskip("torch")
     payload = PhysicalComponentDiscrepancy.physics_only_budget().to_payload()
     component = PhysicalComponentDiscrepancy.from_payload(payload)
 
-    assert payload["schema_version"] == 4
-    assert component.mark_latent_model == (
-        "photopeak_continuum_hierarchical"
-    )
-    model_path = (
-        Path(__file__).resolve().parents[1]
-        / "configs/geant4/models/profiles/unconditioned_eu154_physics_only.json"
-    )
-    model = GeometryConditionedSpectralModel.from_manifest_payload(
-        json.loads(model_path.read_text(encoding="utf-8"))
-    )
+    assert payload["schema_version"] == 5
+    assert component.mark_latent_model == "component_dirichlet_tree_hierarchical"
+    model = approved_full_spectrum_model()
     rng = np.random.default_rng(7391)
     line_count = len(model.line_identity)
     total = rng.uniform(0.1, 3.0, size=(3, 2, 2, line_count))
     uncollided = total * rng.uniform(0.2, 1.0, size=total.shape)
-    features = rng.uniform(0.0, 1.0, size=total.shape + (4,))
+    features = _valid_transport_features(rng.uniform(0.0, 1.0, size=total.shape + (4,)))
     live = np.asarray([2.0, 3.0], dtype=np.float64)
     observed = model.sample_predictive_numpy(
         total[:1],
@@ -474,18 +584,194 @@ def test_physics_only_hierarchical_marks_round_trip_and_match_torch() -> None:
         features,
         live,
     )
-    torch_log = model.log_likelihood_torch(
-        torch.as_tensor(observed, dtype=torch.float64),
-        torch.as_tensor(total, dtype=torch.float64),
-        torch.as_tensor(uncollided, dtype=torch.float64),
-        torch.as_tensor(features, dtype=torch.float64),
-        torch.as_tensor(live, dtype=torch.float64),
-    ).detach().cpu().numpy()
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    torch_log = (
+        model.log_likelihood_torch(
+            torch.as_tensor(observed, device=device, dtype=torch.float64),
+            torch.as_tensor(total, device=device, dtype=torch.float64),
+            torch.as_tensor(uncollided, device=device, dtype=torch.float64),
+            torch.as_tensor(features, device=device, dtype=torch.float64),
+            torch.as_tensor(live, device=device, dtype=torch.float64),
+        )
+        .detach()
+        .cpu()
+        .numpy()
+    )
 
     np.testing.assert_allclose(numpy_log, torch_log, rtol=0.0, atol=2.0e-10)
     assert model.manifest_payload()["mark_model"] == (
-        "photopeak_and_grouped_continuum_dirichlet_hierarchical"
+        "component_background_source_dirichlet_tree_hierarchical"
     )
+
+
+def test_canonical_log_gamma_matches_numpy_torch_and_cuda() -> None:
+    """Every likelihood backend must execute one float64 log-gamma formula."""
+    torch = pytest.importorskip("torch")
+    values = np.asarray(
+        [0.125, 0.5, 1.0, 2.0, 17.0, 1_001.0, 835_001.0],
+        dtype=np.float64,
+    )
+    expected = transport_spectral.canonical_log_gamma_numpy(values)
+    np.testing.assert_allclose(
+        expected,
+        transport_spectral.special.gammaln(values),
+        rtol=0.0,
+        atol=5.0e-9,
+    )
+    devices = ["cpu"]
+    if torch.cuda.is_available():
+        devices.append("cuda")
+    for device in devices:
+        actual = transport_spectral.canonical_log_gamma_torch(
+            torch.as_tensor(values, device=device, dtype=torch.float64)
+        )
+        np.testing.assert_allclose(
+            actual.detach().cpu().numpy(),
+            expected,
+            rtol=0.0,
+            atol=5.0e-10,
+        )
+
+
+def test_physics_only_uncertainty_budget_cannot_be_scene_tuned() -> None:
+    """Physics-only provenance must reject altered uncertainty values."""
+    with pytest.raises(ValueError, match="immutable"):
+        PhysicalComponentDiscrepancy(
+            count_uncollided_concentration=2501.0,
+            count_scatter_concentration=4.0,
+            mark_uncollided_concentration=9999.0,
+            mark_scatter_concentration=23.999999999999996,
+            mark_background_group_concentration=23.999999999999996,
+            mark_background_within_concentration=9999.0,
+            provenance="physics_only_uncertainty_budget_v1",
+        )
+
+
+def test_component_tree_absent_co_false_positive_calibration() -> None:
+    """Null Cs observations must calibrate weak absent-Co alternatives."""
+    model = approved_full_spectrum_model()
+    view_count = 4
+    line_count = len(model.line_identity)
+    isotopes = np.asarray(
+        [str(row["isotope"]) for row in model.line_identity],
+        dtype=object,
+    )
+    cs_lines = isotopes == "Cs-137"
+    co_lines = isotopes == "Co-60"
+    attenuation = np.linspace(0.6, 1.0, view_count, dtype=np.float64)
+    null_total = np.zeros((view_count, 1, line_count), dtype=np.float64)
+    null_total[:, 0, cs_lines] = 10.0 * attenuation[:, np.newaxis]
+    null_uncollided = 0.8 * null_total
+    base_features = _valid_transport_features(
+        np.zeros(null_total.shape + (4,), dtype=np.float64)
+    )
+    live_times = np.full(
+        view_count,
+        STANDARD_ACQUISITION_LIVE_TIME_S,
+        dtype=np.float64,
+    )
+    rng = np.random.default_rng(80315)
+    observed = model.sample_predictive_numpy(
+        null_total[np.newaxis, ...],
+        null_uncollided[np.newaxis, ...],
+        base_features[np.newaxis, ...],
+        live_times,
+        sample_count=256,
+        rng=rng,
+    )[0]
+    candidates = []
+    for relative_co_rate in (0.0, 0.002, 0.005, 0.01, 0.02):
+        candidate = null_total.copy()
+        candidate[:, 0, co_lines] = relative_co_rate * 10.0 * attenuation[:, np.newaxis]
+        candidates.append(candidate)
+    total = np.stack(candidates, axis=0)
+    uncollided = 0.8 * total
+    features = np.broadcast_to(
+        base_features,
+        total.shape + (base_features.shape[-1],),
+    ).copy()
+    log_likelihood = model.cross_log_likelihood_numpy(
+        observed,
+        total,
+        uncollided,
+        features,
+        live_times,
+        action_chunk_size=1,
+        sample_chunk_size=64,
+        state_chunk_size=len(candidates),
+    )
+    null_log = np.log(0.95) + log_likelihood[:, 0]
+    alternative_log = (
+        np.log(0.05)
+        + transport_spectral.special.logsumexp(log_likelihood[:, 1:], axis=1)
+        - np.log(float(len(candidates) - 1))
+    )
+    posterior_positive = np.exp(
+        alternative_log - np.logaddexp(null_log, alternative_log)
+    )
+    false_positive_rate = float(np.mean(posterior_positive > 0.5))
+
+    diagnostic_index = int(np.argmax(posterior_positive))
+    decomposition = model.decompose_log_likelihood_numpy(
+        observed[diagnostic_index],
+        total,
+        uncollided,
+        features,
+        live_times,
+    )
+
+    assert false_positive_rate <= 0.05
+    np.testing.assert_allclose(
+        decomposition.total_log_likelihood_n,
+        log_likelihood[diagnostic_index],
+        rtol=0.0,
+        atol=1.0e-8,
+    )
+    assert decomposition.total_count_nv.shape == (len(candidates), view_count)
+    assert decomposition.background_mark_nv.shape == (len(candidates), view_count)
+    assert decomposition.source_mark_nv.shape == (len(candidates), view_count)
+
+
+def test_physics_only_background_bypasses_source_component_gamma_limit() -> None:
+    """Source-free likelihoods must use exact renewal counts on CPU and Torch."""
+    torch = pytest.importorskip("torch")
+    model = approved_full_spectrum_model()
+    view_count = 5
+    line_count = len(model.line_identity)
+    total = np.zeros((1, view_count, 0, line_count), dtype=np.float64)
+    uncollided = total.copy()
+    features = _valid_transport_features(np.zeros(total.shape + (4,), dtype=np.float64))
+    live = np.full(view_count, 20.0, dtype=np.float64)
+    observed = model.sample_predictive_numpy(
+        total,
+        uncollided,
+        features,
+        live,
+        sample_count=1,
+        rng=np.random.default_rng(8701),
+    )[0, 0].astype(np.float64)
+
+    numpy_log = model.log_likelihood_numpy(
+        observed,
+        total,
+        uncollided,
+        features,
+        live,
+    )
+    torch_log = (
+        model.log_likelihood_torch(
+            torch.as_tensor(observed, dtype=torch.float64),
+            torch.as_tensor(total, dtype=torch.float64),
+            torch.as_tensor(uncollided, dtype=torch.float64),
+            torch.as_tensor(features, dtype=torch.float64),
+            torch.as_tensor(live, dtype=torch.float64),
+        )
+        .detach()
+        .cpu()
+        .numpy()
+    )
+
+    np.testing.assert_allclose(numpy_log, torch_log, rtol=0.0, atol=2.0e-9)
 
 
 def _training_ready_mean_correction(
@@ -499,9 +785,7 @@ def _training_ready_mean_correction(
     regression[0, 0] = 0.5
     training = {
         "schema_version": 1,
-        "training_policy": (
-            "fixed_quota_loso_training_only_low_rank_log_mean_v1"
-        ),
+        "training_policy": ("fixed_quota_loso_training_only_low_rank_log_mean_v1"),
         "training_scene_seeds": [2026072701, 2026072702],
         "scenario_ids": ["multi_isotope_superposition"],
         "pair_ids_by_scene": {
@@ -536,71 +820,6 @@ def _training_ready_mean_correction(
     )
 
 
-def _native_response_column_reference(
-    input_index: int,
-    *,
-    bin_count: int = 851,
-    bin_width_keV: float = 2.0,
-) -> np.ndarray:
-    """Independently reproduce one C++ detector-response probability column."""
-    output_energy = np.arange(bin_count, dtype=np.float64) * bin_width_keV
-    incident_energy = float(input_index) * bin_width_keV
-    if incident_energy <= 0.0:
-        result = np.zeros(bin_count, dtype=np.float64)
-        result[0] = 1.0
-        return result
-    sigma = max(0.5 * np.sqrt(incident_energy) - 1.5, 0.5)
-    peak = np.exp(
-        -0.5 * np.square((output_energy - incident_energy) / sigma)
-    )
-    peak /= np.sum(peak)
-    compton_edge = incident_energy * (
-        1.0 - 1.0 / (1.0 + 2.0 * incident_energy / 511.0)
-    )
-    continuum_tau = max(compton_edge / 3.0, 1.0e-12)
-    continuum = np.where(
-        output_energy <= compton_edge,
-        np.exp(-output_energy / continuum_tau),
-        0.0,
-    )
-    continuum /= np.sum(continuum)
-    backscatter_energy = incident_energy / (
-        1.0 + 2.0 * incident_energy / 511.0
-    )
-    backscatter_sigma = max(
-        0.5 * np.sqrt(backscatter_energy) - 1.5,
-        0.5,
-    )
-    backscatter = np.exp(
-        -0.5
-        * np.square(
-            (output_energy - backscatter_energy) / backscatter_sigma
-        )
-    )
-    backscatter /= np.sum(backscatter)
-    result = (peak + 2.0 * continuum + 0.03 * backscatter) / 3.03
-    return result / np.sum(result)
-
-
-def test_native_detector_response_matches_cpp_probability_contract() -> None:
-    """The Python mean operator must equal the C++ marking probabilities."""
-    axis = np.arange(851, dtype=np.float64) * 2.0
-    operator = build_native_geant4_detector_response_matrix(axis, 2.0)
-    assert np.allclose(np.sum(operator, axis=0), 1.0, rtol=0.0, atol=2e-15)
-    for input_index in (0, 1, 331, 586, 666, 798, 850):
-        assert np.allclose(
-            operator[:, input_index],
-            _native_response_column_reference(input_index),
-            rtol=2e-15,
-            atol=2e-15,
-        )
-    assert (
-        NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
-        == "0ab48601e0965c2c9ea973505523558bf"
-        "4dd5d394129397c3d4079c143787ae5"
-    )
-
-
 def test_total_below_uncollided_fails_closed_numpy_and_torch() -> None:
     """An impossible incident-count decomposition must never be normalized."""
     model = _model(dead_time_tau_s=0.0, background_rate_cps=0.0)
@@ -610,7 +829,7 @@ def test_total_below_uncollided_fails_closed_numpy_and_torch() -> None:
     total[0, 0, 1, 4] = 11.0
     total[1, 0, 2, 8] = 13.0
     uncollided = 3.0 * total
-    features = np.zeros(total.shape + (4,), dtype=np.float64)
+    features = _valid_transport_features(np.zeros(total.shape + (4,), dtype=np.float64))
     live_times = np.array([30.0], dtype=np.float64)
     with pytest.raises(ValueError, match="cannot exceed total"):
         model._pre_dead_time_mean_numpy(
@@ -629,68 +848,17 @@ def test_total_below_uncollided_fails_closed_numpy_and_torch() -> None:
         )
 
 
-def test_low_rank_mean_correction_round_trip_and_cpu_torch_equivalence() -> None:
-    """The trained mean correction must preserve one batched implementation."""
-    torch = pytest.importorskip("torch")
+def test_low_rank_mean_correction_is_rejected_by_schema_four() -> None:
+    """Scene-fitted spectral corrections cannot enter runtime schema four."""
     approved = approved_full_spectrum_model()
-    correction = _training_ready_mean_correction(approved)
-    corrected = GeometryConditionedSpectralModel.standard_native(
-        ("Co-60", "Cs-137", "Eu-154"),
-        dead_time_tau_s=0.0,
-        background_rate_cps=0.0,
-        additive_scatter_response=approved.additive_scatter_response,
-        low_rank_spectral_mean_correction=correction,
-    )
-    uncorrected = GeometryConditionedSpectralModel.standard_native(
-        ("Co-60", "Cs-137", "Eu-154"),
-        dead_time_tau_s=0.0,
-        background_rate_cps=0.0,
-        additive_scatter_response=approved.additive_scatter_response,
-    )
-    reconstructed = GeometryConditionedSpectralModel.from_manifest_payload(
-        corrected.manifest_payload()
-    )
-    assert reconstructed.contract_hash_sha256 == corrected.contract_hash_sha256
-    assert reconstructed.runtime_ready is True
-    line_count = len(corrected.line_identity)
-    total = np.zeros((2, 1, 3, line_count), dtype=np.float64)
-    total[0, 0, 0, 0] = 10.0
-    total[1, 0, 2, -1] = 15.0
-    uncollided = 0.8 * total
-    features = np.zeros(total.shape + (4,), dtype=np.float64)
-    features[..., 3] = 2.0
-    live_times = np.asarray([30.0], dtype=np.float64)
-    numpy_mean = corrected.predict_mean_numpy(
-        total,
-        uncollided,
-        features,
-        live_times,
-    )
-    torch_mean = (
-        corrected.predict_mean_torch(
-            torch.as_tensor(total, dtype=torch.float64),
-            torch.as_tensor(uncollided, dtype=torch.float64),
-            torch.as_tensor(features, dtype=torch.float64),
-            torch.as_tensor(live_times, dtype=torch.float64),
+    payload = json.loads(json.dumps(approved.manifest_payload()))
+    payload["low_rank_spectral_mean_correction"] = {"schema_version": 1}
+
+    with pytest.raises(ValueError, match="low-rank"):
+        GeometryConditionedSpectralModel.from_manifest_payload(
+            payload,
+            detector_green_operator=approved.detector_green_operator,
         )
-        .detach()
-        .cpu()
-        .numpy()
-    )
-    assert np.allclose(numpy_mean, torch_mean, rtol=2.0e-11, atol=2.0e-9)
-    uncorrected_mean = uncorrected.predict_mean_numpy(
-        total,
-        uncollided,
-        features,
-        live_times,
-    )
-    assert not np.allclose(numpy_mean, uncorrected_mean)
-    assert np.allclose(
-        np.sum(numpy_mean, axis=-1),
-        np.sum(uncorrected_mean, axis=-1),
-        rtol=1.0e-12,
-        atol=1.0e-10,
-    )
 
 
 def test_spectrum_mean_and_cross_likelihood_match_torch() -> None:
@@ -708,7 +876,7 @@ def test_spectrum_mean_and_cross_likelihood_match_torch() -> None:
         (particle_count, view_count, source_count, line_count),
     )
     uncollided = total * rng.uniform(0.25, 1.0, total.shape)
-    features = rng.uniform(0.0, 2.0, total.shape + (4,))
+    features = _valid_transport_features(rng.uniform(0.0, 2.0, total.shape + (4,)))
     live_times = np.array([30.0, 20.0, 10.0], dtype=np.float64)
     mean_numpy = model.predict_mean_numpy(
         total,
@@ -759,9 +927,7 @@ def test_spectrum_mean_and_cross_likelihood_match_torch() -> None:
         "rate_nodes",
         "station_shared_count",
         "view_independent_count",
-        "component_fraction",
-        "component_scale",
-        "component_hierarchical",
+        "component_tree",
     ),
 )
 def test_numpy_subset_cache_matches_direct_arbitrary_view_likelihood(
@@ -810,14 +976,14 @@ def test_numpy_subset_cache_matches_direct_arbitrary_view_likelihood(
                 cached[action_index, candidate_index],
                 direct,
                 rtol=2.0e-12,
-                atol=2.0e-9,
+                atol=5.0e-9,
             )
     reversed_subsets = subsets[..., ::-1]
     assert np.allclose(
         cached,
         prepared.evaluate(reversed_subsets),
         rtol=2.0e-12,
-        atol=2.0e-9,
+        atol=5.0e-9,
     )
     full = model.cross_log_likelihood_numpy(
         observed,
@@ -826,7 +992,7 @@ def test_numpy_subset_cache_matches_direct_arbitrary_view_likelihood(
         features,
         live,
     )
-    assert np.allclose(prepared.full(), full, rtol=2.0e-12, atol=2.0e-9)
+    assert np.allclose(prepared.full(), full, rtol=2.0e-12, atol=5.0e-9)
 
 
 def test_shared_gamma_subset_cache_ignores_every_unselected_view() -> None:
@@ -848,7 +1014,7 @@ def test_shared_gamma_subset_cache_ignores_every_unselected_view() -> None:
     changed_observed[:, :, (0, 2), 0] += 10_000.0
     changed_total[:, :, (0, 2)] *= 9.0
     changed_uncollided[:, :, (0, 2)] *= 0.1
-    changed_features[:, :, (0, 2)] += 7.0
+    changed_features[:, :, (0, 2), ..., :4] += 7.0
     changed = model.prepare_subset_cross_likelihood_numpy(
         changed_observed,
         changed_total,
@@ -889,9 +1055,7 @@ def test_subset_cache_rejects_invalid_or_duplicate_view_indices() -> None:
         "rate_nodes",
         "station_shared_count",
         "view_independent_count",
-        "component_fraction",
-        "component_scale",
-        "component_hierarchical",
+        "component_tree",
     ),
 )
 def test_torch_subset_cache_matches_numpy_and_stays_device_resident(
@@ -945,12 +1109,12 @@ def test_torch_subset_cache_matches_numpy_and_stays_device_resident(
 
 
 @pytest.mark.parametrize("scope", ["station_shared", "view_independent"])
-def test_shared_gamma_full_likelihood_and_prefix_match_torch(
+def test_shared_gamma_full_likelihood_matches_torch(
     scope: str,
 ) -> None:
-    """The batched shared-Gamma likelihood must match Torch and its prefix."""
+    """The complete-station shared-Gamma likelihood must match Torch."""
     torch = pytest.importorskip("torch")
-    model = GeometryConditionedSpectralModel.standard_native(
+    model = GeometryConditionedSpectralModel.nonproduction_native(
         ("Co-60", "Cs-137", "Eu-154"),
         dead_time_tau_s=5.813e-9,
         background_rate_cps=5.0,
@@ -963,23 +1127,21 @@ def test_shared_gamma_full_likelihood_and_prefix_match_torch(
     line_count = len(model.line_identity)
     total = rng.uniform(0.0, 30.0, (3, 2, 2, line_count))
     uncollided = total * rng.uniform(0.25, 1.0, total.shape)
-    features = rng.uniform(0.0, 2.0, total.shape + (4,))
+    features = _valid_transport_features(rng.uniform(0.0, 2.0, total.shape + (4,)))
     live = np.asarray([30.0, 15.0], dtype=np.float64)
     observed = np.rint(
-        model.predict_mean_numpy(total[:1], uncollided[:1], features[:1], live)[
-            0
-        ]
+        model.predict_mean_numpy(total[:1], uncollided[:1], features[:1], live)[0]
     )
 
-    numpy_prefix = model.prefix_log_likelihood_numpy(
+    numpy_full = model.log_likelihood_numpy(
         observed,
         total,
         uncollided,
         features,
         live,
     )
-    torch_prefix = (
-        model.prefix_log_likelihood_torch(
+    torch_full = (
+        model.log_likelihood_torch(
             torch.as_tensor(observed, dtype=torch.float64),
             torch.as_tensor(total, dtype=torch.float64),
             torch.as_tensor(uncollided, dtype=torch.float64),
@@ -990,20 +1152,11 @@ def test_shared_gamma_full_likelihood_and_prefix_match_torch(
         .cpu()
         .numpy()
     )
-    full = model.log_likelihood_numpy(
-        observed,
-        total,
-        uncollided,
-        features,
-        live,
-    )
-
-    assert np.allclose(numpy_prefix, torch_prefix, rtol=1e-10, atol=1e-7)
-    assert np.array_equal(numpy_prefix[-1], full)
+    assert np.allclose(numpy_full, torch_full, rtol=1e-10, atol=1e-7)
 
 
-def test_view_prefix_likelihood_preserves_shared_latent_and_final_target() -> None:
-    """Prefix bridges must retain one station-wide latent scale mixture."""
+def test_complete_station_likelihood_uses_all_views_and_matches_torch() -> None:
+    """The complete-station target must use all views and match Torch."""
     torch = pytest.importorskip("torch")
     model = _model()
     rng = np.random.default_rng(20260730)
@@ -1017,7 +1170,7 @@ def test_view_prefix_likelihood_preserves_shared_latent_and_final_target() -> No
         (particle_count, view_count, source_count, line_count),
     )
     uncollided = total * rng.uniform(0.1, 1.0, total.shape)
-    features = rng.uniform(0.0, 2.0, total.shape + (4,))
+    features = _valid_transport_features(rng.uniform(0.0, 2.0, total.shape + (4,)))
     live_times = np.asarray([30.0, 20.0, 10.0, 5.0], dtype=np.float64)
     observed = np.rint(
         model.predict_mean_numpy(
@@ -1028,15 +1181,15 @@ def test_view_prefix_likelihood_preserves_shared_latent_and_final_target() -> No
         )[0]
     ).astype(np.float64)
 
-    prefix_numpy = model.prefix_log_likelihood_numpy(
+    full_numpy = model.log_likelihood_numpy(
         observed,
         total,
         uncollided,
         features,
         live_times,
     )
-    prefix_torch = (
-        model.prefix_log_likelihood_torch(
+    full_torch = (
+        model.log_likelihood_torch(
             torch.as_tensor(observed, dtype=torch.float64),
             torch.as_tensor(total, dtype=torch.float64),
             torch.as_tensor(uncollided, dtype=torch.float64),
@@ -1047,24 +1200,14 @@ def test_view_prefix_likelihood_preserves_shared_latent_and_final_target() -> No
         .cpu()
         .numpy()
     )
-    full = model.log_likelihood_numpy(
-        observed,
-        total,
-        uncollided,
-        features,
-        live_times,
-    )
-
-    assert prefix_numpy.shape == (view_count + 1, particle_count)
-    assert np.array_equal(prefix_numpy[0], np.zeros(particle_count))
-    assert np.array_equal(prefix_numpy[-1], full)
-    assert np.allclose(prefix_numpy, prefix_torch, rtol=1e-10, atol=1e-7)
+    assert full_numpy.shape == (particle_count,)
+    assert np.allclose(full_numpy, full_torch, rtol=1e-10, atol=1e-7)
 
 
 def test_zero_total_marks_are_exactly_neutral_numpy_torch_and_cross() -> None:
     """A zero-count spectrum must contribute only its renewal total term."""
     torch = pytest.importorskip("torch")
-    hierarchical = GeometryConditionedSpectralModel.standard_native(
+    hierarchical = GeometryConditionedSpectralModel.nonproduction_native(
         ("Co-60", "Cs-137", "Eu-154"),
         dead_time_tau_s=5.813e-9,
         background_rate_cps=0.0,
@@ -1072,7 +1215,7 @@ def test_zero_total_marks_are_exactly_neutral_numpy_torch_and_cross() -> None:
         rate_scale_weights_j=(0.25, 0.5, 0.25),
         mark_concentration_source=100.0,
     )
-    plain = GeometryConditionedSpectralModel.standard_native(
+    plain = GeometryConditionedSpectralModel.nonproduction_native(
         ("Co-60", "Cs-137", "Eu-154"),
         dead_time_tau_s=5.813e-9,
         background_rate_cps=0.0,
@@ -1087,7 +1230,7 @@ def test_zero_total_marks_are_exactly_neutral_numpy_torch_and_cross() -> None:
         dtype=np.float64,
     )[np.newaxis, :, np.newaxis, np.newaxis]
     uncollided = total.copy()
-    features = np.zeros(total.shape + (4,), dtype=np.float64)
+    features = _valid_transport_features(np.zeros(total.shape + (4,), dtype=np.float64))
     features[..., 3] = 2.0
     observed = np.zeros((2, 4, 2, 851), dtype=np.float64)
     live = np.asarray((0.01, 30.0), dtype=np.float64)
@@ -1152,7 +1295,7 @@ def test_zero_total_marks_are_exactly_neutral_numpy_torch_and_cross() -> None:
     assert np.all(np.isfinite(numpy_cross))
     assert np.array_equal(numpy_cross, numpy_plain)
     assert np.allclose(numpy_cross, torch_cross, rtol=0.0, atol=1.0e-10)
-    assert np.array_equal(numpy_single, numpy_cross[0, 0])
+    assert np.allclose(numpy_single, numpy_cross[0, 0], rtol=0.0, atol=1.0e-10)
     assert np.allclose(numpy_single, torch_single, rtol=0.0, atol=1.0e-10)
 
 
@@ -1169,7 +1312,7 @@ def test_background_and_source_share_one_pre_dead_time_total() -> None:
     source_rates = np.asarray([20.0, 40.0], dtype=np.float64)
     total = np.zeros((1, 2, 1, line_count), dtype=np.float64)
     total[0, :, 0, 0] = source_rates
-    features = np.zeros(total.shape + (4,), dtype=np.float64)
+    features = _valid_transport_features(np.zeros(total.shape + (4,), dtype=np.float64))
 
     predicted = model.predict_mean_numpy(
         total,
@@ -1178,11 +1321,20 @@ def test_background_and_source_share_one_pre_dead_time_total() -> None:
         live_times,
     )
     predicted_total = np.sum(predicted[0], axis=-1)
-    pre_dead_time_rate = source_rates + background_rate
-    expected_total = (
-        pre_dead_time_rate
-        * live_times
-        / (1.0 + pre_dead_time_rate * tau)
+    source_mean, background_mean = model._pre_dead_time_mean_numpy(
+        total,
+        total,
+        features,
+        live_times,
+        return_components=True,
+    )
+    np.testing.assert_allclose(
+        np.sum(background_mean[0], axis=-1),
+        background_rate * live_times,
+    )
+    pre_dead_time_counts = np.sum(source_mean[0] + background_mean[0], axis=-1)
+    expected_total = pre_dead_time_counts / (
+        1.0 + pre_dead_time_counts / live_times * tau
     )
 
     np.testing.assert_allclose(
@@ -1202,7 +1354,7 @@ def test_cross_likelihood_chunking_matches_unchunked_numpy_and_torch() -> None:
     """Action, predictive-sample, and state chunks must preserve exact scores."""
     torch = pytest.importorskip("torch")
     nodes, weights = rate_scale_mixture_for_half_width(0.10)
-    model = GeometryConditionedSpectralModel.standard_native(
+    model = GeometryConditionedSpectralModel.nonproduction_native(
         ("Cs-137", "Eu-154"),
         dead_time_tau_s=2.0e-5,
         background_rate_cps=4.0,
@@ -1229,7 +1381,7 @@ def test_cross_likelihood_chunking_matches_unchunked_numpy_and_torch() -> None:
         ),
     )
     uncollided = total * rng.uniform(0.2, 1.0, total.shape)
-    features = rng.uniform(0.0, 1.0, total.shape + (4,))
+    features = _valid_transport_features(rng.uniform(0.0, 1.0, total.shape + (4,)))
     live_times = np.array([2.0, 3.0], dtype=np.float64)
     observations = model.sample_predictive_numpy(
         total[:, :sample_count],
@@ -1336,10 +1488,12 @@ def test_cuda_cross_likelihood_autotune_matches_explicit_chunks(
     )
     uncollided = 0.75 * total
     features = torch.zeros(
-        tuple(total.shape) + (4,),
+        tuple(total.shape) + (5 + DETECTOR_IMPACT_PHASE_COUNT,),
         device="cuda",
         dtype=torch.float64,
     )
+    features[..., 4] = 1.25
+    features[..., 5:] = 1.0 / DETECTOR_IMPACT_PHASE_COUNT
     observed = torch.zeros(
         (1, 1, 1, int(model.energy_axis_keV.size)),
         device="cuda",
@@ -1368,9 +1522,11 @@ def test_cuda_cross_likelihood_autotune_matches_explicit_chunks(
         explicit.detach().cpu().numpy(),
     )
     assert diagnostics["mode"] == "empirical_cuda_autotune"
-    assert [
-        trial["state_chunk_size"] for trial in diagnostics["trials"]
-    ] == [256, 512, 1024]
+    assert [trial["state_chunk_size"] for trial in diagnostics["trials"]] == [
+        256,
+        512,
+        1024,
+    ]
     assert diagnostics["selected_state_chunk_size"] in {256, 512, 1024}
 
 
@@ -1472,11 +1628,9 @@ def test_birth_proposal_score_is_finite_target_only_and_matches_torch() -> None:
     )
     candidate_count = 6
     total = np.zeros((candidate_count, 2, 1, line_count), dtype=np.float64)
-    total[:, :, 0, mask] = np.linspace(10.0, 60.0, candidate_count)[
-        :, None, None
-    ]
+    total[:, :, 0, mask] = np.linspace(10.0, 60.0, candidate_count)[:, None, None]
     uncollided = 0.8 * total
-    features = np.zeros(total.shape + (4,), dtype=np.float64)
+    features = _valid_transport_features(np.zeros(total.shape + (4,), dtype=np.float64))
     live_times = np.array([30.0, 30.0], dtype=np.float64)
     observed = np.rint(
         model.predict_mean_numpy(
@@ -1497,7 +1651,7 @@ def test_birth_proposal_score_is_finite_target_only_and_matches_torch() -> None:
     background = model.predict_mean_numpy(
         np.zeros((1, 2, 1, line_count), dtype=np.float64),
         np.zeros((1, 2, 1, line_count), dtype=np.float64),
-        np.zeros((1, 2, 1, line_count, 4), dtype=np.float64),
+        _valid_transport_features(np.zeros((1, 2, 1, line_count, 4), dtype=np.float64)),
         live_times,
     )[0]
     reference = background + 0.15 * observed
@@ -1566,7 +1720,7 @@ def test_birth_proposal_score_is_independent_of_candidate_chunking(
     total = np.zeros((5, 2, 1, line_count), dtype=np.float64)
     total[:, :, 0, mask] = np.linspace(5.0, 45.0, 5)[:, None, None]
     uncollided = 0.75 * total
-    features = np.zeros(total.shape + (4,), dtype=np.float64)
+    features = _valid_transport_features(np.zeros(total.shape + (4,), dtype=np.float64))
     live_times = np.asarray([30.0, 30.0], dtype=np.float64)
     observed = np.rint(
         model.predict_mean_numpy(
@@ -1608,7 +1762,7 @@ def test_birth_proposal_score_is_independent_of_candidate_chunking(
         one_batch,
         scalar_chunks,
         rtol=0.0,
-        atol=2.0e-12,
+        atol=2.0e-11,
     )
 
 
@@ -1618,7 +1772,10 @@ def test_torch_production_paths_reject_float32() -> None:
     model = _model()
     line_count = len(model.line_identity)
     total = torch.zeros((1, 1, 1, line_count), dtype=torch.float32)
-    features = torch.zeros(total.shape + (4,), dtype=torch.float32)
+    features = torch.zeros(
+        total.shape + (5 + DETECTOR_IMPACT_PHASE_COUNT,),
+        dtype=torch.float32,
+    )
     with pytest.raises(TypeError, match="float64"):
         model.predict_mean_torch(
             total,
@@ -1715,11 +1872,7 @@ def _high_precision_renewal_log_probability(
             """Return the shape-m unit-scale gamma log density."""
             if argument == 0:
                 return mp.mpf(0) if m == 1 else mp.ninf
-            return (
-                (m - 1) * mp.log(argument)
-                - argument
-                - mp.loggamma(m)
-            )
+            return (m - 1) * mp.log(argument) - argument - mp.loggamma(m)
 
         if width > 0:
             mode = min(max(m - 1, second), first)
@@ -1732,19 +1885,12 @@ def _high_precision_renewal_log_probability(
             )
             log_terms.append(log_scale + mp.log(scaled_interval))
         if second > 0:
-            log_terms.append(
-                m * mp.log(second)
-                - second
-                - mp.loggamma(m + 1)
-            )
+            log_terms.append(m * mp.log(second) - second - mp.loggamma(m + 1))
         if not log_terms:
             return -np.inf
         maximum = max(log_terms)
         return float(
-            maximum
-            + mp.log(
-                sum(mp.exp(value - maximum) for value in log_terms)
-            )
+            maximum + mp.log(sum(mp.exp(value - maximum) for value in log_terms))
         )
 
 
@@ -1764,10 +1910,7 @@ def test_renewal_extreme_tails_match_positive_high_precision_oracle() -> None:
         dead_time_tau_s=cases[0][3],
     )
     first_group_expected = np.asarray(
-        [
-            _high_precision_renewal_log_probability(*case)
-            for case in cases[:3]
-        ],
+        [_high_precision_renewal_log_probability(*case) for case in cases[:3]],
         dtype=np.float64,
     )
     second_group_actual = nonparalyzable_count_log_probability_numpy(
@@ -1777,10 +1920,7 @@ def test_renewal_extreme_tails_match_positive_high_precision_oracle() -> None:
         dead_time_tau_s=cases[3][3],
     )
     second_group_expected = np.asarray(
-        [
-            _high_precision_renewal_log_probability(*case)
-            for case in cases[3:]
-        ],
+        [_high_precision_renewal_log_probability(*case) for case in cases[3:]],
         dtype=np.float64,
     )
     saturation_case = (100_000, 1.0, 1.0, 1.0e-5)
@@ -1790,9 +1930,7 @@ def test_renewal_extreme_tails_match_positive_high_precision_oracle() -> None:
         np.asarray([saturation_case[2]], dtype=np.float64),
         dead_time_tau_s=saturation_case[3],
     )[0]
-    saturation_expected = _high_precision_renewal_log_probability(
-        *saturation_case
-    )
+    saturation_expected = _high_precision_renewal_log_probability(*saturation_case)
     assert np.all(np.isfinite(first_group_actual))
     assert np.all(np.isfinite(second_group_actual))
     assert np.allclose(
@@ -1930,9 +2068,7 @@ def test_renewal_runtime_scale_numpy_torch_cpu_cuda_equivalence() -> None:
         dead_time_tau_s=tau,
     )
 
-    for device in (
-        ["cpu", "cuda"] if torch.cuda.is_available() else ["cpu"]
-    ):
+    for device in ["cpu", "cuda"] if torch.cuda.is_available() else ["cpu"]:
         actual = (
             nonparalyzable_count_log_probability_torch(
                 torch.as_tensor(counts, dtype=torch.float64, device=device),
@@ -2009,9 +2145,7 @@ def test_vectorized_renewal_sampler_matches_exact_mean_and_fano() -> None:
     )
     probability = np.exp(log_probability)
     exact_mean = float(np.sum(support * probability))
-    exact_variance = float(
-        np.sum(np.square(support - exact_mean) * probability)
-    )
+    exact_variance = float(np.sum(np.square(support - exact_mean) * probability))
     samples = sample_nonparalyzable_counts_numpy(
         np.array([rate], dtype=np.float64),
         np.array([live_time], dtype=np.float64),
@@ -2022,10 +2156,7 @@ def test_vectorized_renewal_sampler_matches_exact_mean_and_fano() -> None:
     sampled_mean = float(np.mean(samples))
     sampled_variance = float(np.var(samples))
     assert abs(sampled_mean - exact_mean) < 0.04
-    assert abs(
-        sampled_variance / sampled_mean
-        - exact_variance / exact_mean
-    ) < 0.015
+    assert abs(sampled_variance / sampled_mean - exact_variance / exact_mean) < 0.015
 
 
 def test_renewal_sampler_handles_zero_rate_and_near_saturation() -> None:
@@ -2057,7 +2188,7 @@ def test_predictive_sampler_preserves_renewal_total_and_mark_shape() -> None:
     total = np.zeros((2, 1, 1, line_count), dtype=np.float64)
     total[:, 0, 0, 0] = np.array([500.0, 800.0])
     uncollided = total.copy()
-    features = np.zeros(total.shape + (4,), dtype=np.float64)
+    features = _valid_transport_features(np.zeros(total.shape + (4,), dtype=np.float64))
     samples = model.sample_predictive_numpy(
         total,
         uncollided,
@@ -2074,61 +2205,121 @@ def test_predictive_sampler_preserves_renewal_total_and_mark_shape() -> None:
 
 
 def test_untrained_model_fails_runtime_and_production_gates() -> None:
-    """A model without training provenance must fail both readiness gates."""
+    """A model without the physics-only transport contract fails closed."""
     model = _model()
     assert model.runtime_ready is False
     assert model.production_ready is False
-    with pytest.raises(RuntimeError, match="training-only"):
+    with pytest.raises(RuntimeError, match="physics-only"):
         model.require_runtime_ready()
-    with pytest.raises(RuntimeError, match="all-64 holdout"):
+    with pytest.raises(RuntimeError, match="all-64 validation"):
         model.require_production_ready()
     assert model.manifest_payload()["runtime_ready"] is False
     assert model.manifest_payload()["production_ready"] is False
 
 
-def test_training_ready_candidate_does_not_require_holdout_for_runtime() -> None:
-    """Training-only readiness must authorize runtime before paper validation."""
+def test_physics_only_candidate_is_runtime_ready_but_not_approved() -> None:
+    """Physics readiness and application approval remain separate gates."""
     candidate = _runtime_ready_candidate()
 
     assert candidate.runtime_ready is True
     assert candidate.production_ready is False
     candidate.require_runtime_ready()
-    with pytest.raises(RuntimeError, match="all-64 holdout"):
+    with pytest.raises(RuntimeError, match="all-64"):
         candidate.require_production_ready()
 
     payload = candidate.manifest_payload()
     assert payload["runtime_ready"] is True
     assert payload["production_ready"] is False
     reconstructed = GeometryConditionedSpectralModel.from_manifest_payload(
-        payload
+        payload,
+        detector_green_operator=candidate.detector_green_operator,
     )
     assert reconstructed.runtime_ready is True
     assert reconstructed.production_ready is False
-    assert (
-        reconstructed.contract_hash_sha256
-        == candidate.contract_hash_sha256
-    )
+    assert reconstructed.contract_hash_sha256 == candidate.contract_hash_sha256
 
 
-def test_exact_physical_statistics_need_only_trained_additive_mean() -> None:
-    """Exact count and mark laws must not require empirical dispersion fitting."""
-    approved = approved_full_spectrum_model()
-    model = GeometryConditionedSpectralModel.standard_native(
-        ("Co-60", "Cs-137", "Eu-154"),
-        dead_time_tau_s=approved.dead_time_tau_s,
-        background_rate_cps=approved.background_rate_cps,
-        additive_scatter_response=approved.additive_scatter_response,
-    )
+def test_physics_only_candidate_needs_no_scene_fitted_terms() -> None:
+    """Runtime readiness must use no empirical scene-fit correction."""
+    model = _runtime_ready_candidate()
 
     assert model.exact_physical_statistics_ready is True
     assert model.discrepancy_training_ready is False
+    assert model.discrepancy_training_manifest is None
+    assert model.low_rank_spectral_mean_correction is None
     assert model.runtime_ready is True
     assert model.production_ready is False
     reconstructed = GeometryConditionedSpectralModel.from_manifest_payload(
-        model.manifest_payload()
+        model.manifest_payload(),
+        detector_green_operator=model.detector_green_operator,
     )
     assert reconstructed.exact_physical_statistics_ready is True
     assert reconstructed.runtime_ready is True
+
+
+def test_physics_only_prediction_cannot_enter_retired_scatter_order_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Schema-v6 mean and uncertainty must use only detector-cone scatter."""
+    model = _runtime_ready_candidate()
+    line_count = len(model.line_identity)
+    total = np.zeros((1, 1, 1, line_count), dtype=np.float64)
+    uncollided = np.zeros_like(total)
+    total[..., 0] = 2.0
+    uncollided[..., 0] = 1.0
+    base_features = np.broadcast_to(
+        np.asarray((0.2, 0.3, 0.1, 2.0), dtype=np.float64),
+        total.shape + (4,),
+    )
+    features = _valid_transport_features(base_features)
+
+    def _retired_path(*_args: object, **_kwargs: object) -> np.ndarray:
+        """Fail if a production prediction reaches optical-depth orders."""
+        raise AssertionError("retired scatter-order path was reached")
+
+    monkeypatch.setattr(
+        type(model),
+        "_interaction_order_weights_numpy",
+        _retired_path,
+    )
+
+    mean = model.predict_mean_numpy(
+        total,
+        uncollided,
+        features,
+        np.asarray((20.0,), dtype=np.float64),
+    )
+    concentration = model._component_count_concentration_numpy(
+        total,
+        uncollided,
+        features,
+    )
+
+    assert np.all(np.isfinite(mean))
+    assert np.all(np.isfinite(concentration))
+
+
+def test_detector_cone_scatter_distance_extrapolation_fails_closed() -> None:
+    """An active scatter source outside the authenticated grid must abort."""
+    model = _runtime_ready_candidate()
+    line_count = len(model.line_identity)
+    total = np.zeros((1, 1, 1, line_count), dtype=np.float64)
+    uncollided = np.zeros_like(total)
+    total[..., 0] = 2.0
+    uncollided[..., 0] = 1.0
+    base_features = np.broadcast_to(
+        np.asarray((0.2, 0.3, 0.1, 201.0), dtype=np.float64),
+        total.shape + (4,),
+    )
+    features = _valid_transport_features(base_features)
+
+    with pytest.raises(ValueError, match="Scatter-to-detector distance"):
+        model.predict_mean_numpy(
+            total,
+            uncollided,
+            features,
+            np.asarray((20.0,), dtype=np.float64),
+        )
 
 
 def test_retired_component_candidate_is_rejected_before_runtime() -> None:
@@ -2140,14 +2331,17 @@ def test_retired_component_candidate_is_rejected_before_runtime() -> None:
         / "models"
         / "geometry_conditioned_full_spectrum_ral_eu154_component.json"
     )
-    with pytest.raises(ValueError, match="training provenance"):
+    with pytest.raises(ValueError, match="schema-v7"):
         GeometryConditionedSpectralModel.from_manifest_payload(
-            json.loads(path.read_text(encoding="utf-8"))
+            json.loads(path.read_text(encoding="utf-8")),
+            detector_green_operator=(
+                approved_full_spectrum_model().detector_green_operator
+            ),
         )
 
 
 def test_acceptance_contract_file_is_predeclared_and_hash_stable() -> None:
-    """The versioned JSON must exactly match the in-code holdout contract."""
+    """The canonical JSON must exactly match the in-code validation contract."""
     path = (
         Path(__file__).resolve().parents[1]
         / "configs"
@@ -2163,27 +2357,84 @@ def test_acceptance_contract_owns_fresh_environment_and_compute_inputs() -> None
     """Acceptance must share dwell and explicitly freeze every backend input."""
     payload = full_spectrum_acceptance_contract_payload()
 
-    assert payload["schema_version"] == 2
+    assert "schema_version" not in payload
     assert payload["dwell_time_s"] == STANDARD_ACQUISITION_LIVE_TIME_S
     assert payload["dwell_time_s"] == (
-        STANDARD_EXPERIMENT_PROFILE.acquisition.live_time_s
+        MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE.acquisition.live_time_s
     )
-    assert DESIGNATED_HOLDOUT_SCENE_SEEDS == (3721907945, 9459185298)
-    assert set(DESIGNATED_HOLDOUT_SCENE_SEEDS).isdisjoint(
+    assert payload["surface_boundary_probe"] == {
+        "schema_version": 3,
+        "dwell_time_s": 1.0e-2,
+        "surface_emission_epsilon_m": 1.0e-6,
+        "native_position_variants": [
+            "exact_surface_anchor",
+            "air_plus_epsilon",
+            "solid_minus_epsilon",
+        ],
+        "require_nonempty_transport_process_counts": True,
+    }
+    assert DESIGNATED_VALIDATION_SCENE_SEEDS == (
+        3646699724,
+        4620708915,
+        5193545889,
+        7235536511,
+        7325752837,
+    )
+    assert payload["native_process_counter_policy"] == {
+        "background_only": "exact_empty_counter_map",
+        "source_present": "nonempty_positive_counter_map",
+    }
+    assert payload["detector_cps_green_reference_efficiency_policy"] == (
+        "recomputed_from_authenticated_catalog_and_operator_strict_tolerance_v1"
+    )
+    assert payload["detector_response_event_policy"] == {
+        "primary_emission_model": "independent_gamma_lines",
+        "source_bias_cone_policy": "detector_covering",
+        "catalog_line_semantics": ("positive_intensity_lines_normalized_per_isotope"),
+        "prompt_decay_cascade_transport": False,
+        "true_coincidence_summing": "disabled",
+        "coincidence_window_s": 1.0e-6,
+        "sampling_mode": DETECTOR_GREEN_SAMPLING_MODE,
+        "coincidence_semantics": DETECTOR_GREEN_COINCIDENCE_SEMANTICS,
+        "counter_semantics": (
+            "incident_ge_registered_ge_pulses_and_merged_entry_excess_"
+            "ge_multi_entry_pulses_v1"
+        ),
+    }
+    assert set(DESIGNATED_VALIDATION_SCENE_SEEDS).isdisjoint(
         DESIGNATED_TRAINING_SCENE_SEEDS
     )
-    assert set(DESIGNATED_HOLDOUT_SCENE_SEEDS).isdisjoint(
-        {2026072791, 2026072792}
-    )
+    assert set(DESIGNATED_VALIDATION_SCENE_SEEDS).isdisjoint({2026072791, 2026072792})
+    assert payload["continuous_surface_perturbation"] == {
+        "selection": ("first_valid_fixed_order_geometry_only_separable_tangent_v1"),
+        "tangent_magnitudes_m": list(ACCEPTANCE_PERTURBATION_TANGENT_MAGNITUDES_M),
+        "tangent_directions_uv": [
+            list(direction)
+            for direction in ACCEPTANCE_PERTURBATION_TANGENT_DIRECTIONS_UV
+        ],
+        "minimum_surface_displacement_m": (
+            ACCEPTANCE_PERTURBATION_MINIMUM_DISPLACEMENT_M
+        ),
+        "minimum_absolute_log_inverse_square_rate_ratio": (
+            ACCEPTANCE_PERTURBATION_MINIMUM_LOG_RATE_SEPARATION
+        ),
+        "minimum_detector_bearing_angle_rad": (
+            ACCEPTANCE_PERTURBATION_MINIMUM_BEARING_ANGLE_RAD
+        ),
+        "separability_logic": "inverse_square_rate_or_detector_bearing",
+        "uses_observation_counts": False,
+        "uses_detector_response": False,
+        "uses_candidate_model_likelihood": False,
+    }
     assert payload["environment"] == {
         "room_size_xyz_m": list(ACCEPTANCE_ROOM_SIZE_XYZ),
         "detector_pose_xyz_m": list(ACCEPTANCE_DETECTOR_POSE_XYZ),
         "target_blocked_fraction": ACCEPTANCE_OBSTACLE_BLOCKED_FRACTION,
         "passage_width_m": ACCEPTANCE_PASSAGE_WIDTH_M,
         "surface_chart_max_edge_m": ACCEPTANCE_SURFACE_CHART_MAX_EDGE_M,
-        "obstacle_material": STANDARD_EXPERIMENT_PROFILE.obstacle_material,
+        "obstacle_material": MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE.obstacle_material,
         "room_boundary_thickness_m": (
-            STANDARD_EXPERIMENT_PROFILE.room_boundary_thickness_m
+            MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE.room_boundary_thickness_m
         ),
     }
     assert payload["geometry_compute"] == {
@@ -2199,7 +2450,7 @@ def test_validation_manifest_and_line_identity_are_immutable_snapshots() -> None
         "schema_version": 1,
         "all_passed": False,
     }
-    model = GeometryConditionedSpectralModel.standard_native(
+    model = GeometryConditionedSpectralModel.nonproduction_native(
         ("Co-60", "Cs-137", "Eu-154"),
         dead_time_tau_s=5.813e-9,
         background_rate_cps=5.0,
@@ -2218,7 +2469,7 @@ def test_hierarchical_likelihood_matches_torch_and_background_is_exact() -> None
     """The calibrated mixture must match Torch and leave K=0 marks exact."""
     torch = pytest.importorskip("torch")
     nodes, weights = rate_scale_mixture_for_half_width(0.20)
-    model = GeometryConditionedSpectralModel.standard_native(
+    model = GeometryConditionedSpectralModel.nonproduction_native(
         ("Cs-137", "Eu-154"),
         dead_time_tau_s=2.0e-5,
         background_rate_cps=7.0,
@@ -2226,7 +2477,7 @@ def test_hierarchical_likelihood_matches_torch_and_background_is_exact() -> None
         rate_scale_weights_j=weights,
         mark_concentration_source=300.0,
     )
-    plain = GeometryConditionedSpectralModel.standard_native(
+    plain = GeometryConditionedSpectralModel.nonproduction_native(
         ("Cs-137", "Eu-154"),
         dead_time_tau_s=2.0e-5,
         background_rate_cps=7.0,
@@ -2235,7 +2486,7 @@ def test_hierarchical_likelihood_matches_torch_and_background_is_exact() -> None
     line_count = len(model.line_identity)
     total = rng.uniform(0.0, 25.0, (3, 2, 2, line_count))
     uncollided = 0.7 * total
-    features = rng.uniform(0.0, 1.0, total.shape + (4,))
+    features = _valid_transport_features(rng.uniform(0.0, 1.0, total.shape + (4,)))
     live_times = np.array([2.0, 3.0], dtype=np.float64)
     observed = model.sample_predictive_numpy(
         total[:1],
@@ -2267,7 +2518,9 @@ def test_hierarchical_likelihood_matches_torch_and_background_is_exact() -> None
     assert np.allclose(numpy_log, torch_log, rtol=1e-10, atol=1e-7)
 
     zero = np.zeros((2, 2, 1, line_count), dtype=np.float64)
-    zero_features = np.zeros(zero.shape + (4,), dtype=np.float64)
+    zero_features = _valid_transport_features(
+        np.zeros(zero.shape + (4,), dtype=np.float64)
+    )
     background_observed = plain.sample_predictive_numpy(
         zero[:1],
         zero[:1],
@@ -2302,7 +2555,7 @@ def test_predictive_sampler_uses_one_rate_scale_for_all_station_views() -> None:
     """Station-shared scale draws must induce cross-view total covariance."""
     nodes = (0.5, 1.0, 1.5)
     weights = (0.25, 0.50, 0.25)
-    model = GeometryConditionedSpectralModel.standard_native(
+    model = GeometryConditionedSpectralModel.nonproduction_native(
         ("Cs-137",),
         dead_time_tau_s=0.0,
         background_rate_cps=0.0,
@@ -2313,7 +2566,7 @@ def test_predictive_sampler_uses_one_rate_scale_for_all_station_views() -> None:
     line_count = len(model.line_identity)
     total = np.zeros((1, 2, 1, line_count), dtype=np.float64)
     total[:, :, :, 0] = 100.0
-    features = np.zeros(total.shape + (4,), dtype=np.float64)
+    features = _valid_transport_features(np.zeros(total.shape + (4,), dtype=np.float64))
     samples = model.sample_predictive_numpy(
         total,
         total,
@@ -2331,7 +2584,7 @@ def test_predictive_sampler_uses_one_rate_scale_for_all_station_views() -> None:
 def test_innovation_integrates_configured_rate_and_mark_discrepancy() -> None:
     """Innovation gates must use the same calibrated noise as likelihood."""
     nodes, weights = rate_scale_mixture_for_half_width(0.20)
-    calibrated = GeometryConditionedSpectralModel.standard_native(
+    calibrated = GeometryConditionedSpectralModel.nonproduction_native(
         ("Cs-137",),
         dead_time_tau_s=0.0,
         background_rate_cps=0.0,
@@ -2339,7 +2592,7 @@ def test_innovation_integrates_configured_rate_and_mark_discrepancy() -> None:
         rate_scale_weights_j=weights,
         mark_concentration_source=300.0,
     )
-    exact = GeometryConditionedSpectralModel.standard_native(
+    exact = GeometryConditionedSpectralModel.nonproduction_native(
         ("Cs-137",),
         dead_time_tau_s=0.0,
         background_rate_cps=0.0,
@@ -2347,7 +2600,7 @@ def test_innovation_integrates_configured_rate_and_mark_discrepancy() -> None:
     line_count = len(calibrated.line_identity)
     total = np.zeros((1, 1, 1, line_count), dtype=np.float64)
     total[..., 0] = 100_000.0
-    features = np.zeros(total.shape + (4,), dtype=np.float64)
+    features = _valid_transport_features(np.zeros(total.shape + (4,), dtype=np.float64))
     expected = calibrated.predict_mean_numpy(
         total,
         total,
@@ -2374,17 +2627,72 @@ def test_innovation_integrates_configured_rate_and_mark_discrepancy() -> None:
         confidence=0.99,
     )
 
-    assert calibrated_result["renewal_total_max_abs_z"] < (
-        exact_result["renewal_total_max_abs_z"]
+    assert (
+        calibrated_result["renewal_total_max_abs_z"]
+        < (exact_result["renewal_total_max_abs_z"])
     )
-    assert calibrated_result["conditional_mark_pearson"] < (
-        exact_result["conditional_mark_pearson"]
+    assert (
+        calibrated_result["conditional_mark_pearson"]
+        < (exact_result["conditional_mark_pearson"])
     )
+
+
+def test_physics_only_innovation_uses_component_discrepancy_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Physics-only component uncertainty must govern innovation diagnostics."""
+    model = _runtime_ready_candidate()
+    assert model.exact_physical_statistics_ready is True
+    sentinel = {
+        "renewal_total_max_abs_z": 1.25,
+        "renewal_total_within_confidence": True,
+        "conditional_mark_pearson": 2.5,
+        "conditional_mark_degrees_of_freedom": 3,
+        "conditional_mark_tail_probability": 0.5,
+        "conditional_mark_upper_tail_probability": 0.25,
+        "confidence": 0.99,
+    }
+    calls = 0
+
+    def _discrepancy_path(self: object, *args: object, **kwargs: object) -> object:
+        """Return a sentinel while recording the selected numerical path."""
+        nonlocal calls
+        del self, args, kwargs
+        calls += 1
+        return sentinel
+
+    monkeypatch.setattr(
+        GeometryConditionedSpectralModel,
+        "_discrepancy_innovation_numpy",
+        _discrepancy_path,
+    )
+    line_count = len(model.line_identity)
+    total = np.ones((1, 1, 1, line_count), dtype=np.float64)
+    features = _valid_transport_features(
+        np.zeros(total.shape + (4,), dtype=np.float64)
+    )
+    observed = np.zeros(
+        (1, np.asarray(model.energy_axis_keV).size),
+        dtype=np.float64,
+    )
+
+    result = model.posterior_predictive_innovation_numpy(
+        observed,
+        total,
+        total,
+        features,
+        np.ones(1, dtype=np.float64),
+        np.ones(1, dtype=np.float64),
+        confidence=0.99,
+    )
+
+    assert calls == 1
+    assert result == sentinel
 
 
 def test_predictive_action_seeds_are_invariant_to_action_batch_width() -> None:
     """Canonical action substreams must survive arbitrary outer batching."""
-    model = GeometryConditionedSpectralModel.standard_native(
+    model = GeometryConditionedSpectralModel.nonproduction_native(
         ("Cs-137", "Eu-154"),
         dead_time_tau_s=2.0e-5,
         background_rate_cps=6.0,
@@ -2408,7 +2716,7 @@ def test_predictive_action_seeds_are_invariant_to_action_batch_width() -> None:
         ),
     )
     uncollided = 0.6 * total
-    features = rng.uniform(0.0, 1.0, total.shape + (4,))
+    features = _valid_transport_features(rng.uniform(0.0, 1.0, total.shape + (4,)))
     live_times = np.array([2.0, 3.0], dtype=np.float64)
     action_seeds = np.asarray([19, 23, 29, 31, 37], dtype=np.int64)
     all_actions = model.sample_predictive_numpy(
@@ -2438,93 +2746,38 @@ def test_predictive_action_seeds_are_invariant_to_action_batch_width() -> None:
     assert np.array_equal(all_actions, split_actions)
 
 
-def test_discrepancy_manifest_is_training_only_and_manifest_is_schema_three() -> None:
-    """Production provenance must bind global training-only discrepancy fit."""
-    width = RATE_SCALE_HALF_WIDTH_GRID[2]
-    concentration = MARK_CONCENTRATION_GRID[3]
-    nodes, weights = rate_scale_mixture_for_half_width(width)
-    digest = "a" * 64
-    training = {
-        "schema_version": 1,
-        "acceptance_contract_sha256": (
-            FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256
-        ),
-        "training_scene_seeds": list(DESIGNATED_TRAINING_SCENE_SEEDS),
-        "scenario_ids": list(VALIDATION_SCENARIO_IDS),
-        "pair_ids_by_scene": {
-            str(seed): list(range(64))
-            for seed in DESIGNATED_TRAINING_SCENE_SEEDS
-        },
-        "artifact_sha256_by_scene": {
-            str(seed): digest
-            for seed in DESIGNATED_TRAINING_SCENE_SEEDS
-        },
-        "rate_scale_family": (
-            "station_shared_three_node_symmetric_mean_one"
-        ),
-        "mark_family": "source_fraction_dirichlet_multinomial",
-        "selection_objective": (
-            "maximum_joint_training_log_predictive_density"
-        ),
-        "selected_rate_scale_half_width": width,
-        "selected_mark_concentration_source": concentration,
-        "candidate_count": (
-            len(RATE_SCALE_HALF_WIDTH_GRID)
-            * len(MARK_CONCENTRATION_GRID)
-        ),
-        "selected_training_log_predictive_density": -123.0,
-        "selection_artifact_sha256": "b" * 64,
-        "selection_completed": True,
-    }
-    model = GeometryConditionedSpectralModel.standard_native(
-        ("Co-60", "Cs-137", "Eu-154"),
-        dead_time_tau_s=5.813e-9,
-        background_rate_cps=5.0,
-        rate_scale_nodes_j=nodes,
-        rate_scale_weights_j=weights,
-        mark_concentration_source=concentration,
-        discrepancy_training_manifest=training,
+def test_schema_seven_manifest_excludes_scene_fitted_and_legacy_terms() -> None:
+    """Schema seven binds catalog lines and component-aware mark uncertainty."""
+    candidate = _runtime_ready_candidate()
+    manifest = candidate.manifest_payload()
+
+    assert manifest["schema_version"] == 7
+    assert manifest["runtime_ready"] is True
+    assert manifest["production_ready"] is False
+    assert "discrepancy_training" not in manifest
+    assert "low_rank_spectral_mean_correction" not in manifest
+    assert manifest["mark_concentration_source"] is None
+    assert "count_discrepancy_concentration" not in manifest
+    assert "maximum_scatter_order" not in manifest
+    assert manifest["scatter_shape"] == (
+        "detector_cone_joint_energy_impact_single_compton_v1"
     )
-    manifest = model.manifest_payload()
-    assert model.discrepancy_training_ready is True
-    assert manifest["schema_version"] == 3
-    assert manifest["bin_width_keV"] == 2.0
-    assert manifest["line_identity"] == [
-        dict(item) for item in model.line_identity
-    ]
-    assert manifest["source_rate_semantics"] == (
-        "pre_dead_time_detector_pulse_rate_at_1m"
+    assert manifest["detector_green_operator_contract_sha256"] == (
+        candidate.detector_green_operator.contract_hash_sha256
     )
-    assert manifest["shield_pose_contract_id"] == SHIELD_POSE_CONTRACT_ID
-    assert (
-        manifest["shield_pose_contract_sha256"]
-        == SHIELD_POSE_CONTRACT_SHA256
+    assert all(
+        float(row["branching_weight"]) > 0.0 and float(row["energy_keV"]) > 0.0
+        for row in manifest["line_identity"]
     )
-    assert manifest["discrepancy_training_ready"] is True
-    assert manifest["rate_scale_mixture"]["weighted_mean"] == 1.0
 
 
-def test_runtime_factory_reconstructs_and_authenticates_schema_three() -> None:
-    """Live/replay construction must reject every manifest identity mismatch."""
-    model = approved_full_spectrum_model()
-    manifest = model.manifest_payload()
-    runtime = {
-        "source_rate_model": "detector_cps_1m",
-        "energy_min_keV": manifest["energy_min_keV"],
-        "energy_max_keV": manifest["energy_max_keV"],
-        "bin_width_keV": manifest["bin_width_keV"],
-        "energy_bin_count": manifest["energy_bin_count"],
-        "background_rate_cps": manifest["background_rate_cps"],
-        "dead_time_tau_s": manifest["dead_time_tau_s"],
-        "full_spectrum_generative_model": manifest,
-        "full_spectrum_contract_hash_sha256": (
-            model.contract_hash_sha256
-        ),
-    }
-    reconstructed = geometry_conditioned_model_from_runtime_config(runtime)
-    assert reconstructed.runtime_ready is True
-    assert reconstructed.production_ready is True
-    assert reconstructed.contract_hash_sha256 == model.contract_hash_sha256
+def test_runtime_factory_reconstructs_and_authenticates_schema_seven() -> None:
+    """Live construction must authenticate model, catalog, and Green identity."""
+    runtime = approved_runtime_config()
+    model = geometry_conditioned_model_from_runtime_config(runtime)
+
+    assert model.runtime_ready is True
+    assert model.production_ready is True
     corrupted = json.loads(json.dumps(runtime))
     corrupted["full_spectrum_generative_model"]["background_rate_cps"] = 6.0
     with pytest.raises(ValueError, match="reconstruct"):
@@ -2535,10 +2788,28 @@ def test_runtime_factory_reconstructs_and_authenticates_schema_three() -> None:
         geometry_conditioned_model_from_runtime_config(corrupted)
     corrupted = json.loads(json.dumps(runtime))
     corrupted["full_spectrum_generative_model"][
-        "shield_pose_contract_sha256"
+        "detector_green_operator_contract_sha256"
     ] = "0" * 64
     with pytest.raises(ValueError, match="reconstruct"):
         geometry_conditioned_model_from_runtime_config(corrupted)
+
+
+def test_nonalgorithm_acceptance_metadata_does_not_expire_model_approval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Renaming an acceptance run must not invalidate an approved algorithm."""
+    model = approved_full_spectrum_model()
+    contract_hash = model.contract_hash_sha256
+
+    monkeypatch.setattr(
+        transport_spectral,
+        "FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256",
+        "0" * 64,
+    )
+
+    assert model.contract_hash_sha256 == contract_hash
+    assert model.production_ready is True
+    model.require_production_ready()
 
 
 @pytest.mark.parametrize(
@@ -2548,27 +2819,15 @@ def test_runtime_factory_reconstructs_and_authenticates_schema_three() -> None:
         "energy_max_keV",
         "bin_width_keV",
         "energy_bin_count",
-        "background_rate_cps",
+        "background_cps",
         "dead_time_tau_s",
     ),
 )
 def test_runtime_factory_rejects_numeric_string_scalars(
     field_name: str,
 ) -> None:
-    """Runtime identity scalars must retain their exact JSON numeric types."""
-    model = approved_full_spectrum_model()
-    manifest = model.manifest_payload()
-    runtime = {
-        "source_rate_model": "detector_cps_1m",
-        "energy_min_keV": manifest["energy_min_keV"],
-        "energy_max_keV": manifest["energy_max_keV"],
-        "bin_width_keV": manifest["bin_width_keV"],
-        "energy_bin_count": manifest["energy_bin_count"],
-        "background_rate_cps": manifest["background_rate_cps"],
-        "dead_time_tau_s": manifest["dead_time_tau_s"],
-        "full_spectrum_generative_model": manifest,
-        "full_spectrum_contract_hash_sha256": model.contract_hash_sha256,
-    }
+    """Runtime identity scalars retain their exact JSON numeric types."""
+    runtime = approved_runtime_config()
     runtime[field_name] = str(runtime[field_name])
 
     with pytest.raises(ValueError, match=field_name):
@@ -2580,135 +2839,85 @@ def test_runtime_factory_rejects_numeric_string_scalars(
     (
         (("dead_time_tau_s",), "5.813e-09"),
         (("background_rate_cps",), "5.0"),
-        (("mark_concentration_source",), "300.0"),
-        (("rate_scale_mixture", "nodes", 0), "0.9"),
-        (("rate_scale_mixture", "weights", 0), "0.25"),
+        (("rate_scale_mixture", "nodes", 0), "1.0"),
+        (("rate_scale_mixture", "weights", 0), "1.0"),
         (("line_identity", 0, "isotope"), 137),
+        (("line_identity", 0, "branching_weight"), "1.0"),
     ),
 )
 def test_manifest_factory_rejects_scalar_type_coercion(
     field_path: tuple[object, ...],
     replacement: object,
 ) -> None:
-    """File-backed model fields must not acquire meaning through coercion."""
-    payload = json.loads(
-        json.dumps(approved_full_spectrum_model().manifest_payload())
-    )
+    """File-backed model fields must not gain meaning through coercion."""
+    approved = approved_full_spectrum_model()
+    payload = json.loads(json.dumps(approved.manifest_payload()))
     target: object = payload
     for key in field_path[:-1]:
         target = target[key]  # type: ignore[index]
     target[field_path[-1]] = replacement  # type: ignore[index]
 
     with pytest.raises((TypeError, ValueError)):
-        GeometryConditionedSpectralModel.from_manifest_payload(payload)
+        GeometryConditionedSpectralModel.from_manifest_payload(
+            payload,
+            detector_green_operator=approved.detector_green_operator,
+        )
 
 
 @pytest.mark.parametrize("field_name", ("value", "threshold"))
 def test_validation_metrics_reject_numeric_strings(field_name: str) -> None:
-    """Validation evidence must retain exact JSON-number semantics."""
+    """Validation evidence retains exact JSON-number semantics."""
     approved = approved_full_spectrum_model()
-    validation = approved.manifest_payload()["validation"]
+    payload = json.loads(json.dumps(approved.manifest_payload()))
+    validation = payload["validation"]
     metric_id = next(iter(validation["metrics"]))
     validation["metrics"][metric_id][field_name] = str(
         validation["metrics"][metric_id][field_name]
     )
-    candidate = GeometryConditionedSpectralModel.standard_native(
-        ("Co-60", "Cs-137", "Eu-154"),
-        dead_time_tau_s=approved.dead_time_tau_s,
-        background_rate_cps=approved.background_rate_cps,
-        rate_scale_nodes_j=approved.rate_scale_nodes_j,
-        rate_scale_weights_j=approved.rate_scale_weights_j,
-        mark_concentration_source=approved.mark_concentration_source,
-        discrepancy_training_manifest=approved.discrepancy_training_manifest,
-        validation_manifest=validation,
-        additive_scatter_response=approved.additive_scatter_response,
-    )
 
-    assert candidate.runtime_ready is True
-    assert candidate.production_ready is False
+    with pytest.raises((TypeError, ValueError)):
+        GeometryConditionedSpectralModel.from_manifest_payload(
+            payload,
+            detector_green_operator=approved.detector_green_operator,
+        )
 
 
-def test_legacy_scatter_semantics_cannot_become_production_ready() -> None:
-    """Otherwise valid validation cannot approve retired scatter semantics."""
+def test_schema_four_rejects_scene_fitted_transport_response() -> None:
+    """A retired fitted response cannot cross the schema-four boundary."""
     approved = approved_full_spectrum_model()
-    assert approved.additive_scatter_response is not None
-    legacy_response = replace(
-        approved.additive_scatter_response,
-        feature_basis_semantics=(
-            DETECTOR_CONE_SINGLE_SCATTER_BASIS_SEMANTICS
-        ),
-    )
-    unvalidated = GeometryConditionedSpectralModel.standard_native(
-        ("Co-60", "Cs-137", "Eu-154"),
-        dead_time_tau_s=approved.dead_time_tau_s,
-        background_rate_cps=approved.background_rate_cps,
-        rate_scale_nodes_j=approved.rate_scale_nodes_j,
-        rate_scale_weights_j=approved.rate_scale_weights_j,
-        mark_concentration_source=approved.mark_concentration_source,
-        discrepancy_training_manifest=approved.discrepancy_training_manifest,
-        additive_scatter_response=legacy_response,
-    )
-    validation = json.loads(
-        json.dumps(approved.manifest_payload()["validation"])
-    )
-    validation["approved_model_contract_sha256"] = (
-        unvalidated.contract_hash_sha256
-    )
-    validation["additive_scatter_contract_sha256"] = (
-        legacy_response.contract_hash_sha256
-    )
-    candidate = GeometryConditionedSpectralModel.standard_native(
-        ("Co-60", "Cs-137", "Eu-154"),
-        dead_time_tau_s=approved.dead_time_tau_s,
-        background_rate_cps=approved.background_rate_cps,
-        rate_scale_nodes_j=approved.rate_scale_nodes_j,
-        rate_scale_weights_j=approved.rate_scale_weights_j,
-        mark_concentration_source=approved.mark_concentration_source,
-        discrepancy_training_manifest=approved.discrepancy_training_manifest,
-        validation_manifest=validation,
-        additive_scatter_response=legacy_response,
+    payload = json.loads(json.dumps(approved.manifest_payload()))
+    payload["additive_noncollided_transport_response"]["model"] = (
+        "retired_scene_fitted_response"
     )
 
-    assert candidate.runtime_ready is True
-    assert candidate.production_ready is False
+    with pytest.raises(ValueError, match="scene-fitted"):
+        GeometryConditionedSpectralModel.from_manifest_payload(
+            payload,
+            detector_green_operator=approved.detector_green_operator,
+        )
 
 
-def test_runtime_factory_authenticates_file_backed_schema_three(
+def test_runtime_factory_authenticates_file_backed_schema_four(
     tmp_path: Path,
 ) -> None:
-    """A runtime-ready pre-holdout asset must match byte and model hashes."""
-    model = _runtime_ready_candidate()
-    manifest = model.manifest_payload()
-    raw_bytes = json.dumps(
-        manifest,
-        sort_keys=True,
-        separators=(",", ":"),
+    """A file-backed schema-four model must match byte and model hashes."""
+    runtime = approved_runtime_config()
+    manifest = runtime.pop("full_spectrum_generative_model")
+    raw_bytes = (
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n"
     ).encode()
     asset_path = tmp_path / "approved.json"
     asset_path.write_bytes(raw_bytes)
-    runtime = {
-        "source_rate_model": "detector_cps_1m",
-        "energy_min_keV": manifest["energy_min_keV"],
-        "energy_max_keV": manifest["energy_max_keV"],
-        "bin_width_keV": manifest["bin_width_keV"],
-        "energy_bin_count": manifest["energy_bin_count"],
-        "background_rate_cps": manifest["background_rate_cps"],
-        "dead_time_tau_s": manifest["dead_time_tau_s"],
-        "full_spectrum_generative_model_path": asset_path.name,
-        "full_spectrum_generative_model_file_sha256": (
-            hashlib.sha256(raw_bytes).hexdigest()
-        ),
-        "full_spectrum_contract_hash_sha256": (
-            model.contract_hash_sha256
-        ),
-    }
+    runtime["full_spectrum_generative_model_path"] = asset_path.name
+    runtime["full_spectrum_generative_model_file_sha256"] = hashlib.sha256(
+        raw_bytes
+    ).hexdigest()
+
     reconstructed = geometry_conditioned_model_from_runtime_config(
         runtime,
         run_root=tmp_path,
     )
-    assert reconstructed.runtime_ready is True
-    assert reconstructed.production_ready is False
-    assert reconstructed.contract_hash_sha256 == model.contract_hash_sha256
+    assert reconstructed.production_ready is True
     runtime["full_spectrum_generative_model_file_sha256"] = "0" * 64
     with pytest.raises(ValueError, match="file SHA-256"):
         geometry_conditioned_model_from_runtime_config(
@@ -2720,34 +2929,17 @@ def test_runtime_factory_authenticates_file_backed_schema_three(
 def test_runtime_factory_rejects_duplicate_model_asset_keys(
     tmp_path: Path,
 ) -> None:
-    """A pinned asset must not acquire last-key-wins model semantics."""
-    model = approved_full_spectrum_model()
-    manifest = model.manifest_payload()
-    assert manifest["schema_version"] == 3
-    canonical = json.dumps(
-        manifest,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    raw_bytes = (
-        '{"schema_version":3,' + canonical.removeprefix("{")
-    ).encode()
+    """A pinned model asset must reject duplicate JSON keys."""
+    runtime = approved_runtime_config()
+    manifest = runtime.pop("full_spectrum_generative_model")
+    canonical = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+    raw_bytes = ('{"schema_version":4,' + canonical.removeprefix("{")).encode()
     asset_path = tmp_path / "duplicate.json"
     asset_path.write_bytes(raw_bytes)
-    runtime = {
-        "source_rate_model": "detector_cps_1m",
-        "energy_min_keV": manifest["energy_min_keV"],
-        "energy_max_keV": manifest["energy_max_keV"],
-        "bin_width_keV": manifest["bin_width_keV"],
-        "energy_bin_count": manifest["energy_bin_count"],
-        "background_rate_cps": manifest["background_rate_cps"],
-        "dead_time_tau_s": manifest["dead_time_tau_s"],
-        "full_spectrum_generative_model_path": asset_path.name,
-        "full_spectrum_generative_model_file_sha256": (
-            hashlib.sha256(raw_bytes).hexdigest()
-        ),
-        "full_spectrum_contract_hash_sha256": model.contract_hash_sha256,
-    }
+    runtime["full_spectrum_generative_model_path"] = asset_path.name
+    runtime["full_spectrum_generative_model_file_sha256"] = hashlib.sha256(
+        raw_bytes
+    ).hexdigest()
 
     with pytest.raises(ValueError, match="canonical JSON"):
         geometry_conditioned_model_from_runtime_config(

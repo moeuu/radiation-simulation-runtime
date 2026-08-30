@@ -474,9 +474,7 @@ def _line_resolved_full_physics_kernel(*, use_gpu: bool) -> ContinuousKernel:
     ).with_transport_model(
         boxes_m=((0.2, 0.2, 0.0, 0.8, 0.8, 2.0),),
         mu_by_isotope={"TestIso": (0.015,)},
-        line_mu_by_isotope={
-            "TestIso": ((0.01,), (0.025,), (0.04,))
-        },
+        line_mu_by_isotope={"TestIso": ((0.01,), (0.025,), (0.04,))},
     )
     return ContinuousKernel(
         mu_by_isotope={"TestIso": {"fe": 0.0, "pb": 0.0}},
@@ -497,9 +495,24 @@ def _line_resolved_full_physics_kernel(*, use_gpu: bool) -> ContinuousKernel:
         source_extent_samples=3,
         line_mu_by_isotope={
             "TestIso": (
-                {"weight": 0.2, "fe": 0.04, "pb": 0.07},
-                {"weight": 0.3, "fe": 0.08, "pb": 0.11},
-                {"weight": 0.5, "fe": 0.13, "pb": 0.18},
+                {
+                    "weight": 0.2,
+                    "energy_keV": 100.0,
+                    "fe": 0.04,
+                    "pb": 0.07,
+                },
+                {
+                    "weight": 0.3,
+                    "energy_keV": 500.0,
+                    "fe": 0.08,
+                    "pb": 0.11,
+                },
+                {
+                    "weight": 0.5,
+                    "energy_keV": 1000.0,
+                    "fe": 0.13,
+                    "pb": 0.18,
+                },
             )
         },
         use_gpu=use_gpu,
@@ -547,9 +560,7 @@ def test_direct_kernel_applies_xcom_air_without_scatter_response() -> None:
             )
         },
         "additive_scatter_response": None,
-        "dry_air_total_attenuation_contract_id": (
-            NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_ID
-        ),
+        "dry_air_total_attenuation_contract_id": (NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_ID),
         "dry_air_total_attenuation_contract_sha256": (
             NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_SHA256
         ),
@@ -586,9 +597,7 @@ def test_absorber_crossing_aborts_batched_kernel(use_gpu: bool) -> None:
         grid_shape=(1, 1),
         blocked_cells=(),
         absorber_transport_group="wall",
-        absorber_transport_boxes_m=(
-            (0.9, -1.0, -1.0, 1.1, 1.0, 1.0),
-        ),
+        absorber_transport_boxes_m=((0.9, -1.0, -1.0, 1.1, 1.0, 1.0),),
     )
     kernel = ContinuousKernel(
         mu_by_isotope={"Cs-137": {"fe": 0.0, "pb": 0.0}},
@@ -686,31 +695,25 @@ def test_matched_row_kernel_apis_match_cpu_and_torch_batches() -> None:
         pb_indices,
         chunk_size=1,
     )
-    selected_torch = (
-        torch_cpu.kernel_values_selected_pairs_for_detector_source_pairs(
-            "TestIso",
-            detectors,
-            sources,
-            fe_indices,
-            pb_indices,
-            chunk_size=2,
-        )
+    selected_torch = torch_cpu.kernel_values_selected_pairs_for_detector_source_pairs(
+        "TestIso",
+        detectors,
+        sources,
+        fe_indices,
+        pb_indices,
+        chunk_size=2,
     )
-    unshielded_cpu = (
-        cpu.kernel_values_unshielded_for_detector_source_pairs(
-            "TestIso",
-            detectors,
-            sources,
-            chunk_size=1,
-        )
+    unshielded_cpu = cpu.kernel_values_unshielded_for_detector_source_pairs(
+        "TestIso",
+        detectors,
+        sources,
+        chunk_size=1,
     )
-    unshielded_torch = (
-        torch_cpu.kernel_values_unshielded_for_detector_source_pairs(
-            "TestIso",
-            detectors,
-            sources,
-            chunk_size=2,
-        )
+    unshielded_torch = torch_cpu.kernel_values_unshielded_for_detector_source_pairs(
+        "TestIso",
+        detectors,
+        sources,
+        chunk_size=2,
     )
 
     assert selected_cpu == pytest.approx(
@@ -754,6 +757,7 @@ def test_line_kernel_shape_order_and_weighted_aggregate_identity() -> None:
         chunk_size=2,
     )
     weights = kernel.line_branching_weights("TestIso", all_indices)
+    contract = kernel.line_transport_contract("TestIso", all_indices)
 
     assert line_values.shape == (2, 3, 3)
     np.testing.assert_allclose(
@@ -763,18 +767,158 @@ def test_line_kernel_shape_order_and_weighted_aggregate_identity() -> None:
         atol=3.0e-14,
     )
     assert not np.allclose(line_values[..., 0], line_values[..., 2])
-    reversed_values = (
-        kernel.kernel_values_selected_pairs_for_detectors_by_line(
-            "TestIso",
-            detectors,
-            sources,
-            fe_indices,
-            pb_indices,
-            np.asarray([2, 0], dtype=np.int64),
-        )
+    for actual, expected in zip(
+        contract,
+        (
+            (0.2, 0.3, 0.5),
+            (100.0, 500.0, 1000.0),
+            (0.04, 0.08, 0.13),
+            (0.07, 0.11, 0.18),
+        ),
+        strict=True,
+    ):
+        np.testing.assert_array_equal(actual, expected)
+    reversed_values = kernel.kernel_values_selected_pairs_for_detectors_by_line(
+        "TestIso",
+        detectors,
+        sources,
+        fe_indices,
+        pb_indices,
+        np.asarray([2, 0], dtype=np.int64),
     )
     np.testing.assert_array_equal(reversed_values[..., 0], line_values[..., 2])
     np.testing.assert_array_equal(reversed_values[..., 1], line_values[..., 0])
+
+
+@pytest.mark.parametrize(
+    "invalid_row",
+    (
+        {"energy_keV": 662.0, "weight": 1.0, "mu_fe": 0.1, "pb": 0.2},
+        {"energy_keV": 662.0, "weight": 0.5, "fe": 0.1, "pb": 0.2},
+        (1.0, 0.1, 0.2),
+    ),
+)
+def test_strict_catalog_line_contract_rejects_aliases_and_repair(
+    invalid_row: object,
+) -> None:
+    """Production line transport must not normalize or reinterpret old rows."""
+    with pytest.raises(ValueError, match="Exact catalog"):
+        ContinuousKernel(
+            line_mu_by_isotope={"Cs-137": (invalid_row,)},
+            strict_catalog_line_contract=True,
+            use_gpu=False,
+        )
+
+
+def _strict_obstacle_kernel(
+    grid: ObstacleGrid,
+    *,
+    use_gpu: bool = False,
+) -> ContinuousKernel:
+    """Build one exact single-line material-obstacle kernel."""
+    return ContinuousKernel(
+        mu_by_isotope={"Cs-137": {"fe": 0.0, "pb": 0.0}},
+        shield_params=ShieldParams(
+            mu_fe=0.0,
+            mu_pb=0.0,
+            thickness_fe_cm=0.0,
+            thickness_pb_cm=0.0,
+        ),
+        obstacle_grid=grid,
+        line_mu_by_isotope={
+            "Cs-137": (
+                {
+                    "weight": 1.0,
+                    "energy_keV": 662.0,
+                    "fe": 0.0,
+                    "pb": 0.0,
+                },
+            )
+        },
+        strict_catalog_line_contract=True,
+        dry_air_total_attenuation_contract_id=(
+            NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_ID
+        ),
+        dry_air_total_attenuation_contract_sha256=(
+            NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_SHA256
+        ),
+        use_gpu=use_gpu,
+        gpu_device="cpu",
+        gpu_dtype="float64",
+    )
+
+
+@pytest.mark.parametrize(
+    ("total", "compton"),
+    (
+        ({}, {}),
+        ({"Cs-137": ((0.1,),)}, {}),
+        ({"Cs137": ((0.1,),)}, {"Cs137": ((0.05,),)}),
+        (
+            {"Cs-137": ((0.1,), (0.2,))},
+            {"Cs-137": ((0.05,), (0.1,))},
+        ),
+        (
+            {"Cs-137": ((0.1,),), "Co-60": ((0.1,),)},
+            {"Cs-137": ((0.05,),), "Co-60": ((0.05,),)},
+        ),
+    ),
+    ids=(
+        "missing-total-and-compton",
+        "missing-compton",
+        "isotope-alias",
+        "wrong-line-count",
+        "unexpected-isotope",
+    ),
+)
+def test_strict_obstacle_transport_rejects_every_fallback(
+    total: dict[str, tuple[tuple[float, ...], ...]],
+    compton: dict[str, tuple[tuple[float, ...], ...]],
+) -> None:
+    """Strict material transport cannot degrade to scalar or zero rows."""
+    grid = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(1, 1),
+        blocked_cells=(),
+        transport_boxes_m=((0.9, -0.5, -0.5, 1.1, 0.5, 0.5),),
+        transport_mu_by_isotope={"Cs-137": (0.1,)},
+        transport_line_mu_by_isotope=total,
+        transport_line_compton_mu_by_isotope=compton,
+    )
+
+    with pytest.raises(ValueError, match="Strict obstacle"):
+        _strict_obstacle_kernel(grid)
+
+
+@pytest.mark.parametrize("use_gpu", [False, True])
+def test_strict_obstacle_transport_is_cpu_torch_equivalent(use_gpu: bool) -> None:
+    """The exact obstacle line contract must serve both execution paths."""
+    if use_gpu:
+        pytest.importorskip("torch")
+    grid = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(1, 1),
+        blocked_cells=(),
+        transport_boxes_m=((0.9, -0.5, -0.5, 1.1, 0.5, 0.5),),
+        transport_mu_by_isotope={"Cs-137": (0.1,)},
+        transport_line_mu_by_isotope={"Cs-137": ((0.1,),)},
+        transport_line_compton_mu_by_isotope={"Cs-137": ((0.05,),)},
+    )
+    kernel = _strict_obstacle_kernel(grid, use_gpu=use_gpu)
+
+    components = kernel.line_transport_components_selected_pairs_for_detectors(
+        "Cs-137",
+        np.asarray([[0.0, 0.0, 0.0]], dtype=np.float64),
+        np.asarray([[2.0, 0.0, 0.0]], dtype=np.float64),
+        np.asarray([0], dtype=np.int64),
+        np.asarray([0], dtype=np.int64),
+        np.asarray([0], dtype=np.int64),
+    )
+
+    assert components.tau_obstacle[0, 0, 0] == pytest.approx(2.0)
+    assert components.tau_obstacle_compton[0, 0, 0] == pytest.approx(1.0)
 
 
 def test_line_kernel_returns_source_equivalent_means_before_branching() -> None:
@@ -852,26 +996,20 @@ def test_line_transport_components_preserve_existing_total_kernel() -> None:
         indices,
         chunk_size=2,
     )
-    components = (
-        kernel.line_transport_components_selected_pairs_for_detectors(
-            "TestIso",
-            detectors,
-            sources,
-            fe_indices,
-            pb_indices,
-            indices,
-            chunk_size=2,
-        )
+    components = kernel.line_transport_components_selected_pairs_for_detectors(
+        "TestIso",
+        detectors,
+        sources,
+        fe_indices,
+        pb_indices,
+        indices,
+        chunk_size=2,
     )
 
     np.testing.assert_array_equal(components.total_kernel, expected)
     assert components.total_kernel.shape == (2, 3, 3)
     assert np.all(components.uncollided_kernel >= 0.0)
-    total_tau = (
-        components.tau_fe
-        + components.tau_pb
-        + components.tau_obstacle
-    )
+    total_tau = components.tau_fe + components.tau_pb + components.tau_obstacle
     assert np.any(total_tau > 0.0)
     assert np.all(components.distance_m > 0.0)
 
@@ -893,16 +1031,14 @@ def test_line_transport_components_cpu_and_torch_are_equivalent() -> None:
         indices,
         chunk_size=2,
     )
-    actual = (
-        torch_kernel.line_transport_components_selected_pairs_for_detectors(
-            "TestIso",
-            detectors,
-            sources,
-            fe_indices,
-            pb_indices,
-            indices,
-            chunk_size=2,
-        )
+    actual = torch_kernel.line_transport_components_selected_pairs_for_detectors(
+        "TestIso",
+        detectors,
+        sources,
+        fe_indices,
+        pb_indices,
+        indices,
+        chunk_size=2,
     )
 
     for field_name in (
@@ -1024,27 +1160,23 @@ def test_line_transport_pair_program_torch_matches_selected_pair_oracle() -> Non
     fe_program = np.asarray([[0, 2, 7], [1, 5, 3]], dtype=np.int64)
     pb_program = np.asarray([[7, 4, 0], [6, 2, 3]], dtype=np.int64)
 
-    expected = (
-        cpu.line_transport_components_selected_pairs_for_detectors(
-            "TestIso",
-            np.repeat(detectors, fe_program.shape[1], axis=0),
-            sources,
-            fe_program.reshape(-1),
-            pb_program.reshape(-1),
-            indices,
-            chunk_size=5,
-        )
+    expected = cpu.line_transport_components_selected_pairs_for_detectors(
+        "TestIso",
+        np.repeat(detectors, fe_program.shape[1], axis=0),
+        sources,
+        fe_program.reshape(-1),
+        pb_program.reshape(-1),
+        indices,
+        chunk_size=5,
     )
-    actual = (
-        torch_kernel.line_transport_components_pair_program_for_detectors(
-            "TestIso",
-            detectors,
-            sources,
-            fe_program,
-            pb_program,
-            indices,
-            chunk_size=5,
-        )
+    actual = torch_kernel.line_transport_components_pair_program_for_detectors(
+        "TestIso",
+        detectors,
+        sources,
+        fe_program,
+        pb_program,
+        indices,
+        chunk_size=5,
     )
     expected_shape = (
         detectors.shape[0],
@@ -1242,10 +1374,7 @@ def test_pair_program_evaluates_only_selected_shield_orientations(
     )
     fe_program = np.asarray([[0, 0, 0], [0, 0, 0]], dtype=np.int64)
     pb_program = np.asarray([[1, 2, 1], [1, 2, 1]], dtype=np.int64)
-    original = (
-        continuous_kernels
-        .segment_rotated_octant_shell_path_length_cm_torch
-    )
+    original = continuous_kernels.segment_rotated_octant_shell_path_length_cm_torch
     call_count = 0
 
     def _counted_segment(*args: object, **kwargs: object) -> object:
@@ -1403,9 +1532,7 @@ def test_line_kernel_exact_input_cache_avoids_recomputation(
     """Repeated exact requests must reuse physics while protecting cache data."""
     kernel = _line_resolved_full_physics_kernel(use_gpu=False)
     detectors, sources, fe_indices, pb_indices = _line_resolved_inputs()
-    original = (
-        kernel._kernel_values_selected_pairs_for_detector_source_numpy_chunk
-    )
+    original = kernel._kernel_values_selected_pairs_for_detector_source_numpy_chunk
     calls = 0
 
     def tracked(*args: object, **kwargs: object) -> np.ndarray:
@@ -2004,9 +2131,6 @@ def test_concrete_obstacle_misses_off_axis_ray() -> None:
     ) == pytest.approx(1.0)
 
 
-
-
-
 def test_continuous_kernel_cuda_matches_cpu_with_detector_aperture() -> None:
     """ContinuousKernel CUDA path should match the CPU finite-aperture geometry."""
     torch = pytest.importorskip("torch")
@@ -2385,15 +2509,13 @@ def test_torch_source_extent_rays_match_numpy() -> None:
     pair_ids = np.arange(pair_count, dtype=np.int64)
     pair_fe = pair_ids // len(kernel.orientations)
     pair_pb = pair_ids % len(kernel.orientations)
-    numpy_all = (
-        kernel._kernel_values_selected_pairs_for_detector_source_numpy_chunk(
-            isotope,
-            np.repeat(detectors, pair_count, axis=0),
-            np.repeat(matched_sources, pair_count, axis=0),
-            np.tile(pair_fe, detectors.shape[0]),
-            np.tile(pair_pb, detectors.shape[0]),
-        ).reshape(detectors.shape[0], pair_count)
-    )
+    numpy_all = kernel._kernel_values_selected_pairs_for_detector_source_numpy_chunk(
+        isotope,
+        np.repeat(detectors, pair_count, axis=0),
+        np.repeat(matched_sources, pair_count, axis=0),
+        np.tile(pair_fe, detectors.shape[0]),
+        np.tile(pair_pb, detectors.shape[0]),
+    ).reshape(detectors.shape[0], pair_count)
     torch_all = kernel._kernel_values_all_pairs_for_detector_source_torch_chunk(
         isotope,
         detectors,

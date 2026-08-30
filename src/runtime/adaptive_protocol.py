@@ -23,9 +23,6 @@ from runtime.shield_timing import (
 ADAPTIVE_EVENT_PREFIX = "adaptive-session "
 ADAPTIVE_CUI_OVERLAY_PREFIX = "adaptive-cui-overlay "
 ADAPTIVE_EVENT_FRAMING = CLIJSONEventFraming(ADAPTIVE_EVENT_PREFIX)
-ADAPTIVE_CUI_OVERLAY_FRAMING = CLIJSONEventFraming(
-    ADAPTIVE_CUI_OVERLAY_PREFIX
-)
 
 
 def _strict_fields(

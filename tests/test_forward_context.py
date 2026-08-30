@@ -93,9 +93,7 @@ def test_live_context_resolves_spectral_model_exactly_once(
 ) -> None:
     """Live construction must not rebuild the authenticated spectral model."""
     log = load_measurement_log(make_measurement_log(tmp_path / "run"))
-    original = (
-        forward_context_module.geometry_conditioned_model_from_runtime_config
-    )
+    original = forward_context_module.geometry_conditioned_model_from_runtime_config
     call_count = 0
 
     def counted_resolver(*args: object, **kwargs: object) -> object:
@@ -119,32 +117,28 @@ def test_live_context_resolves_spectral_model_exactly_once(
     assert resolved.run_root == log.path
 
 
-def test_live_context_rejects_training_ready_pre_holdout_model(
+def test_live_context_rejects_runtime_ready_unapproved_model(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A live context must reject a model without independent approval."""
     log = load_measurement_log(make_measurement_log(tmp_path / "run"))
     approved = approved_full_spectrum_model()
-    training_only = GeometryConditionedSpectralModel.standard_native(
+    unapproved = GeometryConditionedSpectralModel.physics_only_native(
         TEST_ISOTOPES,
         dead_time_tau_s=approved.dead_time_tau_s,
         background_rate_cps=approved.background_rate_cps,
-        rate_scale_nodes_j=approved.rate_scale_nodes_j,
-        rate_scale_weights_j=approved.rate_scale_weights_j,
-        mark_concentration_source=approved.mark_concentration_source,
-        discrepancy_training_manifest=approved.discrepancy_training_manifest,
-        additive_scatter_response=approved.additive_scatter_response,
+        detector_green_operator=approved.detector_green_operator,
     )
-    assert training_only.runtime_ready is True
-    assert training_only.production_ready is False
+    assert unapproved.runtime_ready is True
+    assert unapproved.production_ready is False
     monkeypatch.setattr(
         forward_context_module,
         "geometry_conditioned_model_from_runtime_config",
-        lambda *args, **kwargs: training_only,
+        lambda *args, **kwargs: unapproved,
     )
 
-    with pytest.raises(RuntimeError, match="independent all-64 holdout"):
+    with pytest.raises(RuntimeError, match="independent all-64 validation"):
         ResolvedForwardContext.from_run_context(
             log.context,
             run_root=log.path,

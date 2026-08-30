@@ -10,6 +10,7 @@ import pytest
 import spectrum.geant4_acceptance_backend as acceptance_backend
 
 from measurement.model import PointSource
+from measurement.geometry_family import randomized_training_geometry_parameters
 from measurement.obstacles import ObstacleGrid
 from measurement.source_boundary import (
     SURFACE_EMISSION_EPSILON_M,
@@ -22,9 +23,12 @@ from spectrum.full_spectrum_acceptance_runner import (
 from spectrum.geant4_acceptance_backend import (
     ExternalGeant4AcceptanceBackend,
     _boundary_probe_evidence_sha256,
+    _build_environment,
+    _generate_sources,
     _geometry_batch,
     _mutated_surface_scene,
     _native_fidelity,
+    _perturbed_sources,
     _validation_labels,
 )
 from spectrum.native_metadata import (
@@ -32,13 +36,22 @@ from spectrum.native_metadata import (
     sanitize_native_metadata_token,
 )
 from spectrum.geant4_physics import GEANT4_VERSION_TAG
+from spectrum.detector_green_operator import (
+    DETECTOR_GREEN_COINCIDENCE_SEMANTICS,
+    DETECTOR_GREEN_SAMPLING_MODE,
+)
 from spectrum.response_matrix import NATIVE_GEANT4_BIN_COUNT
 from spectrum.transport_spectral import (
     ACCEPTANCE_GEOMETRY_DEVICE,
     ACCEPTANCE_GEOMETRY_DTYPE,
     ACCEPTANCE_GEOMETRY_USE_GPU,
+    ACCEPTANCE_PERTURBATION_MINIMUM_BEARING_ANGLE_RAD,
+    ACCEPTANCE_PERTURBATION_MINIMUM_DISPLACEMENT_M,
+    ACCEPTANCE_PERTURBATION_MINIMUM_LOG_RATE_SEPARATION,
+    DETECTOR_IMPACT_PHASE_COUNT,
     GeometryConditionedSpectralModel,
 )
+from tests.green_test_support import synthetic_detector_green_operator
 
 
 class _FakeKernel:
@@ -56,9 +69,13 @@ class _FakeKernel:
         fe_indices: np.ndarray,
         pb_indices: np.ndarray,
         local_indices: np.ndarray,
+        impact_parameter_edges_fraction: np.ndarray,
     ) -> SimpleNamespace:
         """Return one finite attenuation batch for all requested pairs."""
         del fe_indices, pb_indices
+        assert impact_parameter_edges_fraction.shape == (
+            DETECTOR_IMPACT_PHASE_COUNT + 1,
+        )
         self.calls.append((isotope, sources.shape, local_indices.shape))
         shape = (detectors.shape[0], sources.shape[0], local_indices.size)
         unattenuated = np.full(shape, 2.0, dtype=np.float64)
@@ -70,6 +87,11 @@ class _FakeKernel:
             tau_obstacle=np.full(shape, 0.3, dtype=np.float64),
             tau_obstacle_compton=np.full(shape, 0.15, dtype=np.float64),
             distance_m=np.full(shape, 3.0, dtype=np.float64),
+            uncollided_impact_fractions=np.full(
+                shape + (DETECTOR_IMPACT_PHASE_COUNT,),
+                1.0 / DETECTOR_IMPACT_PHASE_COUNT,
+                dtype=np.float64,
+            ),
         )
 
     def line_branching_weights(
@@ -98,6 +120,68 @@ class _Source:
     def transport_position_array(self) -> np.ndarray:
         """Return the continuous source transport coordinate."""
         return self._position.copy()
+
+
+def test_surface_perturbation_is_predeclared_and_geometry_separable() -> None:
+    """Acceptance alternatives must differ before any response is observed."""
+    scene_seed = 991_337
+    parameters = randomized_training_geometry_parameters(
+        scene_seed,
+        room_size_xyz=(10.0, 20.0, 10.0),
+    )
+    obstacle_height = float(parameters["obstacle_height_m"])
+    environment, grid, _ = _build_environment(
+        scene_seed=scene_seed,
+        obstacle_height_m=obstacle_height,
+        author_room_boundaries=True,
+        room_boundary_thickness_m=0.1,
+    )
+    expected_isotopes = set(ACCEPTANCE_ISOTOPES)
+    assert set(grid.transport_mu_by_isotope) == expected_isotopes
+    assert set(grid.transport_line_mu_by_isotope) == expected_isotopes
+    assert set(grid.transport_line_compton_mu_by_isotope) == expected_isotopes
+    truth = _generate_sources(
+        environment=environment,
+        grid=grid,
+        scene_seed=scene_seed,
+        scenario_id="continuous_surface_perturbation_ranking",
+        obstacle_height_m=obstacle_height,
+    )[0]
+    alternative = _perturbed_sources(
+        environment=environment,
+        grid=grid,
+        sources=(truth,),
+        obstacle_height_m=obstacle_height,
+    )[0]
+    detector = environment.detector()
+    truth_position = np.asarray(truth.position, dtype=np.float64)
+    alternative_position = np.asarray(alternative.position, dtype=np.float64)
+    truth_vector = truth_position - detector
+    alternative_vector = alternative_position - detector
+    truth_distance = float(np.linalg.norm(truth_vector))
+    alternative_distance = float(np.linalg.norm(alternative_vector))
+    log_rate_separation = abs(2.0 * np.log(alternative_distance / truth_distance))
+    bearing_angle = float(
+        np.arccos(
+            np.clip(
+                np.dot(truth_vector, alternative_vector)
+                / (truth_distance * alternative_distance),
+                -1.0,
+                1.0,
+            )
+        )
+    )
+
+    assert np.linalg.norm(alternative_position - truth_position) >= (
+        ACCEPTANCE_PERTURBATION_MINIMUM_DISPLACEMENT_M
+    )
+    assert (
+        log_rate_separation
+        >= ACCEPTANCE_PERTURBATION_MINIMUM_LOG_RATE_SEPARATION
+        or bearing_angle >= ACCEPTANCE_PERTURBATION_MINIMUM_BEARING_ANGLE_RAD
+    )
+    assert alternative.isotope == truth.isotope
+    assert alternative.intensity_cps_1m == truth.intensity_cps_1m
 
 
 def test_acceptance_kernel_uses_predeclared_cpu_float64_contract(
@@ -174,6 +258,11 @@ def _config() -> SimpleNamespace:
         physics_profile="balanced",
         thread_count=32,
         source_rate_model="detector_cps_1m",
+        primary_emission_model="independent_gamma_lines",
+        source_bias_mode="detector_cone",
+        source_bias_cone_policy="detector_covering",
+        source_bias_isotropic_fraction=1.0,
+        detector_model=SimpleNamespace(coincidence_window_s=1.0e-6),
         detector_scoring_mode="incident_gamma_energy",
         secondary_transport_mode="full_transport",
         primary_sampling_fraction=1.0,
@@ -187,17 +276,26 @@ def _config() -> SimpleNamespace:
 
 def _metadata(*, source_count: int) -> dict[str, object]:
     """Return exact postconditions emitted by a native unit-history run."""
+    operator = synthetic_detector_green_operator()
     payload: dict[str, object] = {
         "backend": "geant4",
         "engine_mode": "external",
         "physics_profile": "balanced",
         "source_rate_model": "detector_cps_1m",
+        "primary_emission_model": "independent_gamma_lines",
+        "emission_model": "detector_equivalent_cone",
+        "source_strength_field": "intensity_cps_1m",
+        "intensity_cps_1m_definition": (
+            "pre_dead_time_detector_pulse_rate_at_1m"
+        ),
+        "true_coincidence_summing": "disabled",
+        "radioactive_decay_time_window": "disabled",
+        "source_bias_mode": "detector_cone",
+        "source_bias_cone_policy": "detector_covering",
         "detector_scoring_mode": "incident_gamma_energy",
         "secondary_transport_mode": "full_transport",
         "transport_history_mode": "full_unit_weight",
-        "validation_entry_spectrum_space": (
-            "pre_dead_time_raw_incident_gamma"
-        ),
+        "validation_entry_spectrum_space": ("pre_dead_time_raw_incident_gamma"),
         "validation_entry_spectrum_grouping": (
             "source_token_initial_gamma_line_entry_class"
         ),
@@ -205,10 +303,16 @@ def _metadata(*, source_count: int) -> dict[str, object]:
         "geant4_version_number": 1132,
         "geant4_version_tag": GEANT4_VERSION_TAG,
         "reference_physics_list": "FTFP_BERT",
-        "electromagnetic_physics_constructor": (
-            "G4EmStandardPhysics_option4"
-        ),
+        "electromagnetic_physics_constructor": ("G4EmStandardPhysics_option4"),
         "production_cut_range_mm": 0.7,
+        "source_bias_isotropic_fraction": 1.0,
+        "source_bias_effective_cone_half_angle_deg_min": (
+            0.1 if source_count else 0.0
+        ),
+        "source_bias_effective_cone_half_angle_deg_max": (
+            0.1 if source_count else 0.0
+        ),
+        "detector_coincidence_window_s": 1.0e-6,
         "gamma_process_names": "GammaGeneralProc,Transportation",
         "gamma_em_subprocess_names": "Rayl,compt,conv,phot",
         "geant4_physics_contract_id": NATIVE_ACCEPTANCE_FIDELITY[
@@ -224,7 +328,7 @@ def _metadata(*, source_count: int) -> dict[str, object]:
         "process_count_rayleigh": 0,
         "process_count_photoelectric": 0,
         "transport_process_counts": (
-            "Rayl:0,Transportation:1,compt:0,phot:0"
+            "Rayl:0,Transportation:1,compt:0,phot:0" if source_count else "-"
         ),
         "requested_threads": 32,
         "primary_sampling_fraction": 1.0,
@@ -240,14 +344,34 @@ def _metadata(*, source_count: int) -> dict[str, object]:
         "detector_response_applied_in_native": True,
         "validation_entry_class_spectra": True,
         "source_bias_weighted_transport": False,
-        "detector_response_sampling_contract_sha256": (
-            NATIVE_ACCEPTANCE_FIDELITY[
-                "detector_response_sampling_contract_sha256"
-            ]
+        "line_intensities_normalized": True,
+        "prompt_decay_cascade_transport": False,
+        "delayed_decay_pulse_separation": False,
+        "detector_response_sampling_contract_sha256": (operator.contract_hash_sha256),
+        "detector_response_operator_binary_sha256": operator.binary_sha256,
+        "detector_response_sampling_model": (
+            "isotope_independent_full_detector_green_operator_v3"
         ),
-        "detector_response_sampling_mode": (
-            "multinomial_marking_with_nonparalyzable_event_time"
+        "detector_response_boundary_state": (
+            "normalized_impact_parameter_at_detector_housing_entry_v1"
         ),
+        "detector_response_conditioning": (
+            "registered_pulse_subprobability_given_housing_incident_gamma_v1"
+        ),
+        "detector_cps_green_reference_normalization": (
+            "catalog_branching_weighted_absolute_detection_efficiency_at_1m_v1"
+        ),
+        "detector_response_sampling_mode": DETECTOR_GREEN_SAMPLING_MODE,
+        "detector_response_coincidence_semantics": (
+            DETECTOR_GREEN_COINCIDENCE_SEMANTICS
+        ),
+        "detector_response_incident_entry_count": 0,
+        "detector_response_registered_entry_count": 0,
+        "detector_response_coincidence_pulse_count": 0,
+        "detector_response_multi_entry_pulse_count": 0,
+        "pre_dead_time_total_spectrum_counts": 0,
+        "weighted_spectrum_sumw2": 0,
+        "dead_time_observed_scale": 1.0,
         "all_sources_surface_bound": source_count > 0,
         "surface_emission_policy_sha256": (
             surface_emission_policy_sha256() if source_count else ""
@@ -261,10 +385,11 @@ def _metadata(*, source_count: int) -> dict[str, object]:
 
 def test_geometry_batch_uses_one_batched_call_per_present_isotope() -> None:
     """All 64 pairs must not be evaluated through scalar pair/source loops."""
-    model = GeometryConditionedSpectralModel.standard_native(
+    model = GeometryConditionedSpectralModel.physics_only_native(
         ACCEPTANCE_ISOTOPES,
         dead_time_tau_s=0.0,
         background_rate_cps=0.0,
+        detector_green_operator=synthetic_detector_green_operator(),
     )
     sources = (
         _Source("Cs-137", (1.0, 2.0, 3.0)),
@@ -287,14 +412,11 @@ def test_geometry_batch_uses_one_batched_call_per_present_isotope() -> None:
         64,
         3,
         len(model.line_identity),
-        4,
+        len(model.transport_feature_order),
     )
     for source_index, source in enumerate(sources):
         wrong_lines = np.asarray(
-            [
-                line["isotope"] != source.isotope
-                for line in model.line_identity
-            ]
+            [line["isotope"] != source.isotope for line in model.line_identity]
         )
         assert np.all(batch.unattenuated_vsl[:, source_index, wrong_lines] == 0)
 
@@ -304,11 +426,15 @@ def test_native_fidelity_accepts_exact_background_and_surface_runs(
     source_count: int,
 ) -> None:
     """Background and source scenes have distinct strict surface provenance."""
-    assert _native_fidelity(
-        _metadata(source_count=source_count),
-        config=_config(),
-        source_count=source_count,
-    ) == NATIVE_ACCEPTANCE_FIDELITY
+    assert (
+        _native_fidelity(
+            _metadata(source_count=source_count),
+            config=_config(),
+            source_count=source_count,
+            operator=synthetic_detector_green_operator(),
+        )
+        == NATIVE_ACCEPTANCE_FIDELITY
+    )
 
 
 def test_native_fidelity_rejects_truthy_integer_boolean() -> None:
@@ -317,7 +443,103 @@ def test_native_fidelity_rejects_truthy_integer_boolean() -> None:
     metadata["weighted_transport"] = 0
 
     with pytest.raises(RuntimeError, match="must be boolean"):
-        _native_fidelity(metadata, config=_config(), source_count=1)
+        _native_fidelity(
+            metadata,
+            config=_config(),
+            source_count=1,
+            operator=synthetic_detector_green_operator(),
+        )
+
+
+def test_native_fidelity_rejects_transport_processes_without_sources() -> None:
+    """Background-only acquisition cannot conceal transported primaries."""
+    metadata = _metadata(source_count=0)
+    metadata["transport_process_counts"] = "Transportation:1"
+
+    with pytest.raises(RuntimeError, match="Background-only"):
+        _native_fidelity(
+            metadata,
+            config=_config(),
+            source_count=0,
+            operator=synthetic_detector_green_operator(),
+        )
+
+
+def test_native_fidelity_rejects_empty_processes_with_sources() -> None:
+    """A source-bearing acquisition must prove native photon transport."""
+    metadata = _metadata(source_count=1)
+    metadata["transport_process_counts"] = "-"
+
+    with pytest.raises(RuntimeError, match="must be nonempty"):
+        _native_fidelity(
+            metadata,
+            config=_config(),
+            source_count=1,
+            operator=synthetic_detector_green_operator(),
+        )
+
+
+def test_native_fidelity_rejects_retired_response_sampling_mode() -> None:
+    """Production acceptance must not adapt the retired response marker."""
+    metadata = _metadata(source_count=1)
+    metadata["detector_response_sampling_mode"] = (
+        "multinomial_marking_with_nonparalyzable_event_time"
+    )
+
+    with pytest.raises(RuntimeError, match="marking is incompatible"):
+        _native_fidelity(
+            metadata,
+            config=_config(),
+            source_count=1,
+            operator=synthetic_detector_green_operator(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    (
+        ("primary_emission_model", "geant4_radioactive_decay"),
+        ("emission_model", "isotropic_parent_radioactive_decay"),
+        ("true_coincidence_summing", "global_time_window_energy_deposit_sum"),
+        ("source_bias_mode", "analog"),
+        ("source_bias_cone_policy", "fixed_angle"),
+        ("line_intensities_normalized", False),
+        ("source_bias_isotropic_fraction", 0.5),
+        ("detector_coincidence_window_s", 2.0e-6),
+    ),
+)
+def test_native_fidelity_rejects_changed_catalog_emission_semantics(
+    field: str,
+    invalid: object,
+) -> None:
+    """Acceptance must bind independent catalog lines and detector timing."""
+    metadata = _metadata(source_count=1)
+    metadata[field] = invalid
+
+    with pytest.raises(RuntimeError, match="metadata|fidelity"):
+        _native_fidelity(
+            metadata,
+            config=_config(),
+            source_count=1,
+            operator=synthetic_detector_green_operator(),
+        )
+
+
+def test_native_fidelity_rejects_inconsistent_coincidence_counters() -> None:
+    """One multi-entry pulse must account for at least one merged entry."""
+    metadata = _metadata(source_count=1)
+    metadata["detector_response_incident_entry_count"] = 2
+    metadata["detector_response_registered_entry_count"] = 2
+    metadata["detector_response_coincidence_pulse_count"] = 2
+    metadata["detector_response_multi_entry_pulse_count"] = 1
+
+    with pytest.raises(RuntimeError, match="counters are inconsistent"):
+        _native_fidelity(
+            metadata,
+            config=_config(),
+            source_count=1,
+            operator=synthetic_detector_green_operator(),
+        )
 
 
 def test_native_metadata_token_matches_cpp_character_contract() -> None:
@@ -341,8 +563,7 @@ def _multi_source_validation_metadata(
     """Return literal C++-style labels for two hyphenated isotopes."""
     sources = ("Cs-137", "Co-60")
     spectrum = ",".join(
-        "1" if index == 10 else "0"
-        for index in range(NATIVE_GEANT4_BIN_COUNT)
+        "1" if index == 10 else "0" for index in range(NATIVE_GEANT4_BIN_COUNT)
     )
     metadata: dict[str, object] = {
         "validation_only_background_analysis_spectrum": ",".join(
@@ -350,30 +571,27 @@ def _multi_source_validation_metadata(
         )
     }
     for source_index, isotope in enumerate(sources):
-        metadata[
-            f"source_equivalent_counts_src{source_index}_{isotope}"
-        ] = 1.0
+        metadata[f"source_equivalent_counts_src{source_index}_{isotope}"] = 1.0
         for line in model.line_identity:
             if line["isotope"] != isotope:
                 continue
             token = (
-                f"src{source_index}_{isotope}_"
-                f"e{float(line['energy_keV']):.1f}"
+                f"src{source_index}_{isotope}_e{float(line['energy_keV']):.1f}"
             ).replace(".", "p")
-            metadata[f"source_equivalent_counts_{token}"] = 1.0
-            metadata[
-                "validation_only_entry_spectrum_"
-                f"{token}_uncollided_primary"
-            ] = spectrum
+            metadata[f"scheduled_incident_gamma_counts_{token}"] = 1.0
+            metadata[f"validation_only_entry_spectrum_{token}_uncollided_primary"] = (
+                spectrum
+            )
     return metadata
 
 
 def test_validation_labels_accept_literal_cpp_multi_source_tokens() -> None:
     """A real multi-source response must retain native isotope hyphens."""
-    model = GeometryConditionedSpectralModel.standard_native(
+    model = GeometryConditionedSpectralModel.physics_only_native(
         ACCEPTANCE_ISOTOPES,
         dead_time_tau_s=0.0,
         background_rate_cps=0.0,
+        detector_green_operator=synthetic_detector_green_operator(),
     )
     sources = (
         PointSource("Cs-137", (1.0, 1.0, 1.0), 800_000.0),
@@ -391,44 +609,43 @@ def test_validation_labels_accept_literal_cpp_multi_source_tokens() -> None:
     assert "src0_Cs-137_e662p0" in totals
     assert "src1_Co-60_e1173p0" in totals
     assert all("Cs_137" not in token for token in totals)
-    assert all(
-        row["uncollided_primary"] == 1
-        for row in totals.values()
-    )
+    assert all(row["uncollided_primary"] == 1 for row in totals.values())
 
 
 def test_validation_labels_require_every_scheduled_line_count_key() -> None:
     """Zero detector hits must not hide native source-line token drift."""
-    model = GeometryConditionedSpectralModel.standard_native(
+    model = GeometryConditionedSpectralModel.physics_only_native(
         ACCEPTANCE_ISOTOPES,
         dead_time_tau_s=0.0,
         background_rate_cps=0.0,
+        detector_green_operator=synthetic_detector_green_operator(),
     )
     sources = (
         PointSource("Cs-137", (1.0, 1.0, 1.0), 800_000.0),
         PointSource("Co-60", (2.0, 2.0, 2.0), 600_000.0),
     )
     metadata = _multi_source_validation_metadata(model)
-    missing_key = "source_equivalent_counts_src0_Cs-137_e662p0"
+    missing_key = "scheduled_incident_gamma_counts_src0_Cs-137_e662p0"
     del metadata[missing_key]
 
-    with pytest.raises(RuntimeError, match="every scheduled line"):
+    with pytest.raises(RuntimeError, match="every catalog line"):
         _validation_labels(metadata, sources=sources, model=model)
 
 
 def test_validation_labels_reject_unexpected_line_count_token() -> None:
     """A Python-only underscore isotope token must fail before checkpointing."""
-    model = GeometryConditionedSpectralModel.standard_native(
+    model = GeometryConditionedSpectralModel.physics_only_native(
         ACCEPTANCE_ISOTOPES,
         dead_time_tau_s=0.0,
         background_rate_cps=0.0,
+        detector_green_operator=synthetic_detector_green_operator(),
     )
     sources = (
         PointSource("Cs-137", (1.0, 1.0, 1.0), 800_000.0),
         PointSource("Co-60", (2.0, 2.0, 2.0), 600_000.0),
     )
     metadata = _multi_source_validation_metadata(model)
-    metadata["source_equivalent_counts_src0_Cs_137_e662p0"] = 1.0
+    metadata["scheduled_incident_gamma_counts_src0_Cs_137_e662p0"] = 1.0
 
     with pytest.raises(RuntimeError, match="unexpected source-resolved"):
         _validation_labels(metadata, sources=sources, model=model)

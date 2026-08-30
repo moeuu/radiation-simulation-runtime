@@ -27,6 +27,10 @@ from sim.protocol import (
     normalize_json_payload,
 )
 from sim.approx.python_transport import PythonTransportSpectrumModel
+from spectrum.detector_green_operator import (
+    DETECTOR_GREEN_COINCIDENCE_SEMANTICS,
+    DETECTOR_GREEN_SAMPLING_MODE,
+)
 
 
 def _reject_nonfinite_json_constant(value: str) -> None:
@@ -280,6 +284,8 @@ class Geant4TCPClientRuntime(TCPSidecarClientRuntime):
         expected_background_cps: float | None = None,
         expected_dead_time_tau_s: float | None = None,
         expected_detector_response_sampling: bool = False,
+        expected_detector_green_operator_contract_sha256: str | None = None,
+        expected_detector_green_operator_binary_sha256: str | None = None,
         expected_runtime_config_sha256: str | None = None,
         expected_native_executable_sha256: str | None = None,
         expected_native_execution_environment_sha256: str | None = None,
@@ -388,6 +394,30 @@ class Geant4TCPClientRuntime(TCPSidecarClientRuntime):
         self.expected_detector_response_sampling = bool(
             expected_detector_response_sampling
         )
+        green_hashes = (
+            expected_detector_green_operator_contract_sha256,
+            expected_detector_green_operator_binary_sha256,
+        )
+        valid_green_hashes = all(
+            isinstance(value, str)
+            and len(value) == 64
+            and all(character in "0123456789abcdef" for character in value)
+            for value in green_hashes
+        )
+        if self.expected_detector_response_sampling != valid_green_hashes or (
+            not self.expected_detector_response_sampling
+            and any(value is not None for value in green_hashes)
+        ):
+            raise ValueError(
+                "Detector Green hashes are required exactly when detector "
+                "response sampling is enabled."
+            )
+        self.expected_detector_green_operator_contract_sha256 = (
+            expected_detector_green_operator_contract_sha256
+        )
+        self.expected_detector_green_operator_binary_sha256 = (
+            expected_detector_green_operator_binary_sha256
+        )
         if expected_runtime_config_sha256 is not None and (
             not isinstance(expected_runtime_config_sha256, str)
             or len(expected_runtime_config_sha256) != 64
@@ -473,6 +503,12 @@ class Geant4TCPClientRuntime(TCPSidecarClientRuntime):
             expected_dead_time_tau_s=self.expected_dead_time_tau_s,
             expected_detector_response_sampling=(
                 self.expected_detector_response_sampling
+            ),
+            expected_detector_green_operator_contract_sha256=(
+                self.expected_detector_green_operator_contract_sha256
+            ),
+            expected_detector_green_operator_binary_sha256=(
+                self.expected_detector_green_operator_binary_sha256
             ),
             expected_surface_source_contract_sha256=(
                 self.expected_surface_source_contract_sha256
@@ -735,14 +771,32 @@ class Geant4TCPClientRuntime(TCPSidecarClientRuntime):
                 NATIVE_GEANT4_BACKGROUND_MODEL_ID,
                 NATIVE_GEANT4_BIN_COUNT,
                 NATIVE_GEANT4_BIN_WIDTH_KEV,
-                NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256,
                 NATIVE_GEANT4_ENERGY_MAX_KEV,
                 NATIVE_GEANT4_ENERGY_MIN_KEV,
             )
 
             expected_response_text = {
+                "detector_response_sampling_model": (
+                    "isotope_independent_full_detector_green_operator_v3"
+                ),
+                "detector_response_sampling_mode": DETECTOR_GREEN_SAMPLING_MODE,
                 "detector_response_sampling_contract_sha256": (
-                    NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
+                    self.expected_detector_green_operator_contract_sha256
+                ),
+                "detector_response_operator_binary_sha256": (
+                    self.expected_detector_green_operator_binary_sha256
+                ),
+                "detector_response_boundary_state": (
+                    "normalized_impact_parameter_at_detector_housing_entry_v1"
+                ),
+                "detector_response_conditioning": (
+                    "registered_pulse_subprobability_given_housing_incident_gamma_v1"
+                ),
+                "detector_response_coincidence_semantics": (
+                    DETECTOR_GREEN_COINCIDENCE_SEMANTICS
+                ),
+                "detector_cps_green_reference_normalization": (
+                    "catalog_branching_weighted_absolute_detection_efficiency_at_1m_v1"
                 ),
                 "background_spectrum_model_id": (NATIVE_GEANT4_BACKGROUND_MODEL_ID),
             }
@@ -1065,6 +1119,8 @@ class ManagedGeant4TCPClientRuntime(Geant4TCPClientRuntime):
         expected_background_cps: float | None = None,
         expected_dead_time_tau_s: float | None = None,
         expected_detector_response_sampling: bool = False,
+        expected_detector_green_operator_contract_sha256: str | None = None,
+        expected_detector_green_operator_binary_sha256: str | None = None,
         expected_runtime_config_sha256: str | None = None,
         expected_native_executable_sha256: str | None = None,
         expected_native_execution_environment_sha256: str | None = None,
@@ -1089,6 +1145,12 @@ class ManagedGeant4TCPClientRuntime(Geant4TCPClientRuntime):
             expected_background_cps=expected_background_cps,
             expected_dead_time_tau_s=expected_dead_time_tau_s,
             expected_detector_response_sampling=(expected_detector_response_sampling),
+            expected_detector_green_operator_contract_sha256=(
+                expected_detector_green_operator_contract_sha256
+            ),
+            expected_detector_green_operator_binary_sha256=(
+                expected_detector_green_operator_binary_sha256
+            ),
             expected_runtime_config_sha256=expected_runtime_config_sha256,
             expected_native_executable_sha256=(expected_native_executable_sha256),
             expected_native_execution_environment_sha256=(
@@ -1144,13 +1206,13 @@ PRODUCTION_RUNTIME_CONFIG_FIELDS = frozenset(
         "auto_start_sidecar",
         "backend",
         "background_cps",
-        "background_rate_cps",
         "background_spectrum_model_id",
         "bin_width_keV",
         "dead_time_tau_s",
         "detector_aperture_samples",
         "detector_aperture_sampling",
         "detector_height_m",
+        "detector_green_operator_manifest",
         "detector_model",
         "detector_scoring_mode",
         "energy_bin_count",
@@ -1169,6 +1231,7 @@ PRODUCTION_RUNTIME_CONFIG_FIELDS = frozenset(
         "persistent_process",
         "physics_profile",
         "port",
+        "primary_emission_model",
         "primary_sampling_fraction",
         "random_seed_base",
         "renderer",
@@ -1176,7 +1239,9 @@ PRODUCTION_RUNTIME_CONFIG_FIELDS = frozenset(
         "secondary_transport_mode",
         "shield_transmission_target",
         "simulation_runtime_schema_version",
-        "source_bias_cone_half_angle_deg",
+        "source_bias_cone_policy",
+        "source_bias_isotropic_fraction",
+        "source_bias_mode",
         "source_extent_radius_m",
         "source_extent_samples",
         "source_rate_model",
@@ -1202,6 +1267,7 @@ _PRODUCTION_DETECTOR_MODEL_FIELDS = frozenset(
         "crystal_material",
         "crystal_radius_m",
         "crystal_shape",
+        "coincidence_window_s",
         "housing_material",
         "housing_thickness_m",
     }
@@ -1333,6 +1399,14 @@ def production_runtime_config_sha256(config: Mapping[str, Any]) -> str:
 
     Geant4AppConfig.from_dict(dict(config))
     return strict_sha256_json(dict(config))
+
+
+def load_production_runtime_config_with_digest(
+    path: str | Path,
+) -> tuple[dict[str, Any], str]:
+    """Load one canonical production config and return its sole approved digest."""
+    config = load_production_runtime_config(path)
+    return config, production_runtime_config_sha256(config)
 
 
 def _load_runtime_config(
@@ -1583,6 +1657,29 @@ def _resolve_geant4_sidecar_config_path(
     return temp_path, temp_path
 
 
+def _configured_detector_green_hashes(
+    config: object,
+) -> tuple[str | None, str | None]:
+    """Load the exact configured detector Green identity or fail closed."""
+    from spectrum.detector_green_operator import DetectorGreenOperator
+
+    sample_response = bool(getattr(config, "sample_detector_response"))
+    manifest_value = getattr(config, "detector_green_operator_manifest")
+    if sample_response != (manifest_value is not None):
+        raise ValueError(
+            "Detector Green manifest is required exactly when response "
+            "sampling is enabled."
+        )
+    if not sample_response:
+        return None, None
+    manifest_path = Path(str(manifest_value)).expanduser()
+    if not manifest_path.is_absolute():
+        manifest_path = _repo_root() / manifest_path
+    operator = DetectorGreenOperator.from_artifact(manifest_path)
+    operator.require_runtime_ready()
+    return operator.contract_hash_sha256, operator.binary_sha256
+
+
 def _start_geant4_sidecar(
     config: dict[str, Any],
     *,
@@ -1598,6 +1695,9 @@ def _start_geant4_sidecar(
     from sim.geant4_app.app import Geant4AppConfig
 
     validated_geant4_config = Geant4AppConfig.from_dict(config)
+    green_contract_hash, green_binary_hash = _configured_detector_green_hashes(
+        validated_geant4_config
+    )
     root = _repo_root()
     script_path = root / "scripts" / "run_geant4_bridge.py"
     config_path, temp_config_path = _resolve_geant4_sidecar_config_path(
@@ -1685,6 +1785,8 @@ def _start_geant4_sidecar(
             expected_detector_response_sampling=(
                 validated_geant4_config.sample_detector_response
             ),
+            expected_detector_green_operator_contract_sha256=(green_contract_hash),
+            expected_detector_green_operator_binary_sha256=(green_binary_hash),
             expected_runtime_config_sha256=expected_runtime_config_sha256,
             expected_native_executable_sha256=(expected_native_executable_sha256),
             expected_native_execution_environment_sha256=(
@@ -2043,6 +2145,9 @@ def create_simulation_runtime(
                     "executable and execution-environment digests."
                 )
         validated_geant4_config = Geant4AppConfig.from_dict(config)
+        green_contract_hash, green_binary_hash = _configured_detector_green_hashes(
+            validated_geant4_config
+        )
         host = _config_string(config, "host", "127.0.0.1")
         port = _config_integer(
             config,
@@ -2111,6 +2216,8 @@ def create_simulation_runtime(
                 expected_detector_response_sampling=(
                     validated_geant4_config.sample_detector_response
                 ),
+                expected_detector_green_operator_contract_sha256=(green_contract_hash),
+                expected_detector_green_operator_binary_sha256=(green_binary_hash),
                 expected_runtime_config_sha256=(expected_runtime_config_sha256),
                 expected_native_executable_sha256=(expected_native_executable_sha256),
                 expected_native_execution_environment_sha256=(

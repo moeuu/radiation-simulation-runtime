@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from pathlib import Path
 
 import numpy as np
 import pytest
 
+import spectrum.transport_spectral as transport_spectral
+from tests.green_test_support import write_synthetic_detector_green_artifact
+
 torch = pytest.importorskip("torch")
 
 from spectrum.predictive_torch import (  # noqa: E402
-    HierarchicalMarkParameters,
+    ComponentTreeMarkParameters,
     nonparalyzable_count_cdf_torch,
     sample_action_seeded_torch,
     sample_mean_one_gamma_torch,
@@ -19,11 +23,35 @@ from spectrum.predictive_torch import (  # noqa: E402
     sample_predictive_action_torch,
 )
 from spectrum.transport_spectral import (  # noqa: E402
+    DETECTOR_IMPACT_PHASE_COUNT,
     GeometryConditionedSpectralModel,
     PhysicalComponentDiscrepancy,
     nonparalyzable_count_cdf_numpy,
     nonparalyzable_count_log_probability_numpy,
 )
+
+
+@pytest.fixture(scope="module")
+def _detector_green_manifest(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Path:
+    """Publish one immutable synthetic Green artifact for this test module."""
+    return write_synthetic_detector_green_artifact(
+        tmp_path_factory.mktemp("detector-green-torch") / "operator"
+    )
+
+
+@pytest.fixture(autouse=True)
+def _use_explicit_detector_green(
+    _detector_green_manifest: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Route sampler models through an authenticated synthetic operator."""
+    monkeypatch.setattr(
+        transport_spectral,
+        "DEFAULT_DETECTOR_GREEN_OPERATOR_MANIFEST",
+        _detector_green_manifest,
+    )
 
 
 def _generator(seed: int, *, device: str = "cpu") -> "torch.Generator":
@@ -36,33 +64,38 @@ def _hierarchical_parameters(
     view_count: int,
     *,
     device: str = "cpu",
-) -> HierarchicalMarkParameters:
-    """Return a small aligned photopeak/continuum hierarchy for tests."""
-    peak = torch.tensor(
-        [True, True, False, False, False, False],
-        device=device,
-    )
-    groups = torch.tensor(
+) -> ComponentTreeMarkParameters:
+    """Return a small aligned component-aware tree for sampler tests."""
+    leaves = torch.tensor(
         [
+            [1.0, 1.0, 0.0, 0.0, 0.0, 0.0],
             [0.0, 0.0, 1.0, 1.0, 0.0, 0.0],
             [0.0, 0.0, 0.0, 0.0, 1.0, 1.0],
         ],
         dtype=torch.float64,
         device=device,
     )
-    concentration = torch.full(
-        leading_shape + (view_count,),
+    tree_concentration = torch.full(
+        leading_shape + (view_count, 2),
         80.0,
         dtype=torch.float64,
         device=device,
     )
-    return HierarchicalMarkParameters(
-        peak_mask_b=peak,
-        continuum_group_mask_gb=groups,
-        peak_fraction_concentration_xv=concentration,
-        peak_shape_concentration=120.0,
-        continuum_group_concentration=60.0,
-        continuum_within_concentration=90.0,
+    leaf_concentration = torch.full(
+        leading_shape + (view_count, 3),
+        90.0,
+        dtype=torch.float64,
+        device=device,
+    )
+    return ComponentTreeMarkParameters(
+        leaf_group_mask_hb=leaves,
+        tree_left_mask_tb=torch.stack((leaves[0], leaves[1])),
+        tree_right_mask_tb=torch.stack((leaves[1] + leaves[2], leaves[2])),
+        tree_depth_t=torch.tensor([0, 1], device=device),
+        tree_left_child_t=torch.tensor([-1, -2], device=device),
+        tree_right_child_t=torch.tensor([1, -3], device=device),
+        tree_concentration_xvt=tree_concentration,
+        leaf_concentration_xvh=leaf_concentration,
     )
 
 
@@ -76,29 +109,18 @@ def _integration_model(branch: str) -> GeometryConditionedSpectralModel:
         keywords["count_discrepancy_scope"] = (
             "view_independent" if branch == "legacy_view_count" else "station_shared"
         )
-    elif branch in (
-        "component_fraction",
-        "component_scale",
-        "component_hierarchical",
-    ):
-        mark_model = {
-            "component_fraction": "fraction_dirichlet_multinomial",
-            "component_scale": "station_shared_two_point_component_scale",
-            "component_hierarchical": "photopeak_continuum_hierarchical",
-        }[branch]
+    elif branch == "component_tree":
         keywords["physical_component_discrepancy"] = PhysicalComponentDiscrepancy(
             count_uncollided_concentration=60.0,
             count_scatter_concentration=12.0,
             mark_uncollided_concentration=90.0,
             mark_scatter_concentration=15.0,
-            mark_latent_model=mark_model,
-            mark_continuum_group_concentration=(
-                25.0 if branch == "component_hierarchical" else None
-            ),
+            mark_background_group_concentration=15.0,
+            mark_background_within_concentration=90.0,
         )
     elif branch != "fixed_renewal":
         raise ValueError(f"Unknown integration branch: {branch!r}.")
-    return GeometryConditionedSpectralModel.standard_native(
+    return GeometryConditionedSpectralModel.nonproduction_native(
         ("Cs-137",),
         dead_time_tau_s=1.0e-5,
         background_rate_cps=1.0,
@@ -128,6 +150,7 @@ def _integration_inputs(
         dtype=torch.float64,
     )
     features[..., 3] = 1.25
+    features[..., 4:] = 1.0 / DETECTOR_IMPACT_PHASE_COUNT
     live_times = torch.tensor(
         [0.25, 0.4],
         device=device,
@@ -314,7 +337,7 @@ def test_hierarchical_marks_preserve_partition_means_and_row_totals() -> None:
         rate_scale_nodes_j=torch.ones(1, dtype=torch.float64),
         rate_scale_weights_j=torch.ones(1, dtype=torch.float64),
         dead_time_tau_s=0.0,
-        mark_model="photopeak_continuum_hierarchical",
+        mark_model="component_dirichlet_tree_hierarchical",
         count_scope="view_independent_gamma_poisson",
         count_concentration_xv=torch.full((1, 1), 40.0, dtype=torch.float64),
         hierarchical_marks=hierarchy,
@@ -374,58 +397,21 @@ def test_fraction_dirichlet_marks_are_exact_and_replayable() -> None:
     assert torch.var(first[0, :, 0, 0].to(torch.float64)) > 0.0
 
 
-def test_component_scale_marks_are_device_batched_and_replayable() -> None:
-    """Two-point physical-component marks must remain exact integer draws."""
-    direct = torch.tensor(
-        [[[30.0, 2.0, 1.0, 1.0]]],
-        dtype=torch.float64,
-    )
-    scatter = torch.tensor(
-        [[[1.0, 2.0, 15.0, 10.0]]],
-        dtype=torch.float64,
-    )
-    source = direct + scatter
-
-    def _run() -> object:
-        """Draw the same component-scale mark stream."""
-        return sample_predictive_action_torch(
+def test_retired_component_scale_mark_model_is_rejected() -> None:
+    """The retired two-point component-scale path must be unreachable."""
+    source = torch.ones((1, 1, 4), dtype=torch.float64)
+    with pytest.raises(ValueError, match="Unsupported predictive mark_model"):
+        sample_predictive_action_torch(
             source,
             torch.ones_like(source),
             torch.ones(1, dtype=torch.float64),
-            sample_count=512,
+            sample_count=2,
             generator=_generator(419),
             rate_scale_nodes_j=torch.ones(1, dtype=torch.float64),
             rate_scale_weights_j=torch.ones(1, dtype=torch.float64),
             dead_time_tau_s=0.0,
-            count_scope="view_independent_gamma_poisson",
-            count_concentration_xv=torch.full(
-                (1, 1),
-                80.0,
-                dtype=torch.float64,
-            ),
             mark_model="station_shared_two_point_component_scale",
-            component_direct_mean_xvb=direct,
-            component_scatter_mean_xvb=scatter,
-            component_scale_nodes_k2=torch.tensor(
-                [[0.5, 1.5], [1.5, 0.5]],
-                dtype=torch.float64,
-            ),
-            component_scale_weights_k=torch.tensor(
-                [0.5, 0.5],
-                dtype=torch.float64,
-            ),
         )
-
-    first = _run()
-    replay = _run()
-    assert torch.equal(first, replay)
-    assert first.dtype == torch.int64
-    assert torch.all(torch.sum(first, dim=-1) >= 0)
-    direct_fraction = first[0, :, 0, 0].to(torch.float64) / torch.clamp(
-        torch.sum(first[0, :, 0], dim=-1).to(torch.float64),
-        min=1.0,
-    )
-    assert torch.var(direct_fraction) > 0.0
 
 
 def test_station_shared_gamma_poisson_scale_correlates_view_totals() -> None:
@@ -456,9 +442,7 @@ def test_station_shared_gamma_poisson_scale_correlates_view_totals() -> None:
         "legacy_fraction",
         "legacy_view_count",
         "legacy_station_count",
-        "component_fraction",
-        "component_scale",
-        "component_hierarchical",
+        "component_tree",
     ),
 )
 def test_model_sampler_maps_every_numpy_predictive_branch(branch: str) -> None:
@@ -495,6 +479,222 @@ def test_model_sampler_maps_every_numpy_predictive_branch(branch: str) -> None:
     )
     assert torch.equal(first, replay)
     assert torch.all(first >= 0)
+
+
+@pytest.mark.parametrize("branch", ("fixed_renewal", "component_tree"))
+@pytest.mark.parametrize(
+    "device",
+    (
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(),
+                reason="CUDA is unavailable",
+            ),
+        ),
+    ),
+)
+def test_exact_slot_overlay_matches_materialized_state(
+    branch: str,
+    device: str,
+) -> None:
+    """Bounded slot replacement must equal an explicitly materialized oracle."""
+    model = _integration_model(branch)
+    action_count = 2
+    accepted_state_count = 5
+    proposal_state_count = 3
+    view_count = 2
+    source_slot_count = 3
+    line_count = len(model.line_identity)
+    total = torch.linspace(
+        12.0,
+        31.0,
+        steps=(
+            action_count
+            * accepted_state_count
+            * view_count
+            * source_slot_count
+            * line_count
+        ),
+        device=device,
+        dtype=torch.float64,
+    ).reshape(
+        action_count,
+        accepted_state_count,
+        view_count,
+        source_slot_count,
+        line_count,
+    )
+    uncollided = 0.7 * total
+    features = torch.zeros(
+        tuple(total.shape) + (len(model.transport_feature_order),),
+        device=device,
+        dtype=torch.float64,
+    )
+    features[..., 4] = 1.0
+    features[..., 5:] = 1.0 / DETECTOR_IMPACT_PHASE_COUNT
+    replacement_total = torch.linspace(
+        4.0,
+        9.0,
+        steps=(
+            action_count
+            * proposal_state_count
+            * view_count
+            * line_count
+        ),
+        device=device,
+        dtype=torch.float64,
+    ).reshape(
+        action_count,
+        proposal_state_count,
+        view_count,
+        1,
+        line_count,
+    )
+    replacement_uncollided = 0.6 * replacement_total
+    replacement_features = torch.zeros(
+        tuple(replacement_total.shape) + (len(model.transport_feature_order),),
+        device=device,
+        dtype=torch.float64,
+    )
+    replacement_features[..., 4] = 1.5
+    replacement_features[..., 5:] = 1.0 / DETECTOR_IMPACT_PHASE_COUNT
+    particle_indices = torch.tensor(
+        [4, 1, 3],
+        device=device,
+        dtype=torch.long,
+    )
+    observed = torch.zeros(
+        (action_count, 1, view_count, int(model.energy_axis_keV.size)),
+        device=device,
+        dtype=torch.float64,
+    )
+    live_times = torch.tensor(
+        [0.25, 0.4],
+        device=device,
+        dtype=torch.float64,
+    )
+    total_before = total.clone()
+    uncollided_before = uncollided.clone()
+    features_before = features.clone()
+
+    materialized_total = torch.index_select(total, -4, particle_indices)
+    materialized_uncollided = torch.index_select(
+        uncollided,
+        -4,
+        particle_indices,
+    )
+    materialized_features = torch.index_select(features, -5, particle_indices)
+    materialized_total[..., 1:2, :] = replacement_total
+    materialized_uncollided[..., 1:2, :] = replacement_uncollided
+    materialized_features[..., 1:2, :, :] = replacement_features
+    expected = model.cross_log_likelihood_torch(
+        observed,
+        materialized_total,
+        materialized_uncollided,
+        materialized_features,
+        live_times,
+        state_chunk_size=2,
+    )
+    actual = model.cross_log_likelihood_replace_slots_torch(
+        observed,
+        total,
+        uncollided,
+        features,
+        replacement_total,
+        replacement_uncollided,
+        replacement_features,
+        live_times,
+        particle_indices_n=particle_indices,
+        slot_start=1,
+        slot_stop=2,
+        state_chunk_size=2,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+    assert torch.equal(total, total_before)
+    assert torch.equal(uncollided, uncollided_before)
+    assert torch.equal(features, features_before)
+    assert model.last_torch_slot_overlay_diagnostics == {
+        "mode": "bounded_exact_slot_overlay",
+        "chunk_selection_mode": "explicit_or_non_cuda",
+        "proposal_state_count": 3,
+        "accepted_state_count": 5,
+        "state_chunk_size": 2,
+        "slab_count": 2,
+        "replacement_slot_count": 1,
+        "source_slot_count": 3,
+        "scratch_peak_bytes": (
+            action_count
+            * 2
+            * view_count
+            * source_slot_count
+            * line_count
+            * 8
+            * (2 + len(model.transport_feature_order))
+        ),
+        "full_history_clone_count": 0,
+    }
+
+
+def test_exact_slot_overlay_rejects_misaligned_replacement() -> None:
+    """Slot replacement must fail before evaluating a malformed state."""
+    model = _integration_model("fixed_renewal")
+    total, uncollided, features, live_times = _integration_inputs(model)
+    observed = torch.zeros(
+        (2, 1, 2, int(model.energy_axis_keV.size)),
+        dtype=torch.float64,
+    )
+    replacement = total[:, :1, :, :, :]
+    replacement_features = features[:, :1, :, :, :, :-1]
+
+    with pytest.raises(ValueError, match="Replacement slot tensors"):
+        model.cross_log_likelihood_replace_slots_torch(
+            observed,
+            total,
+            uncollided,
+            features,
+            replacement,
+            replacement,
+            replacement_features,
+            live_times,
+            particle_indices_n=torch.tensor([0]),
+            slot_start=0,
+            slot_stop=1,
+        )
+
+    valid_replacement = total[:, :1, :, :1, :]
+    valid_replacement_features = features[:, :1, :, :1, :, :]
+    with pytest.raises(TypeError, match="particle indices must be a Torch tensor"):
+        model.cross_log_likelihood_replace_slots_torch(
+            observed,
+            total,
+            uncollided,
+            features,
+            valid_replacement,
+            valid_replacement,
+            valid_replacement_features,
+            live_times,
+            particle_indices_n=[0],
+            slot_start=0,
+            slot_stop=1,
+        )
+
+    with pytest.raises(ValueError, match="share device and dtype"):
+        model.cross_log_likelihood_replace_slots_torch(
+            observed,
+            total,
+            uncollided,
+            features,
+            valid_replacement.to(dtype=torch.float32),
+            valid_replacement.to(dtype=torch.float32),
+            valid_replacement_features.to(dtype=torch.float32),
+            live_times,
+            particle_indices_n=torch.tensor([0], dtype=torch.long),
+            slot_start=0,
+            slot_stop=1,
+        )
 
 
 def test_model_action_streams_are_chunk_order_invariant_and_aligned() -> None:
@@ -597,7 +797,7 @@ def test_model_action_scheduler_accepts_batches_larger_than_32() -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_model_hierarchical_sampler_stays_on_cuda() -> None:
     """Production hierarchical class integration must stay CUDA resident."""
-    model = _integration_model("component_hierarchical")
+    model = _integration_model("component_tree")
     total, uncollided, features, live_times = _integration_inputs(
         model,
         device="cuda",
@@ -731,7 +931,7 @@ def test_hierarchical_action_sampler_stays_on_cuda_and_replays() -> None:
                     device=device,
                 ),
                 dead_time_tau_s=5.813e-9,
-                mark_model="photopeak_continuum_hierarchical",
+                mark_model="component_dirichlet_tree_hierarchical",
                 count_scope="view_independent_gamma_poisson",
                 count_concentration_xv=torch.full(
                     (1,),

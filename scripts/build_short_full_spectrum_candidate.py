@@ -15,6 +15,7 @@ from spectrum.full_spectrum_acceptance_runner import (
     ACCEPTANCE_ISOTOPES,
     canonical_json_bytes,
     canonical_json_sha256,
+    canonical_detector_green_operator,
     file_sha256,
     line_identity_contract_sha256,
     load_acceptance_pair,
@@ -120,7 +121,10 @@ def _parser() -> argparse.ArgumentParser:
 def _load_base_model(path: Path) -> GeometryConditionedSpectralModel:
     """Load the authenticated physical-mean model used by standard runtime."""
     payload = json.loads(path.read_text(encoding="utf-8"))
-    model = GeometryConditionedSpectralModel.from_manifest_payload(payload)
+    model = GeometryConditionedSpectralModel.from_manifest_payload(
+        payload,
+        detector_green_operator=canonical_detector_green_operator(),
+    )
     model.require_runtime_ready()
     return model
 
@@ -425,7 +429,7 @@ def build_short_candidate(
         count_concentration = (
             None if width == 0.0 else 3.0 / float(width**2)
         )
-        candidate = GeometryConditionedSpectralModel.standard_native(
+        candidate = GeometryConditionedSpectralModel.nonproduction_native(
             ACCEPTANCE_ISOTOPES,
             dead_time_tau_s=base_model.dead_time_tau_s,
             background_rate_cps=base_model.background_rate_cps,
@@ -528,7 +532,7 @@ def build_short_candidate(
         if selected_width == 0.0
         else 3.0 / float(selected_width**2)
     )
-    selected_model = GeometryConditionedSpectralModel.standard_native(
+    selected_model = GeometryConditionedSpectralModel.nonproduction_native(
         ACCEPTANCE_ISOTOPES,
         dead_time_tau_s=base_model.dead_time_tau_s,
         background_rate_cps=base_model.background_rate_cps,

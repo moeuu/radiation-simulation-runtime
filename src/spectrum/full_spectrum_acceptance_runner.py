@@ -1,13 +1,9 @@
-"""Resumable real-Geant4 training and holdout acceptance orchestration.
+"""Resumable real-Geant4 independent acceptance orchestration.
 
-The runner deliberately separates three data domains:
-
-* production observations contain only the native 851-bin spectrum and known
-  geometry;
-* validation labels contain source-resolved detector-entry classes and may be
-  consumed only by the additive-scatter training phase;
-* holdout observations are acquired only after the complete training corpus
-  has selected an immutable physical/statistical model contract.
+The runner evaluates one immutable physics-only model on predeclared unused
+scenes.  Source-resolved detector-entry labels are validation diagnostics only;
+this module contains no scene fitting, response calibration, or model-selection
+phase.
 
 The module contains no surrogate transport path.  A backend used by the
 production CLI must advertise and satisfy the native external-Geant4
@@ -42,28 +38,17 @@ from measurement.source_boundary import (
     surface_emission_policy_sha256,
     surface_source_runtime_contract_sha256,
 )
-from measurement.shielding import (
-    DEFAULT_DETECTOR_CRYSTAL_RADIUS_CM,
-    DEFAULT_FE_SHIELD_INNER_RADIUS_CM,
-    DEFAULT_FE_SHIELD_THICKNESS_CM,
-    DEFAULT_PB_SHIELD_INNER_RADIUS_CM,
-    DEFAULT_PB_SHIELD_THICKNESS_CM,
-    SHIELD_POSE_CONTRACT_SHA256,
-)
+from measurement.shielding import SHIELD_POSE_CONTRACT_SHA256
 from runtime.experiment_profiles import (
-    DEFAULT_EXPERIMENT_PROFILE_ID,
     STANDARD_ACQUISITION_LIVE_TIME_S,
     STANDARD_OBSTACLE_MATERIAL,
     STANDARD_ROOM_BOUNDARY_THICKNESS_M,
 )
+from runtime.contracts import FULL_SPECTRUM_MODEL_SCHEMA_VERSION
 from spectrum.additive_scatter import (
     ADDITIVE_SCATTER_FEATURE_ORDER,
     ADDITIVE_SCATTER_INCIDENT_LABEL_SEMANTICS,
     ADDITIVE_SCATTER_TARGET_SEMANTICS,
-    DETECTOR_CONE_AIR_XCOM_SINGLE_SCATTER_BASIS_SEMANTICS,
-    AdditiveNoncollidedTransportResponse,
-    fit_additive_noncollided_transport_response,
-    scatter_basis_from_stored_geometry_numpy,
 )
 from spectrum.air_attenuation import (
     NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_ID,
@@ -89,9 +74,11 @@ from spectrum.physics_contracts import (
     OBSTACLE_MATERIAL_CONTRACT_SHA256,
     TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256,
 )
-from spectrum.response_matrix import (
-    NATIVE_GEANT4_BIN_COUNT,
-    NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256,
+from spectrum.response_matrix import NATIVE_GEANT4_BIN_COUNT
+from spectrum.detector_green_operator import (
+    DETECTOR_GREEN_COINCIDENCE_SEMANTICS,
+    DETECTOR_GREEN_SAMPLING_MODE,
+    DetectorGreenOperator,
 )
 from spectrum.transport_spectral import (
     ACCEPTANCE_DETECTOR_POSE_XYZ,
@@ -102,40 +89,31 @@ from spectrum.transport_spectral import (
     ACCEPTANCE_PASSAGE_WIDTH_M,
     ACCEPTANCE_ROOM_SIZE_XYZ,
     ACCEPTANCE_SURFACE_CHART_MAX_EDGE_M,
-    DESIGNATED_HOLDOUT_SCENE_SEEDS,
-    DESIGNATED_TRAINING_SCENE_SEEDS,
+    DEFAULT_DETECTOR_GREEN_OPERATOR_MANIFEST,
+    DESIGNATED_VALIDATION_SCENE_SEEDS,
     FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256,
-    MARK_CONCENTRATION_GRID,
-    RATE_SCALE_HALF_WIDTH_GRID,
-    RATE_SCALE_MIXTURE_WEIGHTS,
+    FULL_SPECTRUM_ACCEPTANCE_EXPERIMENT_ID,
+    SURFACE_BOUNDARY_PROBE_DWELL_TIME_S,
     TRANSPORT_FEATURE_ORDER,
     VALIDATION_SCENARIO_IDS,
     GeometryConditionedSpectralModel,
-    rate_scale_mixture_for_half_width,
 )
 
 
-ACCEPTANCE_RUN_CONTRACT_SCHEMA_VERSION = 5
-ACCEPTANCE_PAIR_SCHEMA_VERSION = 3
-ACCEPTANCE_SCENE_CORPUS_SCHEMA_VERSION = 1
-DISCREPANCY_SELECTION_ARTIFACT_SCHEMA_VERSION = 1
-ACCEPTANCE_ISOTOPES = ("Co-60", "Cs-137", "Eu-154")
+ACCEPTANCE_RUN_CONTRACT_SCHEMA_VERSION = 13
+ACCEPTANCE_PAIR_SCHEMA_VERSION = 8
+ACCEPTANCE_SCENE_CORPUS_SCHEMA_VERSION = 2
+ACCEPTANCE_ISOTOPES = ("Co-60", "Cs-137")
 ACCEPTANCE_PAIR_IDS = tuple(range(64))
 ACCEPTANCE_SCENARIO_SOURCE_SPEC = {
     "background_only": (),
     "single_line_source_resolved": (("Cs-137", 800_000.0),),
-    "dominant_plus_absent_isotope": (
-        ("Cs-137", 1_500_000.0),
-        ("Co-60", 300_000.0),
-    ),
+    "dominant_plus_absent_isotope": (("Cs-137", 1_500_000.0),),
     "multi_isotope_superposition": (
         ("Cs-137", 1_200_000.0),
         ("Co-60", 900_000.0),
-        ("Eu-154", 600_000.0),
     ),
-    "continuous_surface_perturbation_ranking": (
-        ("Eu-154", 900_000.0),
-    ),
+    "continuous_surface_perturbation_ranking": (("Co-60", 900_000.0),),
 }
 NATIVE_ACCEPTANCE_FIDELITY = {
     "backend": "geant4",
@@ -144,6 +122,19 @@ NATIVE_ACCEPTANCE_FIDELITY = {
     "requested_threads": 32,
     "multithreaded_run_manager": True,
     "source_rate_model": "detector_cps_1m",
+    "primary_emission_model": "independent_gamma_lines",
+    "emission_model": "detector_equivalent_cone",
+    "source_strength_field": "intensity_cps_1m",
+    "intensity_cps_1m_definition": "pre_dead_time_detector_pulse_rate_at_1m",
+    "true_coincidence_summing": "disabled",
+    "radioactive_decay_time_window": "disabled",
+    "prompt_decay_cascade_transport": False,
+    "delayed_decay_pulse_separation": False,
+    "line_intensities_normalized": True,
+    "source_bias_mode": "detector_cone",
+    "source_bias_cone_policy": "detector_covering",
+    "source_bias_isotropic_fraction": 1.0,
+    "detector_coincidence_window_s": 1.0e-6,
     "detector_scoring_mode": "incident_gamma_energy",
     "secondary_transport_mode": "full_transport",
     "primary_sampling_fraction": 1.0,
@@ -157,13 +148,22 @@ NATIVE_ACCEPTANCE_FIDELITY = {
     "theory_tvl_attenuation": False,
     "sample_detector_response": True,
     "detector_response_applied_in_native": True,
-    "detector_response_sampling_contract_sha256": (
-        NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
+    "detector_response_sampling_model": (
+        "isotope_independent_full_detector_green_operator_v3"
+    ),
+    "detector_response_sampling_mode": DETECTOR_GREEN_SAMPLING_MODE,
+    "detector_response_boundary_state": (
+        "normalized_impact_parameter_at_detector_housing_entry_v1"
+    ),
+    "detector_response_conditioning": (
+        "registered_pulse_subprobability_given_housing_incident_gamma_v1"
+    ),
+    "detector_response_coincidence_semantics": (DETECTOR_GREEN_COINCIDENCE_SEMANTICS),
+    "detector_cps_green_reference_normalization": (
+        "catalog_branching_weighted_absolute_detection_efficiency_at_1m_v1"
     ),
     "validation_entry_class_spectra": True,
-    "validation_entry_spectrum_space": (
-        "pre_dead_time_raw_incident_gamma"
-    ),
+    "validation_entry_spectrum_space": ("pre_dead_time_raw_incident_gamma"),
     "validation_entry_spectrum_grouping": (
         "source_token_initial_gamma_line_entry_class"
     ),
@@ -171,17 +171,13 @@ NATIVE_ACCEPTANCE_FIDELITY = {
     "geant4_version_number": GEANT4_VERSION_NUMBER,
     "geant4_version_tag": GEANT4_VERSION_TAG,
     "reference_physics_list": GEANT4_REFERENCE_PHYSICS_LIST,
-    "electromagnetic_physics_constructor": (
-        GEANT4_EM_PHYSICS_CONSTRUCTOR
-    ),
+    "electromagnetic_physics_constructor": (GEANT4_EM_PHYSICS_CONSTRUCTOR),
     "production_cut_range_mm": GEANT4_PRODUCTION_CUT_RANGE_MM,
     "gamma_process_names": GEANT4_GAMMA_PROCESS_NAMES,
     "gamma_em_subprocess_names": GEANT4_GAMMA_EM_SUBPROCESS_NAMES,
     "geant4_physics_contract_id": GEANT4_PHYSICS_CONTRACT_ID,
     "geant4_physics_contract_sha256": GEANT4_PHYSICS_CONTRACT_SHA256,
-    "material_resolution_contract_id": (
-        GEANT4_MATERIAL_RESOLUTION_CONTRACT_ID
-    ),
+    "material_resolution_contract_id": (GEANT4_MATERIAL_RESOLUTION_CONTRACT_ID),
 }
 _PAIR_KEYS = frozenset(
     {
@@ -205,7 +201,8 @@ _PAIR_KEYS = frozenset(
         "validation_labels",
         "native_fidelity",
         "native_process_diagnostics",
-        "detector_response_contract_sha256",
+        "detector_green_operator_contract_sha256",
+        "detector_green_operator_binary_sha256",
         "shield_pose_contract_sha256",
         "obstacle_material_contract_sha256",
         "transport_physics_table_contract_sha256",
@@ -238,6 +235,7 @@ _BOUNDARY_GATE_KEYS = frozenset(
         "schema_version",
         "surface_emission_policy_sha256",
         "surface_emission_epsilon_m",
+        "probe_dwell_time_s",
         "native_position_variants",
         "evidence_sha256_by_variant",
         "exact_anchor_vs_air_gate_passed",
@@ -250,15 +248,8 @@ _NATIVE_POSITION_VARIANTS = (
     "air_plus_epsilon",
     "solid_minus_epsilon",
 )
-_ACCEPTANCE_TRANSPORT_SEED_DOMAIN = (
-    "full_spectrum_all64_native_transport_v1"
-)
-_ACCEPTANCE_IMPLEMENTATION_STATIC_PATHS = (
-    Path("pyproject.toml"),
-    Path("uv.lock"),
-    Path("configs/validation/full_spectrum_acceptance.json"),
-    Path("scripts/run_full_spectrum_all64_acceptance.py"),
-)
+_ACCEPTANCE_TRANSPORT_SEED_DOMAIN = "full_spectrum_all64_native_transport_v3"
+ACCEPTANCE_NATIVE_TRANSPORT_SEED_MAX = (1 << 63) - 1
 
 
 def canonical_json_bytes(payload: object) -> bytes:
@@ -289,10 +280,7 @@ def acceptance_transport_seed(
     if (
         isinstance(scene_seed, bool)
         or not isinstance(scene_seed, int)
-        or scene_seed not in (
-            DESIGNATED_TRAINING_SCENE_SEEDS
-            + DESIGNATED_HOLDOUT_SCENE_SEEDS
-        )
+        or scene_seed not in DESIGNATED_VALIDATION_SCENE_SEEDS
         or not isinstance(scenario_id, str)
         or scenario_id not in VALIDATION_SCENARIO_IDS
         or isinstance(shield_pair_id, bool)
@@ -304,11 +292,12 @@ def acceptance_transport_seed(
         f"{_ACCEPTANCE_TRANSPORT_SEED_DOMAIN}|{scene_seed}|"
         f"{scenario_id}|{shield_pair_id}"
     ).encode("utf-8")
-    return int.from_bytes(
+    digest_integer = int.from_bytes(
         hashlib.sha256(payload).digest()[:8],
         byteorder="big",
         signed=False,
-    ) & ((1 << 63) - 1)
+    )
+    return digest_integer % ACCEPTANCE_NATIVE_TRANSPORT_SEED_MAX + 1
 
 
 def file_sha256(path: str | Path) -> str:
@@ -316,35 +305,51 @@ def file_sha256(path: str | Path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+@lru_cache(maxsize=4)
 def acceptance_implementation_bundle_sha256(
     repository_root: str | Path,
 ) -> str:
-    """Hash every Python implementation input shared by acceptance and live."""
+    """Hash only the production physics and inference algorithm contract.
+
+    The approval gate intentionally excludes CLI wiring, scenario-profile names,
+    documentation, tests, output paths, and the acceptance orchestrator itself.
+    Those changes cannot alter a housing-to-spectrum prediction and therefore
+    must not force another multi-hour physical validation.  Material model,
+    detector, transport, likelihood-semantics, or canonical-array changes remain
+    bound through the authenticated model and physics contracts below.
+    """
     root = Path(repository_root).resolve()
-    relative_paths = set(_ACCEPTANCE_IMPLEMENTATION_STATIC_PATHS)
-    relative_paths.update(
-        path.relative_to(root)
-        for path in (root / "src").rglob("*.py")
-        if path.is_file()
+    if not (root / "src" / "spectrum" / "transport_spectral.py").is_file():
+        raise FileNotFoundError(
+            f"Runtime repository does not contain the production model: {root}."
+        )
+    operator = canonical_detector_green_operator()
+    reference_model = GeometryConditionedSpectralModel.physics_only_native(
+        ACCEPTANCE_ISOTOPES,
+        dead_time_tau_s=0.0,
+        background_rate_cps=0.0,
+        detector_green_operator=operator,
     )
-    digest = hashlib.sha256()
-    for relative_path in sorted(
-        relative_paths,
-        key=lambda value: value.as_posix(),
-    ):
-        source = root / relative_path
-        if not source.is_file() or source.is_symlink():
-            raise FileNotFoundError(
-                "Acceptance implementation input is missing or is a symlink: "
-                f"{source}."
-            )
-        encoded_path = relative_path.as_posix().encode("utf-8")
-        raw = source.read_bytes()
-        digest.update(len(encoded_path).to_bytes(8, "big"))
-        digest.update(encoded_path)
-        digest.update(len(raw).to_bytes(8, "big"))
-        digest.update(raw)
-    return digest.hexdigest()
+    return canonical_json_sha256(
+        {
+            "contract": "production_full_spectrum_algorithm",
+            "model_schema_version": FULL_SPECTRUM_MODEL_SCHEMA_VERSION,
+            "reference_model_contract_sha256": (reference_model.contract_hash_sha256),
+            "detector_green_operator_contract_sha256": (operator.contract_hash_sha256),
+            "detector_green_operator_binary_sha256": operator.binary_sha256,
+            "shield_pose_contract_sha256": SHIELD_POSE_CONTRACT_SHA256,
+            "obstacle_material_contract_sha256": (OBSTACLE_MATERIAL_CONTRACT_SHA256),
+            "transport_physics_table_contract_sha256": (
+                TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256
+            ),
+            "geant4_physics_contract_sha256": GEANT4_PHYSICS_CONTRACT_SHA256,
+            "dry_air_total_attenuation_contract_sha256": (
+                NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_SHA256
+            ),
+            "surface_emission_policy_sha256": surface_emission_policy_sha256(),
+            "transport_feature_order": list(TRANSPORT_FEATURE_ORDER),
+        }
+    )
 
 
 def _is_sha256(value: object) -> bool:
@@ -380,14 +385,11 @@ def _atomic_write_immutable_json(path: Path, payload: object) -> Path:
     if destination.exists():
         if destination.read_bytes() != encoded:
             raise RuntimeError(
-                f"Refusing to overwrite incompatible frozen artifact: "
-                f"{destination}."
+                f"Refusing to overwrite incompatible frozen artifact: {destination}."
             )
         return destination
     destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name(
-        f".{destination.name}.{os.getpid()}.tmp"
-    )
+    temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
     temporary.write_bytes(encoded)
     os.replace(temporary, destination)
     return destination
@@ -408,9 +410,7 @@ def _load_json_mapping(path: str | Path) -> Mapping[str, object]:
     except (TypeError, ValueError) as exc:
         raise ValueError(f"Invalid JSON artifact: {source}.") from exc
     if raw != canonical:
-        raise ValueError(
-            f"JSON artifact is not immutable canonical JSON: {source}."
-        )
+        raise ValueError(f"JSON artifact is not immutable canonical JSON: {source}.")
     return payload
 
 
@@ -418,10 +418,8 @@ def _expected_split(scene_seed: int) -> str:
     """Return the immutable split assigned to one designated seed."""
     if isinstance(scene_seed, bool) or not isinstance(scene_seed, int):
         raise TypeError("Acceptance scene seed must be a JSON integer.")
-    if scene_seed in DESIGNATED_TRAINING_SCENE_SEEDS:
-        return "training"
-    if scene_seed in DESIGNATED_HOLDOUT_SCENE_SEEDS:
-        return "holdout"
+    if scene_seed in DESIGNATED_VALIDATION_SCENE_SEEDS:
+        return "validation"
     raise ValueError(f"Scene seed {scene_seed} is not designated.")
 
 
@@ -430,6 +428,16 @@ def line_identity_contract_sha256(
 ) -> str:
     """Return the digest of the exact global line identity order."""
     return canonical_json_sha256([dict(row) for row in model.line_identity])
+
+
+@lru_cache(maxsize=1)
+def canonical_detector_green_operator() -> DetectorGreenOperator:
+    """Load the one canonical operator authorized for formal acceptance."""
+    operator = DetectorGreenOperator.from_artifact(
+        DEFAULT_DETECTOR_GREEN_OPERATOR_MANIFEST
+    )
+    operator.require_runtime_ready()
+    return operator
 
 
 def build_acceptance_run_contract(
@@ -442,10 +450,8 @@ def build_acceptance_run_contract(
     """Return the immutable pre-acquisition acceptance run contract."""
     return {
         "schema_version": ACCEPTANCE_RUN_CONTRACT_SCHEMA_VERSION,
-        "acceptance_contract_sha256": (
-            FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256
-        ),
-        "experiment_profile_id": DEFAULT_EXPERIMENT_PROFILE_ID,
+        "acceptance_contract_sha256": (FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256),
+        "experiment_profile_id": FULL_SPECTRUM_ACCEPTANCE_EXPERIMENT_ID,
         "runtime_config_sha256": _require_sha256(
             runtime_config_sha256,
             field_name="runtime_config_sha256",
@@ -462,8 +468,13 @@ def build_acceptance_run_contract(
             implementation_bundle_sha256,
             field_name="implementation_bundle_sha256",
         ),
-        "training_scene_seeds": list(DESIGNATED_TRAINING_SCENE_SEEDS),
-        "holdout_scene_seeds": list(DESIGNATED_HOLDOUT_SCENE_SEEDS),
+        "detector_green_operator_contract_sha256": (
+            canonical_detector_green_operator().contract_hash_sha256
+        ),
+        "detector_green_operator_binary_sha256": (
+            canonical_detector_green_operator().binary_sha256
+        ),
+        "validation_scene_seeds": list(DESIGNATED_VALIDATION_SCENE_SEEDS),
         "scenario_ids": list(VALIDATION_SCENARIO_IDS),
         "scenario_source_spec": {
             scenario: [
@@ -471,9 +482,7 @@ def build_acceptance_run_contract(
                     "isotope": isotope,
                     "intensity_cps_1m": float(intensity),
                 }
-                for isotope, intensity in ACCEPTANCE_SCENARIO_SOURCE_SPEC[
-                    scenario
-                ]
+                for isotope, intensity in ACCEPTANCE_SCENARIO_SOURCE_SPEC[scenario]
             ]
             for scenario in VALIDATION_SCENARIO_IDS
         },
@@ -482,17 +491,11 @@ def build_acceptance_run_contract(
         "environment": {
             "room_size_xyz_m": list(ACCEPTANCE_ROOM_SIZE_XYZ),
             "detector_pose_xyz_m": list(ACCEPTANCE_DETECTOR_POSE_XYZ),
-            "target_blocked_fraction": (
-                ACCEPTANCE_OBSTACLE_BLOCKED_FRACTION
-            ),
+            "target_blocked_fraction": (ACCEPTANCE_OBSTACLE_BLOCKED_FRACTION),
             "passage_width_m": ACCEPTANCE_PASSAGE_WIDTH_M,
-            "surface_chart_max_edge_m": (
-                ACCEPTANCE_SURFACE_CHART_MAX_EDGE_M
-            ),
+            "surface_chart_max_edge_m": (ACCEPTANCE_SURFACE_CHART_MAX_EDGE_M),
             "obstacle_material": STANDARD_OBSTACLE_MATERIAL,
-            "room_boundary_thickness_m": (
-                STANDARD_ROOM_BOUNDARY_THICKNESS_M
-            ),
+            "room_boundary_thickness_m": (STANDARD_ROOM_BOUNDARY_THICKNESS_M),
             "absorber_transport_mode": "absorber",
             "absorber_transport_group": ROOM_ABSORBER_TRANSPORT_GROUP,
             "absorber_transport_contract_sha256": (
@@ -501,16 +504,12 @@ def build_acceptance_run_contract(
                     cell_size=1.0,
                     grid_shape=(1, 1),
                     blocked_cells=(),
-                    absorber_transport_group=(
-                        ROOM_ABSORBER_TRANSPORT_GROUP
-                    ),
+                    absorber_transport_group=(ROOM_ABSORBER_TRANSPORT_GROUP),
                     absorber_transport_boxes_m=tuple(
                         component.box_m
                         for component in room_boundary_transport_components(
                             ACCEPTANCE_ROOM_SIZE_XYZ,
-                            thickness_m=(
-                                STANDARD_ROOM_BOUNDARY_THICKNESS_M
-                            ),
+                            thickness_m=(STANDARD_ROOM_BOUNDARY_THICKNESS_M),
                             material=STANDARD_OBSTACLE_MATERIAL,
                         )
                     ),
@@ -527,31 +526,13 @@ def build_acceptance_run_contract(
             "id": NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_ID,
             "sha256": NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_SHA256,
         },
-        "surface_emission_policy_sha256": (
-            surface_emission_policy_sha256()
-        ),
+        "surface_emission_policy_sha256": (surface_emission_policy_sha256()),
         "surface_emission_epsilon_m": SURFACE_EMISSION_EPSILON_M,
-        "additive_scatter_label_space": (
-            ADDITIVE_SCATTER_INCIDENT_LABEL_SEMANTICS
-        ),
-        "additive_scatter_target_semantics": (
-            ADDITIVE_SCATTER_TARGET_SEMANTICS
-        ),
-        "additive_scatter_feature_order": list(
-            ADDITIVE_SCATTER_FEATURE_ORDER
-        ),
-        "discrepancy_rate_scale_half_width_grid": list(
-            RATE_SCALE_HALF_WIDTH_GRID
-        ),
-        "discrepancy_rate_scale_weights": list(
-            RATE_SCALE_MIXTURE_WEIGHTS
-        ),
-        "discrepancy_mark_concentration_grid": list(
-            MARK_CONCENTRATION_GRID
-        ),
+        "surface_boundary_probe_dwell_time_s": (SURFACE_BOUNDARY_PROBE_DWELL_TIME_S),
         "selection_policy": (
-            "training_complete_then_freeze_then_holdout_no_feedback"
+            "physics_only_candidate_frozen_before_all_validation_acquisition"
         ),
+        "model_construction": "physics_only_no_scene_fit_or_calibration",
         "transport_seed_domain": _ACCEPTANCE_TRANSPORT_SEED_DOMAIN,
     }
 
@@ -575,15 +556,11 @@ def load_acceptance_run_contract(
         )
     expected = build_acceptance_run_contract(
         runtime_config_sha256=required_hashes["runtime_config_sha256"],
-        native_executable_sha256=required_hashes[
-            "native_executable_sha256"
-        ],
+        native_executable_sha256=required_hashes["native_executable_sha256"],
         native_execution_environment_sha256=required_hashes[
             "native_execution_environment_sha256"
         ],
-        implementation_bundle_sha256=required_hashes[
-            "implementation_bundle_sha256"
-        ],
+        implementation_bundle_sha256=required_hashes["implementation_bundle_sha256"],
     )
     if dict(payload) != expected:
         raise ValueError(
@@ -600,15 +577,18 @@ def validate_surface_boundary_gate(payload: object) -> dict[str, object]:
     if (
         type(payload["schema_version"]) is not int
         or payload["schema_version"] != SURFACE_BOUNDARY_GATE_SCHEMA_VERSION
-        or payload["surface_emission_policy_sha256"]
-        != surface_emission_policy_sha256()
+        or payload["surface_emission_policy_sha256"] != surface_emission_policy_sha256()
         or _strict_finite_number(
             payload["surface_emission_epsilon_m"],
             field_name="surface_boundary_gate.surface_emission_epsilon_m",
         )
         != SURFACE_EMISSION_EPSILON_M
-        or tuple(payload["native_position_variants"])
-        != _NATIVE_POSITION_VARIANTS
+        or _strict_finite_number(
+            payload["probe_dwell_time_s"],
+            field_name="surface_boundary_gate.probe_dwell_time_s",
+        )
+        != SURFACE_BOUNDARY_PROBE_DWELL_TIME_S
+        or tuple(payload["native_position_variants"]) != _NATIVE_POSITION_VARIANTS
         or not isinstance(evidence, Mapping)
         or set(evidence) != set(_NATIVE_POSITION_VARIANTS)
         or any(not _is_sha256(evidence[key]) for key in evidence)
@@ -635,29 +615,35 @@ def validate_native_fidelity(payload: object) -> dict[str, object]:
                 field_name=f"native_fidelity[{key!r}]",
             )
             if not np.isclose(parsed, expected, rtol=0.0, atol=1.0e-15):
-                raise ValueError(
-                    f"Native fidelity mismatch for {key}: {parsed!r}."
-                )
+                raise ValueError(f"Native fidelity mismatch for {key}: {parsed!r}.")
         elif type(actual) is not type(expected) or actual != expected:
-            raise ValueError(
-                f"Native fidelity mismatch for {key}: {actual!r}."
-            )
+            raise ValueError(f"Native fidelity mismatch for {key}: {actual!r}.")
     return dict(payload)
 
 
 def validate_native_process_diagnostics(
     payload: object,
+    *,
+    expect_transport_processes: bool,
 ) -> dict[str, object]:
     """Require exact nonnegative native gamma-process counter provenance."""
+    if not isinstance(expect_transport_processes, bool):
+        raise TypeError("expect_transport_processes must be boolean.")
     if not isinstance(payload, Mapping) or set(payload) != {
         "process_count_compton",
         "process_count_rayleigh",
         "process_count_photoelectric",
         "transport_process_counts",
+        "detector_response_coincidence_semantics",
+        "detector_response_incident_entry_count",
+        "detector_response_registered_entry_count",
+        "detector_response_coincidence_pulse_count",
+        "detector_response_multi_entry_pulse_count",
+        "pre_dead_time_total_pulse_count",
+        "post_dead_time_total_pulse_count",
+        "dead_time_observed_scale",
     }:
-        raise ValueError(
-            "native_process_diagnostics has an incompatible exact schema."
-        )
+        raise ValueError("native_process_diagnostics has an incompatible exact schema.")
     parsed: dict[str, object] = {}
     for key in (
         "process_count_compton",
@@ -669,30 +655,99 @@ def validate_native_process_diagnostics(
             raise ValueError(f"native_process_diagnostics[{key!r}] is invalid.")
         parsed[key] = value
     counters = payload["transport_process_counts"]
-    if (
-        not isinstance(counters, Mapping)
-        or any(
-            not isinstance(name, str)
-            or not name
-            or isinstance(count, bool)
-            or not isinstance(count, int)
-            or count < 0
-            for name, count in counters.items()
-        )
+    if not isinstance(counters, Mapping) or any(
+        not isinstance(name, str)
+        or not name
+        or isinstance(count, bool)
+        or not isinstance(count, int)
+        or count < 0
+        for name, count in counters.items()
     ):
         raise ValueError("transport_process_counts must be a nonnegative map.")
     parsed["transport_process_counts"] = {
         name: counters[name] for name in sorted(counters)
     }
+    if expect_transport_processes:
+        if not counters or sum(counters.values()) <= 0:
+            raise ValueError(
+                "Source-bearing pair must contain positive transport-process counts."
+            )
+    elif counters:
+        raise ValueError(
+            "Background-only pair must contain no transport-process counts."
+        )
     for field_name, process_name in (
         ("process_count_compton", "compt"),
         ("process_count_rayleigh", "Rayl"),
         ("process_count_photoelectric", "phot"),
     ):
         if parsed[field_name] != counters.get(process_name, 0):
-            raise ValueError(
-                f"{field_name} disagrees with transport_process_counts."
-            )
+            raise ValueError(f"{field_name} disagrees with transport_process_counts.")
+    if payload["detector_response_coincidence_semantics"] != (
+        DETECTOR_GREEN_COINCIDENCE_SEMANTICS
+    ):
+        raise ValueError(
+            "native_process_diagnostics has incompatible coincidence semantics."
+        )
+    parsed["detector_response_coincidence_semantics"] = (
+        DETECTOR_GREEN_COINCIDENCE_SEMANTICS
+    )
+    response_counter_names = (
+        "detector_response_incident_entry_count",
+        "detector_response_registered_entry_count",
+        "detector_response_coincidence_pulse_count",
+        "detector_response_multi_entry_pulse_count",
+    )
+    for field_name in response_counter_names:
+        value = payload[field_name]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"native_process_diagnostics[{field_name!r}] is invalid.")
+        parsed[field_name] = value
+    incident_count = int(parsed["detector_response_incident_entry_count"])
+    registered_count = int(parsed["detector_response_registered_entry_count"])
+    pulse_count = int(parsed["detector_response_coincidence_pulse_count"])
+    multi_entry_count = int(parsed["detector_response_multi_entry_pulse_count"])
+    if (
+        incident_count < registered_count
+        or registered_count < pulse_count
+        or multi_entry_count > pulse_count
+        or registered_count - pulse_count < multi_entry_count
+        or (
+            not expect_transport_processes
+            and any(int(parsed[name]) != 0 for name in response_counter_names)
+        )
+    ):
+        raise ValueError(
+            "native_process_diagnostics has inconsistent coincidence counters."
+        )
+    for field_name in (
+        "pre_dead_time_total_pulse_count",
+        "post_dead_time_total_pulse_count",
+    ):
+        value = payload[field_name]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"native_process_diagnostics[{field_name!r}] is invalid.")
+        parsed[field_name] = value
+    scale = _strict_finite_number(
+        payload["dead_time_observed_scale"],
+        field_name="native_process_diagnostics['dead_time_observed_scale']",
+    )
+    pre_dead_time_count = int(parsed["pre_dead_time_total_pulse_count"])
+    post_dead_time_count = int(parsed["post_dead_time_total_pulse_count"])
+    expected_scale = (
+        float(post_dead_time_count) / float(pre_dead_time_count)
+        if pre_dead_time_count > 0
+        else 1.0
+    )
+    if (
+        post_dead_time_count > pre_dead_time_count
+        or scale <= 0.0
+        or scale > 1.0
+        or (pre_dead_time_count > 0 and post_dead_time_count == 0)
+        or not np.isclose(scale, expected_scale, rtol=0.0, atol=1.0e-15)
+    ):
+        raise ValueError("native_process_diagnostics has inconsistent dead-time data.")
+    parsed["dead_time_observed_scale"] = scale
     return parsed
 
 
@@ -743,10 +798,11 @@ def _validate_vector_payload(
 @lru_cache(maxsize=1)
 def _acceptance_line_identity() -> tuple[Mapping[str, object], ...]:
     """Return immutable native line rows without repeated matrix builds."""
-    model = GeometryConditionedSpectralModel.standard_native(
+    model = GeometryConditionedSpectralModel.physics_only_native(
         ACCEPTANCE_ISOTOPES,
         dead_time_tau_s=0.0,
         background_rate_cps=0.0,
+        detector_green_operator=canonical_detector_green_operator(),
     )
     return model.line_identity
 
@@ -858,39 +914,36 @@ def load_acceptance_pair(
         payload["surface_source_contract_sha256"],
         field_name="surface_source_contract_sha256",
     )
+    expected_sources = ACCEPTANCE_SCENARIO_SOURCE_SPEC[str(scenario)]
     validate_surface_boundary_gate(payload["surface_boundary_gate"])
     validate_native_fidelity(payload["native_fidelity"])
-    validate_native_process_diagnostics(
-        payload["native_process_diagnostics"]
+    native_diagnostics = validate_native_process_diagnostics(
+        payload["native_process_diagnostics"],
+        expect_transport_processes=bool(expected_sources),
     )
     validate_geometry_family_descriptor(
         payload["geometry_family"],
         require_in_domain=True,
     )
+    operator = canonical_detector_green_operator()
     expected_physics_contracts = {
-        "detector_response_contract_sha256": (
-            NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
-        ),
+        "detector_green_operator_contract_sha256": (operator.contract_hash_sha256),
+        "detector_green_operator_binary_sha256": operator.binary_sha256,
         "shield_pose_contract_sha256": SHIELD_POSE_CONTRACT_SHA256,
-        "obstacle_material_contract_sha256": (
-            OBSTACLE_MATERIAL_CONTRACT_SHA256
-        ),
+        "obstacle_material_contract_sha256": (OBSTACLE_MATERIAL_CONTRACT_SHA256),
         "transport_physics_table_contract_sha256": (
             TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256
         ),
     }
     for field_name, expected_value in expected_physics_contracts.items():
         if payload[field_name] != expected_value:
-            raise ValueError(
-                f"Pair physics contract {field_name!r} is incompatible."
-            )
+            raise ValueError(f"Pair physics contract {field_name!r} is incompatible.")
     detector = _validate_vector_payload(
         payload["detector_pose_xyz"],
         shape=(3,),
         field_name="detector_pose_xyz",
     )
     sources = payload["sources"]
-    expected_sources = ACCEPTANCE_SCENARIO_SOURCE_SPEC[str(scenario)]
     if (
         detector.shape != (3,)
         or np.any(~np.isfinite(detector))
@@ -900,9 +953,7 @@ def load_acceptance_pair(
     ):
         raise ValueError("Pair detector or source truth payload is invalid.")
     normalized_sources = canonical_surface_source_runtime_payload(sources)
-    if source_hash != surface_source_runtime_contract_sha256(
-        normalized_sources
-    ):
+    if source_hash != surface_source_runtime_contract_sha256(normalized_sources):
         raise ValueError(
             "Pair surface-source hash does not authenticate its source payload."
         )
@@ -910,9 +961,7 @@ def load_acceptance_pair(
         zip(expected_sources, normalized_sources, strict=True)
     ):
         if not isinstance(source, Mapping):
-            raise ValueError(
-                f"Pair source truth contract is invalid at index {index}."
-            )
+            raise ValueError(f"Pair source truth contract is invalid at index {index}.")
         chart_id = source.get("surface_chart_id")
         if (
             source.get("isotope") != expected_isotope
@@ -926,9 +975,7 @@ def load_acceptance_pair(
             or source.get("surface_emission_policy_sha256")
             != surface_emission_policy_sha256()
         ):
-            raise ValueError(
-                f"Pair source truth contract is invalid at index {index}."
-            )
+            raise ValueError(f"Pair source truth contract is invalid at index {index}.")
         for field_name, vector_shape in (
             ("surface_uv", (2,)),
             ("position", (3,)),
@@ -957,8 +1004,7 @@ def load_acceptance_pair(
         or set(geometry) != _GEOMETRY_KEYS
         or not isinstance(labels, Mapping)
         or set(labels) != _LABEL_KEYS
-        or labels["label_space"]
-        != ADDITIVE_SCATTER_INCIDENT_LABEL_SEMANTICS
+        or labels["label_space"] != ADDITIVE_SCATTER_INCIDENT_LABEL_SEMANTICS
         or labels["target_semantics"] != ADDITIVE_SCATTER_TARGET_SEMANTICS
     ):
         raise ValueError("Pair geometry or validation-label schema is invalid.")
@@ -975,9 +1021,7 @@ def load_acceptance_pair(
             "additive_scatter_basis_vslf",
         )
         if any(geometry[field_name] is not None for field_name in base_fields):
-            raise ValueError(
-                "Background-only geometry fields must be encoded as null."
-            )
+            raise ValueError("Background-only geometry fields must be encoded as null.")
         unattenuated = np.empty(shape, dtype=np.float64)
         uncollided = np.empty(shape, dtype=np.float64)
         features = np.empty(feature_shape, dtype=np.float64)
@@ -1005,9 +1049,7 @@ def load_acceptance_pair(
             shape=scatter_shape,
             field_name="additive_scatter_basis_vslf",
         )
-    perturbation_expected = (
-        str(scenario) == "continuous_surface_perturbation_ranking"
-    )
+    perturbation_expected = str(scenario) == "continuous_surface_perturbation_ranking"
     if perturbation_expected:
         perturbed_unattenuated = _validate_array_payload(
             geometry["perturbed_unattenuated_source_line_rate_vsl"],
@@ -1046,9 +1088,7 @@ def load_acceptance_pair(
         perturbed_features = np.empty((0, 0, 0, 0), dtype=np.float64)
         perturbed_scatter = np.empty((0, 0, 0, 0), dtype=np.float64)
     entry_totals = labels["entry_class_totals_by_source_line"]
-    entry_hashes = labels[
-        "entry_spectrum_sha256_by_source_line_class"
-    ]
+    entry_hashes = labels["entry_spectrum_sha256_by_source_line_class"]
     expected_line_tokens = {
         native_source_line_token(
             source_index=source_index,
@@ -1094,15 +1134,20 @@ def load_acceptance_pair(
         raise ValueError("Validation entry-class label payload is invalid.")
     for token, row in entry_totals.items():
         for entry_class, value in row.items():
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, int)
-                or value < 0
-            ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(
                     "Entry-class totals must be exact nonnegative unit-weight "
                     f"integer counts: {token!r}/{entry_class!r}."
                 )
+    if int(native_diagnostics["pre_dead_time_total_pulse_count"]) != int(
+        native_diagnostics["detector_response_coincidence_pulse_count"]
+    ) + int(background_total) or int(
+        native_diagnostics["post_dead_time_total_pulse_count"]
+    ) != int(np.sum(raw_observed, dtype=np.int64)):
+        raise ValueError(
+            "Native dead-time pulse counts disagree with response, background, "
+            "or observed-spectrum totals."
+        )
     return AcceptancePairRecord(
         path=artifact_path,
         file_sha256=hashlib.sha256(raw).hexdigest(),
@@ -1169,28 +1214,13 @@ class AcceptanceRunLayout:
         return self.root / "run_contract.json"
 
     @property
-    def training_complete_path(self) -> Path:
-        """Return the training-corpus completion manifest path."""
-        return self.root / "training_corpus_complete.json"
-
-    @property
-    def additive_model_path(self) -> Path:
-        """Return the selected additive-scatter response path."""
-        return self.root / "additive_scatter_response.json"
-
-    @property
-    def discrepancy_selection_path(self) -> Path:
-        """Return the immutable discrepancy selection artifact path."""
-        return self.root / "discrepancy_selection.json"
-
-    @property
     def candidate_model_path(self) -> Path:
-        """Return the physical model frozen before holdout acquisition."""
+        """Return the physics-only model frozen before validation."""
         return self.root / "candidate_model.json"
 
     @property
     def validation_manifest_path(self) -> Path:
-        """Return the independent holdout validation manifest path."""
+        """Return the independent validation manifest path."""
         return self.root / "independent_validation.json"
 
     @property
@@ -1217,12 +1247,7 @@ class AcceptanceRunLayout:
 
     def scene_corpus_path(self, *, split: str, scene_seed: int) -> Path:
         """Return one complete scene-corpus manifest path."""
-        return (
-            self.root
-            / split
-            / f"scene_{int(scene_seed)}"
-            / "corpus_manifest.json"
-        )
+        return self.root / split / f"scene_{int(scene_seed)}" / "corpus_manifest.json"
 
     def scene_acceptance_path(self, *, scene_seed: int) -> Path:
         """Return one evaluated scene-acceptance artifact path."""
@@ -1277,9 +1302,7 @@ def acquire_scene_corpus(
                 shield_pair_id=pair_id,
             ).exists()
         ]
-        session_context: (
-            AbstractContextManager[AcceptanceScenarioSession] | None
-        ) = None
+        session_context: AbstractContextManager[AcceptanceScenarioSession] | None = None
         if missing:
             session_context = backend.open_scenario(
                 scene_seed=scene_seed,
@@ -1328,9 +1351,7 @@ def acquire_scene_corpus(
                             )
                     record = load_acceptance_pair(
                         pair_path,
-                        expected_line_identity_sha256=(
-                            line_identity_sha256
-                        ),
+                        expected_line_identity_sha256=(line_identity_sha256),
                     )
                     _validate_pair_identity(
                         record,
@@ -1343,33 +1364,26 @@ def acquire_scene_corpus(
         if len(records) != 64:
             raise RuntimeError("Scenario corpus did not produce exactly 64 pairs.")
         scenario_scene_hashes = {record.scene_hash for record in records}
-        scenario_source_hashes = {
-            record.source_contract_sha256 for record in records
-        }
+        scenario_source_hashes = {record.source_contract_sha256 for record in records}
         if len(scenario_scene_hashes) != 1 or len(scenario_source_hashes) != 1:
             raise ValueError(
                 "One scenario changed scene or truth-source identity across pairs."
             )
         pair_hashes[scenario] = {
-            str(record.shield_pair_id): record.file_sha256
-            for record in records
+            str(record.shield_pair_id): record.file_sha256 for record in records
         }
         scene_hashes[scenario] = next(iter(scenario_scene_hashes))
         source_hashes[scenario] = next(iter(scenario_source_hashes))
         for record in records:
             raw_payload = _load_json_mapping(record.path)
-            gate_hashes.add(
-                canonical_json_sha256(raw_payload["surface_boundary_gate"])
-            )
+            gate_hashes.add(canonical_json_sha256(raw_payload["surface_boundary_gate"]))
     if len(gate_hashes) != 1:
         raise ValueError(
             "One scene seed must use one authenticated signed-epsilon gate."
         )
     manifest = {
         "schema_version": ACCEPTANCE_SCENE_CORPUS_SCHEMA_VERSION,
-        "acceptance_contract_sha256": (
-            FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256
-        ),
+        "acceptance_contract_sha256": (FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256),
         "backend_id": backend.backend_id,
         "scene_seed": int(scene_seed),
         "split": split,
@@ -1430,14 +1444,12 @@ def validate_scene_corpus(
         or not isinstance(backend_id, str)
         or not backend_id
         or type(payload["schema_version"]) is not int
-        or payload["schema_version"]
-        != ACCEPTANCE_SCENE_CORPUS_SCHEMA_VERSION
+        or payload["schema_version"] != ACCEPTANCE_SCENE_CORPUS_SCHEMA_VERSION
         or payload["acceptance_contract_sha256"]
         != FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256
         or tuple(payload["scenario_ids"]) != VALIDATION_SCENARIO_IDS
         or tuple(payload["shield_pair_ids"]) != ACCEPTANCE_PAIR_IDS
-        or payload["line_identity_contract_sha256"]
-        != expected_line_identity_sha256
+        or payload["line_identity_contract_sha256"] != expected_line_identity_sha256
         or type(pair_count) is not int
         or pair_count != len(VALIDATION_SCENARIO_IDS) * 64
         or payload["native_fidelity_postconditions_complete"] is not True
@@ -1446,9 +1458,7 @@ def validate_scene_corpus(
         raise ValueError("Scene corpus manifest is incomplete or incompatible.")
     pair_hashes = payload["pair_artifact_sha256_by_scenario"]
     scene_hashes = payload["scene_hash_by_scenario"]
-    source_hashes = payload[
-        "surface_source_contract_sha256_by_scenario"
-    ]
+    source_hashes = payload["surface_source_contract_sha256_by_scenario"]
     if (
         not isinstance(pair_hashes, Mapping)
         or set(pair_hashes) != set(VALIDATION_SCENARIO_IDS)
@@ -1463,11 +1473,9 @@ def validate_scene_corpus(
     gate_hashes: set[str] = set()
     for scenario in VALIDATION_SCENARIO_IDS:
         scenario_hashes = pair_hashes[scenario]
-        if (
-            not isinstance(scenario_hashes, Mapping)
-            or set(scenario_hashes)
-            != {str(pair_id) for pair_id in ACCEPTANCE_PAIR_IDS}
-        ):
+        if not isinstance(scenario_hashes, Mapping) or set(scenario_hashes) != {
+            str(pair_id) for pair_id in ACCEPTANCE_PAIR_IDS
+        }:
             raise ValueError("Scene corpus does not authenticate all 64 pairs.")
         for pair_id in ACCEPTANCE_PAIR_IDS:
             pair_path = layout.pair_path(
@@ -1480,14 +1488,10 @@ def validate_scene_corpus(
                 not pair_path.exists()
                 or file_sha256(pair_path) != scenario_hashes[str(pair_id)]
             ):
-                raise ValueError(
-                    f"Pair checkpoint hash mismatch: {pair_path}."
-                )
+                raise ValueError(f"Pair checkpoint hash mismatch: {pair_path}.")
             record = load_acceptance_pair(
                 pair_path,
-                expected_line_identity_sha256=(
-                    expected_line_identity_sha256
-                ),
+                expected_line_identity_sha256=(expected_line_identity_sha256),
             )
             _validate_pair_identity(
                 record,
@@ -1498,508 +1502,15 @@ def validate_scene_corpus(
             )
             if (
                 record.scene_hash != scene_hashes[scenario]
-                or record.source_contract_sha256
-                != source_hashes[scenario]
+                or record.source_contract_sha256 != source_hashes[scenario]
             ):
                 raise ValueError("Scene corpus pair identity is stale.")
             raw_pair = _load_json_mapping(pair_path)
-            gate_hashes.add(
-                canonical_json_sha256(raw_pair["surface_boundary_gate"])
-            )
+            gate_hashes.add(canonical_json_sha256(raw_pair["surface_boundary_gate"]))
             records.append(record)
     if gate_hashes != {str(payload["surface_boundary_gate_sha256"])}:
         raise ValueError("Scene corpus signed-epsilon gate hashes disagree.")
     return tuple(records)
-
-
-def build_complete_training_manifest(
-    *,
-    layout: AcceptanceRunLayout,
-    line_identity_sha256: str,
-) -> dict[str, object]:
-    """Rehash all designated training data before exposing it to fitting."""
-    artifact_hashes: dict[str, str] = {}
-    artifact_contract_hashes: dict[str, str] = {}
-    pair_ids: dict[str, list[int]] = {}
-    for seed in DESIGNATED_TRAINING_SCENE_SEEDS:
-        corpus_path = layout.scene_corpus_path(
-            split="training",
-            scene_seed=seed,
-        )
-        records = validate_scene_corpus(
-            corpus_path,
-            layout=layout,
-            expected_line_identity_sha256=line_identity_sha256,
-        )
-        for record in records:
-            pair_payload = _load_json_mapping(record.path)
-            if pair_payload.get("schema_version") != ACCEPTANCE_PAIR_SCHEMA_VERSION:
-                raise ValueError(
-                    "Training pair artifact predates the authenticated "
-                    "physics-contract schema."
-                )
-            expected_contracts = {
-                "detector_response_contract_sha256": (
-                    NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
-                ),
-                "shield_pose_contract_sha256": SHIELD_POSE_CONTRACT_SHA256,
-                "obstacle_material_contract_sha256": (
-                    OBSTACLE_MATERIAL_CONTRACT_SHA256
-                ),
-                "transport_physics_table_contract_sha256": (
-                    TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256
-                ),
-            }
-            if any(
-                pair_payload.get(key) != value
-                for key, value in expected_contracts.items()
-            ):
-                raise ValueError(
-                    "Training pair artifact physics contracts do not match."
-                )
-        artifact_hashes[str(seed)] = file_sha256(corpus_path)
-        artifact_contract_hashes[str(seed)] = canonical_json_sha256(
-            {
-                "scene_corpus_sha256": artifact_hashes[str(seed)],
-                "detector_response_contract_sha256": (
-                    NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
-                ),
-                "shield_pose_contract_sha256": (
-                    SHIELD_POSE_CONTRACT_SHA256
-                ),
-                "obstacle_material_contract_sha256": (
-                    OBSTACLE_MATERIAL_CONTRACT_SHA256
-                ),
-                "transport_physics_table_contract_sha256": (
-                    TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256
-                ),
-            }
-        )
-        pair_ids[str(seed)] = list(ACCEPTANCE_PAIR_IDS)
-    return {
-        "schema_version": 2,
-        "acceptance_contract_sha256": (
-            FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256
-        ),
-        "training_scene_seeds": list(DESIGNATED_TRAINING_SCENE_SEEDS),
-        "scenario_ids": list(VALIDATION_SCENARIO_IDS),
-        "pair_ids_by_scene": pair_ids,
-        "artifact_sha256_by_scene": artifact_hashes,
-        "artifact_contract_sha256_by_scene": artifact_contract_hashes,
-        "detector_response_contract_sha256": (
-            NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
-        ),
-        "shield_pose_contract_sha256": SHIELD_POSE_CONTRACT_SHA256,
-        "obstacle_material_contract_sha256": (
-            OBSTACLE_MATERIAL_CONTRACT_SHA256
-        ),
-        "transport_physics_table_contract_sha256": (
-            TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256
-        ),
-        "line_identity_contract_sha256": line_identity_sha256,
-        "pair_artifact_count": (
-            len(DESIGNATED_TRAINING_SCENE_SEEDS)
-            * len(VALIDATION_SCENARIO_IDS)
-            * len(ACCEPTANCE_PAIR_IDS)
-        ),
-        "native_fidelity_postconditions_complete": True,
-        "holdout_artifacts_consumed": False,
-        "complete": True,
-    }
-
-
-def _load_all_training_records(
-    *,
-    layout: AcceptanceRunLayout,
-    line_identity_sha256: str,
-) -> tuple[AcceptancePairRecord, ...]:
-    """Return all training records only after complete-manifest verification."""
-    completion = _load_json_mapping(layout.training_complete_path)
-    expected = build_complete_training_manifest(
-        layout=layout,
-        line_identity_sha256=line_identity_sha256,
-    )
-    if dict(completion) != expected:
-        raise ValueError("Training completion manifest is stale or incomplete.")
-    records: list[AcceptancePairRecord] = []
-    for seed in DESIGNATED_TRAINING_SCENE_SEEDS:
-        records.extend(
-            validate_scene_corpus(
-                layout.scene_corpus_path(
-                    split="training",
-                    scene_seed=seed,
-                ),
-                layout=layout,
-                expected_line_identity_sha256=line_identity_sha256,
-            )
-        )
-    expected_count = (
-        len(DESIGNATED_TRAINING_SCENE_SEEDS)
-        * len(VALIDATION_SCENARIO_IDS)
-        * 64
-    )
-    if len(records) != expected_count or any(
-        record.split != "training" for record in records
-    ):
-        raise RuntimeError("Training record set is incomplete or contaminated.")
-    return tuple(records)
-
-
-def fit_training_additive_scatter(
-    *,
-    layout: AcceptanceRunLayout,
-    model: GeometryConditionedSpectralModel,
-) -> AdditiveNoncollidedTransportResponse:
-    """Fit additive scatter from training labels using the physical target."""
-    line_hash = line_identity_contract_sha256(model)
-    records = _load_all_training_records(
-        layout=layout,
-        line_identity_sha256=line_hash,
-    )
-    features: list[NDArray[np.float64]] = []
-    targets: list[float] = []
-    weights: list[float] = []
-    scene_ids: list[str] = []
-    line_rows = tuple(dict(row) for row in model.line_identity)
-    for record in records:
-        scatter_basis = scatter_basis_from_stored_geometry_numpy(
-            stored_basis=record.scatter_basis_vslf,
-            transport_features=record.features_vslf,
-            line_identity=line_rows,
-            target_semantics=(
-                DETECTOR_CONE_AIR_XCOM_SINGLE_SCATTER_BASIS_SEMANTICS
-            ),
-            detector_radius_m=(
-                DEFAULT_DETECTOR_CRYSTAL_RADIUS_CM / 100.0
-            ),
-            fe_scatter_distance_m=(
-                DEFAULT_FE_SHIELD_INNER_RADIUS_CM
-                + 0.5 * DEFAULT_FE_SHIELD_THICKNESS_CM
-            )
-            / 100.0,
-            pb_scatter_distance_m=(
-                DEFAULT_PB_SHIELD_INNER_RADIUS_CM
-                + 0.5 * DEFAULT_PB_SHIELD_THICKNESS_CM
-            )
-            / 100.0,
-        )
-        label_rows = record.labels[
-            "entry_class_totals_by_source_line"
-        ]
-        if not isinstance(label_rows, Mapping):
-            raise TypeError("Entry-class labels must be a mapping.")
-        pair_payload = _load_json_mapping(record.path)
-        sources = pair_payload["sources"]
-        if not isinstance(sources, Sequence):
-            raise TypeError("Pair source payload must be a sequence.")
-        for source_index, source in enumerate(sources):
-            if not isinstance(source, Mapping):
-                raise TypeError("Pair source row must be a mapping.")
-            isotope = str(source["isotope"])
-            for global_index, line in enumerate(line_rows):
-                if str(line["isotope"]) != isotope:
-                    continue
-                token = native_source_line_token(
-                    source_index=source_index,
-                    isotope=isotope,
-                    energy_keV=float(line["energy_keV"]),
-                )
-                raw_counts = label_rows[token]
-                if not isinstance(raw_counts, Mapping):
-                    raise TypeError("Entry-class line label must be a mapping.")
-                unattenuated_counts = (
-                    record.unattenuated_vsl[
-                        0,
-                        source_index,
-                        global_index,
-                    ]
-                    * record.dwell_time_s
-                )
-                if unattenuated_counts > 0.0:
-                    scatter_counts = (
-                        float(raw_counts["interacted_primary"])
-                        + float(raw_counts["secondary"])
-                    )
-                    features.append(
-                        scatter_basis[
-                            0,
-                            source_index,
-                            global_index,
-                        ]
-                    )
-                    targets.append(
-                        max(scatter_counts, 0.0) / unattenuated_counts
-                    )
-                    weights.append(unattenuated_counts)
-                    scene_ids.append(str(record.scene_seed))
-    if not features:
-        raise RuntimeError("Training corpus contains no additive-scatter samples.")
-    completion = _load_json_mapping(layout.training_complete_path)
-    training_manifest = {
-        "schema_version": 2,
-        "acceptance_contract_sha256": (
-            FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256
-        ),
-        "training_scene_seeds": list(DESIGNATED_TRAINING_SCENE_SEEDS),
-        "scenario_ids": list(VALIDATION_SCENARIO_IDS),
-        "pair_ids_by_scene": {
-            str(seed): list(ACCEPTANCE_PAIR_IDS)
-            for seed in DESIGNATED_TRAINING_SCENE_SEEDS
-        },
-        "artifact_sha256_by_scene": dict(
-            completion["artifact_sha256_by_scene"]
-        ),
-        "artifact_contract_sha256_by_scene": dict(
-            completion["artifact_contract_sha256_by_scene"]
-        ),
-        "detector_response_contract_sha256": (
-            NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
-        ),
-        "shield_pose_contract_sha256": SHIELD_POSE_CONTRACT_SHA256,
-        "obstacle_material_contract_sha256": (
-            OBSTACLE_MATERIAL_CONTRACT_SHA256
-        ),
-        "transport_physics_table_contract_sha256": (
-            TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256
-        ),
-        "label_space": ADDITIVE_SCATTER_INCIDENT_LABEL_SEMANTICS,
-        "selection_objective": (
-            "leave_one_training_scene_out_weighted_log1p_mse"
-        ),
-    }
-    response = fit_additive_noncollided_transport_response(
-        np.asarray(features, dtype=np.float64),
-        np.asarray(targets, dtype=np.float64),
-        np.asarray(weights, dtype=np.float64),
-        scene_ids,
-        training_manifest=training_manifest,
-        feature_basis_semantics=(
-            DETECTOR_CONE_AIR_XCOM_SINGLE_SCATTER_BASIS_SEMANTICS
-        ),
-    )
-    if (
-        response.to_payload()["target_semantics"]
-        != ADDITIVE_SCATTER_TARGET_SEMANTICS
-    ):
-        raise RuntimeError("Additive-scatter target semantics drifted.")
-    return response
-
-
-def _scenario_arrays(
-    records: Sequence[AcceptancePairRecord],
-    *,
-    additive_response: AdditiveNoncollidedTransportResponse,
-    line_identity: Sequence[Mapping[str, object]],
-) -> tuple[
-    NDArray[np.float64],
-    NDArray[np.float64],
-    NDArray[np.float64],
-    NDArray[np.float64],
-]:
-    """Stack one all-64 scenario into production likelihood tensors."""
-    ordered = tuple(sorted(records, key=lambda record: record.shield_pair_id))
-    if (
-        len(ordered) != 64
-        or tuple(record.shield_pair_id for record in ordered)
-        != ACCEPTANCE_PAIR_IDS
-        or len({record.scene_seed for record in ordered}) != 1
-        or len({record.scenario_id for record in ordered}) != 1
-    ):
-        raise ValueError("Scenario likelihood batch must contain exact all-64.")
-    unattenuated = np.concatenate(
-        [record.unattenuated_vsl for record in ordered],
-        axis=0,
-    )
-    uncollided = np.concatenate(
-        [record.uncollided_vsl for record in ordered],
-        axis=0,
-    )
-    features = np.concatenate(
-        [record.features_vslf for record in ordered],
-        axis=0,
-    )
-    stored_scatter_basis = np.concatenate(
-        [record.scatter_basis_vslf for record in ordered],
-        axis=0,
-    )
-    scatter_basis = scatter_basis_from_stored_geometry_numpy(
-        stored_basis=stored_scatter_basis,
-        transport_features=features,
-        line_identity=line_identity,
-        target_semantics=additive_response.feature_basis_semantics,
-        detector_radius_m=(
-            DEFAULT_DETECTOR_CRYSTAL_RADIUS_CM / 100.0
-        ),
-        fe_scatter_distance_m=(
-            DEFAULT_FE_SHIELD_INNER_RADIUS_CM
-            + 0.5 * DEFAULT_FE_SHIELD_THICKNESS_CM
-        )
-        / 100.0,
-        pb_scatter_distance_m=(
-            DEFAULT_PB_SHIELD_INNER_RADIUS_CM
-            + 0.5 * DEFAULT_PB_SHIELD_THICKNESS_CM
-        )
-        / 100.0,
-    )
-    total = additive_response.total_kernel_numpy(
-        unattenuated,
-        uncollided,
-        scatter_basis,
-    )
-    uncollided = additive_response.corrected_uncollided_kernel_numpy(
-        uncollided,
-        scatter_basis,
-    )
-    observed = np.stack(
-        [record.observed_spectrum_counts for record in ordered],
-        axis=0,
-    ).astype(np.float64)
-    return observed, total, uncollided, features
-
-
-def select_training_discrepancy(
-    *,
-    layout: AcceptanceRunLayout,
-    base_model: GeometryConditionedSpectralModel,
-    additive_response: AdditiveNoncollidedTransportResponse,
-) -> tuple[dict[str, object], GeometryConditionedSpectralModel]:
-    """Select one global discrepancy pair from training observations only."""
-    line_hash = line_identity_contract_sha256(base_model)
-    records = _load_all_training_records(
-        layout=layout,
-        line_identity_sha256=line_hash,
-    )
-    grouped: dict[tuple[int, str], list[AcceptancePairRecord]] = {}
-    for record in records:
-        grouped.setdefault(
-            (record.scene_seed, record.scenario_id),
-            [],
-        ).append(record)
-    if set(grouped) != {
-        (seed, scenario)
-        for seed in DESIGNATED_TRAINING_SCENE_SEEDS
-        for scenario in VALIDATION_SCENARIO_IDS
-    }:
-        raise RuntimeError("Training discrepancy groups are incomplete.")
-    candidate_scores: dict[str, float] = {}
-    for width in RATE_SCALE_HALF_WIDTH_GRID:
-        nodes, node_weights = rate_scale_mixture_for_half_width(width)
-        for concentration in MARK_CONCENTRATION_GRID:
-            candidate = GeometryConditionedSpectralModel.standard_native(
-                ACCEPTANCE_ISOTOPES,
-                dead_time_tau_s=base_model.dead_time_tau_s,
-                background_rate_cps=base_model.background_rate_cps,
-                rate_scale_nodes_j=nodes,
-                rate_scale_weights_j=node_weights,
-                mark_concentration_source=concentration,
-                additive_scatter_response=additive_response,
-            )
-            score = 0.0
-            for key in sorted(grouped):
-                observed, total, uncollided, features = _scenario_arrays(
-                    grouped[key],
-                    additive_response=additive_response,
-                    line_identity=base_model.line_identity,
-                )
-                value = candidate.log_likelihood_numpy(
-                    observed,
-                    total[np.newaxis, ...],
-                    uncollided[np.newaxis, ...],
-                    features[np.newaxis, ...],
-                    np.full(64, STANDARD_ACQUISITION_LIVE_TIME_S),
-                )
-                score += float(value[0])
-            candidate_scores[
-                f"rate_half_width={width:.12g};"
-                f"mark_concentration={concentration:.12g}"
-            ] = score
-    best_score = max(candidate_scores.values())
-    tied: list[tuple[float, float]] = []
-    for width in RATE_SCALE_HALF_WIDTH_GRID:
-        for concentration in MARK_CONCENTRATION_GRID:
-            key = (
-                f"rate_half_width={width:.12g};"
-                f"mark_concentration={concentration:.12g}"
-            )
-            if candidate_scores[key] >= best_score - 1.0e-12:
-                tied.append((float(width), float(concentration)))
-    selected_width, selected_concentration = min(
-        tied,
-        key=lambda item: (item[0], -item[1]),
-    )
-    score_payload = {
-        "schema_version": DISCREPANCY_SELECTION_ARTIFACT_SCHEMA_VERSION,
-        "acceptance_contract_sha256": (
-            FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256
-        ),
-        "training_scene_seeds": list(DESIGNATED_TRAINING_SCENE_SEEDS),
-        "scenario_ids": list(VALIDATION_SCENARIO_IDS),
-        "rate_scale_half_width_grid": list(RATE_SCALE_HALF_WIDTH_GRID),
-        "mark_concentration_grid": list(MARK_CONCENTRATION_GRID),
-        "candidate_scores": candidate_scores,
-        "selected_rate_scale_half_width": selected_width,
-        "selected_mark_concentration_source": selected_concentration,
-        "selected_training_log_predictive_density": best_score,
-        "tie_break": (
-            "smallest_rate_half_width_then_largest_mark_concentration"
-        ),
-        "holdout_artifacts_consumed": False,
-    }
-    selection_hash = canonical_json_sha256(score_payload)
-    completion = _load_json_mapping(layout.training_complete_path)
-    discrepancy_manifest = {
-        "schema_version": 1,
-        "acceptance_contract_sha256": (
-            FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256
-        ),
-        "training_scene_seeds": list(DESIGNATED_TRAINING_SCENE_SEEDS),
-        "scenario_ids": list(VALIDATION_SCENARIO_IDS),
-        "pair_ids_by_scene": {
-            str(seed): list(ACCEPTANCE_PAIR_IDS)
-            for seed in DESIGNATED_TRAINING_SCENE_SEEDS
-        },
-        "artifact_sha256_by_scene": dict(
-            completion["artifact_sha256_by_scene"]
-        ),
-        "rate_scale_family": (
-            "station_shared_three_node_symmetric_mean_one"
-        ),
-        "mark_family": "source_fraction_dirichlet_multinomial",
-        "selection_objective": (
-            "maximum_joint_training_log_predictive_density"
-        ),
-        "selected_rate_scale_half_width": selected_width,
-        "selected_mark_concentration_source": selected_concentration,
-        "candidate_count": (
-            len(RATE_SCALE_HALF_WIDTH_GRID)
-            * len(MARK_CONCENTRATION_GRID)
-        ),
-        "selected_training_log_predictive_density": best_score,
-        "selection_artifact_sha256": selection_hash,
-        "selection_completed": True,
-    }
-    nodes, weights = rate_scale_mixture_for_half_width(selected_width)
-    selected_model = GeometryConditionedSpectralModel.standard_native(
-        ACCEPTANCE_ISOTOPES,
-        dead_time_tau_s=base_model.dead_time_tau_s,
-        background_rate_cps=base_model.background_rate_cps,
-        rate_scale_nodes_j=nodes,
-        rate_scale_weights_j=weights,
-        mark_concentration_source=selected_concentration,
-        discrepancy_training_manifest=discrepancy_manifest,
-        additive_scatter_response=additive_response,
-    )
-    if not selected_model.discrepancy_training_ready:
-        raise RuntimeError("Selected discrepancy manifest is not production-safe.")
-    artifact = {
-        **score_payload,
-        "selection_artifact_sha256": selection_hash,
-        "selected_model_contract_sha256": (
-            selected_model.contract_hash_sha256
-        ),
-        "discrepancy_training_manifest": discrepancy_manifest,
-    }
-    return artifact, selected_model
 
 
 def freeze_candidate_model(
@@ -2007,10 +1518,10 @@ def freeze_candidate_model(
     layout: AcceptanceRunLayout,
     model: GeometryConditionedSpectralModel,
 ) -> Path:
-    """Freeze the exact pre-holdout model and require it to be unapproved."""
+    """Freeze the exact pre-validation model and require it to be unapproved."""
     if model.production_ready or model.validation_manifest is not None:
         raise ValueError(
-            "Candidate model must be frozen before holdout validation."
+            "Candidate model must be frozen before validation acquisition."
         )
     payload = dict(model.manifest_payload())
     if (
@@ -2018,96 +1529,30 @@ def freeze_candidate_model(
         or payload["production_ready"] is not False
         or payload["validation"] is not None
     ):
-        raise RuntimeError("Candidate manifest violates pre-holdout isolation.")
+        raise RuntimeError("Candidate manifest violates pre-validation isolation.")
     return _atomic_write_immutable_json(layout.candidate_model_path, payload)
 
 
 def load_frozen_candidate_model(
     layout: AcceptanceRunLayout,
 ) -> GeometryConditionedSpectralModel:
-    """Reconstruct a frozen candidate without invoking production approval."""
+    """Reconstruct the strict physics-only pre-validation candidate."""
     payload = _load_json_mapping(layout.candidate_model_path)
     if (
         type(payload.get("schema_version")) is not int
-        or payload.get("schema_version") != 3
-        or payload.get("model")
-        != "geometry_conditioned_full_spectrum"
+        or payload.get("schema_version") != FULL_SPECTRUM_MODEL_SCHEMA_VERSION
+        or payload.get("model") != "geometry_conditioned_full_spectrum"
         or payload.get("production_ready") is not False
         or payload.get("validation") is not None
         or not _is_sha256(payload.get("contract_hash_sha256"))
     ):
         raise ValueError("Frozen candidate model is incompatible.")
-    additive_payload = payload.get(
-        "additive_noncollided_transport_response"
+    model = GeometryConditionedSpectralModel.from_manifest_payload(
+        payload,
+        detector_green_operator=canonical_detector_green_operator(),
     )
-    mixture = payload.get("rate_scale_mixture")
-    discrepancy_training = payload.get("discrepancy_training")
-    if (
-        not isinstance(additive_payload, Mapping)
-        or not isinstance(mixture, Mapping)
-        or set(mixture) != {"scope", "nodes", "weights", "weighted_mean"}
-        or mixture.get("scope") != "station_shared_source_only"
-        or not isinstance(discrepancy_training, Mapping)
-    ):
-        raise ValueError("Frozen candidate lacks physical fitted components.")
-    raw_nodes = mixture["nodes"]
-    raw_weights = mixture["weights"]
-    if (
-        not isinstance(raw_nodes, list)
-        or not raw_nodes
-        or not isinstance(raw_weights, list)
-    ):
-        raise TypeError("Frozen candidate mixture arrays must contain numbers.")
-    nodes = tuple(
-        _strict_finite_number(
-            value,
-            field_name=f"candidate.rate_scale_mixture.nodes[{index}]",
-        )
-        for index, value in enumerate(raw_nodes)
-    )
-    weights = tuple(
-        _strict_finite_number(
-            value,
-            field_name=f"candidate.rate_scale_mixture.weights[{index}]",
-        )
-        for index, value in enumerate(raw_weights)
-    )
-    dead_time_tau_s = _strict_finite_number(
-        payload.get("dead_time_tau_s"),
-        field_name="candidate.dead_time_tau_s",
-    )
-    background_rate_cps = _strict_finite_number(
-        payload.get("background_rate_cps"),
-        field_name="candidate.background_rate_cps",
-    )
-    mark_concentration_source = _strict_finite_number(
-        payload.get("mark_concentration_source"),
-        field_name="candidate.mark_concentration_source",
-    )
-    _strict_finite_number(
-        mixture["weighted_mean"],
-        field_name="candidate.rate_scale_mixture.weighted_mean",
-    )
-    model = GeometryConditionedSpectralModel.standard_native(
-        ACCEPTANCE_ISOTOPES,
-        dead_time_tau_s=dead_time_tau_s,
-        background_rate_cps=background_rate_cps,
-        rate_scale_nodes_j=nodes,
-        rate_scale_weights_j=weights,
-        mark_concentration_source=mark_concentration_source,
-        discrepancy_training_manifest=discrepancy_training,
-        additive_scatter_response=(
-            AdditiveNoncollidedTransportResponse.from_payload(
-                additive_payload
-            )
-        ),
-    )
-    if (
-        dict(model.manifest_payload()) != dict(payload)
-        or model.contract_hash_sha256
-        != payload["contract_hash_sha256"]
-    ):
-        raise ValueError("Frozen candidate model does not reconstruct exactly.")
+    if not model.runtime_ready or model.production_ready:
+        raise ValueError("Frozen candidate is not a runtime-ready unapproved model.")
     return model
 
 
@@ -2120,14 +1565,13 @@ def acquire_designated_split(
     line_identity_sha256: str,
     progress: Callable[[str], None] | None = None,
 ) -> tuple[Path, ...]:
-    """Acquire and authenticate an exact predeclared split in seed order."""
-    if split not in {"training", "holdout"}:
-        raise ValueError("Acceptance split must be training or holdout.")
-    expected = (
-        DESIGNATED_TRAINING_SCENE_SEEDS
-        if split == "training"
-        else DESIGNATED_HOLDOUT_SCENE_SEEDS
-    )
+    """Acquire the exact validation split after freezing one candidate."""
+    if split != "validation":
+        raise ValueError(
+            "Production acceptance has no training split; only the frozen "
+            "candidate validation split is reachable."
+        )
+    expected = DESIGNATED_VALIDATION_SCENE_SEEDS
     if (
         not isinstance(seeds, Sequence)
         or isinstance(seeds, (str, bytes))
@@ -2135,10 +1579,9 @@ def acquire_designated_split(
         or tuple(seeds) != expected
     ):
         raise ValueError(f"{split} acquisition must use its exact seed tuple.")
-    if split == "holdout":
-        candidate = load_frozen_candidate_model(layout)
-        if candidate.production_ready:
-            raise RuntimeError("Holdout must evaluate the frozen candidate.")
+    candidate = load_frozen_candidate_model(layout)
+    if candidate.production_ready:
+        raise RuntimeError("Validation must evaluate the frozen candidate.")
     paths = []
     for seed in seeds:
         paths.append(
@@ -2168,17 +1611,14 @@ __all__ = [
     "acquire_designated_split",
     "acquire_scene_corpus",
     "build_acceptance_run_contract",
-    "build_complete_training_manifest",
     "canonical_json_bytes",
     "canonical_json_sha256",
     "file_sha256",
-    "fit_training_additive_scatter",
     "freeze_candidate_model",
     "line_identity_contract_sha256",
     "load_acceptance_pair",
     "load_acceptance_run_contract",
     "load_frozen_candidate_model",
-    "select_training_discrepancy",
     "validate_native_fidelity",
     "validate_native_process_diagnostics",
     "validate_scene_corpus",

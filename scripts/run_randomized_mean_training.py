@@ -1,13 +1,11 @@
-"""Acquire and freeze the randomized-family physical transport mean."""
+"""Build an offline randomized-family transport benchmark artifact."""
 
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 from collections.abc import Sequence
 
-from sim.runtime import load_runtime_config
 from spectrum.mean_calibration_runner import (
     ExternalGeant4MeanCalibrationBackend,
     MeanCalibrationLayout,
@@ -15,7 +13,6 @@ from spectrum.mean_calibration_runner import (
     fit_additive_scatter_from_complete_mean_calibration,
     freeze_mean_calibration_completion_manifest,
     freeze_mean_calibration_scene_manifest,
-    freeze_runtime_ready_model,
     initialize_mean_calibration_layout,
 )
 from spectrum.additive_scatter import EXACT_SINGLE_SCATTER_BASIS_SEMANTICS
@@ -32,20 +29,10 @@ from build_physical_component_full_spectrum_candidate import (
 
 _ROOT = Path(__file__).resolve().parents[1]
 _DEFAULT_CONFIG = (
-    _ROOT
-    / "configs"
-    / "geant4"
-    / "variance_reduction_external_no_isaac_32threads.json"
+    _ROOT / "configs" / "geant4" / "variance_reduction_external_no_isaac_32threads.json"
 )
 _DEFAULT_OUTPUT_ROOT = (
     _ROOT / "results" / "mean_calibration" / "randomized_geometry_family"
-)
-_DEFAULT_MODEL = (
-    _ROOT
-    / "configs"
-    / "geant4"
-    / "models"
-    / "geometry_conditioned_full_spectrum_randomized_mean.json"
 )
 
 
@@ -59,7 +46,6 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--config", type=Path, default=_DEFAULT_CONFIG)
     parser.add_argument("--output-root", type=Path, default=_DEFAULT_OUTPUT_ROOT)
-    parser.add_argument("--output-model", type=Path, default=_DEFAULT_MODEL)
     parser.add_argument("--histories-per-source-line", type=int, default=16384)
     parser.add_argument("--angle-strata-mu", type=int, default=8)
     parser.add_argument("--angle-strata-phi", type=int, default=16)
@@ -72,18 +58,6 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     return parser
-
-
-def _load_additive(layout: MeanCalibrationLayout) -> object:
-    """Load the fitted additive response through its public payload parser."""
-    from spectrum.additive_scatter import (
-        AdditiveNoncollidedTransportResponse,
-    )
-
-    payload = json.loads(
-        layout.additive_model_path.read_text(encoding="utf-8")
-    )
-    return AdditiveNoncollidedTransportResponse.from_payload(payload)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -129,32 +103,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             layout=layout,
             design=design,
         )
-    base_model = GeometryConditionedSpectralModel.standard_native(
+    base_model = GeometryConditionedSpectralModel.nonproduction_native(
         ("Co-60", "Cs-137", "Eu-154"),
         dead_time_tau_s=0.0,
         background_rate_cps=0.0,
     )
-    fit_additive_scatter_from_complete_mean_calibration(
+    response = fit_additive_scatter_from_complete_mean_calibration(
         layout=layout,
         design=design,
         model=base_model,
         feature_basis_semantics=EXACT_SINGLE_SCATTER_BASIS_SEMANTICS,
     )
-    runtime_config = load_runtime_config(arguments.config.resolve())
-    candidate = GeometryConditionedSpectralModel.standard_native(
-        ("Co-60", "Cs-137", "Eu-154"),
-        dead_time_tau_s=float(runtime_config["dead_time_tau_s"]),
-        background_rate_cps=float(runtime_config["background_rate_cps"]),
-        additive_scatter_response=_load_additive(layout),
-    )
-    output_path = freeze_runtime_ready_model(
-        output_path=arguments.output_model.resolve(),
-        model=candidate,
-        additive_response=candidate.additive_scatter_response,
-        layout=layout,
-        design=design,
-    )
-    print(output_path.resolve(), flush=True)
+    print(layout.additive_model_path.resolve(), flush=True)
+    print(response.contract_hash_sha256, flush=True)
     return 0
 
 

@@ -7,32 +7,27 @@ import hashlib
 import json
 from pathlib import Path
 
-from measurement.shielding import (
-    DEFAULT_DETECTOR_CRYSTAL_RADIUS_CM,
-    DEFAULT_FE_SHIELD_INNER_RADIUS_CM,
-    DEFAULT_FE_SHIELD_THICKNESS_CM,
-    DEFAULT_PB_SHIELD_INNER_RADIUS_CM,
-    DEFAULT_PB_SHIELD_THICKNESS_CM,
-)
-from spectrum.additive_scatter import (
-    PhysicsOnlyNoncollidedTransportResponse,
-)
 from spectrum.isotope_profiles import (
     available_isotope_profiles,
     require_isotope_profile,
 )
+from spectrum.detector_green_operator import DetectorGreenOperator
 from spectrum.transport_spectral import (
+    CANONICAL_DETECTOR_GREEN_OPERATOR_MANIFEST,
     GeometryConditionedSpectralModel,
-    PhysicalComponentDiscrepancy,
 )
 
 
 _REGISTRY_CONSUMER_CONFIG_NAMES = (
+    "cs_co_external_no_isaac_32threads.json",
     "diagnostic_external_no_isaac_1thread.json",
     "variance_reduction_external_gui_32threads.json",
     "variance_reduction_external_no_isaac_32threads.json",
     "variance_reduction_external_no_isaac_32threads_cpu_guarded.json",
 )
+_CANONICAL_APPROVED_PROFILE_ASSETS = {
+    "unconditioned_cs_co": ("configs/geant4/models/profiles/unconditioned_cs_co.json"),
+}
 
 
 def _canonical_bytes(payload: object) -> bytes:
@@ -50,51 +45,56 @@ def _canonical_bytes(payload: object) -> bytes:
 
 def build_assets(repository_root: Path) -> dict[str, object]:
     """Build the complete current profile registry and its model assets."""
+    detector_green_operator = DetectorGreenOperator.from_artifact(
+        CANONICAL_DETECTOR_GREEN_OPERATOR_MANIFEST
+    )
+    detector_green_operator.require_runtime_ready()
     registry_path = (
-        repository_root
-        / "configs/geant4/models/isotope_profile_model_registry.json"
+        repository_root / "configs/geant4/models/isotope_profile_model_registry.json"
     )
     profiles: dict[str, object] = {}
-    response = PhysicsOnlyNoncollidedTransportResponse(
-        detector_radius_m=DEFAULT_DETECTOR_CRYSTAL_RADIUS_CM / 100.0,
-        fe_scatter_distance_m=(
-            DEFAULT_FE_SHIELD_INNER_RADIUS_CM
-            + 0.5 * DEFAULT_FE_SHIELD_THICKNESS_CM
-        )
-        / 100.0,
-        pb_scatter_distance_m=(
-            DEFAULT_PB_SHIELD_INNER_RADIUS_CM
-            + 0.5 * DEFAULT_PB_SHIELD_THICKNESS_CM
-        )
-        / 100.0,
-    )
     for profile_name in available_isotope_profiles():
         profile = require_isotope_profile(profile_name)
-        model = GeometryConditionedSpectralModel.standard_native(
-            profile.isotopes,
-            dead_time_tau_s=5.813e-9,
-            background_rate_cps=12.0,
-            physical_component_discrepancy=(
-                PhysicalComponentDiscrepancy.physics_only_budget()
-            ),
-            additive_scatter_response=response,
+        approved_relative_path = _CANONICAL_APPROVED_PROFILE_ASSETS.get(profile_name)
+        approved_path = (
+            None
+            if approved_relative_path is None
+            else repository_root / approved_relative_path
         )
-        relative_path = (
-            "configs/geant4/models/profiles/"
-            f"{profile_name}_physics_only.json"
-        )
-        model_path = repository_root / relative_path
-        model_path.parent.mkdir(parents=True, exist_ok=True)
-        model_bytes = _canonical_bytes(model.manifest_payload())
-        model_path.write_bytes(model_bytes)
+        if approved_path is not None and approved_path.is_file():
+            model_bytes = approved_path.read_bytes()
+            payload = json.loads(model_bytes)
+            model = GeometryConditionedSpectralModel.from_manifest_payload(
+                payload,
+                detector_green_operator=detector_green_operator,
+            )
+            model.require_production_ready()
+            if tuple(sorted(profile.isotopes)) != tuple(
+                sorted({row["isotope"] for row in model.line_identity})
+            ):
+                raise ValueError(
+                    f"Approved model isotopes disagree for {profile_name!r}."
+                )
+            relative_path = approved_relative_path
+        else:
+            model = GeometryConditionedSpectralModel.physics_only_native(
+                profile.isotopes,
+                dead_time_tau_s=5.813e-9,
+                background_rate_cps=12.0,
+                detector_green_operator=detector_green_operator,
+            )
+            relative_path = (
+                f"configs/geant4/models/profiles/{profile_name}_physics_only.json"
+            )
+            model_path = repository_root / relative_path
+            model_path.parent.mkdir(parents=True, exist_ok=True)
+            model_bytes = _canonical_bytes(model.manifest_payload())
+            model_path.write_bytes(model_bytes)
         profiles[profile_name] = {
             "isotopes": list(profile.isotopes),
             "model_path": relative_path,
             "model_file_sha256": hashlib.sha256(model_bytes).hexdigest(),
             "model_contract_hash_sha256": model.contract_hash_sha256,
-            "calibration_status": (
-                "physics_only_no_scene_fit_runtime_unvalidated"
-            ),
         }
     registry = {
         "model": "isotope_profile_full_spectrum_registry",

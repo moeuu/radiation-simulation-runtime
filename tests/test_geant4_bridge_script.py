@@ -74,7 +74,7 @@ def test_bridge_script_rejects_unapproved_model_before_server_start(
     monkeypatch.setattr(module, "serve_forever", start_server)
     monkeypatch.setattr(sys, "argv", [SCRIPT.name, "--config", str(STANDARD_CONFIG)])
 
-    with pytest.raises(RuntimeError, match="independent all-64 holdout"):
+    with pytest.raises(RuntimeError, match="independent all-64 validation"):
         module.main()
 
     assert started is False
