@@ -31,10 +31,18 @@ production configs reject those keys instead of accepting ignored duplicates.
 - `external_gui_scene.json`: explicit USD-backed Manchester Drum Store scene.
 - `shield_validation_scene.json`: material/shield validation config.
 
-The profile registry hash proves which model asset was loaded. Production
-startup additionally requires literal `production_ready=true` provenance for
-the exact model contract; training-only `runtime_ready` models are rejected.
-That approval also binds the canonical runtime configuration, native executable,
+The profile registry hash proves which exact catalog-derived model asset was
+loaded. Production startup requires either literal all-64 application approval
+for that exact model or a schema-v7 catalog-independent approval transferred
+from the canonical validated model. Transfer is allowed only when detector,
+transport, background, dead-time, likelihood uncertainty, and execution
+contracts are identical and every catalog line is inside the validated
+continuous detector-energy domain. The provenance continues to name the
+isotopes that received end-to-end all-64 validation, so a transferred profile
+does not masquerade as application-validated. Changes to the catalog-independent
+algorithm contract fail closed; adding canonical in-domain lines does not force
+another multi-hour acceptance run. Training-only models with neither form of
+approval remain rejected. The evidence also binds the native executable,
 resolved dynamic-library bytes, explicit Geant4 environment and complete physics
 data trees, and the Python implementation bundle. Production requires
 `auto_start_sidecar=true`, refuses an already occupied TCP endpoint, validates all

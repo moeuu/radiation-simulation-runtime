@@ -328,10 +328,10 @@ def test_serve_cli_rejects_invalid_model_registry_before_binding(
     assert bound is False
 
 
-def test_serve_cli_rejects_unapproved_model_before_binding(
+def test_serve_cli_accepts_catalog_independent_profile_approval(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A runtime-ready model without validation approval cannot start a server."""
+    """An in-domain profile with transferable approval may start a server."""
     runtime_root = Path(__file__).resolve().parents[1]
     config_path = (
         runtime_root / MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE.runtime_config_relative_path
@@ -339,16 +339,15 @@ def test_serve_cli_rejects_unapproved_model_before_binding(
     bound = False
 
     def bind_server(*args: object, **kwargs: object) -> None:
-        """Record any forbidden server bind after failed model approval."""
+        """Record server bind after successful model approval."""
         nonlocal bound
         bound = True
 
     monkeypatch.setattr("runtime.cli.serve_forever", bind_server)
 
-    with pytest.raises(RuntimeError, match="independent all-64 validation"):
-        runtime_cli_main(["serve", "--config", str(config_path)])
+    assert runtime_cli_main(["serve", "--config", str(config_path)]) == 0
 
-    assert bound is False
+    assert bound is True
 
 
 def test_private_truth_manifest_is_separate_and_joined_by_run_id(

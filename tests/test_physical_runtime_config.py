@@ -24,7 +24,10 @@ from spectrum.air_attenuation import (
 from sim.geant4_app.app import Geant4Application
 from sim.isaacsim_app.scene_builder import SceneDescription
 from sim.runtime import load_production_runtime_config, load_runtime_config
-from spectrum.transport_spectral import GeometryConditionedSpectralModel
+from spectrum.transport_spectral import (
+    CATALOG_INDEPENDENT_APPROVAL_SCOPE,
+    GeometryConditionedSpectralModel,
+)
 from spectrum.additive_scatter import PhysicsOnlyNoncollidedTransportResponse
 from tests.runtime_test_support import (
     approved_full_spectrum_model,
@@ -116,17 +119,26 @@ def test_production_geant4_reset_rejects_scene_config_overrides() -> None:
     assert mismatched_authoring.author_obstacle_prims is False
 
 
-def test_standard_unapproved_profile_cannot_open_production_session() -> None:
-    """The current unvalidated profile must fail before acquisition starts."""
+def test_standard_profile_reuses_only_catalog_independent_approval() -> None:
+    """An in-domain profile may reuse physics approval without claiming all-64."""
     payload = load_runtime_config(STANDARD_CONFIG)
 
-    with pytest.raises(RuntimeError, match="independent all-64 validation"):
-        estimator_neutral_runtime_config(
-            payload,
-            backend="geant4",
-            isotopes=("Co-60", "Cs-137", "Eu-154"),
-            run_root=ROOT,
-        )
+    resolved = estimator_neutral_runtime_config(
+        payload,
+        backend="geant4",
+        isotopes=("Co-60", "Cs-137", "Eu-154"),
+        run_root=ROOT,
+    )
+    model_payload = resolved["full_spectrum_generative_model"]
+    validation = model_payload["validation"]
+
+    assert model_payload["production_ready"] is True
+    assert validation["schema_version"] == 7
+    assert validation["approval_scope"] == CATALOG_INDEPENDENT_APPROVAL_SCOPE
+    assert validation["application_validation_isotopes"] == ["Co-60", "Cs-137"]
+    assert validation["approved_model_contract_sha256"] != (
+        model_payload["contract_hash_sha256"]
+    )
 
 
 def test_production_session_rejects_analytic_requested_backend() -> None:

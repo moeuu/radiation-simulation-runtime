@@ -55,6 +55,7 @@ from spectrum.transport_spectral import (
     sample_nonparalyzable_counts_numpy,
     station_shared_gamma_poisson_count_log_increments_numpy,
     station_shared_gamma_poisson_count_log_increments_torch,
+    with_catalog_independent_production_approval,
 )
 from tests.runtime_test_support import (
     approved_full_spectrum_model,
@@ -2810,6 +2811,78 @@ def test_nonalgorithm_acceptance_metadata_does_not_expire_model_approval(
     assert model.contract_hash_sha256 == contract_hash
     assert model.production_ready is True
     model.require_production_ready()
+
+
+def test_catalog_independent_approval_preserves_target_profile_contract() -> None:
+    """Approval transfer changes provenance but not catalog-derived physics."""
+    source = approved_full_spectrum_model()
+    target = GeometryConditionedSpectralModel.physics_only_native(
+        ("Cs-137",),
+        dead_time_tau_s=source.dead_time_tau_s,
+        background_rate_cps=source.background_rate_cps,
+        detector_green_operator=source.detector_green_operator,
+    )
+    target_contract = target.contract_hash_sha256
+
+    approved = with_catalog_independent_production_approval(
+        target,
+        approved_source=source,
+    )
+
+    assert approved.contract_hash_sha256 == target_contract
+    assert approved.production_ready is True
+    assert approved.validation_manifest is not None
+    assert approved.validation_manifest["schema_version"] == 7
+    assert approved.validation_manifest["application_validation_isotopes"] == (
+        "Co-60",
+        "Cs-137",
+        "Eu-154",
+    )
+
+
+def test_catalog_independent_approval_rejects_algorithm_drift() -> None:
+    """A background or other algorithm-contract change cannot reuse evidence."""
+    source = approved_full_spectrum_model()
+    changed = GeometryConditionedSpectralModel.physics_only_native(
+        ("Cs-137",),
+        dead_time_tau_s=source.dead_time_tau_s,
+        background_rate_cps=source.background_rate_cps + 1.0,
+        detector_green_operator=source.detector_green_operator,
+    )
+
+    with pytest.raises(RuntimeError, match="algorithm differs"):
+        with_catalog_independent_production_approval(
+            changed,
+            approved_source=source,
+        )
+
+
+def test_catalog_independent_approval_digest_tampering_fails_closed() -> None:
+    """Transferred evidence cannot authorize a different core digest."""
+    source = approved_full_spectrum_model()
+    target = GeometryConditionedSpectralModel.physics_only_native(
+        ("Cs-137",),
+        dead_time_tau_s=source.dead_time_tau_s,
+        background_rate_cps=source.background_rate_cps,
+        detector_green_operator=source.detector_green_operator,
+    )
+    approved = with_catalog_independent_production_approval(
+        target,
+        approved_source=source,
+    )
+    validation = approved.manifest_payload()["validation"]
+    validation["approved_catalog_independent_contract_sha256"] = "0" * 64
+    tampered = GeometryConditionedSpectralModel.physics_only_native(
+        ("Cs-137",),
+        dead_time_tau_s=source.dead_time_tau_s,
+        background_rate_cps=source.background_rate_cps,
+        detector_green_operator=source.detector_green_operator,
+        validation_manifest=validation,
+    )
+
+    assert tampered.production_ready is False
+    with pytest.raises(RuntimeError, match="catalog-independent"):
+        tampered.require_production_ready()
 
 
 @pytest.mark.parametrize(

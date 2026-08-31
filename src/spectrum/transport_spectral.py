@@ -171,6 +171,18 @@ DESIGNATED_VALIDATION_SCENE_SEEDS = (
     7325752837,
 )
 FULL_SPECTRUM_ACCEPTANCE_EXPERIMENT_ID = "cs_co_full_spectrum_acceptance"
+CATALOG_INDEPENDENT_APPROVAL_SCOPE = (
+    "catalog_independent_detector_green_transport_v1"
+)
+TRANSFERRED_VALIDATION_SCHEMA_VERSION = 7
+_TRANSFERRED_VALIDATION_FIELDS = frozenset(
+    {
+        "approval_scope",
+        "approved_catalog_independent_contract_sha256",
+        "application_validation_isotopes",
+        "source_validation_manifest_sha256",
+    }
+)
 ACCEPTANCE_ROOM_SIZE_XYZ = (10.0, 20.0, 10.0)
 ACCEPTANCE_DETECTOR_POSE_XYZ = (1.0, 1.0, 0.5)
 ACCEPTANCE_OBSTACLE_BLOCKED_FRACTION = 0.4
@@ -3655,6 +3667,9 @@ class GeometryConditionedSpectralModel:
             self._mark_tree_right_child_t,
         ):
             array.setflags(write=False)
+        self._catalog_independent_contract_hash_sha256 = (
+            self._build_catalog_independent_contract_hash()
+        )
         self._contract_hash_sha256 = self._build_contract_hash()
 
     @classmethod
@@ -4156,6 +4171,102 @@ class GeometryConditionedSpectralModel:
             digest.update(_portable_derived_array_digest(array))
         digest.update(_array_digest(self._rate_scale_nodes_j))
         digest.update(_array_digest(self._rate_scale_weights_j))
+        return digest.hexdigest()
+
+    def _build_catalog_independent_contract_hash(self) -> str:
+        """Return the production algorithm digest excluding catalog line choices.
+
+        Line energies and branching weights are application inputs.  Their
+        exact derived tensors remain protected by ``contract_hash_sha256``.
+        This second digest intentionally covers only the isotope-independent
+        detector, transport, uncertainty, and count-semantics implementation
+        so adding an in-domain catalog profile does not invalidate physical
+        approval evidence.
+        """
+        scatter_contract = (
+            None
+            if self._detector_cone_scatter_contract is None
+            else dict(self._detector_cone_scatter_contract)
+        )
+        if scatter_contract is not None:
+            scatter_contract.pop("contract_hash_sha256", None)
+        payload = {
+            "contract": "catalog_independent_full_spectrum_runtime_v1",
+            "model_schema_version": FULL_SPECTRUM_MODEL_SCHEMA_VERSION,
+            "source_rate_semantics": (
+                "pre_dead_time_detector_pulse_rate_at_1m"
+            ),
+            "source_rate_green_normalization": (
+                "catalog_branching_weighted_absolute_detection_efficiency_"
+                "at_1m_v1"
+            ),
+            "catalog_line_projection": (
+                "canonical_line_energy_branching_and_xcom_projection_v1"
+            ),
+            "dead_time_tau_s": float(self.dead_time_tau_s),
+            "background_rate_cps": float(self.background_rate_cps),
+            "transport_feature_order": TRANSPORT_FEATURE_ORDER,
+            "detector_green_operator_id": DETECTOR_GREEN_OPERATOR_ID,
+            "detector_green_operator_contract_sha256": (
+                self.detector_green_operator.contract_hash_sha256
+            ),
+            "detector_green_operator_binary_sha256": (
+                self.detector_green_operator.binary_sha256
+            ),
+            "detector_green_input_energy_domain_keV": (
+                self.detector_green_operator.input_energy_domain_keV
+            ),
+            "detector_cone_scatter_response": scatter_contract,
+            "shield_pose_contract_sha256": SHIELD_POSE_CONTRACT_SHA256,
+            "obstacle_material_contract_sha256": (
+                OBSTACLE_MATERIAL_CONTRACT_SHA256
+            ),
+            "transport_physics_table_contract_sha256": (
+                TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256
+            ),
+            "dead_time_model": (
+                "nonparalyzable_renewal_total_conditional_multinomial"
+            ),
+            "detector_green_finite_mc_uncertainty": (
+                "pulse_plus_no_pulse_categorical_covariance_v1"
+            ),
+            "additive_scatter_response": (
+                None
+                if self.additive_scatter_response is None
+                else self.additive_scatter_response.to_payload()
+            ),
+            "physical_component_discrepancy": (
+                None
+                if self.physical_component_discrepancy is None
+                else self.physical_component_discrepancy.to_payload()
+            ),
+            "rate_scale_nodes": self._rate_scale_nodes_j.tolist(),
+            "rate_scale_weights": self._rate_scale_weights_j.tolist(),
+            "mark_concentration_source": self.mark_concentration_source,
+            "mark_concentration_multi_isotope": (
+                self.mark_concentration_multi_isotope
+            ),
+            "count_discrepancy_concentration": (
+                self.count_discrepancy_concentration
+            ),
+            "count_discrepancy_scope": self.count_discrepancy_scope,
+        }
+        digest = hashlib.sha256()
+        digest.update(
+            json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        for array in (
+            self._energy_axis_keV,
+            self.response_operator_br,
+            self.background_shape_b,
+            self._response_concentration_r,
+            self._absolute_response_concentration_r,
+        ):
+            digest.update(_portable_derived_array_digest(array))
         return digest.hexdigest()
 
     @property
@@ -4680,7 +4791,7 @@ class GeometryConditionedSpectralModel:
 
     @property
     def production_ready(self) -> bool:
-        """Return whether independent all-64 validation approved the model."""
+        """Return whether independent evidence approves this runtime algorithm."""
         if not self.runtime_ready:
             return False
         additive_response = self.additive_scatter_response
@@ -4693,7 +4804,7 @@ class GeometryConditionedSpectralModel:
         manifest = self.validation_manifest
         if not isinstance(manifest, Mapping):
             return False
-        expected_keys = {
+        base_expected_keys = {
             "schema_version",
             "validation_contract_sha256",
             "approved_model_contract_sha256",
@@ -4722,13 +4833,59 @@ class GeometryConditionedSpectralModel:
             "metrics",
             "all_passed",
         }
+        schema_version = manifest.get("schema_version")
+        expected_keys = (
+            base_expected_keys
+            if schema_version == 6
+            else base_expected_keys | _TRANSFERRED_VALIDATION_FIELDS
+            if schema_version == TRANSFERRED_VALIDATION_SCHEMA_VERSION
+            else frozenset()
+        )
         if set(manifest) != expected_keys:
             return False
+        exact_application_approval = (
+            manifest.get("approved_model_contract_sha256")
+            == self.contract_hash_sha256
+        )
+        if schema_version == 6 and not exact_application_approval:
+            return False
+        if schema_version == TRANSFERRED_VALIDATION_SCHEMA_VERSION:
+            source_manifest = _thaw_json_value(manifest)
+            for field_name in _TRANSFERRED_VALIDATION_FIELDS:
+                source_manifest.pop(field_name, None)
+            source_manifest["schema_version"] = 6
+            validated_isotopes = manifest.get("application_validation_isotopes")
+            line_energies = np.asarray(
+                [float(row["energy_keV"]) for row in self._line_identity],
+                dtype=np.float64,
+            )
+            lower_energy, upper_energy = (
+                self.detector_green_operator.input_energy_domain_keV
+            )
+            if (
+                manifest.get("approval_scope")
+                != CATALOG_INDEPENDENT_APPROVAL_SCOPE
+                or manifest.get(
+                    "approved_catalog_independent_contract_sha256"
+                )
+                != self.catalog_independent_contract_hash_sha256
+                or manifest.get("source_validation_manifest_sha256")
+                != _canonical_json_sha256(source_manifest)
+                or not isinstance(validated_isotopes, tuple)
+                or not validated_isotopes
+                or any(
+                    type(value) is not str or not value
+                    for value in validated_isotopes
+                )
+                or tuple(sorted(set(validated_isotopes))) != validated_isotopes
+                or np.any(~np.isfinite(line_energies))
+                or np.any(line_energies < float(lower_energy))
+                or np.any(line_energies > float(upper_energy))
+            ):
+                return False
         if (
-            manifest.get("schema_version") != 6
-            or not _is_sha256(manifest.get("validation_contract_sha256"))
-            or manifest.get("approved_model_contract_sha256")
-            != self.contract_hash_sha256
+            not _is_sha256(manifest.get("validation_contract_sha256"))
+            or not _is_sha256(manifest.get("approved_model_contract_sha256"))
             or not _is_sha256(manifest.get("acceptance_run_contract_sha256"))
             or not _is_sha256(manifest.get("runtime_config_sha256"))
             or not _is_sha256(manifest.get("native_executable_sha256"))
@@ -4869,6 +5026,11 @@ class GeometryConditionedSpectralModel:
         return self._contract_hash_sha256
 
     @property
+    def catalog_independent_contract_hash_sha256(self) -> str:
+        """Return the isotope-independent detector/transport algorithm hash."""
+        return self._catalog_independent_contract_hash_sha256
+
+    @property
     def energy_axis_keV(self) -> NDArray[np.float64]:
         """Return a defensive copy of the native analysis axis."""
         return self._energy_axis_keV.copy()
@@ -4898,11 +5060,13 @@ class GeometryConditionedSpectralModel:
         return float(self.detector_green_operator.detector_target_radius_m)
 
     def require_production_ready(self) -> None:
-        """Fail closed until independent validation approves this exact hash."""
+        """Fail closed until independent evidence approves the runtime algorithm."""
         if not self.production_ready:
             raise RuntimeError(
-                "Geometry-conditioned spectrum model has not passed the fixed "
-                "independent all-64 validation gate for this exact contract hash."
+                "Geometry-conditioned spectrum model has neither exact "
+                "independent all-64 validation nor transferable "
+                "catalog-independent algorithm approval for every configured "
+                "line energy."
             )
 
     def require_runtime_ready(self) -> None:
@@ -11331,6 +11495,75 @@ class GeometryConditionedSpectralModel:
         if correction is not None:
             payload["low_rank_spectral_mean_correction"] = correction.to_payload()
         return payload
+
+
+def with_catalog_independent_production_approval(
+    model: GeometryConditionedSpectralModel,
+    *,
+    approved_source: GeometryConditionedSpectralModel,
+) -> GeometryConditionedSpectralModel:
+    """Attach transferable approval without changing the target physics hash.
+
+    The source must carry literal schema-v6 all-64 evidence.  Transfer is
+    permitted only when the target has the same isotope-independent detector,
+    transport, background, dead-time, and uncertainty contract.  The target's
+    catalog lines remain application inputs and must lie inside the validated
+    continuous detector-energy domain.
+    """
+    model.require_runtime_ready()
+    if model.production_ready:
+        return model
+    approved_source.require_production_ready()
+    source_validation = approved_source.validation_manifest
+    if (
+        not isinstance(source_validation, Mapping)
+        or source_validation.get("schema_version") != 6
+    ):
+        raise RuntimeError(
+            "Catalog-independent approval must originate from literal schema-v6 "
+            "all-64 application evidence; chained approval transfer is forbidden."
+        )
+    if (
+        approved_source.catalog_independent_contract_hash_sha256
+        != model.catalog_independent_contract_hash_sha256
+    ):
+        raise RuntimeError(
+            "Full-spectrum catalog-independent detector/transport algorithm "
+            "differs from the independently approved source model."
+        )
+    source_payload = _thaw_json_value(source_validation)
+    source_validation_sha256 = _canonical_json_sha256(source_payload)
+    validated_isotopes = tuple(
+        sorted({str(row["isotope"]) for row in approved_source.line_identity})
+    )
+    transferred_validation = dict(source_payload)
+    transferred_validation.update(
+        {
+            "schema_version": TRANSFERRED_VALIDATION_SCHEMA_VERSION,
+            "approval_scope": CATALOG_INDEPENDENT_APPROVAL_SCOPE,
+            "approved_catalog_independent_contract_sha256": (
+                model.catalog_independent_contract_hash_sha256
+            ),
+            "application_validation_isotopes": list(validated_isotopes),
+            "source_validation_manifest_sha256": source_validation_sha256,
+        }
+    )
+    target_isotopes = tuple(
+        sorted({str(row["isotope"]) for row in model.line_identity})
+    )
+    approved = GeometryConditionedSpectralModel.physics_only_native(
+        target_isotopes,
+        dead_time_tau_s=float(model.dead_time_tau_s),
+        background_rate_cps=float(model.background_rate_cps),
+        detector_green_operator=model.detector_green_operator,
+        validation_manifest=transferred_validation,
+    )
+    if approved.contract_hash_sha256 != model.contract_hash_sha256:
+        raise RuntimeError(
+            "Approval attachment changed the target full-spectrum physics hash."
+        )
+    approved.require_production_ready()
+    return approved
 
 
 def geometry_conditioned_model_from_runtime_config(

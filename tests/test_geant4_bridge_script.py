@@ -59,25 +59,24 @@ def test_bridge_script_rejects_unknown_config_before_server_start(
     assert started is False
 
 
-def test_bridge_script_rejects_unapproved_model_before_server_start(
+def test_bridge_script_accepts_catalog_independent_profile_approval(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The auto-start child must repeat production model approval."""
+    """The auto-start child must repeat transferable algorithm approval."""
     module = _load_script_module()
     started = False
 
     def start_server(*args: object, **kwargs: object) -> None:
-        """Record any forbidden server start after failed model approval."""
+        """Record server start after successful model approval."""
         nonlocal started
         started = True
 
     monkeypatch.setattr(module, "serve_forever", start_server)
     monkeypatch.setattr(sys, "argv", [SCRIPT.name, "--config", str(STANDARD_CONFIG)])
 
-    with pytest.raises(RuntimeError, match="independent all-64 validation"):
-        module.main()
+    module.main()
 
-    assert started is False
+    assert started is True
 
 
 def test_bridge_script_rejects_invalid_registry_before_server_start(

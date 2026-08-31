@@ -17,6 +17,7 @@ from runtime.measurement_log import (
     MeasurementLogRecord,
     MeasurementLogStreamWriter,
 )
+from runtime.provenance import strict_json_loads
 from sim.geant4_app.execution_environment import (
     native_execution_environment_bundle_sha256,
 )
@@ -32,6 +33,7 @@ from spectrum.full_spectrum_acceptance_runner import (
 from spectrum.transport_spectral import (
     GeometryConditionedSpectralModel,
     geometry_conditioned_model_from_runtime_config,
+    with_catalog_independent_production_approval,
 )
 
 
@@ -118,6 +120,38 @@ _TRANSPORT_PROVENANCE_KEYS = frozenset(
 _DETECTOR_QUATERNION_ABSOLUTE_TOLERANCE = 1.0e-10
 _PRODUCTION_BACKEND = "geant4"
 _RUNTIME_REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+_CANONICAL_APPLICATION_APPROVAL_MODEL = (
+    _RUNTIME_REPOSITORY_ROOT
+    / "configs/geant4/models/profiles/unconditioned_cs_co.json"
+)
+
+
+def _attach_canonical_algorithm_approval(
+    model: GeometryConditionedSpectralModel,
+) -> GeometryConditionedSpectralModel:
+    """Authorize an in-domain profile from the canonical all-64 evidence."""
+    if model.production_ready:
+        return model
+    path = _CANONICAL_APPLICATION_APPROVAL_MODEL.absolute()
+    if path.is_symlink() or not path.is_file() or path.resolve() != path:
+        raise RuntimeError(
+            "Canonical full-spectrum application approval must be one regular "
+            "repository file without symlink traversal."
+        )
+    raw_bytes = path.read_bytes()
+    payload = strict_json_loads(raw_bytes)
+    if not isinstance(payload, Mapping):
+        raise RuntimeError(
+            "Canonical full-spectrum application approval is not a JSON object."
+        )
+    approved_source = GeometryConditionedSpectralModel.from_manifest_payload(
+        payload,
+        detector_green_operator=model.detector_green_operator,
+    )
+    return with_catalog_independent_production_approval(
+        model,
+        approved_source=approved_source,
+    )
 
 
 def _native_executable_sha256(
@@ -358,6 +392,7 @@ def require_production_runtime_preflight(
         runtime_config,
         run_root=_RUNTIME_REPOSITORY_ROOT,
     )
+    model = _attach_canonical_algorithm_approval(model)
     require_production_model_approval(model)
     background_cps = runtime_config["background_cps"]
     if (

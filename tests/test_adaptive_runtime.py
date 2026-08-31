@@ -820,11 +820,11 @@ def test_live_session_allows_only_finalize_or_abort_after_exact_limit() -> None:
     assert observation.finalized is True
 
 
-def test_unapproved_model_fails_before_simulator_creation(
+def test_catalog_independent_approval_precedes_simulator_creation(
     monkeypatch: Any,
     tmp_path: Path,
 ) -> None:
-    """Production preflight must reject the model before transport is opened."""
+    """Production preflight must attach approval before opening transport."""
     scenario = build_random_surface_scenario(
         scene_seed=27182,
         measurement_log_output_dir=tmp_path / "measurement-log",
@@ -836,17 +836,20 @@ def test_unapproved_model_fails_before_simulator_creation(
     simulator_created = False
 
     def create_runtime(*args: object, **kwargs: object) -> _DurableFakeRuntime:
-        """Record any forbidden simulator construction after failed preflight."""
+        """Record simulator construction after successful preflight."""
         nonlocal simulator_created
         simulator_created = True
         return _DurableFakeRuntime()
 
     monkeypatch.setattr("runtime.adaptive.create_simulation_runtime", create_runtime)
 
-    with pytest.raises(RuntimeError, match="independent all-64 validation"):
-        AdaptiveRuntimeSession.open(scenario_path)
+    session = AdaptiveRuntimeSession.open(scenario_path)
 
-    assert simulator_created is False
+    assert simulator_created is True
+    model = session.context.runtime_config["full_spectrum_generative_model"]
+    assert model["production_ready"] is True
+    assert model["validation"]["schema_version"] == 7
+    session.close()
 
 
 def test_analytic_scenario_backend_fails_before_runtime_or_writer(
@@ -1118,6 +1121,7 @@ def test_production_scenario_rejects_non_json_metadata_values(
 
 def test_copied_production_config_resolves_assets_from_runtime_repository(
     tmp_path: Path,
+    monkeypatch: Any,
 ) -> None:
     """Moving a canonical config must not relocate repository model assets."""
     scenario = build_random_surface_scenario(
@@ -1133,9 +1137,16 @@ def test_copied_production_config_resolves_assets_from_runtime_repository(
     copied.write_bytes(source.read_bytes())
     scenario["runtime_config_path"] = copied.as_posix()
     scenario_path = write_private_scenario(tmp_path / "scenario.json", scenario)
+    monkeypatch.setattr(
+        "runtime.adaptive.create_simulation_runtime",
+        lambda *args, **kwargs: _DurableFakeRuntime(),
+    )
 
-    with pytest.raises(RuntimeError, match="independent all-64 validation"):
-        AdaptiveRuntimeSession.open(scenario_path)
+    session = AdaptiveRuntimeSession.open(scenario_path)
+    assert session.context.runtime_config["full_spectrum_generative_model"][
+        "production_ready"
+    ] is True
+    session.close()
 
 
 class _FakeAdaptiveSession:
