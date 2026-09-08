@@ -934,6 +934,9 @@ def _geometry_batch(
     )
     if source_count == 0:
         return _GeometryBatch(unattenuated, uncollided, features, scatter)
+    response = model.additive_scatter_response
+    if response is None:
+        raise ValueError("Acceptance geometry requires the current physical response.")
     detectors = np.broadcast_to(
         np.asarray(detector_pose_xyz, dtype=np.float64),
         (view_count, 3),
@@ -1017,6 +1020,9 @@ def _geometry_batch(
             axis=-1,
         )
         scatter_values = physical_scatter_basis_numpy(
+            detector_radius_m=response.detector_radius_m,
+            fe_scatter_distance_m=response.fe_scatter_distance_m,
+            pb_scatter_distance_m=response.pb_scatter_distance_m,
             tau_fe=components.tau_fe,
             tau_pb=components.tau_pb,
             tau_obstacle=components.tau_obstacle,

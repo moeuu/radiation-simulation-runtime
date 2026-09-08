@@ -30,6 +30,14 @@ when transferring an existing dataset.
 
 ## Commands
 
+Configurations select the current implementation automatically;
+`simulation_runtime_schema_version` may be omitted. The production spectrum model
+uses the detector Green operator and XCOM-air detector-cone transport. Retired
+scene-fitted response, low-rank mean correction, and old scatter bases are removed.
+Serialized schema numbers and hash identifiers describe saved formats, not
+selectable implementations; current evidence keeps its original identity.
+See [the model maintenance policy](docs/current_model.md).
+
 ```bash
 uv sync --extra test
 uv run rotating-shield-sim validate-log PATH

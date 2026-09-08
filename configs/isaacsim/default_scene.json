@@ -11,7 +11,6 @@
   "random_source_intensity_max_cps_1m": 2000000.0,
   "random_source_intensity_min_cps_1m": 300000.0,
   "renderer": "RayTracedLighting",
-  "simulation_runtime_schema_version": 1,
   "stage_material_rules": [
     {
       "material": "concrete",

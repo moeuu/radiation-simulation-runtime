@@ -29,8 +29,7 @@ from measurement.shielding import (
     spherical_shell_path_length_cm_torch,
 )
 from spectrum.additive_scatter import (
-    AdditiveNoncollidedTransportResponse,
-    DETECTOR_CONE_SCATTER_BASIS_SEMANTICS,
+    PHYSICAL_SCATTER_BASIS_SEMANTICS,
     PhysicsOnlyNoncollidedTransportResponse,
     klein_nishina_forward_cone_fraction_numpy,
     klein_nishina_forward_cone_fraction_torch,
@@ -1455,9 +1454,7 @@ class ContinuousKernel:
     line_mu_by_isotope: dict[str, object] | None = None
     strict_catalog_line_contract: bool = False
     additive_scatter_response: (
-        AdditiveNoncollidedTransportResponse
-        | PhysicsOnlyNoncollidedTransportResponse
-        | None
+        PhysicsOnlyNoncollidedTransportResponse | None
     ) = None
     dry_air_total_attenuation_contract_id: str | None = None
     dry_air_total_attenuation_contract_sha256: str | None = None
@@ -4972,7 +4969,7 @@ class ContinuousKernel:
                     if (
                         obstacle_path_cm is not None
                         and self.additive_scatter_response.feature_basis_semantics
-                        in DETECTOR_CONE_SCATTER_BASIS_SEMANTICS
+                        == PHYSICAL_SCATTER_BASIS_SEMANTICS
                     ):
                         obstacle_compton_mu = self._constant_tensor_torch(
                             f"obstacle-compton-mu:{isotope}",
@@ -5558,7 +5555,7 @@ class ContinuousKernel:
                 if (
                     obstacle_path_cm is not None
                     and self.additive_scatter_response.feature_basis_semantics
-                    in DETECTOR_CONE_SCATTER_BASIS_SEMANTICS
+                    == PHYSICAL_SCATTER_BASIS_SEMANTICS
                 ):
                     obstacle_single_scatter = (
                         _obstacle_single_scatter_probability_numpy(
@@ -6195,7 +6192,7 @@ class ContinuousKernel:
                     if (
                         obstacle_path_cm is not None
                         and self.additive_scatter_response.feature_basis_semantics
-                        in DETECTOR_CONE_SCATTER_BASIS_SEMANTICS
+                        == PHYSICAL_SCATTER_BASIS_SEMANTICS
                     ):
                         obstacle_compton_mu = torch.as_tensor(
                             self.obstacle_line_compton_mu_values_cm_inv(isotope),

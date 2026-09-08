@@ -47,7 +47,6 @@
   "sample_detector_response": true,
   "secondary_transport_mode": "full_transport",
   "shield_transmission_target": 0.2,
-  "simulation_runtime_schema_version": 1,
   "source_bias_cone_policy": "detector_covering",
   "source_bias_isotropic_fraction": 1.0,
   "source_bias_mode": "detector_cone",

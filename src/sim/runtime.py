@@ -1300,21 +1300,21 @@ def validate_production_runtime_config(config: Mapping[str, Any]) -> None:
     expected = PRODUCTION_RUNTIME_CONFIG_FIELDS | (
         PRODUCTION_GUI_RUNTIME_CONFIG_FIELDS if gui_enabled else frozenset()
     )
-    missing = sorted(expected - actual)
+    missing = sorted(expected - actual - {"simulation_runtime_schema_version"})
     unknown = sorted(actual - expected)
     if missing or unknown:
         raise ValueError(
             "Production runtime config fields differ from the canonical schema: "
             f"missing={missing}, unknown_or_retired={unknown}."
         )
-    schema_version = config["simulation_runtime_schema_version"]
+    schema_version = config.get("simulation_runtime_schema_version", 1)
     if (
         isinstance(schema_version, bool)
         or not isinstance(schema_version, int)
         or schema_version != 1
     ):
         raise ValueError(
-            "Production runtime config requires simulation_runtime_schema_version=1."
+            "Unsupported simulation_runtime_schema_version; use the current runtime format."
         )
     invalid_booleans = sorted(
         name for name in _PRODUCTION_BOOLEAN_FIELDS if type(config[name]) is not bool
@@ -1372,6 +1372,7 @@ def load_production_runtime_config(path: str | Path) -> dict[str, Any]:
         raise ValueError(
             "Production runtime config cannot use retired 'extends' inheritance."
         )
+    data.setdefault("simulation_runtime_schema_version", 1)
     validate_production_runtime_config(data)
     usd_path = data["usd_path"]
     if not isinstance(usd_path, str) or not usd_path.strip():
@@ -1391,6 +1392,8 @@ def load_production_runtime_config(path: str | Path) -> dict[str, Any]:
 def production_runtime_config_sha256(config: Mapping[str, Any]) -> str:
     """Hash one normalized exact production runtime configuration."""
     validate_production_runtime_config(config)
+    config = dict(config)
+    config.setdefault("simulation_runtime_schema_version", 1)
     usd_path = config["usd_path"]
     if not isinstance(usd_path, str) or not Path(usd_path).is_absolute():
         raise ValueError(

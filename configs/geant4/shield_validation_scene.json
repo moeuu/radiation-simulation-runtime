@@ -38,7 +38,6 @@
   "sample_detector_response": true,
   "detector_green_operator_manifest": "src/spectrum/assets/detector_green_operator/manifest.json",
   "secondary_transport_mode": "full_transport",
-  "simulation_runtime_schema_version": 1,
   "source_bias_isotropic_fraction": 1.0,
   "source_bias_mode": "detector_cone",
   "source_rate_model": "detector_cps_1m",

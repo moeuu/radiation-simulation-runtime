@@ -25,7 +25,6 @@ from numpy.typing import NDArray
 from scipy import special, stats
 
 from measurement.geometry_family import (
-    GEOMETRY_FAMILY_APPLICABILITY_SHA256,
     validate_geometry_family_descriptor,
 )
 from measurement.source_boundary import (
@@ -50,9 +49,8 @@ from runtime.contracts import FULL_SPECTRUM_MODEL_SCHEMA_VERSION
 from runtime.forward_model_manifest import resolve_file_backed_model_asset
 from spectrum.additive_scatter import (
     ADDITIVE_SCATTER_INCIDENT_LABEL_SEMANTICS,
-    DETECTOR_CONE_AIR_XCOM_SINGLE_SCATTER_BASIS_SEMANTICS,
+    PHYSICAL_SCATTER_BASIS_SEMANTICS,
     PHYSICS_ONLY_TRANSPORT_RESPONSE_ID,
-    AdditiveNoncollidedTransportResponse,
     PhysicsOnlyNoncollidedTransportResponse,
     klein_nishina_forward_cone_fraction_numpy,
     klein_nishina_forward_cone_fraction_torch,
@@ -160,8 +158,7 @@ RENEWAL_GAMMA_INTERVAL_QUADRATURE_ORDER = 32
     _RENEWAL_GAMMA_INTERVAL_NODES,
     _RENEWAL_GAMMA_INTERVAL_WEIGHTS,
 ) = np.polynomial.legendre.leggauss(RENEWAL_GAMMA_INTERVAL_QUADRATURE_ORDER)
-# Historical scene-fit tooling remains benchmark-only and is not referenced by
-# the schema-v7 production runtime or schema-v7 application-approval contract.
+# These historical seeds remain only as an exclusion set for independent evidence.
 DESIGNATED_TRAINING_SCENE_SEEDS = (2026072701, 2026072702, 2026072703)
 DESIGNATED_VALIDATION_SCENE_SEEDS = (
     3646699724,
@@ -208,14 +205,6 @@ ACCEPTANCE_PERTURBATION_MINIMUM_BEARING_ANGLE_RAD = math.radians(10.0)
 RATE_SCALE_HALF_WIDTH_GRID = (0.0, 0.02, 0.05, 0.10, 0.20)
 RATE_SCALE_MIXTURE_WEIGHTS = (0.25, 0.50, 0.25)
 RATE_SCALE_UNIFORM_QUADRATURE_ORDER = 9
-MARK_CONCENTRATION_GRID = (
-    100.0,
-    300.0,
-    1_000.0,
-    3_000.0,
-    10_000.0,
-    100_000.0,
-)
 
 
 def _detector_green_model_response_bundle(
@@ -2200,445 +2189,6 @@ def _line_order_shapes(
     return direct, np.stack(orders, axis=1)
 
 
-def low_rank_spectral_mean_descriptor_numpy(
-    total_xvsl: NDArray[np.float64],
-    uncollided_xvsl: NDArray[np.float64],
-    features_xvslf: NDArray[np.float64],
-) -> NDArray[np.float64]:
-    """Return rate, line-mixture, and transport descriptors in one batch."""
-    total = np.asarray(total_xvsl, dtype=np.float64)
-    uncollided = np.asarray(uncollided_xvsl, dtype=np.float64)
-    features = np.asarray(features_xvslf, dtype=np.float64)
-    if (
-        total.ndim < 2
-        or uncollided.shape != total.shape
-        or features.shape != total.shape + (len(TRANSPORT_FEATURE_ORDER),)
-        or np.any(~np.isfinite(total))
-        or np.any(total < 0.0)
-        or np.any(~np.isfinite(uncollided))
-        or np.any(uncollided < 0.0)
-        or np.any(~np.isfinite(features))
-        or np.any(features < 0.0)
-    ):
-        raise ValueError("Low-rank descriptor inputs are invalid.")
-    line_rates = np.sum(total, axis=-2)
-    total_rate = np.sum(line_rates, axis=-1)
-    line_fractions = np.divide(
-        line_rates,
-        total_rate[..., np.newaxis],
-        out=np.zeros_like(line_rates),
-        where=total_rate[..., np.newaxis] > 0.0,
-    )
-    uncollided_fraction = np.divide(
-        np.sum(uncollided, axis=(-2, -1)),
-        total_rate,
-        out=np.zeros_like(total_rate),
-        where=total_rate > 0.0,
-    )
-    feature_numerator = np.sum(
-        total[..., np.newaxis] * features,
-        axis=(-3, -2),
-    )
-    feature_mean = np.divide(
-        feature_numerator,
-        total_rate[..., np.newaxis],
-        out=np.zeros_like(feature_numerator),
-        where=total_rate[..., np.newaxis] > 0.0,
-    )
-    return np.concatenate(
-        (
-            np.log1p(total_rate)[..., np.newaxis],
-            line_fractions,
-            uncollided_fraction[..., np.newaxis],
-            feature_mean,
-        ),
-        axis=-1,
-    )
-
-
-@dataclass
-class LowRankSpectralMeanCorrection:
-    """Apply a count-preserving correction to conditional spectral marks."""
-
-    descriptor_order: tuple[str, ...]
-    descriptor_center_d: NDArray[np.float64]
-    descriptor_scale_d: NDArray[np.float64]
-    regression_qk: NDArray[np.float64]
-    basis_kb: NDArray[np.float64]
-    maximum_abs_log_correction: float
-    training_manifest: Mapping[str, object]
-
-    def __post_init__(self) -> None:
-        """Validate, own, and freeze the learned low-rank arrays."""
-        self.descriptor_order = tuple(str(value) for value in self.descriptor_order)
-        self.descriptor_center_d = np.ascontiguousarray(
-            self.descriptor_center_d,
-            dtype=np.float64,
-        )
-        self.descriptor_scale_d = np.ascontiguousarray(
-            self.descriptor_scale_d,
-            dtype=np.float64,
-        )
-        self.regression_qk = np.ascontiguousarray(
-            self.regression_qk,
-            dtype=np.float64,
-        )
-        self.basis_kb = np.ascontiguousarray(
-            self.basis_kb,
-            dtype=np.float64,
-        )
-        self.training_manifest = _freeze_json_value(dict(self.training_manifest))
-        descriptor_count = len(self.descriptor_order)
-        rank = int(self.basis_kb.shape[0]) if self.basis_kb.ndim == 2 else 0
-        if (
-            descriptor_count == 0
-            or len(set(self.descriptor_order)) != descriptor_count
-            or self.descriptor_center_d.shape != (descriptor_count,)
-            or self.descriptor_scale_d.shape != (descriptor_count,)
-            or self.regression_qk.shape != (descriptor_count + 1, rank)
-            or rank <= 0
-            or self.basis_kb.shape[1] <= 1
-            or np.any(~np.isfinite(self.descriptor_center_d))
-            or np.any(~np.isfinite(self.descriptor_scale_d))
-            or np.any(self.descriptor_scale_d <= 0.0)
-            or np.any(~np.isfinite(self.regression_qk))
-            or np.any(~np.isfinite(self.basis_kb))
-            or not np.isfinite(self.maximum_abs_log_correction)
-            or not 0.0 < float(self.maximum_abs_log_correction) <= 4.0
-        ):
-            raise ValueError("Low-rank spectral mean correction is invalid.")
-        for array in (
-            self.descriptor_center_d,
-            self.descriptor_scale_d,
-            self.regression_qk,
-            self.basis_kb,
-        ):
-            array.setflags(write=False)
-        self._contract_hash_sha256 = self._build_contract_hash()
-
-    @property
-    def contract_hash_sha256(self) -> str:
-        """Return the immutable correction identity."""
-        return self._contract_hash_sha256
-
-    @property
-    def training_ready(self) -> bool:
-        """Return whether only the designated fixed-quota training was used."""
-        manifest = self.training_manifest
-        legacy_keys = {
-            "schema_version",
-            "training_policy",
-            "training_scene_seeds",
-            "scenario_ids",
-            "pair_ids_by_scene",
-            "artifact_sha256_by_scene",
-            "rank_grid",
-            "ridge_lambda_grid",
-            "selected_rank",
-            "selected_ridge_lambda",
-            "selection_objective",
-            "selected_validation_score",
-            "selection_completed",
-            "holdout_artifacts_consumed",
-        }
-        exact_basis_keys = legacy_keys | {
-            "base_additive_response_contract_sha256",
-            "feature_basis_semantics",
-        }
-        policy = manifest.get("training_policy")
-        training_seeds = tuple(manifest.get("training_scene_seeds", ()))
-        legacy_training = bool(
-            policy == "fixed_quota_loso_training_only_low_rank_log_mean_v1"
-            and training_seeds == (2026072701, 2026072702)
-        )
-        randomized_family_training = bool(
-            policy == "randomized_geometry_family_loso_low_rank_log_mean_v2"
-            and training_seeds == DESIGNATED_TRAINING_SCENE_SEEDS
-            and tuple(manifest.get("scenario_ids", ()))
-            == tuple(
-                scenario
-                for scenario in VALIDATION_SCENARIO_IDS
-                if scenario != "background_only"
-            )
-        )
-        exact_basis_training = bool(
-            policy == "randomized_geometry_family_loso_low_rank_log_mean_v3"
-            and manifest.get("schema_version") == 2
-            and set(manifest) == exact_basis_keys
-            and _is_sha256(manifest.get("base_additive_response_contract_sha256"))
-            and manifest.get("feature_basis_semantics")
-            == "exactly_one_compton_with_zero_other_los_interactions_v2"
-            and training_seeds == DESIGNATED_TRAINING_SCENE_SEEDS
-            and tuple(manifest.get("scenario_ids", ()))
-            == tuple(
-                scenario
-                for scenario in VALIDATION_SCENARIO_IDS
-                if scenario != "background_only"
-            )
-        )
-        return bool(
-            isinstance(manifest, Mapping)
-            and set(manifest) in (legacy_keys, exact_basis_keys)
-            and (
-                (
-                    manifest.get("schema_version") == 1
-                    and (legacy_training or randomized_family_training)
-                )
-                or exact_basis_training
-            )
-            and manifest.get("selection_objective")
-            == "leave_one_scene_out_target_probability_weighted_log_mse"
-            and manifest.get("selection_completed") is True
-            and manifest.get("holdout_artifacts_consumed") is False
-            and int(manifest.get("selected_rank", 0)) == self.basis_kb.shape[0]
-            and np.isfinite(float(manifest.get("selected_ridge_lambda", np.nan)))
-            and np.isfinite(float(manifest.get("selected_validation_score", np.nan)))
-            and all(
-                _is_sha256(value)
-                for value in dict(manifest.get("artifact_sha256_by_scene", {})).values()
-            )
-        )
-
-    def _build_contract_hash(self) -> str:
-        """Hash the correction semantics, training, and numeric arrays."""
-        digest = hashlib.sha256()
-        digest.update(b"low_rank_spectral_mean_correction_v1")
-        digest.update(
-            json.dumps(
-                {
-                    "descriptor_order": list(self.descriptor_order),
-                    "maximum_abs_log_correction": float(
-                        self.maximum_abs_log_correction
-                    ),
-                    "training_manifest_sha256": _canonical_json_sha256(
-                        self.training_manifest
-                    ),
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode()
-        )
-        for array in (
-            self.descriptor_center_d,
-            self.descriptor_scale_d,
-            self.regression_qk,
-            self.basis_kb,
-        ):
-            digest.update(_array_digest(array))
-        return digest.hexdigest()
-
-    def _descriptor_numpy(
-        self,
-        total_xvsl: NDArray[np.float64],
-        uncollided_xvsl: NDArray[np.float64],
-        features_xvslf: NDArray[np.float64],
-    ) -> NDArray[np.float64]:
-        """Return physical rate, line-mixture, and transport descriptors."""
-        descriptor = low_rank_spectral_mean_descriptor_numpy(
-            total_xvsl,
-            uncollided_xvsl,
-            features_xvslf,
-        )
-        if descriptor.shape[-1] != len(self.descriptor_order):
-            raise ValueError("Low-rank correction descriptor width is invalid.")
-        return descriptor
-
-    def apply_numpy(
-        self,
-        marked_source_xvb: NDArray[np.float64],
-        total_xvsl: NDArray[np.float64],
-        uncollided_xvsl: NDArray[np.float64],
-        features_xvslf: NDArray[np.float64],
-    ) -> NDArray[np.float64]:
-        """Apply the bounded learned log-mean correction in one batch."""
-        marked = np.asarray(marked_source_xvb, dtype=np.float64)
-        descriptor = self._descriptor_numpy(total_xvsl, uncollided_xvsl, features_xvslf)
-        standardized = (descriptor - self.descriptor_center_d) / self.descriptor_scale_d
-        design = np.concatenate(
-            (np.ones(standardized.shape[:-1] + (1,)), standardized),
-            axis=-1,
-        )
-        log_correction = np.einsum(
-            "...q,qk,kb->...b",
-            design,
-            self.regression_qk,
-            self.basis_kb,
-            optimize=True,
-        )
-        bound = float(self.maximum_abs_log_correction)
-        log_correction = np.clip(log_correction, -bound, bound)
-        floor = np.sum(marked, axis=-1, keepdims=True) * 1.0e-12
-        floor /= float(marked.shape[-1])
-        corrected = np.maximum(
-            (marked + floor) * np.exp(log_correction),
-            0.0,
-        )
-        marked_total = np.sum(marked, axis=-1, keepdims=True)
-        corrected_total = np.sum(corrected, axis=-1, keepdims=True)
-        return np.divide(
-            corrected * marked_total,
-            corrected_total,
-            out=np.zeros_like(corrected),
-            where=corrected_total > 0.0,
-        )
-
-    def apply_torch(
-        self,
-        marked_source_xvb: object,
-        total_xvsl: object,
-        uncollided_xvsl: object,
-        features_xvslf: object,
-    ) -> object:
-        """Return the Torch-equivalent corrected source spectrum."""
-        import torch
-
-        marked = torch.as_tensor(marked_source_xvb)
-        total = torch.as_tensor(total_xvsl, device=marked.device, dtype=marked.dtype)
-        uncollided = torch.as_tensor(
-            uncollided_xvsl,
-            device=marked.device,
-            dtype=marked.dtype,
-        )
-        features = torch.as_tensor(
-            features_xvslf,
-            device=marked.device,
-            dtype=marked.dtype,
-        )
-        line_rates = torch.sum(total, dim=-2)
-        total_rate = torch.sum(line_rates, dim=-1)
-        tiny = torch.finfo(marked.dtype).tiny
-        line_fractions = torch.where(
-            total_rate.unsqueeze(-1) > 0.0,
-            line_rates / torch.clamp(total_rate.unsqueeze(-1), min=tiny),
-            torch.zeros_like(line_rates),
-        )
-        uncollided_fraction = torch.where(
-            total_rate > 0.0,
-            torch.sum(uncollided, dim=(-2, -1)) / torch.clamp(total_rate, min=tiny),
-            torch.zeros_like(total_rate),
-        )
-        feature_numerator = torch.sum(
-            total.unsqueeze(-1) * features,
-            dim=(-3, -2),
-        )
-        feature_mean = torch.where(
-            total_rate.unsqueeze(-1) > 0.0,
-            feature_numerator / torch.clamp(total_rate.unsqueeze(-1), min=tiny),
-            torch.zeros_like(feature_numerator),
-        )
-        descriptor = torch.cat(
-            (
-                torch.log1p(total_rate).unsqueeze(-1),
-                line_fractions,
-                uncollided_fraction.unsqueeze(-1),
-                feature_mean,
-            ),
-            dim=-1,
-        )
-        center = torch.as_tensor(
-            np.array(self.descriptor_center_d, copy=True),
-            device=marked.device,
-            dtype=marked.dtype,
-        )
-        scale = torch.as_tensor(
-            np.array(self.descriptor_scale_d, copy=True),
-            device=marked.device,
-            dtype=marked.dtype,
-        )
-        standardized = (descriptor - center) / scale
-        design = torch.cat(
-            (torch.ones_like(standardized[..., :1]), standardized),
-            dim=-1,
-        )
-        regression = torch.as_tensor(
-            np.array(self.regression_qk, copy=True),
-            device=marked.device,
-            dtype=marked.dtype,
-        )
-        basis = torch.as_tensor(
-            np.array(self.basis_kb, copy=True),
-            device=marked.device,
-            dtype=marked.dtype,
-        )
-        log_correction = torch.einsum(
-            "...q,qk,kb->...b",
-            design,
-            regression,
-            basis,
-        )
-        bound = float(self.maximum_abs_log_correction)
-        log_correction = torch.clamp(log_correction, min=-bound, max=bound)
-        floor = torch.sum(marked, dim=-1, keepdim=True) * 1.0e-12
-        floor = floor / float(marked.shape[-1])
-        corrected = torch.clamp(
-            (marked + floor) * torch.exp(log_correction),
-            min=0.0,
-        )
-        marked_total = torch.sum(marked, dim=-1, keepdim=True)
-        corrected_total = torch.sum(corrected, dim=-1, keepdim=True)
-        return torch.where(
-            corrected_total > 0.0,
-            corrected
-            * marked_total
-            / torch.clamp(corrected_total, min=torch.finfo(marked.dtype).tiny),
-            torch.zeros_like(corrected),
-        )
-
-    def to_payload(self) -> dict[str, object]:
-        """Return the authenticated JSON representation."""
-        return {
-            "schema_version": 1,
-            "model": "geometry_conditioned_low_rank_log_mean_correction_v1",
-            "contract_hash_sha256": self.contract_hash_sha256,
-            "descriptor_order": list(self.descriptor_order),
-            "descriptor_center": self.descriptor_center_d.tolist(),
-            "descriptor_scale": self.descriptor_scale_d.tolist(),
-            "regression": self.regression_qk.tolist(),
-            "basis": self.basis_kb.tolist(),
-            "maximum_abs_log_correction": float(self.maximum_abs_log_correction),
-            "training_ready": self.training_ready,
-            "training": _thaw_json_value(self.training_manifest),
-        }
-
-    @classmethod
-    def from_payload(
-        cls,
-        payload: Mapping[str, object],
-    ) -> "LowRankSpectralMeanCorrection":
-        """Reconstruct and authenticate one low-rank correction."""
-        if (
-            not isinstance(payload, Mapping)
-            or payload.get("schema_version") != 1
-            or payload.get("model")
-            != "geometry_conditioned_low_rank_log_mean_correction_v1"
-        ):
-            raise ValueError("Low-rank correction payload is invalid.")
-        correction = cls(
-            descriptor_order=tuple(payload.get("descriptor_order", ())),
-            descriptor_center_d=np.asarray(
-                payload.get("descriptor_center"),
-                dtype=np.float64,
-            ),
-            descriptor_scale_d=np.asarray(
-                payload.get("descriptor_scale"),
-                dtype=np.float64,
-            ),
-            regression_qk=np.asarray(payload.get("regression"), dtype=np.float64),
-            basis_kb=np.asarray(payload.get("basis"), dtype=np.float64),
-            maximum_abs_log_correction=float(
-                payload.get("maximum_abs_log_correction", np.nan)
-            ),
-            training_manifest=(
-                payload.get("training")
-                if isinstance(payload.get("training"), Mapping)
-                else {}
-            ),
-        )
-        if correction.to_payload() != dict(payload):
-            raise ValueError("Low-rank correction does not reconstruct exactly.")
-        return correction
-
-
 @dataclass(frozen=True)
 class PhysicalComponentDiscrepancy:
     """Define physical count and component-aware mark uncertainty.
@@ -2892,14 +2442,10 @@ class GeometryConditionedSpectralModel:
     mark_concentration_source: float | None = None
     mark_concentration_multi_isotope: float | None = None
     physical_component_discrepancy: PhysicalComponentDiscrepancy | None = None
-    discrepancy_training_manifest: Mapping[str, object] | None = None
     validation_manifest: Mapping[str, object] | None = None
     additive_scatter_response: (
-        AdditiveNoncollidedTransportResponse
-        | PhysicsOnlyNoncollidedTransportResponse
-        | None
+        PhysicsOnlyNoncollidedTransportResponse | None
     ) = None
-    low_rank_spectral_mean_correction: LowRankSpectralMeanCorrection | None = None
     _torch_cache: dict[tuple[str, str], tuple[object, ...]] = field(
         default_factory=dict,
         init=False,
@@ -2991,28 +2537,12 @@ class GeometryConditionedSpectralModel:
             if self.validation_manifest is None
             else _freeze_json_value(dict(self.validation_manifest))
         )
-        self.discrepancy_training_manifest = (
-            None
-            if self.discrepancy_training_manifest is None
-            else _freeze_json_value(dict(self.discrepancy_training_manifest))
-        )
         if self.additive_scatter_response is not None and not isinstance(
             self.additive_scatter_response,
-            (
-                AdditiveNoncollidedTransportResponse,
-                PhysicsOnlyNoncollidedTransportResponse,
-            ),
+            PhysicsOnlyNoncollidedTransportResponse,
         ):
             raise TypeError(
-                "additive_scatter_response must use the authenticated additive "
-                "noncollided schema."
-            )
-        if self.low_rank_spectral_mean_correction is not None and not isinstance(
-            self.low_rank_spectral_mean_correction,
-            LowRankSpectralMeanCorrection,
-        ):
-            raise TypeError(
-                "low_rank_spectral_mean_correction must use its authenticated schema."
+                "additive_scatter_response requires the current physics-only model."
             )
         component_discrepancy = self.physical_component_discrepancy
         if component_discrepancy is not None and not isinstance(
@@ -3022,11 +2552,6 @@ class GeometryConditionedSpectralModel:
             raise TypeError(
                 "physical_component_discrepancy must use its authenticated schema."
             )
-        self._discrepancy_training_manifest_sha256 = (
-            None
-            if self.discrepancy_training_manifest is None
-            else _canonical_json_sha256(self.discrepancy_training_manifest)
-        )
         self._validation_manifest_sha256 = (
             None
             if self.validation_manifest is None
@@ -3116,16 +2641,6 @@ class GeometryConditionedSpectralModel:
             atol=1.0e-12,
         ):
             raise ValueError("Background mark probabilities must sum to one.")
-        correction = self.low_rank_spectral_mean_correction
-        if correction is not None and (
-            len(correction.descriptor_order)
-            != 2 + line_count + len(TRANSPORT_FEATURE_ORDER)
-            or correction.basis_kb.shape[1] != bin_count
-        ):
-            raise ValueError(
-                "Low-rank spectral mean correction dimensions do not match "
-                "the physical spectrum model."
-            )
         if (
             not np.isfinite(self.dead_time_tau_s)
             or self.dead_time_tau_s < 0.0
@@ -3211,9 +2726,7 @@ class GeometryConditionedSpectralModel:
             PhysicsOnlyNoncollidedTransportResponse,
         )
         if physics_response and (
-            self.low_rank_spectral_mean_correction is not None
-            or self.discrepancy_training_manifest is not None
-            or component_discrepancy is None
+            component_discrepancy is None
             or not component_discrepancy.physics_only
         ):
             raise ValueError(
@@ -3722,15 +3235,9 @@ class GeometryConditionedSpectralModel:
         mark_concentration_source: float | None = None,
         mark_concentration_multi_isotope: float | None = None,
         physical_component_discrepancy: (PhysicalComponentDiscrepancy | None) = None,
-        discrepancy_training_manifest: Mapping[str, object] | None = None,
-        validation_manifest: Mapping[str, object] | None = None,
+            validation_manifest: Mapping[str, object] | None = None,
         additive_scatter_response: (
-            AdditiveNoncollidedTransportResponse
-            | PhysicsOnlyNoncollidedTransportResponse
-            | None
-        ) = None,
-        low_rank_spectral_mean_correction: (
-            LowRankSpectralMeanCorrection | None
+            PhysicsOnlyNoncollidedTransportResponse | None
         ) = None,
         detector_green_operator: DetectorGreenOperator | None = None,
     ) -> GeometryConditionedSpectralModel:
@@ -3823,10 +3330,8 @@ class GeometryConditionedSpectralModel:
                 else float(mark_concentration_multi_isotope)
             ),
             physical_component_discrepancy=physical_component_discrepancy,
-            discrepancy_training_manifest=discrepancy_training_manifest,
             validation_manifest=validation_manifest,
             additive_scatter_response=additive_scatter_response,
-            low_rank_spectral_mean_correction=(low_rank_spectral_mean_correction),
         )
 
     @classmethod
@@ -3836,7 +3341,7 @@ class GeometryConditionedSpectralModel:
         *,
         detector_green_operator: DetectorGreenOperator,
     ) -> GeometryConditionedSpectralModel:
-        """Reconstruct and authenticate one runtime-ready schema-v7 model."""
+        """Reconstruct and authenticate one runtime-ready model."""
         if not isinstance(payload, Mapping):
             raise TypeError("Full-spectrum model manifest must be a mapping.")
         if (
@@ -3844,7 +3349,7 @@ class GeometryConditionedSpectralModel:
             or payload.get("model") != "geometry_conditioned_full_spectrum"
         ):
             raise ValueError(
-                "Runtime requires a geometry-conditioned schema-v7 spectrum manifest."
+                "Runtime requires the current geometry-conditioned spectrum manifest."
             )
         line_rows = payload.get("line_identity")
         mixture = payload.get("rate_scale_mixture")
@@ -3867,7 +3372,7 @@ class GeometryConditionedSpectralModel:
         additive_payload = payload.get("additive_noncollided_transport_response")
         if not isinstance(additive_payload, Mapping):
             raise ValueError(
-                "Schema-v7 full-spectrum manifests require the authenticated "
+                "Current full-spectrum manifests require the authenticated "
                 "additive noncollided transport response."
             )
         mixture_nodes = _strict_json_number_sequence(
@@ -3883,7 +3388,7 @@ class GeometryConditionedSpectralModel:
             field_name="rate_scale_mixture.weighted_mean",
         )
         if mixture_nodes != (1.0,) or mixture_weights != (1.0,) or mixture_mean != 1.0:
-            raise ValueError("Production schema-v7 forbids rate-scale mixtures.")
+            raise ValueError("Production forbids rate-scale mixtures.")
         dead_time_tau_s = _strict_json_number(
             payload.get("dead_time_tau_s"),
             field_name="dead_time_tau_s",
@@ -3901,7 +3406,7 @@ class GeometryConditionedSpectralModel:
         response_model_id = additive_payload.get("model")
         if response_model_id != PHYSICS_ONLY_TRANSPORT_RESPONSE_ID:
             raise ValueError(
-                "Production schema-v7 forbids scene-fitted and legacy "
+                "Production forbids scene-fitted and legacy "
                 "transport responses."
             )
         if (
@@ -3919,7 +3424,7 @@ class GeometryConditionedSpectralModel:
             or payload.get("mark_concentration_source") is not None
         ):
             raise ValueError(
-                "Production schema-v7 forbids trained, global, and low-rank "
+                "Production forbids trained, global, and low-rank "
                 "response corrections."
             )
         additive_response = PhysicsOnlyNoncollidedTransportResponse.from_payload(
@@ -3947,7 +3452,7 @@ class GeometryConditionedSpectralModel:
             or "maximum_scatter_order" in payload
         ):
             raise ValueError(
-                "Production schema-v7 requires the generic physics-only "
+                "Production requires the generic physics-only "
                 "transport uncertainty contract."
             )
         model = cls.physics_only_native(
@@ -3970,7 +3475,7 @@ class GeometryConditionedSpectralModel:
             != physical_component_discrepancy.to_payload()
         ):
             raise ValueError(
-                "Schema-v7 physical transport parameters are not canonical."
+                "Current physical transport parameters are not canonical."
             )
         reconstructed = model.manifest_payload()
         supplied = _thaw_json_value(_freeze_json_value(dict(payload)))
@@ -4090,9 +3595,8 @@ class GeometryConditionedSpectralModel:
                         if self.mark_concentration_source is None
                         else float(self.mark_concentration_source)
                     ),
-                    "discrepancy_training_manifest_sha256": (
-                        self._discrepancy_training_manifest_sha256
-                    ),
+                    # Preserve the existing scientific identity after retiring fits.
+                    "discrepancy_training_manifest_sha256": None,
                     "additive_scatter_contract_sha256": (
                         None
                         if self.additive_scatter_response is None
@@ -4106,10 +3610,6 @@ class GeometryConditionedSpectralModel:
                 separators=(",", ":"),
             ).encode()
         )
-        correction = self.low_rank_spectral_mean_correction
-        if correction is not None:
-            digest.update(b"\0low_rank_spectral_mean_correction_sha256\0")
-            digest.update(correction.contract_hash_sha256.encode("ascii"))
         if self.count_discrepancy_concentration is not None:
             digest.update(b"\0count_discrepancy_concentration\0")
             digest.update(
@@ -4270,467 +3770,11 @@ class GeometryConditionedSpectralModel:
         return digest.hexdigest()
 
     @property
-    def discrepancy_training_ready(self) -> bool:
-        """Return whether global discrepancy parameters used training only."""
-        manifest = self.discrepancy_training_manifest
-        if not isinstance(manifest, Mapping):
-            return False
-        if manifest.get("schema_version") in (3, 4, 5):
-            return self._physical_component_training_ready(manifest)
-        if manifest.get("schema_version") == 2:
-            return self._short_discrepancy_training_ready(manifest)
-        expected_keys = {
-            "schema_version",
-            "acceptance_contract_sha256",
-            "training_scene_seeds",
-            "scenario_ids",
-            "pair_ids_by_scene",
-            "artifact_sha256_by_scene",
-            "rate_scale_family",
-            "mark_family",
-            "selection_objective",
-            "selected_rate_scale_half_width",
-            "selected_mark_concentration_source",
-            "candidate_count",
-            "selected_training_log_predictive_density",
-            "selection_artifact_sha256",
-            "selection_completed",
-        }
-        if set(manifest) != expected_keys:
-            return False
-        if (
-            manifest.get("schema_version") != 1
-            or manifest.get("acceptance_contract_sha256")
-            != FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256
-            or tuple(manifest.get("training_scene_seeds", ()))
-            != DESIGNATED_TRAINING_SCENE_SEEDS
-            or tuple(manifest.get("scenario_ids", ())) != VALIDATION_SCENARIO_IDS
-            or manifest.get("rate_scale_family")
-            != "station_shared_three_node_symmetric_mean_one"
-            or manifest.get("mark_family") != "source_fraction_dirichlet_multinomial"
-            or manifest.get("selection_objective")
-            != "maximum_joint_training_log_predictive_density"
-            or manifest.get("selection_completed") is not True
-            or manifest.get("candidate_count")
-            != len(RATE_SCALE_HALF_WIDTH_GRID) * len(MARK_CONCENTRATION_GRID)
-            or not _is_sha256(manifest.get("selection_artifact_sha256"))
-        ):
-            return False
-        pair_ids = manifest.get("pair_ids_by_scene")
-        artifact_hashes = manifest.get("artifact_sha256_by_scene")
-        expected_seed_keys = {str(seed) for seed in DESIGNATED_TRAINING_SCENE_SEEDS}
-        if (
-            not isinstance(pair_ids, Mapping)
-            or set(pair_ids) != expected_seed_keys
-            or any(
-                tuple(pair_ids[str(seed)]) != tuple(range(64))
-                for seed in DESIGNATED_TRAINING_SCENE_SEEDS
-            )
-            or not isinstance(artifact_hashes, Mapping)
-            or set(artifact_hashes) != expected_seed_keys
-            or any(
-                not _is_sha256(artifact_hashes[str(seed)])
-                for seed in DESIGNATED_TRAINING_SCENE_SEEDS
-            )
-        ):
-            return False
-        try:
-            width = float(manifest["selected_rate_scale_half_width"])
-            concentration = float(manifest["selected_mark_concentration_source"])
-            selected_score = float(manifest["selected_training_log_predictive_density"])
-        except (TypeError, ValueError):
-            return False
-        if (
-            width not in RATE_SCALE_HALF_WIDTH_GRID
-            or concentration not in MARK_CONCENTRATION_GRID
-            or not np.isfinite(selected_score)
-            or self.mark_concentration_source is None
-            or float(self.mark_concentration_source) != concentration
-        ):
-            return False
-        expected_nodes, expected_weights = rate_scale_mixture_for_half_width(width)
-        return bool(
-            np.array_equal(
-                self._rate_scale_nodes_j,
-                np.asarray(expected_nodes, dtype=np.float64),
-            )
-            and np.array_equal(
-                self._rate_scale_weights_j,
-                np.asarray(expected_weights, dtype=np.float64),
-            )
-        )
-
-    def _physical_component_training_ready(
-        self,
-        manifest: Mapping[str, object],
-    ) -> bool:
-        """Validate randomized-family training for component latents."""
-        legacy_keys = {
-            "schema_version",
-            "training_policy",
-            "acceptance_contract_sha256",
-            "geometry_family_applicability_sha256",
-            "training_scene_seeds",
-            "scenario_ids",
-            "artifact_sha256_by_scene_and_scenario",
-            "component_family",
-            "selected_concentrations",
-            "selection_objective",
-            "selection_completed",
-            "holdout_artifacts_consumed",
-        }
-        exact_basis_keys = legacy_keys | {
-            "base_additive_response_contract_sha256",
-            "low_rank_mean_correction_contract_sha256",
-            "feature_basis_semantics",
-        }
-        calibrated_exact_basis_keys = exact_basis_keys | {
-            "mark_tail_probability_threshold",
-            "mark_cross_fitted_coverage_threshold",
-            "selected_mark_cross_fitted_coverage",
-        }
-        component = self.physical_component_discrepancy
-        selected = manifest.get("selected_concentrations")
-        selection_contract = (
-            manifest.get("training_policy"),
-            manifest.get("selection_objective"),
-        )
-        if (
-            component is None
-            or set(manifest)
-            not in (
-                legacy_keys,
-                exact_basis_keys,
-                calibrated_exact_basis_keys,
-            )
-            or manifest.get("schema_version") not in (3, 4, 5)
-            or selection_contract
-            not in {
-                (
-                    "randomized_geometry_family_training_only_v1",
-                    "maximum_training_log_predictive_density_regularized",
-                ),
-                (
-                    "randomized_geometry_family_cross_fitted_component_v2",
-                    "leave_one_geometry_out_log_predictive_density_regularized",
-                ),
-                (
-                    "randomized_geometry_family_cross_fitted_component_v3",
-                    "leave_one_geometry_out_log_predictive_density_regularized",
-                ),
-                (
-                    "randomized_geometry_family_cross_fitted_component_v4",
-                    "leave_one_geometry_out_log_predictive_density_regularized_"
-                    "subject_to_predeclared_pairwise_mark_coverage",
-                ),
-            }
-            or manifest.get("acceptance_contract_sha256")
-            != FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256
-            or manifest.get("geometry_family_applicability_sha256")
-            != GEOMETRY_FAMILY_APPLICABILITY_SHA256
-            or tuple(manifest.get("training_scene_seeds", ()))
-            != DESIGNATED_TRAINING_SCENE_SEEDS
-            or tuple(manifest.get("scenario_ids", ())) != VALIDATION_SCENARIO_IDS
-            or manifest.get("component_family")
-            != "uncollided_scatter_component_latents_v1"
-            or manifest.get("selection_completed") is not True
-            or manifest.get("holdout_artifacts_consumed") is not False
-            or not isinstance(
-                manifest.get("artifact_sha256_by_scene_and_scenario"),
-                Mapping,
-            )
-            or not isinstance(selected, Mapping)
-        ):
-            return False
-        if manifest.get("schema_version") in (4, 5):
-            additive = self.additive_scatter_response
-            correction = self.low_rank_spectral_mean_correction
-            if (
-                set(manifest)
-                != (
-                    exact_basis_keys
-                    if manifest.get("schema_version") == 4
-                    else calibrated_exact_basis_keys
-                )
-                or additive is None
-                or correction is None
-                or manifest.get("base_additive_response_contract_sha256")
-                != additive.contract_hash_sha256
-                or manifest.get("low_rank_mean_correction_contract_sha256")
-                != correction.contract_hash_sha256
-                or manifest.get("feature_basis_semantics")
-                != additive.feature_basis_semantics
-            ):
-                return False
-        if manifest.get("schema_version") == 5:
-            try:
-                mark_tail_threshold = float(manifest["mark_tail_probability_threshold"])
-                mark_coverage_threshold = float(
-                    manifest["mark_cross_fitted_coverage_threshold"]
-                )
-                selected_mark_coverage = float(
-                    manifest["selected_mark_cross_fitted_coverage"]
-                )
-            except (TypeError, ValueError):
-                return False
-            required_coverage = float(
-                ACCEPTANCE_METRIC_CONTRACT[
-                    "conditional_mark_upper_tail_ge_0p01_fraction"
-                ][1]
-            )
-            if (
-                mark_tail_threshold != 0.01
-                or mark_coverage_threshold != required_coverage
-                or not np.isfinite(selected_mark_coverage)
-                or selected_mark_coverage + 1.0e-12 < mark_coverage_threshold
-                or selected_mark_coverage > 1.0
-            ):
-                return False
-        expected_selected = {
-            "count_uncollided_concentration": float(
-                component.count_uncollided_concentration
-            ),
-            "count_scatter_concentration": float(component.count_scatter_concentration),
-            "mark_uncollided_concentration": float(
-                component.mark_uncollided_concentration
-            ),
-            "mark_scatter_concentration": float(component.mark_scatter_concentration),
-            "count_scope": component.count_scope,
-        }
-        return dict(selected) == expected_selected
-
-    def _short_discrepancy_training_ready(
-        self,
-        manifest: Mapping[str, object],
-    ) -> bool:
-        """Validate a declared short diagnostic training-only discrepancy.
-
-        This contract authorizes runtime diagnosis but never production
-        approval.  It exists to decouple a logically complete model from the
-        optional multi-day all-64 release evaluation.  Holdout artifacts are
-        explicitly forbidden from parameter selection.
-        """
-        expected_keys = {
-            "schema_version",
-            "training_policy",
-            "acceptance_contract_sha256",
-            "training_scene_seeds",
-            "scenario_ids",
-            "pair_ids_by_scene_and_scenario",
-            "artifact_sha256_by_scene_and_scenario",
-            "rate_scale_family",
-            "mark_family",
-            "mark_calibration",
-            "selection_objective",
-            "selected_rate_scale_half_width",
-            "selected_count_discrepancy_scope",
-            "selected_mark_concentration_source",
-            "selected_mark_concentration_multi_isotope",
-            "candidate_count",
-            "selected_training_log_predictive_density",
-            "selection_artifact_sha256",
-            "selection_completed",
-            "holdout_artifacts_consumed",
-        }
-        if set(manifest) != expected_keys:
-            return False
-        training_policy = manifest.get("training_policy")
-        rate_scale_family = manifest.get("rate_scale_family")
-        legacy_training = (
-            training_policy == "declared_short_diagnostic_training_no_holdout_feedback"
-        )
-        runtime_training = (
-            training_policy == "declared_runtime_training_no_holdout_feedback_v2"
-        )
-        expected_candidate_count = (
-            1
-            + (1 if runtime_training else 2) * (len(RATE_SCALE_HALF_WIDTH_GRID) - 1)
-            + 2 * len(MARK_CONCENTRATION_GRID)
-        )
-        if (
-            not (legacy_training or runtime_training)
-            or manifest.get("acceptance_contract_sha256")
-            != FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256
-            or (
-                legacy_training
-                and rate_scale_family
-                != "selected_scope_gamma_poisson_recorded_count_mean_one"
-            )
-            or (
-                runtime_training
-                and rate_scale_family
-                != "view_conditioned_gamma_poisson_recorded_count_mean_one"
-            )
-            or manifest.get("mark_family") != "source_fraction_dirichlet_multinomial"
-            or manifest.get("selection_objective")
-            != "maximum_joint_training_log_predictive_density"
-            or manifest.get("selection_completed") is not True
-            or manifest.get("holdout_artifacts_consumed") is not False
-            or manifest.get("candidate_count") != expected_candidate_count
-            or not _is_sha256(manifest.get("selection_artifact_sha256"))
-        ):
-            return False
-        raw_seeds = manifest.get("training_scene_seeds")
-        raw_scenarios = manifest.get("scenario_ids")
-        pair_ids = manifest.get("pair_ids_by_scene_and_scenario")
-        artifact_hashes = manifest.get("artifact_sha256_by_scene_and_scenario")
-        mark_calibration = manifest.get("mark_calibration")
-        if (
-            not isinstance(raw_seeds, tuple)
-            or not raw_seeds
-            or any(type(seed) is not int for seed in raw_seeds)
-            or len(set(raw_seeds)) != len(raw_seeds)
-            or any(seed in DESIGNATED_VALIDATION_SCENE_SEEDS for seed in raw_seeds)
-            or not isinstance(raw_scenarios, tuple)
-            or len(raw_scenarios) < 2
-            or any(
-                scenario not in VALIDATION_SCENARIO_IDS for scenario in raw_scenarios
-            )
-            or "single_line_source_resolved" not in raw_scenarios
-            or "dominant_plus_absent_isotope" not in raw_scenarios
-            or not isinstance(pair_ids, Mapping)
-            or not isinstance(artifact_hashes, Mapping)
-            or not isinstance(mark_calibration, Mapping)
-        ):
-            return False
-        expected_seed_keys = {str(seed) for seed in raw_seeds}
-        if set(pair_ids) != expected_seed_keys or set(artifact_hashes) != (
-            expected_seed_keys
-        ):
-            return False
-        for seed in raw_seeds:
-            seed_key = str(seed)
-            scenario_pairs = pair_ids.get(seed_key)
-            scenario_hashes = artifact_hashes.get(seed_key)
-            if (
-                not isinstance(scenario_pairs, Mapping)
-                or set(scenario_pairs) != set(raw_scenarios)
-                or not isinstance(scenario_hashes, Mapping)
-                or set(scenario_hashes) != set(raw_scenarios)
-            ):
-                return False
-            for scenario in raw_scenarios:
-                values = scenario_pairs[scenario]
-                hashes = scenario_hashes[scenario]
-                if (
-                    not isinstance(values, tuple)
-                    or not values
-                    or any(
-                        type(value) is not int or value < 0 or value >= 64
-                        for value in values
-                    )
-                    or len(set(values)) != len(values)
-                    or not isinstance(hashes, Mapping)
-                    or set(hashes) != {str(value) for value in values}
-                    or any(not _is_sha256(value) for value in hashes.values())
-                ):
-                    return False
-        try:
-            width = float(manifest["selected_rate_scale_half_width"])
-            selected_scope = manifest["selected_count_discrepancy_scope"]
-            concentration = float(manifest["selected_mark_concentration_source"])
-            multi_concentration = float(
-                manifest["selected_mark_concentration_multi_isotope"]
-            )
-            selected_score = float(manifest["selected_training_log_predictive_density"])
-        except (TypeError, ValueError):
-            return False
-        expected_mark_keys = {
-            "method",
-            "lower_quantile",
-            "lower_quantile_moment_concentration_by_scenario",
-            "selected_concentration",
-            "selected_multi_isotope_concentration",
-            "training_scene_seeds",
-            "scenario_ids",
-            "pair_ids",
-            "artifact_sha256_by_scene_and_scenario",
-            "design_sha256",
-            "holdout_artifacts_consumed",
-        }
-        if (
-            set(mark_calibration) != expected_mark_keys
-            or mark_calibration.get("method")
-            not in {
-                "training_mean_dirichlet_moment_lower_quantile_v1",
-                (
-                    "training_mean_dirichlet_moment_lower_quantile_"
-                    "cardinality_conservative_v2"
-                ),
-            }
-            or float(mark_calibration.get("lower_quantile", -1.0)) != 0.05
-            or mark_calibration.get("holdout_artifacts_consumed") is not False
-            or not _is_sha256(mark_calibration.get("design_sha256"))
-            or tuple(mark_calibration.get("training_scene_seeds", ()))
-            != (2026072701, 2026072702)
-            or tuple(mark_calibration.get("scenario_ids", ()))
-            != (
-                "dominant_plus_absent_isotope",
-                "multi_isotope_superposition",
-                "continuous_surface_perturbation_ranking",
-            )
-            or len(tuple(mark_calibration.get("pair_ids", ()))) < 16
-            or float(mark_calibration.get("selected_concentration", -1.0))
-            != concentration
-            or float(
-                mark_calibration.get(
-                    "selected_multi_isotope_concentration",
-                    -1.0,
-                )
-            )
-            != multi_concentration
-            or not isinstance(
-                mark_calibration.get("lower_quantile_moment_concentration_by_scenario"),
-                Mapping,
-            )
-            or not isinstance(
-                mark_calibration.get("artifact_sha256_by_scene_and_scenario"),
-                Mapping,
-            )
-        ):
-            return False
-        if (
-            width not in RATE_SCALE_HALF_WIDTH_GRID
-            or concentration not in MARK_CONCENTRATION_GRID
-            or not np.isfinite(selected_score)
-            or self.mark_concentration_source is None
-            or float(self.mark_concentration_source) != concentration
-            or self.mark_concentration_multi_isotope is None
-            or float(self.mark_concentration_multi_isotope) != multi_concentration
-        ):
-            return False
-        expected_count_concentration = None if width == 0.0 else 3.0 / float(width**2)
-        if selected_scope not in (
-            None,
-            "station_shared",
-            "view_independent",
-        ) or (width == 0.0) != (selected_scope is None):
-            return False
-        if runtime_training and (
-            selected_scope != (None if width == 0.0 else "view_independent")
-            or mark_calibration.get("method")
-            != (
-                "training_mean_dirichlet_moment_lower_quantile_"
-                "cardinality_conservative_v2"
-            )
-            or concentration != multi_concentration
-        ):
-            return False
-        return bool(
-            np.array_equal(self._rate_scale_nodes_j, np.asarray((1.0,)))
-            and np.array_equal(self._rate_scale_weights_j, np.asarray((1.0,)))
-            and self.count_discrepancy_concentration == expected_count_concentration
-            and self.count_discrepancy_scope == selected_scope
-        )
-
-    @property
     def exact_physical_statistics_ready(self) -> bool:
         """Return whether no empirical likelihood discrepancy is configured."""
         component = self.physical_component_discrepancy
         return bool(
-            self.discrepancy_training_manifest is None
-            and self.low_rank_spectral_mean_correction is None
-            and self.mark_concentration_source is None
+            self.mark_concentration_source is None
             and np.array_equal(
                 self._rate_scale_nodes_j,
                 np.asarray((1.0,), dtype=np.float64),
@@ -4743,10 +3787,6 @@ class GeometryConditionedSpectralModel:
             and self.count_discrepancy_scope is None
             and self.mark_concentration_multi_isotope is None
             and (component is None or component.physics_only)
-            and not isinstance(
-                self.additive_scatter_response,
-                AdditiveNoncollidedTransportResponse,
-            )
         )
 
     @property
@@ -4758,9 +3798,6 @@ class GeometryConditionedSpectralModel:
                 additive_response,
                 PhysicsOnlyNoncollidedTransportResponse,
             )
-            and additive_response.training_ready
-            and self.low_rank_spectral_mean_correction is None
-            and self.discrepancy_training_manifest is None
             and self.physical_component_discrepancy is not None
             and self.physical_component_discrepancy.physics_only
             and self.physical_component_discrepancy.mark_latent_model
@@ -4798,7 +3835,7 @@ class GeometryConditionedSpectralModel:
         if (
             additive_response is None
             or additive_response.feature_basis_semantics
-            != DETECTOR_CONE_AIR_XCOM_SINGLE_SCATTER_BASIS_SEMANTICS
+            != PHYSICAL_SCATTER_BASIS_SEMANTICS
         ):
             return False
         manifest = self.validation_manifest
@@ -5629,19 +4666,6 @@ class GeometryConditionedSpectralModel:
                 optimize=True,
             )
         marked_source = marked_direct + marked_scatter
-        correction = self.low_rank_spectral_mean_correction
-        if correction is not None:
-            if return_physical_components:
-                raise RuntimeError(
-                    "Physical mark-component latents cannot be combined with "
-                    "an undecomposed learned spectral correction."
-                )
-            marked_source = correction.apply_numpy(
-                marked_source,
-                total_counts,
-                uncollided_counts,
-                features,
-            )
         background = (
             float(self.background_rate_cps)
             * live_times[:, np.newaxis]
@@ -6295,19 +5319,6 @@ class GeometryConditionedSpectralModel:
                 torch.full_like(total_rate, 1.0e15),
             )
         marked_source = marked_direct + marked_scatter
-        correction = self.low_rank_spectral_mean_correction
-        if correction is not None:
-            if return_physical_components:
-                raise RuntimeError(
-                    "Physical mark-component latents cannot be combined with "
-                    "an undecomposed learned spectral correction."
-                )
-            marked_source = correction.apply_torch(
-                marked_source,
-                total_counts,
-                uncollided_counts,
-                features,
-            )
         background = (
             float(self.background_rate_cps)
             * live_times[:, None]
@@ -6317,7 +5328,7 @@ class GeometryConditionedSpectralModel:
             background,
             marked_source.shape,
         )
-        if correction is None and bool(
+        if bool(
             torch.any(~torch.isfinite(marked_source)) or torch.any(marked_source < 0.0)
         ):
             raise RuntimeError(
@@ -11478,7 +10489,6 @@ class GeometryConditionedSpectralModel:
         }
         if not physics_response:
             payload["maximum_scatter_order"] = int(self.maximum_scatter_order)
-        correction = self.low_rank_spectral_mean_correction
         if self.count_discrepancy_concentration is not None:
             payload["count_discrepancy_concentration"] = float(
                 self.count_discrepancy_concentration
@@ -11492,8 +10502,6 @@ class GeometryConditionedSpectralModel:
             payload["physical_component_discrepancy"] = (
                 self.physical_component_discrepancy.to_payload()
             )
-        if correction is not None:
-            payload["low_rank_spectral_mean_correction"] = correction.to_payload()
         return payload
 
 
@@ -11504,7 +10512,7 @@ def with_catalog_independent_production_approval(
 ) -> GeometryConditionedSpectralModel:
     """Attach transferable approval without changing the target physics hash.
 
-    The source must carry literal schema-v6 all-64 evidence.  Transfer is
+    The source must carry direct all-64 validation evidence.  Transfer is
     permitted only when the target has the same isotope-independent detector,
     transport, background, dead-time, and uncertainty contract.  The target's
     catalog lines remain application inputs and must lie inside the validated
@@ -11520,7 +10528,7 @@ def with_catalog_independent_production_approval(
         or source_validation.get("schema_version") != 6
     ):
         raise RuntimeError(
-            "Catalog-independent approval must originate from literal schema-v6 "
+            "Catalog-independent approval must originate from direct "
             "all-64 application evidence; chained approval transfer is forbidden."
         )
     if (

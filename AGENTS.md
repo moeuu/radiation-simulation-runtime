@@ -32,6 +32,9 @@ observation generation, and MeasurementLog publication.
 - Run `uv run python scripts/audit_artifacts.py --check` before committing.
 - Keep generated data and logs out of Git. Preserve canonical model assets and
   raw evidence for current approvals and current RA-L results.
+- Follow `docs/current_model.md`: keep one current implementation, recover old
+  code from Git rather than local archives, and preserve scientific identities
+  when cleaning names or removing unused paths.
 
 ## Physical semantics
 

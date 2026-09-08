@@ -25,7 +25,6 @@ from measurement.shielding import (
 from sim.shield_geometry import nested_shield_inner_radii_cm
 from sim.shield_geometry import resolve_shield_thickness_config
 from spectrum.additive_scatter import (
-    AdditiveNoncollidedTransportResponse,
     PhysicsOnlyNoncollidedTransportResponse,
 )
 from spectrum.air_attenuation import (
@@ -47,9 +46,7 @@ class RuntimeObservationModel:
     mu_by_isotope: dict[str, object]
     line_mu_by_isotope: dict[str, tuple[dict[str, float], ...]] | None
     additive_scatter_response: (
-        AdditiveNoncollidedTransportResponse
-        | PhysicsOnlyNoncollidedTransportResponse
-        | None
+        PhysicsOnlyNoncollidedTransportResponse | None
     )
     obstacle_mu_by_isotope: dict[str, float] | None
     obstacle_height_m: float

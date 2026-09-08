@@ -45,7 +45,6 @@ from spectrum.transport_spectral import (
     FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256,
     DETECTOR_IMPACT_PHASE_COUNT,
     GeometryConditionedSpectralModel,
-    LowRankSpectralMeanCorrection,
     PhysicalComponentDiscrepancy,
     full_spectrum_acceptance_contract_payload,
     geometry_conditioned_model_from_runtime_config,
@@ -434,7 +433,6 @@ def test_physical_component_concentration_propagates_detector_information() -> N
     )
 
     assert model.runtime_ready is False
-    assert model.discrepancy_training_ready is False
     assert count[0, 0] > count[1, 0] > 0.0
     assert np.median(tree[0]) > np.median(tree[1]) > 0.0
     assert np.all(leaf > 0.0)
@@ -775,52 +773,6 @@ def test_physics_only_background_bypasses_source_component_gamma_limit() -> None
     np.testing.assert_allclose(numpy_log, torch_log, rtol=0.0, atol=2.0e-9)
 
 
-def _training_ready_mean_correction(
-    model: GeometryConditionedSpectralModel,
-) -> LowRankSpectralMeanCorrection:
-    """Return one synthetic authenticated correction for equivalence tests."""
-    descriptor_count = 2 + len(model.line_identity) + 4
-    basis = np.zeros((1, model.energy_axis_keV.size), dtype=np.float64)
-    basis[0, :2] = (0.2, -0.1)
-    regression = np.zeros((descriptor_count + 1, 1), dtype=np.float64)
-    regression[0, 0] = 0.5
-    training = {
-        "schema_version": 1,
-        "training_policy": ("fixed_quota_loso_training_only_low_rank_log_mean_v1"),
-        "training_scene_seeds": [2026072701, 2026072702],
-        "scenario_ids": ["multi_isotope_superposition"],
-        "pair_ids_by_scene": {
-            "2026072701": [0],
-            "2026072702": [0],
-        },
-        "artifact_sha256_by_scene": {
-            "2026072701": "1" * 64,
-            "2026072702": "2" * 64,
-        },
-        "rank_grid": [1],
-        "ridge_lambda_grid": [1.0],
-        "selected_rank": 1,
-        "selected_ridge_lambda": 1.0,
-        "selection_objective": (
-            "leave_one_scene_out_target_probability_weighted_log_mse"
-        ),
-        "selected_validation_score": 0.1,
-        "selection_completed": True,
-        "holdout_artifacts_consumed": False,
-    }
-    return LowRankSpectralMeanCorrection(
-        descriptor_order=tuple(
-            f"descriptor_{index}" for index in range(descriptor_count)
-        ),
-        descriptor_center_d=np.zeros(descriptor_count),
-        descriptor_scale_d=np.ones(descriptor_count),
-        regression_qk=regression,
-        basis_kb=basis,
-        maximum_abs_log_correction=2.0,
-        training_manifest=training,
-    )
-
-
 def test_total_below_uncollided_fails_closed_numpy_and_torch() -> None:
     """An impossible incident-count decomposition must never be normalized."""
     model = _model(dead_time_tau_s=0.0, background_rate_cps=0.0)
@@ -849,8 +801,8 @@ def test_total_below_uncollided_fails_closed_numpy_and_torch() -> None:
         )
 
 
-def test_low_rank_mean_correction_is_rejected_by_schema_four() -> None:
-    """Scene-fitted spectral corrections cannot enter runtime schema four."""
+def test_low_rank_mean_correction_is_rejected_by_current_model() -> None:
+    """Scene-fitted spectral corrections cannot enter the current runtime."""
     approved = approved_full_spectrum_model()
     payload = json.loads(json.dumps(approved.manifest_payload()))
     payload["low_rank_spectral_mean_correction"] = {"schema_version": 1}
@@ -2245,9 +2197,6 @@ def test_physics_only_candidate_needs_no_scene_fitted_terms() -> None:
     model = _runtime_ready_candidate()
 
     assert model.exact_physical_statistics_ready is True
-    assert model.discrepancy_training_ready is False
-    assert model.discrepancy_training_manifest is None
-    assert model.low_rank_spectral_mean_correction is None
     assert model.runtime_ready is True
     assert model.production_ready is False
     reconstructed = GeometryConditionedSpectralModel.from_manifest_payload(
@@ -2325,7 +2274,7 @@ def test_detector_cone_scatter_distance_extrapolation_fails_closed() -> None:
 
 def test_retired_model_schema_is_rejected_before_runtime() -> None:
     """Reject a retired schema without retaining an obsolete learned asset."""
-    with pytest.raises(ValueError, match="schema-v7"):
+    with pytest.raises(ValueError, match="current geometry-conditioned"):
         GeometryConditionedSpectralModel.from_manifest_payload(
             {"schema_version": 3, "model": "geometry_conditioned_full_spectrum"},
             detector_green_operator=(
@@ -2740,7 +2689,7 @@ def test_predictive_action_seeds_are_invariant_to_action_batch_width() -> None:
     assert np.array_equal(all_actions, split_actions)
 
 
-def test_schema_seven_manifest_excludes_scene_fitted_and_legacy_terms() -> None:
+def test_current_manifest_excludes_scene_fitted_and_legacy_terms() -> None:
     """Schema seven binds catalog lines and component-aware mark uncertainty."""
     candidate = _runtime_ready_candidate()
     manifest = candidate.manifest_payload()
@@ -2765,7 +2714,7 @@ def test_schema_seven_manifest_excludes_scene_fitted_and_legacy_terms() -> None:
     )
 
 
-def test_runtime_factory_reconstructs_and_authenticates_schema_seven() -> None:
+def test_runtime_factory_reconstructs_and_authenticates_current_model() -> None:
     """Live construction must authenticate model, catalog, and Green identity."""
     runtime = approved_runtime_config()
     model = geometry_conditioned_model_from_runtime_config(runtime)
@@ -2948,7 +2897,7 @@ def test_validation_metrics_reject_numeric_strings(field_name: str) -> None:
         )
 
 
-def test_schema_four_rejects_scene_fitted_transport_response() -> None:
+def test_current_model_rejects_scene_fitted_transport_response() -> None:
     """A retired fitted response cannot cross the schema-four boundary."""
     approved = approved_full_spectrum_model()
     payload = json.loads(json.dumps(approved.manifest_payload()))
@@ -2963,7 +2912,7 @@ def test_schema_four_rejects_scene_fitted_transport_response() -> None:
         )
 
 
-def test_runtime_factory_authenticates_file_backed_schema_four(
+def test_runtime_factory_authenticates_file_backed_current_model(
     tmp_path: Path,
 ) -> None:
     """A file-backed schema-four model must match byte and model hashes."""

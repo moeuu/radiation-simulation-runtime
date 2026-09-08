@@ -300,7 +300,7 @@ def test_actual_native_forced_collision_response_reconstructs() -> None:
     fixture_path = (
         Path(__file__).resolve().parent
         / "fixtures"
-        / "force_collision_thin_forced_v2.json"
+        / "force_collision_thin_forced.json"
     )
     fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
     assert (

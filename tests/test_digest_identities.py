@@ -17,7 +17,7 @@ from runtime.provenance import DigestIdentity
 from runtime.records import measurement_record_from_payload
 
 
-FIXTURE = Path(__file__).parent / "fixtures" / "digest_identity_v1.json"
+FIXTURE = Path(__file__).parent / "fixtures" / "digest_identity.json"
 
 
 def test_runtime_digest_algorithms_match_golden_fixture() -> None:

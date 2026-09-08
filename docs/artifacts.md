@@ -25,9 +25,14 @@ with `git add -f` for these files.
 
 Keep commands, resolved configuration, revisions, start/end status, logs, and
 raw evidence together for a run. Start new experiments with a fresh directory.
-Calibration and acceptance CLIs require `--output-root`; resuming or advancing
+The acceptance CLI requires `--output-root`; resuming or advancing
 a phase must explicitly name that same recorded directory. Never overwrite a
 completed run just because the software or contract hash is unchanged.
+
+Use a timestamp or run ID for new output directories, rather than implementation
+suffixes such as `v7`. Existing evidence paths remain immutable references.
+Do not restore retired model implementations or their scene-fitting launchers;
+follow the [current model policy](current_model.md).
 
 Sidecar defaults create a fresh `logs/<backend>-<port>-<id>/bridge.log` for each
 launch. Set `sidecar_log_path` or `isaacsim_sidecar_log_path` to keep it within an

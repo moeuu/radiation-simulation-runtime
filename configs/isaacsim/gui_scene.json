@@ -104,7 +104,6 @@
   "robot_animation_time_scale": 0.1,
   "robot_max_animation_steps": 200,
   "robot_motion_speed_m_s": 0.5,
-  "simulation_runtime_schema_version": 1,
   "stage_material_rules": [
     {
       "material": "concrete",

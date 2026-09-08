@@ -1,4 +1,4 @@
-"""Local schema-v6 physics-only fixtures for runtime contract tests."""
+"""Local physics-only fixtures for runtime contract tests."""
 
 from __future__ import annotations
 
@@ -93,7 +93,7 @@ def _synthetic_validation_manifest(
     model_contract_hash: str,
     additive_scatter_contract_hash: str,
 ) -> dict[str, object]:
-    """Return a strict schema-v6 validation-only approval manifest."""
+    """Return a strict validation-only approval manifest."""
     operator = _test_operator()
     green_validation = synthetic_detector_green_validation_manifest(
         operator,
@@ -198,7 +198,7 @@ def approved_full_spectrum_model() -> GeometryConditionedSpectralModel:
 
 @lru_cache(maxsize=1)
 def _runtime_config_template() -> dict[str, object]:
-    """Build one immutable schema-v6 runtime fixture template."""
+    """Build one immutable runtime fixture template."""
     model = approved_full_spectrum_model()
     payload = model.manifest_payload()
     return {
@@ -228,7 +228,7 @@ def _runtime_config_template() -> dict[str, object]:
 
 
 def runtime_config() -> dict[str, object]:
-    """Return a fresh resolved schema-v6 physical test configuration."""
+    """Return a fresh resolved physical test configuration."""
     return copy.deepcopy(_runtime_config_template())
 
 

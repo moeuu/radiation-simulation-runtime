@@ -16,6 +16,7 @@ from measurement.source_boundary import (
     surface_source_runtime_contract_sha256,
 )
 from sim.runtime import (
+    validate_production_runtime_config,
     Geant4TCPClientRuntime,
     ManagedGeant4TCPClientRuntime,
     SimulationRuntime,
@@ -1178,3 +1179,39 @@ def test_reset_handshake_binds_source_strength_and_transport_sha() -> None:
     client._round_trip = lambda *_args, **_kwargs: stale  # type: ignore[method-assign]
     with pytest.raises(RuntimeError, match="contract hash differs"):
         client.reset({"sources": [source]})
+
+
+def test_unversioned_config_resolves_to_the_same_runtime_identity(
+    tmp_path: Path,
+) -> None:
+    """Omitting a format tag must preserve the current resolved configuration hash."""
+    root = Path(__file__).resolve().parents[1]
+    config = root / "configs/geant4/variance_reduction_external_no_isaac_32threads.json"
+    raw = json.loads(config.read_text())
+    assert "simulation_runtime_schema_version" not in raw
+    current = load_production_runtime_config(config)
+    tagged = tmp_path / "tagged.json"
+    tagged.write_text(json.dumps({**raw, "simulation_runtime_schema_version": 1}))
+    assert load_production_runtime_config(tagged) == current
+    untagged = dict(current)
+    untagged.pop("simulation_runtime_schema_version")
+    assert production_runtime_config_sha256(
+        untagged
+    ) == production_runtime_config_sha256(current)
+    assert "simulation_runtime_schema_version" not in untagged
+
+
+@pytest.mark.parametrize("schema_version", [None, 0, 2, True, 1.0, "1"])
+def test_explicit_unsupported_runtime_format_is_rejected(
+    schema_version: object,
+) -> None:
+    """Automatic current defaults must not reinterpret an explicit old format."""
+    root = Path(__file__).resolve().parents[1]
+    current = load_production_runtime_config(
+        root / "configs/geant4/variance_reduction_external_no_isaac_32threads.json"
+    )
+    current["simulation_runtime_schema_version"] = schema_version
+    with pytest.raises(
+        ValueError, match="Unsupported simulation_runtime_schema_version"
+    ):
+        validate_production_runtime_config(current)

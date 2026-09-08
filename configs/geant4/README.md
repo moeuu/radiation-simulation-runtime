@@ -6,7 +6,7 @@ Standard top-level configs use `primary_sampling_fraction=1.0`. The Python
 Geant4 application rejects fractional primary-history sampling unless the
 nonstandard accelerated mode is selected explicitly, and it checks native
 response provenance before returning any observation to an estimator.
-Production adaptive sessions accept only complete, self-contained schema-1
+Production adaptive sessions accept only complete, self-contained current
 documents with the canonical field set. Unknown fields, missing fields,
 estimator-owned controls, implicit type coercion, and `extends` inheritance are
 rejected before simulator construction. Diagnostic tooling may still use the
@@ -33,7 +33,7 @@ production configs reject those keys instead of accepting ignored duplicates.
 
 The profile registry hash proves which exact catalog-derived model asset was
 loaded. Production startup requires either literal all-64 application approval
-for that exact model or a schema-v7 catalog-independent approval transferred
+for that exact model or a catalog-independent approval transferred
 from the canonical validated model. Transfer is allowed only when detector,
 transport, background, dead-time, likelihood uncertainty, and execution
 contracts are identical and every catalog line is inside the validated
@@ -57,7 +57,7 @@ and profile generations remain recoverable from Git history instead of living
 beside the active assets. The profile directory contains assets authenticated by
 `isotope_profile_model_registry.json` and the canonical all-64-approved
 `unconditioned_cs_co.json` used to authorize compatible profiles. Retired
-schema-v3 training candidates and low-rank correction files are not runtime
+scene-fitted training candidates and low-rank correction files are not runtime
 assets; obsolete-schema rejection uses a minimal in-memory test payload.
 
 Generation suffixes are omitted when only one active asset exists. Explicit

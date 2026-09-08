@@ -60,7 +60,6 @@
   "robot_motion_speed_m_s": 0.5,
   "scatter_gain": 0.03,
   "estimator_visualization_enabled": true,
-  "simulation_runtime_schema_version": 1,
   "stage_material_rules": [
     {
       "material": "concrete",
