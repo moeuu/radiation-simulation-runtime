@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-import shutil
 import subprocess
-import sys
 
 import pytest
 
@@ -24,30 +22,6 @@ from sim.isaacsim_app.scene_builder import StagePrimPaths
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
-
-
-@pytest.fixture(scope="module")
-def radioactive_decay_sidecar(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """Build the complete sidecar once when Geant4 is available."""
-    if shutil.which("g++") is None or shutil.which("geant4-config") is None:
-        pytest.skip("g++ and geant4-config are required for this integration.")
-    executable = tmp_path_factory.mktemp("radioactive_decay") / "sidecar"
-    completed = subprocess.run(
-        [
-            sys.executable,
-            "scripts/build_geant4_sidecar.py",
-            "--profile",
-            "portable",
-            "--output",
-            executable.as_posix(),
-        ],
-        cwd=REPOSITORY_ROOT,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    assert completed.returncode == 0, completed.stderr
-    return executable
 
 
 def _surface_source(
@@ -84,7 +58,7 @@ def _parse_response(path: Path) -> tuple[dict[str, str], tuple[float, ...]]:
 
 
 def test_radioactive_decay_tracks_cascade_as_one_detector_event(
-    radioactive_decay_sidecar: Path,
+    native_sidecar_executable: Path,
     tmp_path: Path,
 ) -> None:
     """Co-60 and long-lived Eu-152 must run through evaluated RDM cascades."""
@@ -122,7 +96,7 @@ def test_radioactive_decay_tracks_cascade_as_one_detector_event(
     )
     completed = subprocess.run(
         [
-            radioactive_decay_sidecar.as_posix(),
+            native_sidecar_executable.as_posix(),
             "--scene",
             scene_path.as_posix(),
             "--request",
@@ -184,7 +158,7 @@ def test_radioactive_decay_tracks_cascade_as_one_detector_event(
 
 
 def test_decay_comparison_axis_preserves_co60_sum_peak(
-    radioactive_decay_sidecar: Path,
+    native_sidecar_executable: Path,
     tmp_path: Path,
 ) -> None:
     """The diagnostic-only wide axis must retain the 2506-keV Co-60 sum peak."""
@@ -225,7 +199,7 @@ def test_decay_comparison_axis_preserves_co60_sum_peak(
     )
     completed = subprocess.run(
         [
-            radioactive_decay_sidecar.as_posix(),
+            native_sidecar_executable.as_posix(),
             "--scene",
             scene_path.as_posix(),
             "--request",
@@ -285,7 +259,7 @@ def test_decay_comparison_axis_preserves_co60_sum_peak(
     ),
 )
 def test_requested_nuclide_has_live_evaluated_radioactive_decay(
-    radioactive_decay_sidecar: Path,
+    native_sidecar_executable: Path,
     tmp_path: Path,
     isotope: str,
 ) -> None:
@@ -321,7 +295,7 @@ def test_requested_nuclide_has_live_evaluated_radioactive_decay(
     )
     completed = subprocess.run(
         [
-            radioactive_decay_sidecar.as_posix(),
+            native_sidecar_executable.as_posix(),
             "--scene",
             scene_path.as_posix(),
             "--request",

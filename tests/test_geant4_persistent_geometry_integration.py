@@ -6,9 +6,7 @@ from dataclasses import dataclass
 import hashlib
 import math
 from pathlib import Path
-import shutil
 import subprocess
-import sys
 
 import pytest
 
@@ -49,33 +47,16 @@ class SidecarFixture:
 @pytest.fixture(scope="module")
 def geant4_sidecar(
     tmp_path_factory: pytest.TempPathFactory,
+    native_sidecar_executable: Path,
 ) -> SidecarFixture:
-    """Build the sidecar and one explicit synthetic detector operator."""
+    """Reuse the shared sidecar with a separate synthetic detector operator."""
 
-    if shutil.which("g++") is None or shutil.which("geant4-config") is None:
-        pytest.skip("g++ and geant4-config are required for this integration.")
-    executable = tmp_path_factory.mktemp("persistent_geometry_sidecar") / "sidecar"
-    completed = subprocess.run(
-        [
-            sys.executable,
-            "scripts/build_geant4_sidecar.py",
-            "--profile",
-            "portable",
-            "--output",
-            executable.as_posix(),
-        ],
-        cwd=REPOSITORY_ROOT,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    assert completed.returncode == 0, completed.stderr
     operator_manifest = write_synthetic_detector_green_artifact(
         tmp_path_factory.mktemp("persistent_geometry_green") / "operator"
     )
     operator = DetectorGreenOperator.from_artifact(operator_manifest)
     return SidecarFixture(
-        executable=executable,
+        executable=native_sidecar_executable,
         detector_green_binary=operator_manifest.parent / "operator.bin",
         detector_green_binary_sha256=str(operator.binary_sha256),
         detector_green_contract_sha256=str(operator.contract_hash_sha256),

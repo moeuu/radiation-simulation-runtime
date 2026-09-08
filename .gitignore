@@ -9,4 +9,5 @@ dist/
 results/
 private_runs/
 logs/
+/tmp/
 /data/manchester_nuclear_assets/

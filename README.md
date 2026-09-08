@@ -183,3 +183,14 @@ If this software contributes to research, use the metadata in
 a scholarly request, not an additional license condition. Repository-authored
 software and documentation are released under the [MIT License](LICENSE);
 third-party dependencies and externally sourced data retain their own terms.
+
+## Verification scope
+
+Run affected test files during development, then the full runtime suite for core
+protocol/physics changes and releases. Documentation or local asset moves do not
+require repeated native simulations. The full suite remains `uv run pytest`; use
+`--durations=20` when measuring test cost. Native integration tests share one
+portable sidecar build per invocation, with separate simulation processes and
+outputs. A new invocation rebuilds from the current source.
+Synthetic test operators use process-owned temporary directories under ignored
+`tmp/`, preserving runtime-relative paths and removing the files at process exit.

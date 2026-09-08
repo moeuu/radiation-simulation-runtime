@@ -16,7 +16,11 @@ observation generation, and MeasurementLog publication.
   owner-only socket and join truth to completed results only by exact `run_id`.
 - Keep Geant4 physics fidelity and the event-level observation distribution
   unchanged when optimizing runtime performance.
-- Use Python 3.12 and `uv`; run `uv run pytest` after changes.
+- Use Python 3.12 and `uv`. Run affected tests during iteration and the full
+  runtime suite for core protocol/physics changes and releases. Documentation,
+  ignore rules, and local asset moves need relevant checks only. Native
+  sidecar/physics changes require the native integration tests; share only the
+  compiled executable within one pytest session, never mutable simulation state.
 - Follow PEP 8. Every function must have an English docstring.
 - Commit only to `main`. Do not create a pull request unless explicitly asked.
 

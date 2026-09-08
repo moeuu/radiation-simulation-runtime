@@ -3,43 +3,14 @@
 from __future__ import annotations
 
 from pathlib import Path
-import shutil
 import subprocess
-import sys
-
-import pytest
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
-@pytest.fixture(scope="module")
-def geant4_sidecar(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """Build the complete sidecar once when Geant4 is available."""
-
-    if shutil.which("g++") is None or shutil.which("geant4-config") is None:
-        pytest.skip("g++ and geant4-config are required for this integration.")
-    executable = tmp_path_factory.mktemp("force_collision_sidecar") / "sidecar"
-    completed = subprocess.run(
-        [
-            sys.executable,
-            "scripts/build_geant4_sidecar.py",
-            "--profile",
-            "portable",
-            "--output",
-            executable.as_posix(),
-        ],
-        cwd=REPOSITORY_ROOT,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    assert completed.returncode == 0, completed.stderr
-    return executable
-
-
 def test_unvalidated_forced_collision_fails_before_transport(
-    geant4_sidecar: Path,
+    native_sidecar_executable: Path,
     tmp_path: Path,
 ) -> None:
     """The biased shortcut must not silently enter calibration or runtime."""
@@ -47,7 +18,7 @@ def test_unvalidated_forced_collision_fails_before_transport(
     response = tmp_path / "rejected.response"
     completed = subprocess.run(
         [
-            geant4_sidecar.as_posix(),
+            native_sidecar_executable.as_posix(),
             "--scene",
             (
                 REPOSITORY_ROOT

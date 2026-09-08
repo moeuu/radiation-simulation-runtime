@@ -51,11 +51,19 @@ _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
 @lru_cache(maxsize=1)
+def _test_operator_directory() -> tempfile.TemporaryDirectory[str]:
+    """Keep fixture files alive for this process and remove them at exit."""
+    temporary_root = _REPOSITORY_ROOT / "tmp"
+    temporary_root.mkdir(parents=True, exist_ok=True)
+    return tempfile.TemporaryDirectory(
+        prefix="runtime-test-green-", dir=temporary_root
+    )
+
+
+@lru_cache(maxsize=1)
 def _test_operator_manifest_path() -> Path:
     """Publish one process-local immutable synthetic Green artifact."""
-    results_root = _REPOSITORY_ROOT / "results"
-    results_root.mkdir(parents=True, exist_ok=True)
-    root = Path(tempfile.mkdtemp(prefix="runtime-test-green-", dir=results_root))
+    root = Path(_test_operator_directory().name)
     return write_synthetic_detector_green_artifact(root / "operator")
 
 
