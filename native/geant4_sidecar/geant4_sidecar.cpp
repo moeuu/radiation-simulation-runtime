@@ -412,6 +412,11 @@ struct TransportOptions {
     bool decay_comparison_diagnostic = false;
     double decay_comparison_energy_max_keV = 3400.0;
     bool decay_comparison_energy_max_overridden = false;
+#if defined(ROTATING_SHIELD_TRAJECTORY_DIAGNOSTIC)
+    std::string trajectory_output_path;
+    int trajectory_max_tracks_per_source = 256;
+    int trajectory_max_points_per_track = 512;
+#endif
 };
 
 enum class DetectorEntryClass {
@@ -3544,6 +3549,264 @@ DetectorEntryClass ClassifyDetectorEntryTrack(const G4Track* track) {
     return DetectorEntryClass::kUncollidedPrimary;
 }
 
+#if defined(ROTATING_SHIELD_TRAJECTORY_DIAGNOSTIC)
+struct Geant4TrajectoryPoint {
+    double x_m = 0.0;
+    double y_m = 0.0;
+    double z_m = 0.0;
+};
+
+struct Geant4PrimaryGammaTrajectory {
+    std::size_t source_index = std::numeric_limits<std::size_t>::max();
+    std::size_t primary_batch_index = std::numeric_limits<std::size_t>::max();
+    long long primary_history_index = -1;
+    long long bias_branch_lineage_id = -1;
+    int track_id = -1;
+    int parent_id = -1;
+    double initial_energy_keV = 0.0;
+    long long raw_step_count = 0;
+    bool detector_entered = false;
+    bool interacted = false;
+    bool points_truncated = false;
+    std::vector<Geant4TrajectoryPoint> points;
+};
+
+class Geant4TrajectoryStore {
+public:
+    Geant4TrajectoryStore(
+        const int max_tracks_per_source,
+        const int max_points_per_track
+    ) : max_tracks_per_source_(
+            static_cast<std::size_t>(std::max(1, max_tracks_per_source))
+        ),
+        max_points_per_track_(
+            static_cast<std::size_t>(std::max(2, max_points_per_track))
+        ) {}
+
+    void Clear() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        trajectories_.clear();
+        track_count_by_source_.clear();
+    }
+
+    void RecordStep(const G4Step* step) {
+        if (step == nullptr) {
+            return;
+        }
+        auto* track = step->GetTrack();
+        if (
+            track == nullptr
+            || track->GetDefinition() != G4Gamma::Definition()
+            || track->GetParentID() != 0
+        ) {
+            return;
+        }
+        const auto* information = TrackInformation(track);
+        if (
+            information == nullptr
+            || information->PrimaryHistoryIndex() < 0
+            || information->SourceIndex()
+                == std::numeric_limits<std::size_t>::max()
+        ) {
+            return;
+        }
+        const auto key = std::make_tuple(
+            information->SourceIndex(),
+            information->PrimaryHistoryIndex(),
+            information->BiasBranchLineageId(),
+            track->GetTrackID()
+        );
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto found = trajectories_.find(key);
+        if (found == trajectories_.end()) {
+            auto& source_count = track_count_by_source_[
+                information->SourceIndex()
+            ];
+            if (source_count >= max_tracks_per_source_) {
+                return;
+            }
+            Geant4PrimaryGammaTrajectory trajectory;
+            trajectory.source_index = information->SourceIndex();
+            trajectory.primary_batch_index = information->PrimaryBatchIndex();
+            trajectory.primary_history_index = (
+                information->PrimaryHistoryIndex()
+            );
+            trajectory.bias_branch_lineage_id = (
+                information->BiasBranchLineageId()
+            );
+            trajectory.track_id = track->GetTrackID();
+            trajectory.parent_id = track->GetParentID();
+            trajectory.initial_energy_keV = (
+                track->GetVertexKineticEnergy() / keV
+            );
+            found = trajectories_.emplace(key, std::move(trajectory)).first;
+            ++source_count;
+        }
+        auto& trajectory = found->second;
+        ++trajectory.raw_step_count;
+        const auto* pre_point = step->GetPreStepPoint();
+        const auto* post_point = step->GetPostStepPoint();
+        if (trajectory.points.empty() && pre_point != nullptr) {
+            AppendPoint(&trajectory, pre_point->GetPosition());
+        }
+        if (post_point != nullptr) {
+            AppendPoint(&trajectory, post_point->GetPosition());
+            trajectory.detector_entered = (
+                trajectory.detector_entered
+                || IsDetectorVolume(post_point->GetPhysicalVolume())
+            );
+            const auto* process = post_point->GetProcessDefinedStep();
+            trajectory.interacted = (
+                trajectory.interacted
+                || (
+                    process != nullptr
+                    && process->GetProcessType() != fTransportation
+                )
+            );
+        }
+        if (pre_point != nullptr) {
+            trajectory.detector_entered = (
+                trajectory.detector_entered
+                || IsDetectorVolume(pre_point->GetPhysicalVolume())
+            );
+        }
+    }
+
+    std::size_t TrackCount() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return trajectories_.size();
+    }
+
+    std::size_t DetectorEnteredTrackCount() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return static_cast<std::size_t>(std::count_if(
+            trajectories_.begin(),
+            trajectories_.end(),
+            [](const auto& item) {
+                return item.second.detector_entered;
+            }
+        ));
+    }
+
+    void Write(
+        const std::string& path,
+        const SceneSpec& scene,
+        const RequestSpec& request
+    ) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::ofstream output(path);
+        if (!output) {
+            throw std::runtime_error(
+                "Failed to open Geant4 trajectory output: " + path
+            );
+        }
+        output << "FORMAT geant4_primary_gamma_step_trajectory_v1\n";
+        output << "META scene_hash=" << scene.scene_hash << "\n";
+        output << "META step_id=" << request.step_id << "\n";
+        output << "META seed=" << request.seed << "\n";
+        output << "META detector_x_m=" << std::setprecision(17)
+               << request.detector_pose.x << "\n";
+        output << "META detector_y_m=" << std::setprecision(17)
+               << request.detector_pose.y << "\n";
+        output << "META detector_z_m=" << std::setprecision(17)
+               << request.detector_pose.z << "\n";
+        output << "META max_tracks_per_source="
+               << max_tracks_per_source_ << "\n";
+        output << "META max_points_per_track="
+               << max_points_per_track_ << "\n";
+        output << "META recorded_track_count="
+               << trajectories_.size() << "\n";
+        for (const auto& item : trajectories_) {
+            const auto& trajectory = item.second;
+            if (trajectory.source_index >= scene.sources.size()) {
+                throw std::runtime_error(
+                    "Recorded Geant4 trajectory has an invalid source index."
+                );
+            }
+            output << "TRACK"
+                   << " source_index=" << trajectory.source_index
+                   << " isotope="
+                   << scene.sources[trajectory.source_index].isotope
+                   << " primary_batch_index="
+                   << trajectory.primary_batch_index
+                   << " primary_history_index="
+                   << trajectory.primary_history_index
+                   << " bias_branch_lineage_id="
+                   << trajectory.bias_branch_lineage_id
+                   << " track_id=" << trajectory.track_id
+                   << " parent_id=" << trajectory.parent_id
+                   << " initial_energy_keV=" << std::setprecision(17)
+                   << trajectory.initial_energy_keV
+                   << " raw_step_count=" << trajectory.raw_step_count
+                   << " detector_entered="
+                   << (trajectory.detector_entered ? 1 : 0)
+                   << " interacted=" << (trajectory.interacted ? 1 : 0)
+                   << " points_truncated="
+                   << (trajectory.points_truncated ? 1 : 0)
+                   << " point_count=" << trajectory.points.size()
+                   << "\n";
+            for (std::size_t index = 0; index < trajectory.points.size(); ++index) {
+                const auto& point = trajectory.points[index];
+                output << "POINT index=" << index
+                       << " x_m=" << std::setprecision(17) << point.x_m
+                       << " y_m=" << std::setprecision(17) << point.y_m
+                       << " z_m=" << std::setprecision(17) << point.z_m
+                       << "\n";
+            }
+            output << "END_TRACK\n";
+        }
+    }
+
+private:
+    static bool IsDetectorVolume(const G4VPhysicalVolume* volume) {
+        if (volume == nullptr) {
+            return false;
+        }
+        const auto name = volume->GetName();
+        return name == "DetectorCrystalPV" || name == "DetectorHousingPV";
+    }
+
+    void AppendPoint(
+        Geant4PrimaryGammaTrajectory* trajectory,
+        const G4ThreeVector& point
+    ) const {
+        if (trajectory == nullptr) {
+            return;
+        }
+        const Geant4TrajectoryPoint converted = {
+            point.x() / m,
+            point.y() / m,
+            point.z() / m,
+        };
+        if (!trajectory->points.empty()) {
+            const auto& previous = trajectory->points.back();
+            if (
+                std::abs(previous.x_m - converted.x_m) <= 1.0e-15
+                && std::abs(previous.y_m - converted.y_m) <= 1.0e-15
+                && std::abs(previous.z_m - converted.z_m) <= 1.0e-15
+            ) {
+                return;
+            }
+        }
+        if (trajectory->points.size() < max_points_per_track_) {
+            trajectory->points.push_back(converted);
+            return;
+        }
+        trajectory->points.back() = converted;
+        trajectory->points_truncated = true;
+    }
+
+    std::size_t max_tracks_per_source_ = 256;
+    std::size_t max_points_per_track_ = 512;
+    mutable std::mutex mutex_;
+    std::map<
+        std::tuple<std::size_t, long long, long long, int>,
+        Geant4PrimaryGammaTrajectory
+    > trajectories_;
+    std::map<std::size_t, std::size_t> track_count_by_source_;
+};
+#endif
+
 class CrystalSensitiveDetector : public G4VSensitiveDetector {
 public:
     CrystalSensitiveDetector(
@@ -4928,6 +5191,9 @@ public:
         TransportDiagnostics* diagnostics,
         ForceCollisionDiagnostics* force_collision_diagnostics,
         EventStore* event_store,
+#if defined(ROTATING_SHIELD_TRAJECTORY_DIAGNOSTIC)
+        Geant4TrajectoryStore* trajectory_store,
+#endif
         const std::string& detector_scoring_mode,
         const std::string& secondary_transport_mode,
         const RuntimeDetectorState* detector_state,
@@ -4944,6 +5210,9 @@ public:
         event_state_(
             event_store == nullptr ? nullptr : event_store->AcquireLocal()
         ),
+#if defined(ROTATING_SHIELD_TRAJECTORY_DIAGNOSTIC)
+        trajectory_store_(trajectory_store),
+#endif
         detector_scoring_mode_(NormalizeDetectorScoringMode(detector_scoring_mode)),
         secondary_transport_mode_(NormalizeSecondaryTransportMode(secondary_transport_mode)),
         detector_state_(detector_state),
@@ -4955,6 +5224,11 @@ public:
         }
         TransportDiagnostics::AddStep(diagnostics_state_.get(), step);
         MarkGammaInteraction(step);
+#if defined(ROTATING_SHIELD_TRAJECTORY_DIAGNOSTIC)
+        if (trajectory_store_ != nullptr) {
+            trajectory_store_->RecordStep(step);
+        }
+#endif
         RecordCompletedForceCollisionBranch(step);
         if (ScoreFastDetectorEntry(step)) {
             return;
@@ -5166,6 +5440,9 @@ private:
     ForceCollisionDiagnostics::LocalHandle
         force_collision_diagnostics_state_;
     EventStore::LocalHandle event_state_;
+#if defined(ROTATING_SHIELD_TRAJECTORY_DIAGNOSTIC)
+    Geant4TrajectoryStore* trajectory_store_ = nullptr;
+#endif
     std::string detector_scoring_mode_ = "full_transport";
     std::string secondary_transport_mode_ = "full_transport";
     const RuntimeDetectorState* detector_state_ = nullptr;
@@ -5206,6 +5483,9 @@ public:
         TransportDiagnostics* diagnostics,
         ForceCollisionDiagnostics* force_collision_diagnostics,
         EventStore* event_store,
+#if defined(ROTATING_SHIELD_TRAJECTORY_DIAGNOSTIC)
+        Geant4TrajectoryStore* trajectory_store,
+#endif
         std::string detector_scoring_mode,
         std::string secondary_transport_mode,
         const RuntimeDetectorState* detector_state,
@@ -5215,6 +5495,9 @@ public:
         diagnostics_(diagnostics),
         force_collision_diagnostics_(force_collision_diagnostics),
         event_store_(event_store),
+#if defined(ROTATING_SHIELD_TRAJECTORY_DIAGNOSTIC)
+        trajectory_store_(trajectory_store),
+#endif
         detector_scoring_mode_(std::move(detector_scoring_mode)),
         secondary_transport_mode_(std::move(secondary_transport_mode)),
         detector_state_(detector_state),
@@ -5240,6 +5523,9 @@ public:
             diagnostics_,
             force_collision_diagnostics_,
             event_store_,
+#if defined(ROTATING_SHIELD_TRAJECTORY_DIAGNOSTIC)
+            trajectory_store_,
+#endif
             detector_scoring_mode_,
             secondary_transport_mode_,
             detector_state_,
@@ -5253,6 +5539,9 @@ private:
     TransportDiagnostics* diagnostics_ = nullptr;
     ForceCollisionDiagnostics* force_collision_diagnostics_ = nullptr;
     EventStore* event_store_ = nullptr;
+#if defined(ROTATING_SHIELD_TRAJECTORY_DIAGNOSTIC)
+    Geant4TrajectoryStore* trajectory_store_ = nullptr;
+#endif
     std::string detector_scoring_mode_ = "full_transport";
     std::string secondary_transport_mode_ = "full_transport";
     const RuntimeDetectorState* detector_state_ = nullptr;
@@ -5846,6 +6135,12 @@ public:
         std::string detector_green_operator_path,
         std::string detector_green_operator_binary_sha256,
         std::string detector_green_operator_contract_sha256
+#if defined(ROTATING_SHIELD_TRAJECTORY_DIAGNOSTIC)
+        ,
+        std::string trajectory_output_path,
+        const int trajectory_max_tracks_per_source,
+        const int trajectory_max_points_per_track
+#endif
     ) : scene_(std::move(scene)),
         geometry_request_(geometry_request),
         physics_profile_(std::move(physics_profile)),
@@ -5868,6 +6163,9 @@ public:
         detector_green_operator_contract_sha256_(
             std::move(detector_green_operator_contract_sha256)
         ),
+#if defined(ROTATING_SHIELD_TRAJECTORY_DIAGNOSTIC)
+        trajectory_output_path_(std::move(trajectory_output_path)),
+#endif
         use_theory_tvl_(UseTheoryTvlProfile(physics_profile_)),
         event_store_(scene_.detector.coincidence_window_s) {
         const bool green_contract_complete = (
@@ -5898,6 +6196,14 @@ public:
                 DetectorGreenOperator
             >(detector_green_operator_path_);
         }
+#if defined(ROTATING_SHIELD_TRAJECTORY_DIAGNOSTIC)
+        if (!trajectory_output_path_.empty()) {
+            trajectory_store_ = std::make_unique<Geant4TrajectoryStore>(
+                trajectory_max_tracks_per_source,
+                trajectory_max_points_per_track
+            );
+        }
+#endif
         for (const auto& volume : scene_.volumes) {
             if (ToLower(volume.transport_mode) != "absorber") {
                 continue;
@@ -5962,6 +6268,9 @@ public:
                 ? &force_collision_diagnostics_
                 : nullptr,
             &event_store_,
+#if defined(ROTATING_SHIELD_TRAJECTORY_DIAGNOSTIC)
+            trajectory_store_.get(),
+#endif
             detector_scoring_mode_,
             secondary_transport_mode_,
             &detector_runtime_state_,
@@ -6060,6 +6369,16 @@ public:
                 "initialization."
             );
         }
+#if defined(ROTATING_SHIELD_TRAJECTORY_DIAGNOSTIC)
+        if (
+            options.trajectory_output_path != trajectory_output_path_
+            || (trajectory_output_path_.empty() != (trajectory_store_ == nullptr))
+        ) {
+            throw std::runtime_error(
+                "Geant4 trajectory-output contract changed after initialization."
+            );
+        }
+#endif
         CLHEP::HepRandom::setTheSeed(request.seed);
         bool movable_geometry_updated = false;
         if (detector_construction_ != nullptr) {
@@ -6071,6 +6390,11 @@ public:
         detector_runtime_state_.Update(request.detector_pose);
         event_store_.ClearDeposits();
         diagnostics_.Clear();
+#if defined(ROTATING_SHIELD_TRAJECTORY_DIAGNOSTIC)
+        if (trajectory_store_ != nullptr) {
+            trajectory_store_->Clear();
+        }
+#endif
         if (mean_calibration_forced_collision_) {
             force_collision_diagnostics_.Clear();
         }
@@ -7597,6 +7921,29 @@ public:
         event_store_.ClearDeposits();
 
         SimulationResult result;
+#if defined(ROTATING_SHIELD_TRAJECTORY_DIAGNOSTIC)
+        if (trajectory_store_ != nullptr) {
+            trajectory_store_->Write(
+                trajectory_output_path_,
+                scene_,
+                request
+            );
+            result.metadata["geant4_trajectory_recording"] = "true";
+            result.metadata["geant4_trajectory_format"] = (
+                "geant4_primary_gamma_step_trajectory_v1"
+            );
+            result.metadata["geant4_trajectory_track_count"] = (
+                std::to_string(trajectory_store_->TrackCount())
+            );
+            result.metadata["geant4_trajectory_detector_entered_track_count"] = (
+                std::to_string(
+                    trajectory_store_->DetectorEnteredTrackCount()
+                )
+            );
+        } else {
+            result.metadata["geant4_trajectory_recording"] = "false";
+        }
+#endif
         result.spectrum_counts = std::move(spectrum);
         result.spectrum_count_variance = std::move(spectrum_variance);
         result.metadata["backend"] = "geant4";
@@ -8446,7 +8793,13 @@ private:
     std::string detector_green_operator_path_;
     std::string detector_green_operator_binary_sha256_;
     std::string detector_green_operator_contract_sha256_;
+#if defined(ROTATING_SHIELD_TRAJECTORY_DIAGNOSTIC)
+    std::string trajectory_output_path_;
+#endif
     std::unique_ptr<DetectorGreenOperator> detector_green_operator_;
+#if defined(ROTATING_SHIELD_TRAJECTORY_DIAGNOSTIC)
+    std::unique_ptr<Geant4TrajectoryStore> trajectory_store_;
+#endif
     bool use_theory_tvl_ = false;
     bool run_manager_multithreaded_ = false;
     EventStore event_store_;
@@ -8483,6 +8836,12 @@ SimulationResult RunTransport(
         options.detector_green_operator_path,
         options.detector_green_operator_binary_sha256,
         options.detector_green_operator_contract_sha256
+#if defined(ROTATING_SHIELD_TRAJECTORY_DIAGNOSTIC)
+        ,
+        options.trajectory_output_path,
+        options.trajectory_max_tracks_per_source,
+        options.trajectory_max_points_per_track
+#endif
     );
     return session.Run(request, dead_time_tau_s, options, false, false);
 }
@@ -8577,6 +8936,12 @@ void RunPersistentServer(
                     options.detector_green_operator_path,
                     options.detector_green_operator_binary_sha256,
                     options.detector_green_operator_contract_sha256
+#if defined(ROTATING_SHIELD_TRAJECTORY_DIAGNOSTIC)
+                    ,
+                    options.trajectory_output_path,
+                    options.trajectory_max_tracks_per_source,
+                    options.trajectory_max_points_per_track
+#endif
                 );
                 session_key = key;
             }
@@ -8752,6 +9117,48 @@ int main(int argc, char** argv) {
                 transport_options.decay_comparison_energy_max_overridden = (
                     true
                 );
+#if defined(ROTATING_SHIELD_TRAJECTORY_DIAGNOSTIC)
+            } else if (
+                arg == "--geant4-trajectory-output"
+                && index + 1 < argc
+            ) {
+                transport_options.trajectory_output_path = argv[++index];
+                if (transport_options.trajectory_output_path.empty()) {
+                    throw std::runtime_error(
+                        "--geant4-trajectory-output requires a nonempty path"
+                    );
+                }
+            } else if (
+                arg == "--geant4-trajectory-max-tracks-per-source"
+                && index + 1 < argc
+            ) {
+                transport_options.trajectory_max_tracks_per_source = (
+                    std::stoi(argv[++index])
+                );
+                if (
+                    transport_options.trajectory_max_tracks_per_source <= 0
+                ) {
+                    throw std::runtime_error(
+                        "--geant4-trajectory-max-tracks-per-source requires "
+                        "a positive integer"
+                    );
+                }
+            } else if (
+                arg == "--geant4-trajectory-max-points-per-track"
+                && index + 1 < argc
+            ) {
+                transport_options.trajectory_max_points_per_track = (
+                    std::stoi(argv[++index])
+                );
+                if (
+                    transport_options.trajectory_max_points_per_track < 2
+                ) {
+                    throw std::runtime_error(
+                        "--geant4-trajectory-max-points-per-track requires "
+                        "an integer of at least two"
+                    );
+                }
+#endif
             } else if (arg == "--persistent") {
                 persistent = true;
             } else {
@@ -8831,6 +9238,14 @@ int main(int argc, char** argv) {
             );
         }
         transport_options.secondary_transport_mode = normalized_secondary_transport_mode;
+#if defined(ROTATING_SHIELD_TRAJECTORY_DIAGNOSTIC)
+        if (persistent && !transport_options.trajectory_output_path.empty()) {
+            throw std::runtime_error(
+                "Geant4 trajectory recording is a one-shot diagnostic and "
+                "cannot be combined with --persistent."
+            );
+        }
+#endif
         const bool detector_green_contract_complete = (
             !transport_options.detector_green_operator_path.empty()
             && IsLowercaseSha256(

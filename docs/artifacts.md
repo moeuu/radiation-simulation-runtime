@@ -39,6 +39,10 @@ launch. Set `sidecar_log_path` or `isaacsim_sidecar_log_path` to keep it within 
 acquisition bundle. Environment preview defaults also create a fresh run
 directory. Explicit output paths remain caller-controlled.
 
+[Native trajectory diagnostics](trajectory_diagnostics.md) keep private source
+tracks and their raw files together in a fresh directory under
+`private_runs/ral_ablation/figure_tracks/`. Existing exports are never overwritten.
+
 The existing `results/full_spectrum_all64_acceptance/` is the retained canonical
 approval bundle. Keep its evidence and associated logs together while the current
 approved model depends on it. Existing `ral_isaac_figures/` and

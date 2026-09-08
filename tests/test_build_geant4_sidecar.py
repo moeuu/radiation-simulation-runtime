@@ -46,6 +46,33 @@ def test_portable_profile_omits_host_specific_instructions() -> None:
     assert "-ffast-math" not in command
 
 
+def test_trajectory_diagnostic_define_is_opt_in() -> None:
+    """Production and trajectory builds must have distinct compiler contracts."""
+    production = build_geant4_sidecar._build_command(
+        source_path=Path("/tmp/sidecar.cpp"),
+        output_path=Path("/tmp/sidecar"),
+        standard="c++17",
+        profile="native",
+        cflags="",
+        libs="",
+    )
+    diagnostic = build_geant4_sidecar._build_command(
+        source_path=Path("/tmp/sidecar.cpp"),
+        output_path=Path("/tmp/trajectory-sidecar"),
+        standard="c++17",
+        profile="native",
+        cflags="",
+        libs="",
+        preprocessor_defines=(
+            "ROTATING_SHIELD_TRAJECTORY_DIAGNOSTIC=1",
+        ),
+    )
+
+    define = "-DROTATING_SHIELD_TRAJECTORY_DIAGNOSTIC=1"
+    assert define not in production
+    assert define in diagnostic
+
+
 def test_build_command_rejects_unknown_profile() -> None:
     """An unknown release profile must fail before invoking the compiler."""
     with pytest.raises(ValueError, match="Unsupported build profile"):
@@ -170,3 +197,39 @@ def test_cli_defaults_to_native_and_records_build_metadata(
     assert payload["geant4_version"] == "11.3.2"
     assert payload["pgo_mode"] == "off"
     assert payload["pgo_profile_directory"] is None
+    assert payload["trajectory_diagnostic"] is False
+
+
+@pytest.mark.parametrize("reserved", ("executable", "metadata", "existing_metadata"))
+def test_diagnostic_build_cannot_replace_production_inputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reserved: str,
+) -> None:
+    """Reject production output paths before any compiler or Geant4 invocation."""
+    monkeypatch.setattr(build_geant4_sidecar, "ROOT", tmp_path)
+    production = tmp_path / "build/geant4_sidecar"
+    metadata = production.with_name(
+        "geant4_sidecar-build.json"
+        if reserved == "existing_metadata"
+        else "geant4_sidecar.build.json"
+    )
+    production.parent.mkdir()
+    production.write_bytes(b"approved binary")
+    metadata.write_bytes(b"approved build metadata")
+    args = ["build_geant4_sidecar.py", "--trajectory-diagnostic", "--output"]
+    if reserved == "executable":
+        args += [str(production)]
+    else:
+        args += [str(tmp_path / "diagnostic"), "--metadata-output", str(metadata)]
+    monkeypatch.setattr(sys, "argv", args)
+
+    def unexpected_command(*_args: object, **_kwargs: object) -> None:
+        """Fail if validation allows any external process to start."""
+        pytest.fail("Invalid diagnostic output must fail before invoking tools.")
+
+    monkeypatch.setattr(build_geant4_sidecar.subprocess, "run", unexpected_command)
+    with pytest.raises(SystemExit, match="requires a separate --output path"):
+        build_geant4_sidecar.main()
+    assert production.read_bytes() == b"approved binary"
+    assert metadata.read_bytes() == b"approved build metadata"

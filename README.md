@@ -30,6 +30,11 @@ when transferring an existing dataset.
 
 ## Commands
 
+For private source-track inspection, use the separate
+[native trajectory diagnostic](docs/trajectory_diagnostics.md), with an explicit
+run and station. Its executable and output bundles are independent of production
+acquisition and approval evidence.
+
 Configurations select the current implementation automatically;
 `simulation_runtime_schema_version` may be omitted. The production spectrum model
 uses the detector Green operator and XCOM-air detector-cone transport. Retired
