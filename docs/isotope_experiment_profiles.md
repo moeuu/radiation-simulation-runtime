@@ -32,11 +32,13 @@ with the legacy Eu-154 model; selecting a truth isotope without a matching PF
 state would make correct inference impossible.
 
 `configs/geant4/models/isotope_profile_model_registry.json` binds every
-profile to one model file, file digest, and model-contract digest. The RA-L
-Eu-154 entry includes the designated-training discrepancy model. Other
-profiles currently use their matching physical line mean and are explicitly
-labelled runtime-unvalidated; selecting them is supported, but does not imply
-that an independent Geant4 accuracy holdout has been passed.
+profile to one model file, file digest, and model-contract digest. The canonical
+`unconditioned_cs_co.json` carries the all-64 application approval. Other
+profile-specific physical models can receive catalog-independent approval at
+startup when their detector, transport, observation, and algorithm contracts
+match and their lines lie in the validated detector-energy domain. The recorded
+provenance still distinguishes this transfer from direct application validation
+of every isotope profile.
 
 ## Decay and detector semantics
 

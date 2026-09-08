@@ -2323,18 +2323,11 @@ def test_detector_cone_scatter_distance_extrapolation_fails_closed() -> None:
         )
 
 
-def test_retired_component_candidate_is_rejected_before_runtime() -> None:
-    """A stale learned asset cannot cross the current training boundary."""
-    path = (
-        Path(__file__).resolve().parents[1]
-        / "configs"
-        / "geant4"
-        / "models"
-        / "geometry_conditioned_full_spectrum_ral_eu154_component.json"
-    )
+def test_retired_model_schema_is_rejected_before_runtime() -> None:
+    """Reject a retired schema without retaining an obsolete learned asset."""
     with pytest.raises(ValueError, match="schema-v7"):
         GeometryConditionedSpectralModel.from_manifest_payload(
-            json.loads(path.read_text(encoding="utf-8")),
+            {"schema_version": 3, "model": "geometry_conditioned_full_spectrum"},
             detector_green_operator=(
                 approved_full_spectrum_model().detector_green_operator
             ),

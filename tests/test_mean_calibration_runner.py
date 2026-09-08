@@ -180,11 +180,15 @@ def test_forced_collision_is_selected_only_by_calibration_design() -> None:
     assert "mean_calibration_forced_collision" not in standard
 
 
-def test_cli_predeclares_forced_collision_and_small_training_scope() -> None:
+def test_cli_predeclares_forced_collision_and_small_training_scope(
+    tmp_path: Path,
+) -> None:
     """CLI flags must become immutable design fields before acquisition."""
     arguments = calibration_cli_parser().parse_args(
         [
             "init",
+            "--output-root",
+            str(tmp_path),
             "--histories-per-source-line",
             "16",
             "--angle-strata-mu",
@@ -207,6 +211,17 @@ def test_cli_predeclares_forced_collision_and_small_training_scope() -> None:
     assert design["training_scene_seeds"] == [2026072901]
     assert design["scenario_ids"] == ["single_line_source_resolved"]
     assert design["shield_pair_ids"] == [7]
+
+
+def test_calibration_requires_an_explicit_run_directory(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Calibration phases must not share an implicit global output root."""
+    with pytest.raises(SystemExit):
+        calibration_cli_parser().parse_args(
+            ["init", "--histories-per-source-line", "16"]
+        )
+    assert "--output-root" in capsys.readouterr().err
 
 
 def test_smaller_predeclared_design_seals_only_declared_artifacts(

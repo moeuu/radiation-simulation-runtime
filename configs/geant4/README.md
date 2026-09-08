@@ -18,10 +18,10 @@ production configs reject those keys instead of accepting ignored duplicates.
   standard no-GUI Geant4 acquisition config for the shared runtime,
   `--cui`, and `--full-simulation`. It requires one authenticated
   profile-selected geometry-conditioned joint full-spectrum model with a
-  globally fitted, nonnegative additive noncollided transport component. The
-  standard RA-L profile uses a training-only, view-conditioned count and mark
-  discrepancy; the rejected deterministic low-rank mean correction is not in
-  the runtime path.
+  canonical detector Green operator and physical transport contracts. Its
+  profile-specific model must obtain exact application approval or compatible
+  catalog-independent approval before acquisition. Retired learned candidates
+  and deterministic low-rank mean corrections are not standard runtime assets.
 - `variance_reduction_external_gui_32threads.json`: standard Geant4 acquisition
   simulation config plus an Isaac Sim sidecar for visualization. It is a
   complete standalone production document; the intended runtime difference is
@@ -54,9 +54,11 @@ before starting the native process.
 Only model assets referenced by the current runtime, registry, builders, tests,
 or documentation are kept in this production repository. Superseded training
 and profile generations remain recoverable from Git history instead of living
-beside the active assets. The profile directory is intentionally limited to the
-seven `physics_only` files authenticated by
-`isotope_profile_model_registry.json`.
+beside the active assets. The profile directory contains assets authenticated by
+`isotope_profile_model_registry.json` and the canonical all-64-approved
+`unconditioned_cs_co.json` used to authorize compatible profiles. Retired
+schema-v3 training candidates and low-rank correction files are not runtime
+assets; obsolete-schema rejection uses a minimal in-memory test payload.
 
 Generation suffixes are omitted when only one active asset exists. Explicit
 serialized schema numbers and stable contract identifiers remain versioned

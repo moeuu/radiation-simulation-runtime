@@ -882,6 +882,40 @@ def test_production_reset_rejects_mismatched_native_execution_provenance(
         _client(**arguments)._validate_fidelity_handshake(handshake)
 
 
+def test_default_sidecar_logs_are_separate_for_each_launch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reusing a sidecar port must not combine unrelated acquisition logs."""
+    root = Path(__file__).resolve().parents[1]
+    config = load_production_runtime_config(
+        root / "configs/geant4/diagnostic_external_no_isaac_1thread.json"
+    )
+    log_paths = []
+
+    def stop_before_launch(**kwargs: object) -> None:
+        """Capture the selected destination without creating a child process."""
+        log_paths.append(kwargs["log_path"])
+        raise OSError("test stopped before launch")
+
+    monkeypatch.setattr("sim.runtime._tcp_server_available", lambda *_args: False)
+    monkeypatch.setattr("sim.runtime._start_sidecar_process", stop_before_launch)
+    monkeypatch.setattr(
+        "sim.runtime._configured_detector_green_hashes",
+        lambda *_args: (TEST_GREEN_CONTRACT_SHA256, TEST_GREEN_BINARY_SHA256),
+    )
+    for _ in range(2):
+        with pytest.raises(OSError, match="test stopped before launch"):
+            create_simulation_runtime(
+                "geant4", sources=[], mu_by_isotope={}, shield_params=None,
+                runtime_config=config,
+                expected_native_executable_sha256="d" * 64,
+                expected_native_execution_environment_sha256="e" * 64,
+                expected_implementation_bundle_sha256="f" * 64,
+            )
+    assert len(log_paths) == 2 and log_paths[0] != log_paths[1]
+    assert all(path.parent.parent == root / "logs" for path in log_paths)
+
+
 def test_production_create_rejects_existing_tcp_endpoint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

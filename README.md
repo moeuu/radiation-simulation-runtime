@@ -194,3 +194,18 @@ portable sidecar build per invocation, with separate simulation processes and
 outputs. A new invocation rebuilds from the current source.
 Synthetic test operators use process-owned temporary directories under ignored
 `tmp/`, preserving runtime-relative paths and removing the files at process exit.
+
+## Artifact layout and distributions
+
+Follow the [artifact and Git policy](docs/artifacts.md). Keep each run's outputs,
+configuration, status, and logs together. Calibration and all-64 acceptance
+commands require an explicit `--output-root`; reuse it only to continue that run.
+Sidecar logs and environment previews get fresh output directories by default.
+Use `uv run python scripts/audit_artifacts.py --check` before committing to detect
+ignored clutter and generated files accidentally added to Git.
+
+`uv build` builds directly from current source. Wheels include the runtime
+packages, `runtime_environment.py`, and the canonical detector operator. Source
+distributions also include native build inputs and public configurations. Build
+tests reject stale `build/lib` modules, private data, logs, and local datasets in
+both direct wheels and wheels rebuilt from a source distribution.

@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from typing import Mapping
 
 import numpy as np
+import pytest
 
 from measurement.source_boundary import (
     SURFACE_EMISSION_EPSILON_M,
@@ -454,14 +455,16 @@ def _passing_metrics(
     }
 
 
-def test_default_output_root_is_scoped_to_the_current_contract() -> None:
-    """The CLI must never resume the stale unversioned acceptance root."""
-    assert acceptance_cli._DEFAULT_OUTPUT.name == (
-        FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256
-    )
-    assert acceptance_cli._DEFAULT_OUTPUT.parent.name == (
-        "full_spectrum_all64_acceptance"
-    )
+def test_acceptance_run_directory_must_be_selected_explicitly(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A new invocation must not implicitly reuse a previous acceptance run."""
+    parser = acceptance_cli._parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["status"])
+    assert "--output-root" in capsys.readouterr().err
+    arguments = parser.parse_args(["status", "--output-root", str(tmp_path)])
+    assert arguments.output_root == tmp_path
 
 
 def test_mark_diagnostic_uses_physical_component_concentration() -> None:

@@ -38,7 +38,6 @@ from spectrum.geant4_acceptance_backend import (
 )
 from spectrum.transport_spectral import (
     DESIGNATED_VALIDATION_SCENE_SEEDS,
-    FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256,
     GeometryConditionedSpectralModel,
 )
 
@@ -49,12 +48,6 @@ _DEFAULT_CONFIG = (
     / "configs"
     / "geant4"
     / "variance_reduction_external_no_isaac_32threads.json"
-)
-_DEFAULT_OUTPUT = (
-    _REPOSITORY_ROOT
-    / "results"
-    / "full_spectrum_all64_acceptance"
-    / FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256
 )
 
 
@@ -69,8 +62,11 @@ def _common_parser(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--output-root",
         type=Path,
-        default=_DEFAULT_OUTPUT,
-        help=(f"Immutable/resumable artifact root (default: {_DEFAULT_OUTPUT})."),
+        required=True,
+        help=(
+            "Run directory under results/full_spectrum_all64_acceptance/. "
+            "Reuse the same path explicitly to resume a recorded run."
+        ),
     )
 
 

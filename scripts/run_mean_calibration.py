@@ -30,7 +30,6 @@ _DEFAULT_CONFIG = (
     / "geant4"
     / "variance_reduction_external_no_isaac_32threads.json"
 )
-_DEFAULT_OUTPUT = _REPOSITORY_ROOT / "results" / "mean_calibration"
 
 
 def _add_layout_arguments(parser: argparse.ArgumentParser) -> None:
@@ -38,8 +37,11 @@ def _add_layout_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--output-root",
         type=Path,
-        default=_DEFAULT_OUTPUT,
-        help=f"Calibration artifact root (default: {_DEFAULT_OUTPUT}).",
+        required=True,
+        help=(
+            "Run directory under results/mean_calibration/. Reuse the same "
+            "path explicitly for subsequent phases or resume."
+        ),
     )
     parser.add_argument(
         "--histories-per-source-line",

@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=77"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
 
 [project]
 name = "rotating-shield-simulation-runtime"
@@ -30,11 +30,38 @@ test = ["pytest>=9.0.1"]
 [project.scripts]
 rotating-shield-sim = "runtime.cli:main"
 
-[tool.setuptools]
-package-dir = {"" = "src"}
+[tool.hatch.build]
+exclude = ["**/__pycache__/**", "**/*.py[cod]", "**/*.egg-info/**"]
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.hatch.build.targets.wheel]
+only-include = [
+    "src/measurement",
+    "src/runtime",
+    "src/sim",
+    "src/spectrum",
+    "src/runtime_environment.py",
+]
+sources = ["src"]
+
+[tool.hatch.build.targets.sdist]
+only-include = [
+    "src",
+    "native",
+    "configs",
+    "source_layouts",
+    "obstacle_layouts",
+    "scripts",
+    "tests",
+    "docs",
+    "AGENTS.md",
+    "CITATION.cff",
+    "LICENSE",
+    "README.md",
+    "pyproject.toml",
+    "uv.lock",
+    ".gitignore",
+    ".python-version",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

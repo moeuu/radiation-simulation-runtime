@@ -6,13 +6,14 @@ definition, statistics, and observation path.
 
 ## Standard Full Simulation Entry Point
 
-- "Full simulation" means `uv run python main.py --full-simulation`.
-- The default `uv run python main.py` entry point and `--cui` alias must resolve
-  to the standard no-GUI Geant4/PF runtime:
-  `--mode geant4-cui` with
+- The estimator controls one causal acquisition through the shared adaptive API.
+  This repository serves it with `rotating-shield-sim
+  serve-adaptive-session-socket <private-scenario> --socket-path <socket>`.
+- The standard no-GUI Geant4 configuration is
   `configs/geant4/variance_reduction_external_no_isaac_32threads.json`.
-- Python analytic CUI is available only through the explicit `--python-cui` or
-  `--mode python-cui` options.
+- PF inference, planning, and its live command belong to the sibling estimator
+  repository. This repository has no `main.py` PF launcher. Analytic backends are
+  explicit test fixtures and do not replace production Geant4 acquisition.
 
 ## Prohibited Runtime Shortcuts
 
@@ -91,9 +92,12 @@ definition, statistics, and observation path.
 
 ## Required Checks
 
-- Run `uv run pytest` after any simulation change.
-- Keep `tests/test_geant4_fidelity_config.py` and
-  `tests/test_simulation_fidelity_shortcuts.py` passing.
+- Run affected tests during iteration and the full runtime suite before
+  publishing core protocol/physics changes or a release. Include native
+  integration tests for native transport changes.
+- Keep physical-runtime configuration, production preflight, observation
+  contract, and native integration tests passing. Artifact-only changes use
+  packaging and hygiene checks described in [the artifact policy](artifacts.md).
 - Add a regression test before introducing any new simulation option that could
   lower runtime fidelity.
 - For any accuracy-motivated calibration or observation-model change, use failed

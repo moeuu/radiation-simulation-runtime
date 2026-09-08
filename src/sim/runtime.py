@@ -16,6 +16,7 @@ import sys
 import tempfile
 import time
 from typing import Any
+from uuid import uuid4
 
 from measurement.model import PointSource
 from runtime.provenance import strict_sha256_json
@@ -1718,7 +1719,7 @@ def _start_geant4_sidecar(
         str(
             config.get(
                 "sidecar_log_path",
-                root / "results" / "sidecars" / f"geant4_bridge_{port}.log",
+                root / "logs" / f"geant4-{port}-{uuid4().hex}" / "bridge.log",
             )
         )
     ).expanduser()
@@ -1917,7 +1918,9 @@ def _start_isaacsim_sidecar(
         )
     root = _repo_root()
     script_path = root / "scripts" / "run_isaacsim_bridge.py"
-    default_log_path = root / "results" / "sidecars" / f"isaacsim_bridge_{port}.log"
+    default_log_path = (
+        root / "logs" / f"isaacsim-{port}-{uuid4().hex}" / "bridge.log"
+    )
     log_path = Path(
         str(config.get("isaacsim_sidecar_log_path", default_log_path))
     ).expanduser()

@@ -24,6 +24,15 @@ observation generation, and MeasurementLog publication.
 - Follow PEP 8. Every function must have an English docstring.
 - Commit only to `main`. Do not create a pull request unless explicitly asked.
 
+## Artifact hygiene
+
+- Follow `docs/artifacts.md` for output ownership, retention, and distribution
+  builds. Keep related outputs and logs under a fresh run directory; resumption
+  must explicitly select an existing run. Tests must clean their temporary files.
+- Run `uv run python scripts/audit_artifacts.py --check` before committing.
+- Keep generated data and logs out of Git. Preserve canonical model assets and
+  raw evidence for current approvals and current RA-L results.
+
 ## Physical semantics
 
 - `intensity_cps_1m` is expected pre-dead-time detector pulse rate at 1 m for

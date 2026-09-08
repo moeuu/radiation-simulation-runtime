@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import sys
+from uuid import uuid4
 
 import matplotlib
 
@@ -49,8 +50,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("results/environment.png"),
-        help="Output PNG path (relative to repo root if not absolute).",
+        default=(
+            Path("results") / "previews" / f"environment-{uuid4().hex}"
+            / "environment.png"
+        ),
+        help="Output PNG path; defaults to a fresh results/previews run directory.",
     )
     parser.add_argument(
         "--size-x",

@@ -1,13 +1,16 @@
+# Local environments and reproducible Python caches.
 .venv/
 .pytest_cache/
 .ruff_cache/
 __pycache__/
 *.py[cod]
 *.egg-info/
-build/
-dist/
-results/
-private_runs/
-logs/
+# Generated distributions, native executables, and run artifacts.
+/build/
+/dist/
+/results/
+/private_runs/
+/logs/
 /tmp/
+# Downloaded environment assets; canonical package model assets stay tracked.
 /data/manchester_nuclear_assets/
