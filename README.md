@@ -19,6 +19,15 @@ controller can choose the next position and shield posture from the observations
 so far. This repository supplies the same simulator implementation and physics
 configuration to every live session.
 
+Manchester environment assets belong in this repository's ignored
+`data/manchester_nuclear_assets/` directory: downloaded ZIPs in `downloads/`,
+extracted originals in `raw/`, and converted scenes plus textures in `usd/`.
+The bundled Isaac Sim configurations resolve their USD paths here. Keep these
+local assets out of estimator repositories and Git; prepare them with
+`uv run python scripts/prepare_manchester_dataset.py --asset Drum_Store` when
+they are unavailable. Preserve the originals and textures alongside the USD
+when transferring an existing dataset.
+
 ## Commands
 
 ```bash
